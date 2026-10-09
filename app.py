@@ -30,6 +30,7 @@ from flask_cors import CORS
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "Pop-A-Licious <noreply@pop-a-licious.com>")
 SITE_URL = os.environ.get("SITE_URL", "https://pop-a-licious.com").rstrip("/")
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "giftcards.db")
@@ -41,7 +42,8 @@ MAX_AMOUNT_CENTS = 50000    # $500
 stripe.api_key = STRIPE_SECRET_KEY
 
 app = Flask(__name__)
-CORS(app, origins=[SITE_URL, "http://localhost:3000", "http://127.0.0.1:3000"])
+_cors_origins = "*" if CORS_ORIGINS.strip() == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
+CORS(app, origins=_cors_origins)
 
 # ---------------------------------------------------------------- db
 
