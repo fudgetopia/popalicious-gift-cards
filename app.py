@@ -1148,6 +1148,7 @@ def auth_resend():
         return err
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
+    email_error = None
     conn = db()
     row = conn.execute(
         "SELECT id, name, verified FROM users WHERE email = ?", (email,)
@@ -1160,7 +1161,6 @@ def auth_resend():
             (token, row["id"], expires),
         )
         conn.commit()
-        email_error = None
         try:
             _send_verification_email(row["name"], email, token)
         except Exception as e:
