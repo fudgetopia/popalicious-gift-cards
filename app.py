@@ -18,6 +18,7 @@ import re
 import secrets
 import sqlite3
 import string
+import html
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -302,6 +303,50 @@ def order_email_html(name, items_summary, amount_total_cents, gift_card_code, di
 <p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong></p>
 </body></html>"""
 
+# Where new-order notifications go (merchant inbox).
+ORDER_NOTIFY_EMAIL = os.environ.get("ORDER_NOTIFY_EMAIL", "orders@pop-a-licious.com")
+
+def merchant_order_email_html(order_ref, name, email, items_summary,
+                              amount_total_cents, gift_card_code,
+                              discount_cents, promo_code="", shipping=""):
+    dollars = lambda c: f"${c / 100:,.2f}"
+    rows = [
+        ("Order", order_ref),
+        ("Customer", html.escape(f"{name} <{email}>" if name else email)),
+        ("Items", html.escape(items_summary or "—")),
+        ("Total charged", dollars(amount_total_cents)),
+    ]
+    if gift_card_code:
+        rows.append(("Gift card", f"{html.escape(gift_card_code)} (−{dollars(discount_cents)})"))
+    if promo_code:
+        rows.append(("Promo code", html.escape(promo_code)))
+    if shipping:
+        rows.append(("Ship to", html.escape(shipping)))
+    body = "".join(f"<p><strong>{k}:</strong> {v}</p>" for k, v in rows)
+    return (
+        '<html><body style="font-family: Arial, sans-serif; line-height: 1.6;">'
+        "<h2>New Pop-A-Licious order</h2>"
+        f"{body}</body></html>"
+    )
+
+def notify_merchant_of_order(order_ref, name, email, items_summary,
+                             amount_total_cents, gift_card_code,
+                             discount_cents, promo_code="", shipping=""):
+    """Email the merchant about a new order. Never raises — a failed
+    notification must not break order fulfillment."""
+    if not ORDER_NOTIFY_EMAIL:
+        return
+    try:
+        send_email(
+            ORDER_NOTIFY_EMAIL,
+            f"New order {order_ref} — ${amount_total_cents / 100:,.2f}",
+            merchant_order_email_html(order_ref, name, email, items_summary,
+                                      amount_total_cents, gift_card_code,
+                                      discount_cents, promo_code, shipping),
+        )
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------- routes
 
 @app.get("/healthz")
@@ -448,6 +493,19 @@ def fulfill_order(session, meta):
     )
     conn.commit()
     conn.close()
+
+    ship = session.get("shipping_details") or {}
+    ship_addr = ship.get("address") or {}
+    shipping = ", ".join(
+        x for x in [
+            ship.get("name"),
+            ship_addr.get("line1"), ship_addr.get("line2"),
+            ship_addr.get("city"), ship_addr.get("state"),
+            ship_addr.get("postal_code"), ship_addr.get("country"),
+        ] if x
+    )
+    notify_merchant_of_order(session_id, name, email, items_summary,
+                             amount_total, code, discount, promo, shipping)
 
 def fulfill_gift_card(session, meta):
     session_id = session["id"]
@@ -1016,6 +1074,27 @@ def paypal_capture_order():
             )
     except Exception:
         pass  # payment already captured; never fail the response on email
+
+    shipping = ""
+    try:
+        pu0 = (pp.get("purchase_units") or [{}])[0]
+        sh = pu0.get("shipping") or {}
+        sh_name = sh.get("name")
+        sh_name = sh_name.get("full_name") if isinstance(sh_name, dict) else sh_name
+        addr = sh.get("address") or {}
+        shipping = ", ".join(
+            x for x in [
+                sh_name,
+                addr.get("address_line_1"), addr.get("address_line_2"),
+                addr.get("admin_area_2"), addr.get("admin_area_1"),
+                addr.get("postal_code"), addr.get("country_code"),
+            ] if x
+        )
+    except Exception:
+        pass
+    notify_merchant_of_order(order_id, name, email, row["items_summary"],
+                             row["amount_total_cents"], code, discount,
+                             promo, shipping)
 
     conn.execute("UPDATE paypal_orders SET status = 'captured' WHERE paypal_order_id = ?", (order_id,))
     conn.execute(
