@@ -1108,11 +1108,15 @@ def auth_signup():
     )
     conn.commit()
     conn.close()
+    email_error = None
     try:
         _send_verification_email(name, email, token)
-    except Exception:
-        pass
-    return jsonify(ok=True)
+    except Exception as e:
+        email_error = str(e)
+    resp = jsonify(ok=True)
+    if email_error:
+        resp = jsonify(ok=True, email_error=email_error)
+    return resp
 
 @app.get("/api/auth/verify")
 def auth_verify():
@@ -1156,11 +1160,14 @@ def auth_resend():
             (token, row["id"], expires),
         )
         conn.commit()
+        email_error = None
         try:
             _send_verification_email(row["name"], email, token)
-        except Exception:
-            pass
+        except Exception as e:
+            email_error = str(e)
     conn.close()
+    if email_error:
+        return jsonify(ok=True, email_error=email_error)
     return jsonify(ok=True)
 
 @app.post("/api/auth/login")
