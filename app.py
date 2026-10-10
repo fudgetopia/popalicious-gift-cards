@@ -171,8 +171,23 @@ def init_db():
             expires_at TEXT NOT NULL,
             used INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            flavor_slug TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            user_name TEXT NOT NULL,
+            rating INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            approved INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(flavor_slug, user_id)
+        );
         """
     )
+    # Migration for databases created before the approved column existed.
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(reviews)").fetchall()]
+    if "approved" not in cols:
+        conn.execute("ALTER TABLE reviews ADD COLUMN approved INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -1224,7 +1239,8 @@ def auth_me():
     row = _auth_user_from_token(token or _session_token_from_request())
     if not row:
         return jsonify(error="not logged in"), 401
-    return jsonify(id=row["id"], name=row["name"], email=row["email"])
+    return jsonify(id=row["id"], name=row["name"], email=row["email"],
+                   is_admin=row["email"].lower() in ADMIN_EMAILS)
 
 @app.get("/api/auth/google/start")
 def google_start():
@@ -1309,6 +1325,126 @@ def google_callback():
     conn.close()
     token = _issue_auth_token(user_id)
     return _set_session_cookie(redirect(f"{SITE_URL}/#login"), token)
+
+
+# Reviews are held for approval: only approved=1 reviews are public.
+# Admins (emails in ADMIN_EMAILS) approve via the hidden /admin-reviews page.
+ADMIN_EMAILS = [
+    e.strip().lower()
+    for e in os.environ.get("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+]
+
+def _is_admin(user):
+    return bool(user) and (user["email"].lower() in ADMIN_EMAILS)
+
+# ---------------------------------------------------------------- flavor reviews
+
+@app.get("/api/reviews")
+def list_reviews():
+    flavor = (request.args.get("flavor") or "").strip().lower()
+    if not flavor:
+        return jsonify(error="flavor is required"), 400
+    conn = db()
+    rows = conn.execute(
+        "SELECT user_name, rating, text, created_at FROM reviews"
+        " WHERE flavor_slug = ? AND approved = 1 ORDER BY created_at DESC",
+        (flavor,),
+    ).fetchall()
+    conn.close()
+    reviews = [
+        {"name": r["user_name"], "rating": r["rating"], "text": r["text"],
+         "created_at": r["created_at"]}
+        for r in rows
+    ]
+    avg = round(sum(r["rating"] for r in reviews) / len(reviews), 1) if reviews else 0
+    return jsonify(reviews=reviews, count=len(reviews), average=avg)
+
+@app.post("/api/reviews")
+def post_review():
+    err = _require_auth_ready()
+    if err:
+        return err
+    user = _auth_user_from_token(_session_token_from_request())
+    if not user:
+        return jsonify(error="please log in to leave a review"), 401
+    data = request.get_json(force=True) or {}
+    flavor = (data.get("flavor") or "").strip().lower()
+    try:
+        rating = int(data.get("rating", 0))
+    except (TypeError, ValueError):
+        return jsonify(error="rating is required"), 400
+    text = (data.get("text") or "").strip()
+    if not flavor:
+        return jsonify(error="flavor is required"), 400
+    if rating < 1 or rating > 5:
+        return jsonify(error="rating must be between 1 and 5 stars"), 400
+    if len(text) < 2:
+        return jsonify(error="please write a few words"), 400
+    if len(text) > 1000:
+        return jsonify(error="review is too long (1000 characters max)"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        """INSERT INTO reviews (flavor_slug, user_id, user_name, rating, text, approved, created_at)
+           VALUES (?, ?, ?, ?, ?, 0, ?)
+           ON CONFLICT(flavor_slug, user_id) DO UPDATE SET
+             rating = excluded.rating, text = excluded.text,
+             approved = 0, created_at = excluded.created_at""",
+        (flavor, user["id"], user["name"], rating, text, now),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, pending=True,
+                   message="Thanks! Your review will appear once it's approved.")
+
+@app.get("/api/reviews/pending")
+def pending_reviews():
+    err = _require_auth_ready()
+    if err:
+        return err
+    user = _auth_user_from_token(_session_token_from_request())
+    if not _is_admin(user):
+        return jsonify(error="not authorized"), 403
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, flavor_slug, user_name, rating, text, created_at FROM reviews"
+        " WHERE approved = 0 ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    return jsonify(reviews=[
+        {"id": r["id"], "flavor": r["flavor_slug"], "name": r["user_name"],
+         "rating": r["rating"], "text": r["text"], "created_at": r["created_at"]}
+        for r in rows
+    ])
+
+@app.post("/api/reviews/<int:review_id>/approve")
+def approve_review(review_id):
+    err = _require_auth_ready()
+    if err:
+        return err
+    user = _auth_user_from_token(_session_token_from_request())
+    if not _is_admin(user):
+        return jsonify(error="not authorized"), 403
+    conn = db()
+    conn.execute("UPDATE reviews SET approved = 1 WHERE id = ?", (review_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/reviews/<int:review_id>/reject")
+def reject_review(review_id):
+    err = _require_auth_ready()
+    if err:
+        return err
+    user = _auth_user_from_token(_session_token_from_request())
+    if not _is_admin(user):
+        return jsonify(error="not authorized"), 403
+    conn = db()
+    conn.execute("DELETE FROM reviews WHERE id = ?", (review_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
 
 
 if __name__ == "__main__":
