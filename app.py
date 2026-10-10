@@ -272,30 +272,33 @@ def create_checkout():
     if not non_refundable_ok:
         return jsonify(error="please acknowledge the gift card is non-refundable"), 400
 
-    session = stripe.checkout.Session.create(
-        mode="payment",
-        line_items=[
-            {
-                "price_data": {
-                    "currency": "usd",
-                    "unit_amount": amount,
-                    "product": GIFT_CARD_PRODUCT_ID,
-                },
-                "quantity": 1,
-            }
-        ],
-        customer_email=purchaser_email,
-        metadata={
-            "type": "gift_card",
-            "purchaser_name": purchaser_name,
-            "purchaser_email": purchaser_email,
-            "recipient_name": recipient_name,
-            "recipient_email": recipient_email,
-            "message": message,
-        },
-        success_url=f"{SITE_URL}/gift-card-success?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{SITE_URL}/gift-cards",
-    )
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=[
+                {
+                    "price_data": {
+                        "currency": "usd",
+                        "unit_amount": amount,
+                        "product": GIFT_CARD_PRODUCT_ID,
+                    },
+                    "quantity": 1,
+                }
+            ],
+            customer_email=purchaser_email,
+            metadata={
+                "type": "gift_card",
+                "purchaser_name": purchaser_name,
+                "purchaser_email": purchaser_email,
+                "recipient_name": recipient_name,
+                "recipient_email": recipient_email,
+                "message": message,
+            },
+            success_url=f"{SITE_URL}/gift-card-success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{SITE_URL}/gift-cards",
+        )
+    except stripe.error.StripeError:
+        return jsonify(error="the payment service could not start checkout"), 502
     return jsonify(url=session.url)
 
 @app.post("/api/webhooks/stripe")
@@ -756,26 +759,29 @@ def create_order_checkout():
                 "quantity": 1,
             }
         )
-    session = stripe.checkout.Session.create(
-        mode="payment",
-        line_items=line_items,
-        discounts=discounts,
-        # A backend-applied discount means the Stripe promo-code box stays off
-        # so discounts can never be combined.
-        allow_promotion_codes=not (order["gift_card_code"] or order["promo_code"]),
-        customer_email=order["email"] or None,
-        shipping_address_collection={"allowed_countries": ["US"]},
-        phone_number_collection={"enabled": True},
-        metadata={
-            "type": "order",
-            "items_summary": order["summary"],
-            "gift_card_code": order["gift_card_code"],
-            "gift_card_discount_cents": str(order["gift_card_discount_cents"]),
-            "promo_code": order["promo_code"],
-        },
-        success_url=f"{SITE_URL}/order-success?session_id={{CHECKOUT_SESSION_ID}}",
-        cancel_url=f"{SITE_URL}/",
-    )
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            line_items=line_items,
+            discounts=discounts,
+            # A backend-applied discount means the Stripe promo-code box stays off
+            # so discounts can never be combined.
+            allow_promotion_codes=not (order["gift_card_code"] or order["promo_code"]),
+            customer_email=order["email"] or None,
+            shipping_address_collection={"allowed_countries": ["US"]},
+            phone_number_collection={"enabled": True},
+            metadata={
+                "type": "order",
+                "items_summary": order["summary"],
+                "gift_card_code": order["gift_card_code"],
+                "gift_card_discount_cents": str(order["gift_card_discount_cents"]),
+                "promo_code": order["promo_code"],
+            },
+            success_url=f"{SITE_URL}/order-success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{SITE_URL}/",
+        )
+    except stripe.error.StripeError:
+        return jsonify(error="the payment service could not start checkout"), 502
     return jsonify(url=session.url, gift_card_discount_cents=order["gift_card_discount_cents"])
 
 # ---------------------------------------------------------------- paypal checkout
