@@ -176,7 +176,18 @@ def init_db():
     conn.commit()
     conn.close()
 
-init_db()
+# The database must live on persistent storage (e.g. a Railway Volume).
+# If it can't be opened, keep the app up but report it on /healthz instead
+# of crashing the whole service.
+DB_OK = True
+DB_ERROR = None
+try:
+    parent = os.path.dirname(os.path.abspath(DATABASE_PATH))
+    os.makedirs(parent, exist_ok=True)
+    init_db()
+except Exception as e:
+    DB_OK = False
+    DB_ERROR = f"{type(e).__name__}: {e}"
 
 # ---------------------------------------------------------------- helpers
 
@@ -280,7 +291,7 @@ def order_email_html(name, items_summary, amount_total_cents, gift_card_code, di
 
 @app.get("/healthz")
 def healthz():
-    return jsonify(ok=True)
+    return jsonify(ok=DB_OK, db_error=DB_ERROR, database_path=DATABASE_PATH)
 
 @app.get("/api/stripe/config")
 def stripe_config():
