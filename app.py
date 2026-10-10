@@ -29,6 +29,7 @@ from flask_cors import CORS
 
 STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
+STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "Pop-A-Licious <noreply@pop-a-licious.com>")
@@ -70,6 +71,9 @@ PROMOS = {
 
 MIN_AMOUNT_CENTS = 500      # $5
 MAX_AMOUNT_CENTS = 50000    # $500
+# When true, the gift card checkout also accepts a $0.50 test amount
+# (for the hidden pre-launch test gift card page). Turn off when live.
+ALLOW_TEST_AMOUNTS = os.environ.get("ALLOW_TEST_AMOUNTS", "").lower() == "true"
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -249,6 +253,13 @@ def order_email_html(name, items_summary, amount_total_cents, gift_card_code, di
 def healthz():
     return jsonify(ok=True)
 
+@app.get("/api/stripe/config")
+def stripe_config():
+    """Public Stripe publishable key for embedded checkout (Stripe.js)."""
+    if not STRIPE_PUBLISHABLE_KEY:
+        return jsonify(error="Stripe is not configured"), 503
+    return jsonify(publishable_key=STRIPE_PUBLISHABLE_KEY)
+
 @app.post("/api/gift-cards/checkout")
 def create_checkout():
     data = request.get_json(force=True) or {}
@@ -263,8 +274,10 @@ def create_checkout():
     message = (data.get("message") or "").strip()[:500]
     non_refundable_ok = bool(data.get("non_refundable_ack"))
 
-    if not (MIN_AMOUNT_CENTS <= amount <= MAX_AMOUNT_CENTS):
-        return jsonify(error=f"amount must be between ${MIN_AMOUNT_CENTS//100} and ${MAX_AMOUNT_CENTS//100}"), 400
+    min_allowed = 50 if (ALLOW_TEST_AMOUNTS and amount == 50) else MIN_AMOUNT_CENTS
+    if not (min_allowed <= amount <= MAX_AMOUNT_CENTS):
+        min_str = "$0.50" if min_allowed == 50 else f"${min_allowed // 100}"
+        return jsonify(error=f"amount must be between {min_str} and ${MAX_AMOUNT_CENTS // 100}"), 400
     if not purchaser_name or not EMAIL_RE.match(purchaser_email):
         return jsonify(error="valid purchaser name and email are required"), 400
     if not recipient_name or not EMAIL_RE.match(recipient_email):
@@ -760,8 +773,11 @@ def create_order_checkout():
             }
         )
     try:
+        # Embedded checkout: the payment form renders inside our checkout page,
+        # so customers never leave the site (no redirect to stripe.com).
         session = stripe.checkout.Session.create(
             mode="payment",
+            ui_mode="embedded",
             line_items=line_items,
             discounts=discounts,
             # A backend-applied discount means the Stripe promo-code box stays off
@@ -777,12 +793,11 @@ def create_order_checkout():
                 "gift_card_discount_cents": str(order["gift_card_discount_cents"]),
                 "promo_code": order["promo_code"],
             },
-            success_url=f"{SITE_URL}/order-success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{SITE_URL}/",
+            return_url=f"{SITE_URL}/order-success?session_id={{CHECKOUT_SESSION_ID}}",
         )
     except stripe.error.StripeError:
         return jsonify(error="the payment service could not start checkout"), 502
-    return jsonify(url=session.url, gift_card_discount_cents=order["gift_card_discount_cents"])
+    return jsonify(client_secret=session.client_secret, gift_card_discount_cents=order["gift_card_discount_cents"])
 
 # ---------------------------------------------------------------- paypal checkout
 
