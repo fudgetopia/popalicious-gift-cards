@@ -18,12 +18,15 @@ import re
 import secrets
 import sqlite3
 import string
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 
 import requests
 import stripe
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, redirect, request
 from flask_cors import CORS
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # ---------------------------------------------------------------- config
 
@@ -31,7 +34,7 @@ STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
-CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "*")
+CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "https://muse.ai")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "Pop-A-Licious <noreply@pop-a-licious.com>")
 SITE_URL = os.environ.get("SITE_URL", "https://pop-a-licious.com").rstrip("/")
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "giftcards.db")
@@ -47,6 +50,17 @@ SHIP_FROM = {
     "zip": os.environ.get("SHIP_FROM_ZIP", "89074"),
     "country": "US",
 }
+
+# Customer accounts (login page)
+# AUTH_SECRET signs the login tokens — set it to any long random string.
+# GOOGLE_CLIENT_ID/SECRET enable the "Continue with Google" button
+# (from Google Cloud Console; redirect URI is BACKEND_URL + /api/auth/google/callback).
+AUTH_SECRET = os.environ.get("AUTH_SECRET", "")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+BACKEND_URL = os.environ.get(
+    "BACKEND_URL", "https://popalicious-gift-cards-production.up.railway.app"
+).rstrip("/")
 
 # Promo codes shown on the site's Offers & Discounts page.
 # percent -> Stripe percent-off coupon (one use). free_shipping -> zeroes the
@@ -79,7 +93,7 @@ stripe.api_key = STRIPE_SECRET_KEY
 
 app = Flask(__name__)
 _cors_origins = "*" if CORS_ORIGINS.strip() == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
-CORS(app, origins=_cors_origins)
+CORS(app, origins=_cors_origins, supports_credentials=True)
 
 # ---------------------------------------------------------------- db
 
@@ -141,6 +155,21 @@ def init_db():
             amount_total_cents INTEGER,
             status TEXT NOT NULL,
             created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            password_hash TEXT NOT NULL DEFAULT '',
+            verified INTEGER NOT NULL DEFAULT 0,
+            google_id TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS verification_tokens (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
         );
         """
     )
@@ -973,6 +1002,295 @@ def paypal_capture_order():
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- customer auth
+
+def _auth_serializer():
+    if not AUTH_SECRET:
+        return None
+    return URLSafeTimedSerializer(AUTH_SECRET, salt="popalicious-auth")
+
+def _require_auth_ready():
+    if not AUTH_SECRET:
+        return jsonify(error="accounts are not set up yet"), 503
+    return None
+
+def _issue_auth_token(user_id):
+    return _auth_serializer().dumps({"uid": user_id})
+
+def _auth_user_from_token(token):
+    s = _auth_serializer()
+    if not s or not token:
+        return None
+    try:
+        payload = s.loads(token, max_age=30 * 24 * 3600)  # 30 days
+    except (BadSignature, SignatureExpired):
+        return None
+    conn = db()
+    row = conn.execute(
+        "SELECT id, email, name FROM users WHERE id = ?", (payload.get("uid"),)
+    ).fetchone()
+    conn.close()
+    return row
+
+# Sessions live in a secure HttpOnly cookie set by the backend (never in
+# browser storage). SameSite=None + Secure lets the site on muse.ai use it
+# cross-origin; every auth fetch must use credentials: "include".
+SESSION_COOKIE = "pal_session"
+SESSION_MAX_AGE = 30 * 24 * 3600
+
+def _set_session_cookie(resp, token):
+    resp.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="None",
+        path="/",
+    )
+    return resp
+
+def _clear_session_cookie(resp):
+    resp.delete_cookie(SESSION_COOKIE, path="/", samesite="None", secure=True)
+    return resp
+
+def _session_token_from_request():
+    return request.cookies.get(SESSION_COOKIE, "")
+
+def _send_verification_email(name, email, token):
+    link = f"{SITE_URL}/verify?token={token}"
+    first = (name or "").split(" ")[0] or "there"
+    html = (
+        "<html><body style=\"font-family:Arial,sans-serif\">"
+        f"<p>Hi {first},</p>"
+        "<p>Thanks for creating a Pop-A-Licious account! "
+        "Click the link below to verify your email address:</p>"
+        f"<p><a href=\"{link}\">Verify my account</a></p>"
+        "<p>This link expires in 24 hours.</p>"
+        "<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong></p>"
+        "</body></html>"
+    )
+    send_email(email, "Verify your Pop-A-Licious account", html)
+
+@app.post("/api/auth/signup")
+def auth_signup():
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    if not name:
+        return jsonify(error="please enter your name"), 400
+    if not EMAIL_RE.match(email):
+        return jsonify(error="please enter a valid email address"), 400
+    if len(password) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+    conn = db()
+    if conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone():
+        conn.close()
+        return jsonify(error="an account with this email already exists — try logging in"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO users (email, name, password_hash, verified, created_at)"
+        " VALUES (?, ?, ?, 0, ?)",
+        (email, name, generate_password_hash(password), now),
+    )
+    user_id = cur.lastrowid
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    conn.execute(
+        "INSERT INTO verification_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
+        (token, user_id, expires),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        _send_verification_email(name, email, token)
+    except Exception:
+        pass
+    return jsonify(ok=True)
+
+@app.get("/api/auth/verify")
+def auth_verify():
+    err = _require_auth_ready()
+    if err:
+        return err
+    token = request.args.get("token", "")
+    conn = db()
+    row = conn.execute(
+        "SELECT user_id, expires_at, used FROM verification_tokens WHERE token = ?",
+        (token,),
+    ).fetchone()
+    if not row or row["used"]:
+        conn.close()
+        return jsonify(error="this verification link is invalid or already used"), 400
+    if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
+        conn.close()
+        return jsonify(error="this verification link has expired — request a new one"), 400
+    conn.execute("UPDATE users SET verified = 1 WHERE id = ?", (row["user_id"],))
+    conn.execute("UPDATE verification_tokens SET used = 1 WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/auth/resend-verification")
+def auth_resend():
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    conn = db()
+    row = conn.execute(
+        "SELECT id, name, verified FROM users WHERE email = ?", (email,)
+    ).fetchone()
+    if row and not row["verified"]:
+        token = secrets.token_urlsafe(32)
+        expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+        conn.execute(
+            "INSERT INTO verification_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
+            (token, row["id"], expires),
+        )
+        conn.commit()
+        try:
+            _send_verification_email(row["name"], email, token)
+        except Exception:
+            pass
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/auth/login")
+def auth_login():
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    conn = db()
+    row = conn.execute(
+        "SELECT id, name, email, password_hash, verified FROM users WHERE email = ?",
+        (email,),
+    ).fetchone()
+    conn.close()
+    if not row or not row["password_hash"] or not check_password_hash(
+        row["password_hash"], password
+    ):
+        return jsonify(error="email or password is incorrect"), 401
+    if not row["verified"]:
+        return jsonify(
+            error="please verify your email before logging in — check your inbox",
+            needs_verification=True,
+        ), 403
+    resp = jsonify(name=row["name"], email=row["email"])
+    return _set_session_cookie(resp, _issue_auth_token(row["id"]))
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    err = _require_auth_ready()
+    if err:
+        return err
+    return _clear_session_cookie(jsonify(ok=True))
+
+@app.get("/api/auth/me")
+def auth_me():
+    err = _require_auth_ready()
+    if err:
+        return err
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    row = _auth_user_from_token(token or _session_token_from_request())
+    if not row:
+        return jsonify(error="not logged in"), 401
+    return jsonify(id=row["id"], name=row["name"], email=row["email"])
+
+@app.get("/api/auth/google/start")
+def google_start():
+    err = _require_auth_ready()
+    if err:
+        return err
+    if not GOOGLE_CLIENT_ID:
+        return jsonify(error="Google sign-in is not set up yet"), 400
+    state = _auth_serializer().dumps({"nonce": secrets.token_urlsafe(8)})
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": BACKEND_URL + "/api/auth/google/callback",
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": state,
+        "prompt": "select_account",
+    }
+    return redirect(
+        "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    )
+
+@app.get("/api/auth/google/callback")
+def google_callback():
+    err = _require_auth_ready()
+    if err:
+        return err
+    if not (GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET):
+        return jsonify(error="Google sign-in is not set up yet"), 400
+    code = request.args.get("code", "")
+    state = request.args.get("state", "")
+    try:
+        _auth_serializer().loads(state, max_age=600)
+    except (BadSignature, SignatureExpired):
+        return jsonify(error="invalid sign-in request"), 400
+    try:
+        tok = requests.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "code": code,
+                "grant_type": "authorization_code",
+                "redirect_uri": BACKEND_URL + "/api/auth/google/callback",
+            },
+            timeout=20,
+        )
+        tok.raise_for_status()
+        access_token = tok.json()["access_token"]
+        me = requests.get(
+            "https://www.googleapis.com/oauth2/v3/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=20,
+        )
+        me.raise_for_status()
+        info = me.json()
+    except Exception:
+        return jsonify(error="Google sign-in failed"), 502
+    google_id = info.get("sub", "")
+    email = (info.get("email") or "").strip().lower()
+    name = (info.get("name") or "").strip()
+    if not google_id or not email:
+        return jsonify(error="Google sign-in failed"), 502
+    conn = db()
+    row = conn.execute(
+        "SELECT id FROM users WHERE google_id = ? OR email = ?", (google_id, email)
+    ).fetchone()
+    now = datetime.now(timezone.utc).isoformat()
+    if row:
+        user_id = row["id"]
+        conn.execute(
+            "UPDATE users SET google_id = ?, verified = 1 WHERE id = ?",
+            (google_id, user_id),
+        )
+    else:
+        cur = conn.execute(
+            "INSERT INTO users (email, name, password_hash, verified, google_id, created_at)"
+            " VALUES (?, '', 1, ?, ?)",
+            (email, name, google_id, now),
+        )
+        user_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    token = _issue_auth_token(user_id)
+    return _set_session_cookie(redirect(f"{SITE_URL}/#login"), token)
 
 
 if __name__ == "__main__":
