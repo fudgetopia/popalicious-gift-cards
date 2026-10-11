@@ -237,6 +237,8 @@ def init_db():
             kernels INTEGER NOT NULL DEFAULT 0,
             birthday TEXT NOT NULL DEFAULT '',
             hire_date TEXT NOT NULL DEFAULT '',
+            referral_code TEXT NOT NULL DEFAULT '',
+            verified INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS staff_kernel_transactions (
@@ -246,6 +248,11 @@ def init_db():
             reason TEXT NOT NULL,
             ref TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS staff_verification_tokens (
+            token TEXT PRIMARY KEY,
+            staff_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS loyalty_rewards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -290,6 +297,21 @@ def init_db():
         conn.execute("ALTER TABLE staff ADD COLUMN birthday TEXT NOT NULL DEFAULT ''")
     if "hire_date" not in scols:
         conn.execute("ALTER TABLE staff ADD COLUMN hire_date TEXT NOT NULL DEFAULT ''")
+    if "referral_code" not in scols:
+        conn.execute("ALTER TABLE staff ADD COLUMN referral_code TEXT NOT NULL DEFAULT ''")
+    if "verified" not in scols:
+        conn.execute("ALTER TABLE staff ADD COLUMN verified INTEGER NOT NULL DEFAULT 1")
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS staff_verification_tokens (
+            token TEXT PRIMARY KEY,
+            staff_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL
+        )"""
+    )
+    # Backfill referral codes for existing staff.
+    for r in conn.execute("SELECT id FROM staff WHERE referral_code = ''").fetchall():
+        code = "STF-" + secrets.token_hex(3).upper()
+        conn.execute("UPDATE staff SET referral_code = ? WHERE id = ?", (code, r["id"]))
     conn.execute(
         """CREATE TABLE IF NOT EXISTS staff_kernel_transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1421,6 +1443,15 @@ def auth_signup():
         "INSERT INTO verification_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
         (token, user_id, expires),
     )
+    # Staff referral: if the signup came from an employee's QR code, credit them.
+    staff_ref = (data.get("staff_ref") or "").strip().upper()
+    if staff_ref:
+        srow = conn.execute(
+            "SELECT id FROM staff WHERE referral_code = ? AND active = 1",
+            (staff_ref,),
+        ).fetchone()
+        if srow:
+            _credit_staff_kernels(conn, srow["id"], 1, "member_signup", ref=email)
     conn.commit()
     conn.close()
     email_error = None
@@ -1847,7 +1878,7 @@ def _staff_from_request():
         return None
     conn = db()
     row = conn.execute(
-        "SELECT id, email, name FROM staff WHERE id = ? AND active = 1",
+        "SELECT id, email, name FROM staff WHERE id = ? AND active = 1 AND verified = 1",
         (payload.get("sid"),),
     ).fetchone()
     conn.close()
@@ -1980,12 +2011,15 @@ def staff_login():
     password = data.get("password") or ""
     conn = db()
     row = conn.execute(
-        "SELECT id, email, name, password_hash FROM staff WHERE email = ? AND active = 1",
+        "SELECT id, email, name, password_hash, verified FROM staff WHERE email = ? AND active = 1",
         (email,),
     ).fetchone()
     if not row or not check_password_hash(row["password_hash"], password):
         conn.close()
         return jsonify(error="invalid staff login"), 401
+    if not row["verified"]:
+        conn.close()
+        return jsonify(error="please verify your account via the email we sent"), 403
     # Auto-credit birthday + work-anniversary kernels (once per year each).
     occasion_credits = _maybe_credit_staff_occasions(conn, row["id"])
     conn.commit()
@@ -2179,6 +2213,49 @@ def _maybe_credit_staff_occasions(conn, staff_id):
                 credited.append(f"{years}-year anniversary")
     return credited
 
+@app.get("/api/loyalty/staff/verify-check")
+def staff_verify_check():
+    token = (request.args.get("token") or "").strip()
+    conn = db()
+    row = conn.execute(
+        "SELECT t.staff_id, t.expires_at, s.name, s.email FROM staff_verification_tokens t"
+        " JOIN staff s ON s.id = t.staff_id WHERE t.token = ?",
+        (token,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return jsonify(error="invalid or expired link"), 400
+    if row["expires_at"] < datetime.now(timezone.utc).isoformat():
+        return jsonify(error="this link has expired"), 400
+    return jsonify(ok=True, name=row["name"], email=row["email"])
+
+@app.post("/api/loyalty/staff/set-password")
+def staff_set_password():
+    data = request.get_json(force=True) or {}
+    token = (data.get("token") or "").strip()
+    new = data.get("new_password") or ""
+    confirm = data.get("confirm_password") or ""
+    if len(new) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+    if new != confirm:
+        return jsonify(error="passwords do not match"), 400
+    conn = db()
+    row = conn.execute(
+        "SELECT staff_id, expires_at FROM staff_verification_tokens WHERE token = ?",
+        (token,),
+    ).fetchone()
+    if not row or row["expires_at"] < datetime.now(timezone.utc).isoformat():
+        conn.close()
+        return jsonify(error="invalid or expired link"), 400
+    conn.execute(
+        "UPDATE staff SET password_hash = ?, verified = 1 WHERE id = ?",
+        (generate_password_hash(new), row["staff_id"]),
+    )
+    conn.execute("DELETE FROM staff_verification_tokens WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
 @app.post("/api/loyalty/staff/birthday")
 def staff_birthday():
     staff, err = _require_staff()
@@ -2201,7 +2278,8 @@ def staff_profile():
         return err
     conn = db()
     row = conn.execute(
-        "SELECT id, name, email, headshot, kernels, birthday, hire_date, created_at"
+        "SELECT id, name, email, headshot, kernels, birthday, hire_date,"
+        " referral_code, created_at"
         " FROM staff WHERE id = ?",
         (staff["id"],),
     ).fetchone()
@@ -2215,6 +2293,7 @@ def staff_profile():
         id=row["id"], name=row["name"], email=row["email"],
         headshot=row["headshot"] or "", kernels=row["kernels"] or 0,
         birthday=row["birthday"] or "", hire_date=row["hire_date"] or "",
+        referral_code=row["referral_code"] or "",
         created_at=row["created_at"],
         reward_tiers={k: v["kernels"] for k, v in STAFF_REWARD_TIERS.items()},
         reward_labels={k: v["label"] for k, v in STAFF_REWARD_TIERS.items()},
@@ -2665,25 +2744,42 @@ def admin_create_staff():
     email = (data.get("email") or "").strip().lower()
     name = (data.get("name") or "").strip()
     password = data.get("password") or ""
-    hire_date = (data.get("hire_date") or "").strip()
     if not EMAIL_RE.match(email):
         return jsonify(error="valid email required"), 400
     if len(password) < 8:
         return jsonify(error="password must be at least 8 characters"), 400
-    if hire_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", hire_date):
-        return jsonify(error="hire date must be YYYY-MM-DD"), 400
     conn = db()
     try:
-        conn.execute(
-            "INSERT INTO staff (email, name, password_hash, hire_date, created_at) VALUES (?, ?, ?, ?, ?)",
+        ref_code = "STF-" + secrets.token_hex(3).upper()
+        cur = conn.execute(
+            "INSERT INTO staff (email, name, password_hash, referral_code, verified, created_at) VALUES (?, ?, ?, ?, 0, ?)",
             (email, name or email.split("@")[0], generate_password_hash(password),
-             hire_date, datetime.now(timezone.utc).isoformat()),
+             ref_code, datetime.now(timezone.utc).isoformat()),
+        )
+        staff_id = cur.lastrowid
+        # Verification token for the staff welcome email.
+        vtoken = secrets.token_urlsafe(32)
+        vexpires = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
+        conn.execute(
+            "INSERT INTO staff_verification_tokens (token, staff_id, expires_at) VALUES (?, ?, ?)",
+            (vtoken, staff_id, vexpires),
         )
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
         return jsonify(error="that staff email already exists"), 409
     conn.close()
+    verify_url = f"{SITE_URL}/#staff-verify?token={vtoken}"
+    try:
+        send_email(
+            email,
+            "Your Pop-A-Licious staff account",
+            f"Hi {name or 'there'},\n\nYour staff account has been created.\n"
+            f"Click below to verify your account and set your password:\n{verify_url}\n\n"
+            f"This link expires in 48 hours.\n",
+        )
+    except Exception:
+        pass
     return jsonify(ok=True)
 
 @app.get("/api/admin/dashboard")
