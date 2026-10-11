@@ -165,6 +165,8 @@ def init_db():
             password_hash TEXT NOT NULL DEFAULT '',
             verified INTEGER NOT NULL DEFAULT 0,
             google_id TEXT NOT NULL DEFAULT '',
+            birthday TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS verification_tokens (
@@ -249,6 +251,9 @@ def init_db():
     ucols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
     if "birthday" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN birthday TEXT NOT NULL DEFAULT ''")
+    # Migration: active flag for admin customer deactivation.
+    if "active" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
     # Migration: reward_code on paypal_orders for loyalty reward redemption.
     pcols = [r["name"] for r in conn.execute("PRAGMA table_info(paypal_orders)").fetchall()]
     if "reward_code" not in pcols:
@@ -1276,7 +1281,7 @@ def _auth_user_from_token(token):
         return None
     conn = db()
     row = conn.execute(
-        "SELECT id, email, name FROM users WHERE id = ?", (payload.get("uid"),)
+        "SELECT id, email, name FROM users WHERE id = ? AND active = 1", (payload.get("uid"),)
     ).fetchone()
     conn.close()
     return row
@@ -1337,9 +1342,16 @@ def auth_signup():
     if len(password) < 8:
         return jsonify(error="password must be at least 8 characters"), 400
     conn = db()
-    if conn.execute("SELECT id FROM users WHERE email = ?", (email,)).fetchone():
-        conn.close()
-        return jsonify(error="an account with this email already exists — try logging in"), 409
+    existing = conn.execute(
+        "SELECT id, active FROM users WHERE email = ?", (email,)
+    ).fetchone()
+    if existing:
+        if existing["active"]:
+            conn.close()
+            return jsonify(error="an account with this email already exists — try logging in"), 409
+        # Deactivated account: remove it so the email can be re-registered fresh.
+        conn.execute("DELETE FROM users WHERE id = ?", (existing["id"],))
+        conn.commit()
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO users (email, name, password_hash, verified, created_at)"
@@ -1498,7 +1510,7 @@ def auth_login():
     password = data.get("password") or ""
     conn = db()
     row = conn.execute(
-        "SELECT id, name, email, password_hash, verified FROM users WHERE email = ?",
+        "SELECT id, name, email, password_hash, verified, active FROM users WHERE email = ?",
         (email,),
     ).fetchone()
     conn.close()
@@ -1506,6 +1518,8 @@ def auth_login():
         row["password_hash"], password
     ):
         return jsonify(error="email or password is incorrect"), 401
+    if not row["active"]:
+        return jsonify(error="this account has been deactivated"), 403
     if not row["verified"]:
         return jsonify(
             error="please verify your email before logging in — check your inbox",
@@ -1801,6 +1815,9 @@ def loyalty_status():
     conn.commit()
     balance = _kernel_balance(conn, user["id"])
     lifetime = _lifetime_kernels(conn, user["id"])
+    brow = conn.execute(
+        "SELECT birthday FROM users WHERE id = ?", (user["id"],)
+    ).fetchone()
     rewards = conn.execute(
         "SELECT reward_type, code, created_at FROM loyalty_rewards"
         " WHERE user_id = ? AND used = 0 ORDER BY created_at DESC",
@@ -1811,6 +1828,7 @@ def loyalty_status():
         kernels=balance,
         lifetime_kernels=lifetime,
         tier=_loyalty_tier(lifetime),
+        birthday=(brow["birthday"] or "") if brow else "",
         kernels_per_dollar=KERNELS_PER_DOLLAR,
         reward_tiers={k: v["kernels"] for k, v in REWARD_TIERS.items()},
         available_rewards=[
@@ -2196,6 +2214,94 @@ def admin_flavor_sales():
     ]
     return jsonify(series=series)
 
+@app.post("/api/admin/customers/<int:customer_id>/deactivate")
+def admin_deactivate_customer(customer_id):
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    if customer_id == user["id"]:
+        return jsonify(error="you cannot deactivate your own account"), 400
+    conn = db()
+    conn.execute("UPDATE users SET active = 0 WHERE id = ?", (customer_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/admin/customers/<int:customer_id>/activate")
+def admin_activate_customer(customer_id):
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    conn.execute("UPDATE users SET active = 1 WHERE id = ?", (customer_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.get("/api/admin/orders")
+def admin_orders():
+    """Full order list for admins, with search. Params: search?, limit?, offset?"""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    search = (request.args.get("search") or "").strip()
+    try:
+        limit = min(max(int(request.args.get("limit") or 50), 1), 200)
+        offset = max(int(request.args.get("offset") or 0), 0)
+    except (TypeError, ValueError):
+        limit, offset = 50, 0
+    conn = db()
+    params = []
+    where = ""
+    if search:
+        where = "WHERE lower(o.email) LIKE ? OR lower(o.items_summary) LIKE ? OR lower(o.stripe_session_id) LIKE ?"
+        like = f"%{search.lower()}%"
+        params = [like, like, like]
+    total = conn.execute(
+        f"SELECT COUNT(*) AS c FROM orders o {where}", params).fetchone()["c"]
+    rows = conn.execute(
+        "SELECT o.stripe_session_id, o.email, o.items_summary, o.amount_total_cents,"
+        " o.gift_card_code, o.gift_card_discount_cents, o.created_at,"
+        " (SELECT promo_code FROM promo_redemptions p"
+        "  WHERE p.stripe_session_id = o.stripe_session_id LIMIT 1) AS promo_code,"
+        " (SELECT reward_code FROM paypal_orders po"
+        "  WHERE 'paypal:' || po.paypal_order_id = o.stripe_session_id LIMIT 1) AS reward_code"
+        f" FROM orders o {where} ORDER BY o.id DESC LIMIT ? OFFSET ?",
+        params + [limit, offset],
+    ).fetchall()
+    conn.close()
+    return jsonify(total=total, orders=[
+        {"id": r["stripe_session_id"], "email": r["email"], "items": r["items_summary"] or "",
+         "total_cents": r["amount_total_cents"] or 0,
+         "gift_card_code": r["gift_card_code"] or "",
+         "gift_card_discount_cents": r["gift_card_discount_cents"] or 0,
+         "promo_code": r["promo_code"] or "", "reward_code": r["reward_code"] or "",
+         "created_at": r["created_at"]}
+        for r in rows
+    ])
+
+@app.get("/api/admin/gift-cards")
+def admin_gift_card_list():
+    """All gift cards for the admin dashboard drill-down."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    rows = conn.execute(
+        "SELECT code, amount_cents, balance_cents, purchaser_name, purchaser_email,"
+        " recipient_name, recipient_email, active, created_at"
+        " FROM gift_cards ORDER BY created_at DESC LIMIT 500"
+    ).fetchall()
+    conn.close()
+    return jsonify(gift_cards=[
+        {"code": r["code"], "amount_cents": r["amount_cents"],
+         "balance_cents": r["balance_cents"], "purchaser_name": r["purchaser_name"],
+         "purchaser_email": r["purchaser_email"], "recipient_name": r["recipient_name"],
+         "recipient_email": r["recipient_email"], "active": bool(r["active"]),
+         "created_at": r["created_at"]}
+        for r in rows
+    ])
+
 @app.get("/api/admin/customers")
 def admin_customers():
     """List of everyone with an account."""
@@ -2204,7 +2310,7 @@ def admin_customers():
         return jsonify(error="admin required"), 403
     conn = db()
     rows = conn.execute(
-        "SELECT u.id, u.name, u.email, u.verified, u.birthday, u.created_at,"
+        "SELECT u.id, u.name, u.email, u.verified, u.birthday, u.active, u.created_at,"
         " COALESCE((SELECT SUM(kernels) FROM kernel_transactions k WHERE k.user_id = u.id), 0) AS kernels,"
         " (SELECT COUNT(*) FROM orders o WHERE o.email = u.email) AS orders"
         " FROM users u ORDER BY u.created_at DESC LIMIT 1000"
@@ -2213,6 +2319,7 @@ def admin_customers():
     return jsonify(customers=[
         {"id": r["id"], "name": r["name"], "email": r["email"],
          "verified": bool(r["verified"]), "birthday": r["birthday"] or "",
+         "active": bool(r["active"]),
          "kernels": r["kernels"], "orders": r["orders"], "created_at": r["created_at"]}
         for r in rows
     ])
@@ -2319,6 +2426,17 @@ def admin_deactivate_staff(staff_id):
     conn.close()
     return jsonify(ok=True)
 
+@app.post("/api/admin/staff/<int:staff_id>/activate")
+def admin_activate_staff(staff_id):
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    conn.execute("UPDATE staff SET active = 1 WHERE id = ?", (staff_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
 # ---------------------------------------------------------------- flavor reviews
 
 @app.get("/api/reviews")
@@ -2346,7 +2464,7 @@ def post_review():
     err = _require_auth_ready()
     if err:
         return err
-    user = _auth_user_from_token(_session_token_from_request())
+    user = _current_member()
     if not user:
         return jsonify(error="please log in to leave a review"), 401
     data = request.get_json(force=True) or {}
@@ -2384,7 +2502,7 @@ def pending_reviews():
     err = _require_auth_ready()
     if err:
         return err
-    user = _auth_user_from_token(_session_token_from_request())
+    user = _current_member()
     if not _is_admin(user):
         return jsonify(error="not authorized"), 403
     conn = db()
@@ -2404,7 +2522,7 @@ def approve_review(review_id):
     err = _require_auth_ready()
     if err:
         return err
-    user = _auth_user_from_token(_session_token_from_request())
+    user = _current_member()
     if not _is_admin(user):
         return jsonify(error="not authorized"), 403
     conn = db()
@@ -2418,7 +2536,7 @@ def reject_review(review_id):
     err = _require_auth_ready()
     if err:
         return err
-    user = _auth_user_from_token(_session_token_from_request())
+    user = _current_member()
     if not _is_admin(user):
         return jsonify(error="not authorized"), 403
     conn = db()
