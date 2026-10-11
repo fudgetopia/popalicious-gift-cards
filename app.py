@@ -179,6 +179,28 @@ def init_db():
             expires_at TEXT NOT NULL,
             used INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS site_visits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL DEFAULT '',
+            path TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS cart_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL DEFAULT '',
+            email TEXT NOT NULL DEFAULT '',
+            items_summary TEXT NOT NULL DEFAULT '',
+            item_count INTEGER NOT NULL DEFAULT 0,
+            ordered INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS subscription_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL DEFAULT '',
+            name TEXT NOT NULL DEFAULT '',
+            config TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             flavor_slug TEXT NOT NULL,
@@ -539,6 +561,12 @@ def fulfill_order(session, meta):
         conn.execute(
             "UPDATE loyalty_rewards SET used = 1, used_at = ? WHERE code = ? AND used = 0",
             (now, rcode),
+        )
+    # Analytics: this shopper's cart converted — not abandoned.
+    if email:
+        conn.execute(
+            "UPDATE cart_events SET ordered = 1 WHERE email = ? AND ordered = 0",
+            (email,),
         )
     # Loyalty: credit Kernels (1 per $1 of total charged) to the member's account.
     if email:
@@ -1202,6 +1230,12 @@ def paypal_capture_order():
         conn.execute(
             "UPDATE loyalty_rewards SET used = 1, used_at = ? WHERE code = ? AND used = 0",
             (now, rcode),
+        )
+    # Analytics: this shopper's cart converted — not abandoned.
+    if email:
+        conn.execute(
+            "UPDATE cart_events SET ordered = 1 WHERE email = ? AND ordered = 0",
+            (email,),
         )
     # Loyalty: credit Kernels (1 per $1 of total charged) to the member's account.
     if email:
@@ -2000,6 +2034,188 @@ def staff_redeem_for_member():
     conn.commit()
     conn.close()
     return jsonify(ok=True, label=tier["label"], balance=balance)
+
+# ---------------- analytics: tracking (public, no auth) ----------------
+
+@app.post("/api/track/visit")
+def track_visit():
+    """Log a site visit. Body: {session_id?, path?}. Throttled client-side."""
+    data = request.get_json(force=True) or {}
+    conn = db()
+    conn.execute(
+        "INSERT INTO site_visits (session_id, path, created_at) VALUES (?, ?, ?)",
+        ((data.get("session_id") or "")[:64], (data.get("path") or "")[:120],
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/track/cart")
+def track_cart():
+    """Log a cart snapshot for abandonment tracking."""
+    data = request.get_json(force=True) or {}
+    try:
+        item_count = int(data.get("item_count") or 0)
+    except (TypeError, ValueError):
+        item_count = 0
+    if item_count <= 0:
+        return jsonify(ok=True)
+    conn = db()
+    conn.execute(
+        "INSERT INTO cart_events (session_id, email, items_summary, item_count, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        ((data.get("session_id") or "")[:64], (data.get("email") or "").strip().lower()[:120],
+         (data.get("items_summary") or "")[:500], item_count,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/subscriptions/request")
+def subscription_request():
+    """Log a Subscribe & Save request (in addition to the email the site sends)."""
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not EMAIL_RE.match(email):
+        return jsonify(error="valid email required"), 400
+    conn = db()
+    conn.execute(
+        "INSERT INTO subscription_requests (email, name, config, created_at)"
+        " VALUES (?, ?, ?, ?)",
+        (email, (data.get("name") or "")[:120], (data.get("config") or "")[:500],
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+# ---------------- analytics: admin queries ----------------
+
+def _period_key(group):
+    # SQLite expression extracting the day/month/year bucket from ISO created_at.
+    if group == "month":
+        return "substr(created_at, 1, 7)"
+    if group == "year":
+        return "substr(created_at, 1, 4)"
+    return "substr(created_at, 1, 10)"  # day
+
+def _time_series(conn, table, group, value_expr="COUNT(*)", limit=365):
+    key = _period_key(group)
+    rows = conn.execute(
+        f"SELECT {key} AS period, {value_expr} AS value FROM {table}"
+        f" GROUP BY period ORDER BY period DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [{"period": r["period"], "value": r["value"]} for r in rows]
+
+def _parse_flavor_qty(items_summary):
+    """Parse '2x Alien Mix, 1x Caramel' into {flavor: qty}."""
+    out = {}
+    for part in (items_summary or "").split(","):
+        part = part.strip()
+        m = re.match(r"^(\d+)\s*x\s*(.+)$", part, re.IGNORECASE)
+        if m:
+            out[m.group(2).strip()] = out.get(m.group(2).strip(), 0) + int(m.group(1))
+    return out
+
+@app.get("/api/admin/analytics")
+def admin_analytics():
+    """Time-series analytics for the admin dashboard.
+    Params: group=day|month|year (default day)."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    group = (request.args.get("group") or "day").strip()
+    if group not in ("day", "month", "year"):
+        group = "day"
+    conn = db()
+    data = {
+        "sales": _time_series(conn, "orders", group, "COALESCE(SUM(amount_total_cents), 0)"),
+        "orders": _time_series(conn, "orders", group),
+        "visits": _time_series(conn, "site_visits", group, "COUNT(DISTINCT session_id)"),
+        "signups": _time_series(conn, "users", group),
+        "rewards_members": _time_series(
+            conn,
+            "(SELECT user_id, MIN(created_at) AS created_at FROM kernel_transactions GROUP BY user_id)",
+            group),
+        "promo_uses": _time_series(conn, "promo_redemptions", group),
+        "subscriptions": _time_series(conn, "subscription_requests", group),
+        "abandoned_carts": _time_series(
+            conn,
+            "(SELECT created_at FROM cart_events WHERE ordered = 0"
+            " AND created_at < datetime('now', '-2 hours'))",
+            group),
+        "gift_cards": _time_series(conn, "gift_cards", group),
+        "gift_card_revenue": _time_series(conn, "gift_cards", group,
+                                          "COALESCE(SUM(amount_cents), 0)"),
+    }
+    # Variety packs: count orders whose items mention a pack.
+    key = _period_key(group)
+    pack_rows = conn.execute(
+        f"SELECT {key} AS period,"
+        " SUM(CASE WHEN lower(items_summary) LIKE '%3-pack%' THEN 1 ELSE 0 END) AS packs3,"
+        " SUM(CASE WHEN lower(items_summary) LIKE '%6-pack%' THEN 1 ELSE 0 END) AS packs6"
+        " FROM orders GROUP BY period ORDER BY period DESC LIMIT 365",
+    ).fetchall()
+    data["variety_packs"] = [
+        {"period": r["period"], "packs_3": r["packs3"], "packs_6": r["packs6"]}
+        for r in pack_rows
+    ]
+    conn.close()
+    return jsonify(data)
+
+@app.get("/api/admin/flavor-sales")
+def admin_flavor_sales():
+    """Per-flavor unit sales time series. Params: group=day|month|year, flavor? (omit for all)."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    group = (request.args.get("group") or "day").strip()
+    if group not in ("day", "month", "year"):
+        group = "day"
+    want = (request.args.get("flavor") or "").strip().lower()
+    conn = db()
+    rows = conn.execute(
+        "SELECT items_summary, created_at FROM orders ORDER BY created_at DESC LIMIT 5000"
+    ).fetchall()
+    conn.close()
+    buckets = {}
+    for r in rows:
+        created = r["created_at"] or ""
+        period = created[:10] if group == "day" else created[:7] if group == "month" else created[:4]
+        for flavor, qty in _parse_flavor_qty(r["items_summary"]).items():
+            if want and flavor.lower() != want:
+                continue
+            b = buckets.setdefault(period, {})
+            b[flavor] = b.get(flavor, 0) + qty
+    series = [
+        {"period": p, "flavors": buckets[p]}
+        for p in sorted(buckets, reverse=True)[:365]
+    ]
+    return jsonify(series=series)
+
+@app.get("/api/admin/customers")
+def admin_customers():
+    """List of everyone with an account."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    rows = conn.execute(
+        "SELECT u.id, u.name, u.email, u.verified, u.birthday, u.created_at,"
+        " COALESCE((SELECT SUM(kernels) FROM kernel_transactions k WHERE k.user_id = u.id), 0) AS kernels,"
+        " (SELECT COUNT(*) FROM orders o WHERE o.email = u.email) AS orders"
+        " FROM users u ORDER BY u.created_at DESC LIMIT 1000"
+    ).fetchall()
+    conn.close()
+    return jsonify(customers=[
+        {"id": r["id"], "name": r["name"], "email": r["email"],
+         "verified": bool(r["verified"]), "birthday": r["birthday"] or "",
+         "kernels": r["kernels"], "orders": r["orders"], "created_at": r["created_at"]}
+        for r in rows
+    ])
 
 # ---------------- admin: manage staff logins ----------------
 
