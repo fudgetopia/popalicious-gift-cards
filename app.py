@@ -153,6 +153,7 @@ def init_db():
             gift_card_code TEXT,
             gift_card_discount_cents INTEGER,
             promo_code TEXT,
+            reward_code TEXT NOT NULL DEFAULT '',
             amount_total_cents INTEGER,
             status TEXT NOT NULL,
             created_at TEXT NOT NULL
@@ -183,12 +184,47 @@ def init_db():
             created_at TEXT NOT NULL,
             UNIQUE(flavor_slug, user_id)
         );
+        CREATE TABLE IF NOT EXISTS kernel_transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kernels INTEGER NOT NULL,
+            reason TEXT NOT NULL,
+            order_ref TEXT NOT NULL DEFAULT '',
+            staff_id INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS staff (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL DEFAULT '',
+            password_hash TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS loyalty_rewards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            reward_type TEXT NOT NULL,
+            code TEXT UNIQUE NOT NULL,
+            kernels_spent INTEGER NOT NULL DEFAULT 0,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            used_at TEXT NOT NULL DEFAULT ''
+        );
         """
     )
     # Migration for databases created before the approved column existed.
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(reviews)").fetchall()]
     if "approved" not in cols:
         conn.execute("ALTER TABLE reviews ADD COLUMN approved INTEGER NOT NULL DEFAULT 0")
+    # Migration: birthday field for the loyalty birthday reward.
+    ucols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "birthday" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN birthday TEXT NOT NULL DEFAULT ''")
+    # Migration: reward_code on paypal_orders for loyalty reward redemption.
+    pcols = [r["name"] for r in conn.execute("PRAGMA table_info(paypal_orders)").fetchall()]
+    if "reward_code" not in pcols:
+        conn.execute("ALTER TABLE paypal_orders ADD COLUMN reward_code TEXT NOT NULL DEFAULT ''")
     conn.commit()
     conn.close()
 
@@ -491,6 +527,22 @@ def fulfill_order(session, meta):
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (session_id, email, items_summary, amount_total, code, discount, now),
     )
+    # Loyalty: mark a redeemed reward code as used (single use).
+    rcode = meta.get("reward_code", "")
+    if rcode:
+        conn.execute(
+            "UPDATE loyalty_rewards SET used = 1, used_at = ? WHERE code = ? AND used = 0",
+            (now, rcode),
+        )
+    # Loyalty: credit Kernels (1 per $1 of total charged) to the member's account.
+    if email:
+        urow = conn.execute(
+            "SELECT id FROM users WHERE email = ?", (email,)
+        ).fetchone()
+        if urow:
+            _credit_kernels(conn, urow["id"],
+                            amount_total // 100 * KERNELS_PER_DOLLAR,
+                            "purchase", order_ref=session_id)
     conn.commit()
     conn.close()
 
@@ -783,6 +835,9 @@ def _compute_order(data):
         "promo_percent_off": 0,
         "gift_card_code": "",
         "gift_card_discount_cents": 0,
+        "reward_code": "",
+        "reward_type": "",
+        "reward_discount_cents": 0,
     }
     if code and code in PROMOS:
         # Offers-page promo code: one use per email address, one per order.
@@ -808,17 +863,34 @@ def _compute_order(data):
             order["shipping_label"] = f"FREE ({code})"
     elif code:
         conn = db()
-        row = conn.execute(
-            "SELECT balance_cents, active FROM gift_cards WHERE code = ?", (code,)
+        reward = conn.execute(
+            "SELECT reward_type FROM loyalty_rewards WHERE code = ? AND used = 0",
+            (code,),
         ).fetchone()
-        conn.close()
-        if not row or not row["active"]:
-            return None, (jsonify(error="gift card not found"), 404)
-        if row["balance_cents"] <= 0:
-            return None, (jsonify(error="gift card has no balance"), 402)
-        order["discount_kind"] = "gift_card"
-        order["gift_card_code"] = code
-        order["gift_card_discount_cents"] = min(row["balance_cents"], total)
+        if reward:
+            # Loyalty reward code (single use, issued from Kernels redemption).
+            order["discount_kind"] = "reward"
+            order["reward_code"] = code
+            order["reward_type"] = reward["reward_type"]
+            if reward["reward_type"] == "free_shipping":
+                order["shipping_cents"] = 0
+                order["shipping_label"] = f"FREE ({code})"
+            else:
+                order["reward_discount_cents"] = REWARD_DISCOUNT_CENTS.get(
+                    reward["reward_type"], 0)
+            conn.close()
+        else:
+            row = conn.execute(
+                "SELECT balance_cents, active FROM gift_cards WHERE code = ?", (code,)
+            ).fetchone()
+            conn.close()
+            if not row or not row["active"]:
+                return None, (jsonify(error="gift card not found"), 404)
+            if row["balance_cents"] <= 0:
+                return None, (jsonify(error="gift card has no balance"), 402)
+            order["discount_kind"] = "gift_card"
+            order["gift_card_code"] = code
+            order["gift_card_discount_cents"] = min(row["balance_cents"], total)
 
     summary = ", ".join(f"{it['quantity']}x {it['name']}" for it in items)
     if order["shipping_cents"] > 0:
@@ -860,6 +932,16 @@ def create_order_checkout():
             metadata={"gift_card_code": order["gift_card_code"]},
         )
         discounts = [{"coupon": coupon.id}]
+    elif order["discount_kind"] == "reward" and order["reward_discount_cents"]:
+        coupon = stripe.Coupon.create(
+            amount_off=order["reward_discount_cents"],
+            currency="usd",
+            duration="once",
+            max_redemptions=1,
+            redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
+            metadata={"reward_code": order["reward_code"]},
+        )
+        discounts = [{"coupon": coupon.id}]
 
     line_items = [
         {
@@ -895,7 +977,8 @@ def create_order_checkout():
             discounts=discounts,
             # A backend-applied discount means the Stripe promo-code box stays off
             # so discounts can never be combined.
-            allow_promotion_codes=not (order["gift_card_code"] or order["promo_code"]),
+            allow_promotion_codes=not (order["gift_card_code"] or order["promo_code"]
+                                       or order["reward_code"]),
             customer_email=order["email"] or None,
             shipping_address_collection={"allowed_countries": ["US"]},
             phone_number_collection={"enabled": True},
@@ -905,6 +988,7 @@ def create_order_checkout():
                 "gift_card_code": order["gift_card_code"],
                 "gift_card_discount_cents": str(order["gift_card_discount_cents"]),
                 "promo_code": order["promo_code"],
+                "reward_code": order["reward_code"],
             },
             return_url=f"{SITE_URL}/order-success?session_id={{CHECKOUT_SESSION_ID}}",
         )
@@ -935,6 +1019,8 @@ def paypal_create_order():
         disc = round((merch + ship) * order["promo_percent_off"] / 100)
     elif order["discount_kind"] == "gift_card":
         disc = order["gift_card_discount_cents"]
+    elif order["discount_kind"] == "reward":
+        disc = order["reward_discount_cents"]
     else:
         disc = 0
     grand = max(merch + ship - disc, 0)
@@ -991,11 +1077,11 @@ def paypal_create_order():
     conn.execute(
         """INSERT INTO paypal_orders
            (paypal_order_id, email, items_summary, gift_card_code,
-            gift_card_discount_cents, promo_code, amount_total_cents, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            gift_card_discount_cents, promo_code, reward_code, amount_total_cents, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             pp["id"], order["email"], order["summary"], order["gift_card_code"],
-            order["gift_card_discount_cents"], order["promo_code"], grand,
+            order["gift_card_discount_cents"], order["promo_code"], order["reward_code"], grand,
             "created", now,
         ),
     )
@@ -1104,6 +1190,22 @@ def paypal_capture_order():
            VALUES (?, ?, ?, ?, ?, ?, ?)""",
         (f"paypal:{order_id}", email, row["items_summary"], row["amount_total_cents"], code, discount, now),
     )
+    # Loyalty: mark a redeemed reward code as used (single use).
+    rcode = row["reward_code"] or ""
+    if rcode:
+        conn.execute(
+            "UPDATE loyalty_rewards SET used = 1, used_at = ? WHERE code = ? AND used = 0",
+            (now, rcode),
+        )
+    # Loyalty: credit Kernels (1 per $1 of total charged) to the member's account.
+    if email:
+        urow = conn.execute(
+            "SELECT id FROM users WHERE email = ?", (email,)
+        ).fetchone()
+        if urow:
+            _credit_kernels(conn, urow["id"],
+                            (row["amount_total_cents"] or 0) // 100 * KERNELS_PER_DOLLAR,
+                            "purchase", order_ref=f"paypal:{order_id}")
     conn.commit()
     conn.close()
     return jsonify(ok=True)
@@ -1416,6 +1518,445 @@ ADMIN_EMAILS = [
 
 def _is_admin(user):
     return bool(user) and (user["email"].lower() in ADMIN_EMAILS)
+
+# ---------------- Pop-A-Licious Rewards (loyalty program) ----------------
+# Members earn Kernels (1 per $1 by default, never expire). Tiers:
+#   25 Kernels → free shipping | 50 → free bag | 150 → free 3-pack | 300 → free 6-pack
+# Status: Popped → Buttery → Golden Kernel (by lifetime Kernels earned).
+
+KERNELS_PER_DOLLAR = int(os.environ.get("KERNELS_PER_DOLLAR", "1"))
+LOYALTY_TIER_BUTTERY_AT = int(os.environ.get("LOYALTY_TIER_BUTTERY_AT", "300"))
+LOYALTY_TIER_GOLDEN_AT = int(os.environ.get("LOYALTY_TIER_GOLDEN_AT", "1000"))
+
+REWARD_TIERS = {
+    "free_shipping": {"kernels": 25, "label": "Free shipping on one order"},
+    "free_bag": {"kernels": 50, "label": "Free single bag"},
+    "free_3pack": {"kernels": 150, "label": "Free 3-pack"},
+    "free_6pack": {"kernels": 300, "label": "Free 6-pack"},
+}
+# Discount applied at checkout per reward type ("shipping" = free shipping).
+REWARD_DISCOUNT_CENTS = {
+    "free_shipping": "shipping",
+    "free_bag": 800,
+    "free_3pack": 2100,
+    "free_6pack": 4000,
+    "birthday_bag": 800,
+}
+
+def _kernel_balance(conn, user_id):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(kernels), 0) AS bal FROM kernel_transactions WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    return int(row["bal"])
+
+def _lifetime_kernels(conn, user_id):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(kernels), 0) AS tot FROM kernel_transactions"
+        " WHERE user_id = ? AND kernels > 0",
+        (user_id,),
+    ).fetchone()
+    return int(row["tot"])
+
+def _loyalty_tier(lifetime):
+    if lifetime >= LOYALTY_TIER_GOLDEN_AT:
+        return "Golden Kernel"
+    if lifetime >= LOYALTY_TIER_BUTTERY_AT:
+        return "Buttery"
+    return "Popped"
+
+def _credit_kernels(conn, user_id, kernels, reason, order_ref="", staff_id=None):
+    if kernels <= 0:
+        return 0
+    conn.execute(
+        "INSERT INTO kernel_transactions (user_id, kernels, reason, order_ref, staff_id, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, kernels, reason, order_ref, staff_id,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    return kernels
+
+def _debit_kernels(conn, user_id, kernels, reason, order_ref=""):
+    if kernels <= 0:
+        return False
+    if _kernel_balance(conn, user_id) < kernels:
+        return False
+    conn.execute(
+        "INSERT INTO kernel_transactions (user_id, kernels, reason, order_ref, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (user_id, -kernels, reason, order_ref,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    return True
+
+def _new_reward_code():
+    return "KERN-" + secrets.token_hex(4).upper()
+
+def _maybe_grant_birthday_reward(conn, user_id):
+    """Grant the yearly free birthday bag if it's the member's birthday month."""
+    row = conn.execute(
+        "SELECT birthday FROM users WHERE id = ?", (user_id,)
+    ).fetchone()
+    bday = (row["birthday"] or "") if row else ""
+    if not bday:
+        return None
+    try:
+        month = int(bday.split("-")[1])
+    except (IndexError, ValueError):
+        return None
+    if month != datetime.now().month:
+        return None
+    year = str(datetime.now().year)
+    exists = conn.execute(
+        "SELECT 1 FROM loyalty_rewards WHERE user_id = ? AND reward_type = 'birthday_bag'"
+        " AND substr(created_at, 1, 4) = ?",
+        (user_id, year),
+    ).fetchone()
+    if exists:
+        return None
+    code = _new_reward_code()
+    conn.execute(
+        "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent, created_at)"
+        " VALUES (?, 'birthday_bag', ?, 0, ?)",
+        (user_id, code, datetime.now(timezone.utc).isoformat()),
+    )
+    return code
+
+def _current_member():
+    """The logged-in customer (or None)."""
+    err = _require_auth_ready()
+    if err:
+        return None
+    row = _auth_user_from_token(_session_token_from_request())
+    return row
+
+# ---------------- staff sessions (individual logins, loyalty tools only) ----------------
+STAFF_COOKIE = "pal_staff"
+
+def _staff_serializer():
+    if not AUTH_SECRET:
+        return None
+    return URLSafeTimedSerializer(AUTH_SECRET, salt="popalicious-staff")
+
+def _issue_staff_token(staff_id):
+    return _staff_serializer().dumps({"sid": staff_id})
+
+def _staff_from_request():
+    s = _staff_serializer()
+    token = request.cookies.get(STAFF_COOKIE, "")
+    if not s or not token:
+        return None
+    try:
+        payload = s.loads(token, max_age=12 * 3600)  # 12-hour staff sessions
+    except (BadSignature, SignatureExpired):
+        return None
+    conn = db()
+    row = conn.execute(
+        "SELECT id, email, name FROM staff WHERE id = ? AND active = 1",
+        (payload.get("sid"),),
+    ).fetchone()
+    conn.close()
+    return row
+
+def _require_staff():
+    staff = _staff_from_request()
+    if not staff:
+        return None, (jsonify(error="staff login required"), 401)
+    return staff, None
+
+def _set_staff_cookie(resp, token):
+    resp.set_cookie(
+        STAFF_COOKIE, token, max_age=12 * 3600, httponly=True,
+        secure=True, samesite="None", path="/",
+    )
+    return resp
+
+def _clear_staff_cookie(resp):
+    resp.delete_cookie(STAFF_COOKIE, path="/", samesite="None", secure=True)
+    return resp
+
+# ---------------- member loyalty endpoints ----------------
+
+@app.get("/api/loyalty/status")
+def loyalty_status():
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    conn = db()
+    _maybe_grant_birthday_reward(conn, user["id"])
+    conn.commit()
+    balance = _kernel_balance(conn, user["id"])
+    lifetime = _lifetime_kernels(conn, user["id"])
+    rewards = conn.execute(
+        "SELECT reward_type, code, created_at FROM loyalty_rewards"
+        " WHERE user_id = ? AND used = 0 ORDER BY created_at DESC",
+        (user["id"],),
+    ).fetchall()
+    conn.close()
+    return jsonify(
+        kernels=balance,
+        lifetime_kernels=lifetime,
+        tier=_loyalty_tier(lifetime),
+        kernels_per_dollar=KERNELS_PER_DOLLAR,
+        reward_tiers={k: v["kernels"] for k, v in REWARD_TIERS.items()},
+        available_rewards=[
+            {"type": r["reward_type"], "code": r["code"],
+             "label": REWARD_TIERS.get(r["reward_type"], {}).get("label", "Birthday reward"),
+             "created_at": r["created_at"]}
+            for r in rewards
+        ],
+    )
+
+@app.get("/api/loyalty/history")
+def loyalty_history():
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    conn = db()
+    rows = conn.execute(
+        "SELECT kernels, reason, order_ref, created_at FROM kernel_transactions"
+        " WHERE user_id = ? ORDER BY id DESC LIMIT 50",
+        (user["id"],),
+    ).fetchall()
+    conn.close()
+    return jsonify(history=[
+        {"kernels": r["kernels"], "reason": r["reason"],
+         "order_ref": r["order_ref"], "created_at": r["created_at"]}
+        for r in rows
+    ])
+
+@app.post("/api/loyalty/redeem")
+def loyalty_redeem():
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    reward_type = (data.get("reward_type") or "").strip()
+    tier = REWARD_TIERS.get(reward_type)
+    if not tier:
+        return jsonify(error="unknown reward"), 400
+    conn = db()
+    if not _debit_kernels(conn, user["id"], tier["kernels"], "redemption"):
+        conn.close()
+        return jsonify(error="not enough Kernels"), 402
+    code = _new_reward_code()
+    conn.execute(
+        "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (user["id"], reward_type, code, tier["kernels"],
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, code=code, label=tier["label"])
+
+@app.post("/api/loyalty/birthday")
+def loyalty_birthday():
+    """Save the member's birthday (enables the birthday reward)."""
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    bday = (data.get("birthday") or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", bday):
+        return jsonify(error="birthday must be YYYY-MM-DD"), 400
+    conn = db()
+    conn.execute("UPDATE users SET birthday = ? WHERE id = ?", (bday, user["id"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+# ---------------- staff loyalty endpoints ----------------
+
+@app.post("/api/loyalty/staff/login")
+def staff_login():
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    conn = db()
+    row = conn.execute(
+        "SELECT id, email, name, password_hash FROM staff WHERE email = ? AND active = 1",
+        (email,),
+    ).fetchone()
+    conn.close()
+    if not row or not check_password_hash(row["password_hash"], password):
+        return jsonify(error="invalid staff login"), 401
+    return _set_staff_cookie(
+        jsonify(ok=True, name=row["name"], email=row["email"]),
+        _issue_staff_token(row["id"]),
+    )
+
+@app.post("/api/loyalty/staff/logout")
+def staff_logout():
+    return _clear_staff_cookie(jsonify(ok=True))
+
+@app.get("/api/loyalty/staff/me")
+def staff_me():
+    staff, err = _require_staff()
+    if err:
+        return err[0], err[1]
+    return jsonify(id=staff["id"], email=staff["email"], name=staff["name"])
+
+@app.get("/api/loyalty/staff/members")
+def staff_member_search():
+    staff, err = _require_staff()
+    if err:
+        return err[0], err[1]
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify(members=[])
+    # Accept a member QR code (PAL:<user_id>) as well as email/name.
+    conn = db()
+    if q.upper().startswith("PAL:"):
+        try:
+            uid = int(q.split(":", 1)[1])
+        except ValueError:
+            uid = -1
+        rows = conn.execute(
+            "SELECT id, email, name FROM users WHERE id = ?", (uid,)
+        ).fetchall()
+    else:
+        like = f"%{q}%"
+        rows = conn.execute(
+            "SELECT id, email, name FROM users WHERE email LIKE ? OR name LIKE ? LIMIT 20",
+            (like, like),
+        ).fetchall()
+    members = []
+    for r in rows:
+        members.append({
+            "id": r["id"], "email": r["email"], "name": r["name"],
+            "kernels": _kernel_balance(conn, r["id"]),
+            "tier": _loyalty_tier(_lifetime_kernels(conn, r["id"])),
+        })
+    conn.close()
+    return jsonify(members=members)
+
+@app.post("/api/loyalty/staff/credit")
+def staff_credit_kernels():
+    """Credit Kernels for an in-person sale. Body: {user_id, amount_cents, note?}"""
+    staff, err = _require_staff()
+    if err:
+        return err[0], err[1]
+    data = request.get_json(force=True) or {}
+    try:
+        user_id = int(data.get("user_id") or 0)
+        amount_cents = int(data.get("amount_cents") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="invalid input"), 400
+    if user_id <= 0 or amount_cents <= 0 or amount_cents > 100000:
+        return jsonify(error="invalid input"), 400
+    kernels = max(amount_cents // 100 * KERNELS_PER_DOLLAR, 0)
+    conn = db()
+    if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+        conn.close()
+        return jsonify(error="member not found"), 404
+    _credit_kernels(conn, user_id, kernels, "in_person",
+                    order_ref=(data.get("note") or "")[:120], staff_id=staff["id"])
+    conn.commit()
+    balance = _kernel_balance(conn, user_id)
+    conn.close()
+    return jsonify(ok=True, kernels_credited=kernels, balance=balance)
+
+@app.post("/api/loyalty/staff/redeem")
+def staff_redeem_for_member():
+    """Redeem a reward on a member's behalf in person. Body: {user_id, reward_type}"""
+    staff, err = _require_staff()
+    if err:
+        return err[0], err[1]
+    data = request.get_json(force=True) or {}
+    try:
+        user_id = int(data.get("user_id") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="invalid input"), 400
+    reward_type = (data.get("reward_type") or "").strip()
+    tier = REWARD_TIERS.get(reward_type)
+    if user_id <= 0 or not tier:
+        return jsonify(error="invalid input"), 400
+    conn = db()
+    if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+        conn.close()
+        return jsonify(error="member not found"), 404
+    if not _debit_kernels(conn, user_id, tier["kernels"], "redemption_in_person"):
+        conn.close()
+        return jsonify(error="not enough Kernels"), 402
+    code = _new_reward_code()
+    conn.execute(
+        "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (user_id, reward_type, code, tier["kernels"],
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    balance = _kernel_balance(conn, user_id)
+    conn.close()
+    # In person the reward is applied on the spot, so mark it used immediately.
+    conn = db()
+    conn.execute(
+        "UPDATE loyalty_rewards SET used = 1, used_at = ? WHERE code = ?",
+        (datetime.now(timezone.utc).isoformat(), code),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, label=tier["label"], balance=balance)
+
+# ---------------- admin: manage staff logins ----------------
+
+@app.post("/api/admin/staff")
+def admin_create_staff():
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    name = (data.get("name") or "").strip()
+    password = data.get("password") or ""
+    if not EMAIL_RE.match(email):
+        return jsonify(error="valid email required"), 400
+    if len(password) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+    conn = db()
+    try:
+        conn.execute(
+            "INSERT INTO staff (email, name, password_hash, created_at) VALUES (?, ?, ?, ?)",
+            (email, name or email.split("@")[0], generate_password_hash(password),
+             datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return jsonify(error="that staff email already exists"), 409
+    conn.close()
+    return jsonify(ok=True)
+
+@app.get("/api/admin/staff")
+def admin_list_staff():
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, email, name, active, created_at FROM staff ORDER BY created_at DESC"
+    ).fetchall()
+    conn.close()
+    return jsonify(staff=[
+        {"id": r["id"], "email": r["email"], "name": r["name"],
+         "active": bool(r["active"]), "created_at": r["created_at"]}
+        for r in rows
+    ])
+
+@app.post("/api/admin/staff/<int:staff_id>/deactivate")
+def admin_deactivate_staff(staff_id):
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    conn.execute("UPDATE staff SET active = 0 WHERE id = ?", (staff_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
 
 # ---------------------------------------------------------------- flavor reviews
 
