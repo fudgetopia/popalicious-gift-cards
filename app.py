@@ -1870,6 +1870,11 @@ def _issue_staff_token(staff_id):
 def _staff_from_request():
     s = _staff_serializer()
     token = request.cookies.get(STAFF_COOKIE, "")
+    if not token:
+        # Fall back to the Authorization header (mobile/Safari cookie blockers).
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            token = auth[7:].strip()
     if not s or not token:
         return None
     try:
@@ -2068,11 +2073,20 @@ def staff_member_search():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify(members=[])
-    # Accept a member QR code (PAL:<user_id>) as well as email/name.
+    # Accept a scanned member QR code (full URL with ?member=PAL:<id>),
+    # a raw PAL:<user_id>, or email/name.
     conn = db()
-    if q.upper().startswith("PAL:"):
+    qr_member = ""
+    if "member=" in q:
+        # Extract member=... from a scanned QR URL.
         try:
-            uid = int(q.split(":", 1)[1])
+            qr_member = q.split("member=", 1)[1].split("&")[0].split("#")[0].strip()
+        except IndexError:
+            qr_member = ""
+    pal = qr_member or q
+    if pal.upper().startswith("PAL:"):
+        try:
+            uid = int(pal.split(":", 1)[1])
         except ValueError:
             uid = -1
         rows = conn.execute(
@@ -2645,6 +2659,60 @@ def admin_activate_customer(customer_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+@app.get("/api/admin/orders/<path:order_id>")
+def admin_order_detail(order_id):
+    """Full detail for one order. Backfills name/address from Stripe if blank."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    r = conn.execute(
+        "SELECT stripe_session_id, email, customer_name, shipping_address,"
+        " items_summary, amount_total_cents, gift_card_code,"
+        " gift_card_discount_cents, promo_code, reward_code, created_at"
+        " FROM orders WHERE stripe_session_id = ?",
+        (order_id,),
+    ).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    name = r["customer_name"] or ""
+    address = r["shipping_address"] or ""
+    # Backfill from Stripe for orders placed before the detail fields existed.
+    if (not name or not address) and not order_id.startswith("paypal:"):
+        try:
+            session = stripe.checkout.Session.retrieve(order_id)
+            details = session.get("customer_details") or {}
+            if not name:
+                name = details.get("name") or ""
+            if not address:
+                addr = details.get("address") or {}
+                parts = [addr.get("line1", ""), addr.get("line2", ""),
+                         addr.get("city", ""), addr.get("state", ""),
+                         addr.get("postal_code", ""), addr.get("country", "")]
+                address = ", ".join(p for p in parts if p)
+            if name or address:
+                conn.execute(
+                    "UPDATE orders SET customer_name = ?, shipping_address = ?"
+                    " WHERE stripe_session_id = ?",
+                    (name, address, order_id),
+                )
+                conn.commit()
+        except Exception:
+            pass
+    conn.close()
+    return jsonify(
+        id=r["stripe_session_id"], email=r["email"] or "",
+        customer_name=name, shipping_address=address,
+        items=r["items_summary"] or "",
+        total_cents=r["amount_total_cents"] or 0,
+        gift_card_code=r["gift_card_code"] or "",
+        gift_card_discount_cents=r["gift_card_discount_cents"] or 0,
+        promo_code=r["promo_code"] or "", reward_code=r["reward_code"] or "",
+        payment_method="PayPal" if r["stripe_session_id"].startswith("paypal:") else "Stripe",
+        created_at=r["created_at"],
+    )
 
 @app.get("/api/admin/orders")
 def admin_orders():
