@@ -173,6 +173,12 @@ def init_db():
             expires_at TEXT NOT NULL,
             used INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS reviews (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             flavor_slug TEXT NOT NULL,
@@ -1377,6 +1383,77 @@ def auth_resend():
         return jsonify(ok=True, email_error=email_error)
     return jsonify(ok=True)
 
+def _send_password_reset_email(name, email, token):
+    link = f"{SITE_URL}/#reset-password?token={token}"
+    first = (name or "").split(" ")[0] or "there"
+    html = (
+        "<html><body style=\"font-family:Arial,sans-serif\">"
+        f"<p>Hi {first},</p>"
+        "<p>Someone requested a password reset for your Pop-A-Licious account. "
+        "Click the link below to choose a new password:</p>"
+        f"<p><a href=\"{link}\">Reset my password</a></p>"
+        "<p>This link expires in 1 hour. If you didn't request this, just ignore this email.</p>"
+        "<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong></p>"
+        "</body></html>"
+    )
+    send_email(email, "Reset your Pop-A-Licious password", html)
+
+@app.post("/api/auth/forgot-password")
+def auth_forgot_password():
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    conn = db()
+    row = conn.execute(
+        "SELECT id, name FROM users WHERE email = ?", (email,)
+    ).fetchone()
+    if row:
+        token = secrets.token_urlsafe(32)
+        expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        conn.execute(
+            "INSERT INTO password_reset_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
+            (token, row["id"], expires),
+        )
+        conn.commit()
+        try:
+            _send_password_reset_email(row["name"], email, token)
+        except Exception:
+            pass  # never reveal whether the email exists or sending failed
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/auth/reset-password")
+def auth_reset_password():
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    token = data.get("token") or ""
+    password = data.get("password") or ""
+    if len(password) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+    conn = db()
+    row = conn.execute(
+        "SELECT user_id, expires_at, used FROM password_reset_tokens WHERE token = ?",
+        (token,),
+    ).fetchone()
+    if not row or row["used"]:
+        conn.close()
+        return jsonify(error="this reset link is invalid or already used"), 400
+    if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
+        conn.close()
+        return jsonify(error="this reset link has expired — request a new one"), 400
+    conn.execute(
+        "UPDATE users SET password_hash = ? WHERE id = ?",
+        (generate_password_hash(password), row["user_id"]),
+    )
+    conn.execute("UPDATE password_reset_tokens SET used = 1 WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
 @app.post("/api/auth/login")
 def auth_login():
     err = _require_auth_ready()
@@ -1624,11 +1701,13 @@ def _maybe_grant_birthday_reward(conn, user_id):
     return code
 
 def _current_member():
-    """The logged-in customer (or None)."""
+    """The logged-in customer (or None). Accepts the Bearer token or session cookie."""
     err = _require_auth_ready()
     if err:
         return None
-    row = _auth_user_from_token(_session_token_from_request())
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    row = _auth_user_from_token(token or _session_token_from_request())
     return row
 
 # ---------------- staff sessions (individual logins, loyalty tools only) ----------------
@@ -1794,6 +1873,25 @@ def staff_login():
 def staff_logout():
     return _clear_staff_cookie(jsonify(ok=True))
 
+@app.get("/api/orders/mine")
+def my_orders():
+    """Order history for the logged-in customer."""
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    conn = db()
+    rows = conn.execute(
+        "SELECT stripe_session_id, items_summary, amount_total_cents, created_at"
+        " FROM orders WHERE email = ? ORDER BY id DESC LIMIT 25",
+        (user["email"],),
+    ).fetchall()
+    conn.close()
+    return jsonify(orders=[
+        {"id": r["stripe_session_id"], "items": r["items_summary"] or "",
+         "total_cents": r["amount_total_cents"] or 0, "created_at": r["created_at"]}
+        for r in rows
+    ])
+
 @app.get("/api/loyalty/staff/me")
 def staff_me():
     staff, err = _require_staff()
@@ -1931,6 +2029,52 @@ def admin_create_staff():
         return jsonify(error="that staff email already exists"), 409
     conn.close()
     return jsonify(ok=True)
+
+@app.get("/api/admin/dashboard")
+def admin_dashboard():
+    """Key site stats for the admin dashboard."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    revenue = conn.execute(
+        "SELECT COALESCE(SUM(amount_total_cents), 0) AS s FROM orders").fetchone()["s"]
+    total_orders = conn.execute(
+        "SELECT COUNT(*) AS c FROM orders").fetchone()["c"]
+    orders_today = conn.execute(
+        "SELECT COUNT(*) AS c FROM orders WHERE substr(created_at, 1, 10) = date('now')").fetchone()["c"]
+    revenue_today = conn.execute(
+        "SELECT COALESCE(SUM(amount_total_cents), 0) AS s FROM orders"
+        " WHERE substr(created_at, 1, 10) = date('now')").fetchone()["s"]
+    gift_cards_sold = conn.execute(
+        "SELECT COUNT(*) AS c FROM gift_cards").fetchone()["c"]
+    gift_cards_outstanding = conn.execute(
+        "SELECT COALESCE(SUM(balance_cents), 0) AS s FROM gift_cards WHERE active = 1").fetchone()["s"]
+    members = conn.execute(
+        "SELECT COUNT(*) AS c FROM users WHERE verified = 1").fetchone()["c"]
+    kernels_issued = conn.execute(
+        "SELECT COALESCE(SUM(kernels), 0) AS s FROM kernel_transactions WHERE kernels > 0").fetchone()["s"]
+    pending_reviews = conn.execute(
+        "SELECT COUNT(*) AS c FROM reviews WHERE approved = 0").fetchone()["c"]
+    active_staff = conn.execute(
+        "SELECT COUNT(*) AS c FROM staff WHERE active = 1").fetchone()["c"]
+    recent_orders = conn.execute(
+        "SELECT email, items_summary, amount_total_cents, created_at FROM orders"
+        " ORDER BY id DESC LIMIT 10").fetchall()
+    conn.close()
+    return jsonify(
+        revenue_cents=revenue, total_orders=total_orders,
+        orders_today=orders_today, revenue_today_cents=revenue_today,
+        gift_cards_sold=gift_cards_sold,
+        gift_cards_outstanding_cents=gift_cards_outstanding,
+        loyalty_members=members, kernels_issued=kernels_issued,
+        pending_reviews=pending_reviews, active_staff=active_staff,
+        recent_orders=[
+            {"email": r["email"], "items": r["items_summary"] or "",
+             "total_cents": r["amount_total_cents"] or 0, "created_at": r["created_at"]}
+            for r in recent_orders
+        ],
+    )
 
 @app.get("/api/admin/staff")
 def admin_list_staff():
