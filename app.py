@@ -443,8 +443,8 @@ def create_checkout():
                 "recipient_email": recipient_email,
                 "message": message,
             },
-            success_url=f"{SITE_URL}/gift-card-success?session_id={{CHECKOUT_SESSION_ID}}",
-            cancel_url=f"{SITE_URL}/gift-cards",
+            success_url=f"{SITE_URL}/#gift-card-success?session_id={{CHECKOUT_SESSION_ID}}",
+            cancel_url=f"{SITE_URL}/#gift-cards",
         )
     except stripe.error.StripeError:
         return jsonify(error="the payment service could not start checkout"), 502
@@ -990,7 +990,7 @@ def create_order_checkout():
                 "promo_code": order["promo_code"],
                 "reward_code": order["reward_code"],
             },
-            return_url=f"{SITE_URL}/order-success?session_id={{CHECKOUT_SESSION_ID}}",
+            return_url=f"{SITE_URL}/#order-success?session_id={{CHECKOUT_SESSION_ID}}",
         )
     except stripe.error.StripeError:
         return jsonify(error="the payment service could not start checkout"), 502
@@ -1267,7 +1267,7 @@ def _session_token_from_request():
     return request.cookies.get(SESSION_COOKIE, "")
 
 def _send_verification_email(name, email, token):
-    link = f"{SITE_URL}/verify?token={token}"
+    link = f"{SITE_URL}/#verify?token={token}"
     first = (name or "").split(" ")[0] or "there"
     html = (
         "<html><body style=\"font-family:Arial,sans-serif\">"
