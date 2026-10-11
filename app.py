@@ -1400,8 +1400,9 @@ def auth_login():
             error="please verify your email before logging in — check your inbox",
             needs_verification=True,
         ), 403
-    resp = jsonify(name=row["name"], email=row["email"])
-    return _set_session_cookie(resp, _issue_auth_token(row["id"]))
+    token = _issue_auth_token(row["id"])
+    resp = jsonify(name=row["name"], email=row["email"], token=token)
+    return _set_session_cookie(resp, token)
 
 @app.post("/api/auth/logout")
 def auth_logout():
