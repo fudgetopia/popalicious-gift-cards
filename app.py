@@ -1428,7 +1428,9 @@ def auth_signup():
         if existing["active"]:
             conn.close()
             return jsonify(error="an account with this email already exists — try logging in"), 409
-        # Deactivated account: remove it so the email can be re-registered fresh.
+        # Deactivated account: remove it and its old tokens so the email
+        # re-registers completely fresh, like a new address.
+        conn.execute("DELETE FROM verification_tokens WHERE user_id = ?", (existing["id"],))
         conn.execute("DELETE FROM users WHERE id = ?", (existing["id"],))
         conn.commit()
     now = datetime.now(timezone.utc).isoformat()
@@ -1477,6 +1479,15 @@ def auth_verify():
         (token,),
     ).fetchone()
     if not row or row["used"]:
+        # Idempotent: if the token's account is already verified, count it as
+        # success (covers double-clicks and email clients that pre-fetch links).
+        if row:
+            urow = conn.execute(
+                "SELECT verified FROM users WHERE id = ?", (row["user_id"],)
+            ).fetchone()
+            if urow and urow["verified"]:
+                conn.close()
+                return jsonify(ok=True)
         conn.close()
         return jsonify(error="this verification link is invalid or already used"), 400
     if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
@@ -2878,13 +2889,38 @@ def admin_create_staff():
     if len(password) < 8:
         return jsonify(error="password must be at least 8 characters"), 400
     conn = db()
-    # A deactivated staff email can be reused: drop the old inactive row first.
+    # A deactivated staff email can be reused: reactivate the old row so their
+    # Kernel balance, history, and referral code are preserved (points never reset).
     old = conn.execute(
-        "SELECT id FROM staff WHERE email = ? AND active = 0", (email,)
+        "SELECT id, referral_code FROM staff WHERE email = ? AND active = 0", (email,)
     ).fetchone()
     if old:
-        conn.execute("DELETE FROM staff WHERE id = ?", (old["id"],))
+        conn.execute(
+            "UPDATE staff SET name = ?, password_hash = ?, verified = 0,"
+            " active = 1 WHERE id = ?",
+            (name or email.split("@")[0], generate_password_hash(password), old["id"]),
+        )
+        staff_id = old["id"]
+        vtoken = secrets.token_urlsafe(32)
+        vexpires = (datetime.now(timezone.utc) + timedelta(hours=48)).isoformat()
+        conn.execute(
+            "INSERT INTO staff_verification_tokens (token, staff_id, expires_at) VALUES (?, ?, ?)",
+            (vtoken, staff_id, vexpires),
+        )
         conn.commit()
+        conn.close()
+        verify_url = f"{SITE_URL}/#staff-verify?token={vtoken}"
+        try:
+            send_email(
+                email,
+                "Your Pop-A-Licious staff account",
+                f"Hi {name or 'there'},\n\nYour staff account has been reactivated.\n"
+                f"Click below to verify your account and set your password:\n{verify_url}\n\n"
+                f"This link expires in 48 hours.\n",
+            )
+        except Exception:
+            pass
+        return jsonify(ok=True, reactivated=True)
     try:
         ref_code = "STF-" + secrets.token_hex(3).upper()
         cur = conn.execute(
