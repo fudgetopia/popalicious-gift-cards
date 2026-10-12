@@ -1617,6 +1617,39 @@ def auth_login():
     resp = jsonify(name=row["name"], email=row["email"], token=token)
     return _set_session_cookie(resp, token)
 
+@app.get("/api/admin/is-admin")
+def admin_is_admin():
+    """Public check: is this email an admin? Used for auto-redirect on login."""
+    email = (request.args.get("email") or "").strip().lower()
+    return jsonify(is_admin=email in ADMIN_EMAILS)
+
+@app.post("/api/admin/login")
+def admin_login():
+    """Password-based admin login. Email must be in ADMIN_EMAILS."""
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    if email not in ADMIN_EMAILS:
+        return jsonify(error="not an admin email"), 403
+    conn = db()
+    row = conn.execute(
+        "SELECT id, name, email, password_hash, verified, active FROM users WHERE email = ?",
+        (email,),
+    ).fetchone()
+    conn.close()
+    if not row or not row["password_hash"] or not check_password_hash(
+        row["password_hash"], password
+    ):
+        return jsonify(error="email or password is incorrect"), 401
+    if not row["active"]:
+        return jsonify(error="this account has been deactivated"), 403
+    token = _issue_auth_token(row["id"])
+    resp = jsonify(name=row["name"], email=row["email"], token=token, is_admin=True)
+    return _set_session_cookie(resp, token)
+
 @app.post("/api/auth/logout")
 def auth_logout():
     err = _require_auth_ready()
@@ -2030,10 +2063,11 @@ def staff_login():
     occasion_credits = _maybe_credit_staff_occasions(conn, row["id"])
     conn.commit()
     conn.close()
+    staff_token = _issue_staff_token(row["id"])
     return _set_staff_cookie(
         jsonify(ok=True, name=row["name"], email=row["email"],
-                occasion_credits=occasion_credits),
-        _issue_staff_token(row["id"]),
+                occasion_credits=occasion_credits, token=staff_token),
+        staff_token,
     )
 
 @app.post("/api/loyalty/staff/logout")
