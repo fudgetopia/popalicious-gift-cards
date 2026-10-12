@@ -2980,6 +2980,17 @@ def admin_staff_detail(staff_id):
         " WHERE kt.staff_id = ? ORDER BY kt.id DESC LIMIT 50",
         (staff_id,),
     ).fetchall()
+    staff_rewards = conn.execute(
+        "SELECT code, reward_type, created_at FROM loyalty_rewards"
+        " WHERE staff_id = ? AND used = 0 ORDER BY created_at DESC",
+        (staff_id,),
+    ).fetchall()
+    staff_gift_cards = conn.execute(
+        "SELECT code, amount_cents, balance_cents, created_at FROM gift_cards"
+        " WHERE stripe_session_id = ? AND active = 1 AND balance_cents > 0"
+        " ORDER BY created_at DESC",
+        (f"staff:{staff_id}",),
+    ).fetchall()
     conn.close()
     return jsonify(
         id=s["id"], name=s["name"], email=s["email"],
@@ -2988,6 +2999,17 @@ def admin_staff_detail(staff_id):
         birthday=s["birthday"] or "", hire_date=s["hire_date"] or "",
         kernels_credited=credited["total"] or 0, credit_count=credited["n"] or 0,
         kernels_redeemed=redeemed["total"] or 0, redeem_count=redeemed["n"] or 0,
+        available_rewards=[
+            {"code": rw["code"],
+             "label": STAFF_REWARD_TIERS.get(rw["reward_type"], {}).get("label", rw["reward_type"]),
+             "created_at": rw["created_at"]}
+            for rw in staff_rewards
+        ],
+        available_gift_cards=[
+            {"code": g["code"], "amount_cents": g["amount_cents"],
+             "balance_cents": g["balance_cents"], "created_at": g["created_at"]}
+            for g in staff_gift_cards
+        ],
         recent_activity=[
             {"kernels": r["kernels"], "reason": r["reason"], "note": r["order_ref"] or "",
              "member_email": r["member_email"] or "", "member_name": r["member_name"] or "",
