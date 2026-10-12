@@ -94,7 +94,8 @@ stripe.api_key = STRIPE_SECRET_KEY
 
 app = Flask(__name__)
 _cors_origins = "*" if CORS_ORIGINS.strip() == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
-CORS(app, origins=_cors_origins, supports_credentials=True)
+CORS(app, origins=_cors_origins, supports_credentials=True,
+     allow_headers=["Content-Type", "Authorization"])
 
 # ---------------------------------------------------------------- db
 
@@ -2227,6 +2228,19 @@ def _maybe_credit_staff_occasions(conn, staff_id):
                 credited.append(f"{years}-year anniversary")
     return credited
 
+@app.get("/api/loyalty/staff/is-staff")
+def staff_is_staff():
+    """Public check: does this email belong to an active staff account?"""
+    email = (request.args.get("email") or "").strip().lower()
+    if not email:
+        return jsonify(is_staff=False)
+    conn = db()
+    row = conn.execute(
+        "SELECT 1 FROM staff WHERE email = ? AND active = 1", (email,)
+    ).fetchone()
+    conn.close()
+    return jsonify(is_staff=bool(row))
+
 @app.get("/api/loyalty/staff/verify-check")
 def staff_verify_check():
     token = (request.args.get("token") or "").strip()
@@ -2667,22 +2681,33 @@ def admin_order_detail(order_id):
     if not _is_admin(user):
         return jsonify(error="admin required"), 403
     conn = db()
-    r = conn.execute(
-        "SELECT stripe_session_id, email, customer_name, shipping_address,"
-        " items_summary, amount_total_cents, gift_card_code,"
-        " gift_card_discount_cents, promo_code, reward_code, created_at"
-        " FROM orders WHERE stripe_session_id = ?",
-        (order_id,),
-    ).fetchone()
+    # Accept either the Stripe/PayPal session ID or the friendly order number.
+    if order_id.isdigit():
+        r = conn.execute(
+            "SELECT id, stripe_session_id, email, customer_name, shipping_address,"
+            " items_summary, amount_total_cents, gift_card_code,"
+            " gift_card_discount_cents, promo_code, reward_code, created_at"
+            " FROM orders WHERE id = ?",
+            (int(order_id) - 1000,),
+        ).fetchone()
+    else:
+        r = conn.execute(
+            "SELECT id, stripe_session_id, email, customer_name, shipping_address,"
+            " items_summary, amount_total_cents, gift_card_code,"
+            " gift_card_discount_cents, promo_code, reward_code, created_at"
+            " FROM orders WHERE stripe_session_id = ?",
+            (order_id,),
+        ).fetchone()
     if not r:
         conn.close()
         return jsonify(error="order not found"), 404
     name = r["customer_name"] or ""
     address = r["shipping_address"] or ""
+    stripe_id = r["stripe_session_id"]
     # Backfill from Stripe for orders placed before the detail fields existed.
-    if (not name or not address) and not order_id.startswith("paypal:"):
+    if (not name or not address) and not stripe_id.startswith("paypal:"):
         try:
-            session = stripe.checkout.Session.retrieve(order_id)
+            session = stripe.checkout.Session.retrieve(stripe_id)
             details = session.get("customer_details") or {}
             if not name:
                 name = details.get("name") or ""
@@ -2696,14 +2721,15 @@ def admin_order_detail(order_id):
                 conn.execute(
                     "UPDATE orders SET customer_name = ?, shipping_address = ?"
                     " WHERE stripe_session_id = ?",
-                    (name, address, order_id),
+                    (name, address, stripe_id),
                 )
                 conn.commit()
         except Exception:
             pass
     conn.close()
     return jsonify(
-        id=r["stripe_session_id"], email=r["email"] or "",
+        id=r["stripe_session_id"], order_number=1000 + r["id"],
+        email=r["email"] or "",
         customer_name=name, shipping_address=address,
         items=r["items_summary"] or "",
         total_cents=r["amount_total_cents"] or 0,
@@ -2736,7 +2762,7 @@ def admin_orders():
     total = conn.execute(
         f"SELECT COUNT(*) AS c FROM orders o {where}", params).fetchone()["c"]
     rows = conn.execute(
-        "SELECT o.stripe_session_id, o.email, o.customer_name, o.shipping_address,"
+        "SELECT o.id, o.stripe_session_id, o.email, o.customer_name, o.shipping_address,"
         " o.items_summary, o.amount_total_cents,"
         " o.gift_card_code, o.gift_card_discount_cents,"
         " o.promo_code, o.reward_code, o.created_at"
@@ -2745,7 +2771,8 @@ def admin_orders():
     ).fetchall()
     conn.close()
     return jsonify(total=total, orders=[
-        {"id": r["stripe_session_id"], "email": r["email"],
+        {"id": r["stripe_session_id"], "order_number": 1000 + r["id"],
+         "email": r["email"],
          "customer_name": r["customer_name"] or "",
          "shipping_address": r["shipping_address"] or "",
          "items": r["items_summary"] or "",
@@ -2790,7 +2817,7 @@ def admin_customers():
         "SELECT u.id, u.name, u.email, u.verified, u.birthday, u.active, u.created_at,"
         " COALESCE((SELECT SUM(kernels) FROM kernel_transactions k WHERE k.user_id = u.id), 0) AS kernels,"
         " (SELECT COUNT(*) FROM orders o WHERE o.email = u.email) AS orders"
-        " FROM users u ORDER BY u.created_at DESC LIMIT 1000"
+        " FROM users u WHERE u.active = 1 ORDER BY u.created_at DESC LIMIT 1000"
     ).fetchall()
     conn.close()
     return jsonify(customers=[
@@ -2817,6 +2844,13 @@ def admin_create_staff():
     if len(password) < 8:
         return jsonify(error="password must be at least 8 characters"), 400
     conn = db()
+    # A deactivated staff email can be reused: drop the old inactive row first.
+    old = conn.execute(
+        "SELECT id FROM staff WHERE email = ? AND active = 0", (email,)
+    ).fetchone()
+    if old:
+        conn.execute("DELETE FROM staff WHERE id = ?", (old["id"],))
+        conn.commit()
     try:
         ref_code = "STF-" + secrets.token_hex(3).upper()
         cur = conn.execute(
@@ -2903,7 +2937,8 @@ def admin_list_staff():
         return jsonify(error="admin required"), 403
     conn = db()
     rows = conn.execute(
-        "SELECT id, email, name, active, created_at FROM staff ORDER BY created_at DESC"
+        "SELECT id, email, name, active, created_at FROM staff"
+        " WHERE active = 1 ORDER BY created_at DESC"
     ).fetchall()
     conn.close()
     return jsonify(staff=[
