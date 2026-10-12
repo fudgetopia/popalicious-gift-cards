@@ -90,6 +90,23 @@ MAX_AMOUNT_CENTS = 50000    # $500
 # (for the hidden pre-launch test gift card page). Turn off when live.
 ALLOW_TEST_AMOUNTS = os.environ.get("ALLOW_TEST_AMOUNTS", "").lower() == "true"
 
+# Default subscription renewal reminder email template (seeded into
+# subscription_email_templates on init; admins can edit it live).
+_SUBSCRIPTION_REMINDER_SUBJECT = "Your Pop-A-Licious subscription renews in 3 days"
+_SUBSCRIPTION_REMINDER_BODY = """\
+<html><body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+<p style="text-align:center;"><img src="https://pop-a-licious.com/logo.png" alt="Pop-A-Licious" style="max-width:220px;"></p>
+<p>Hi {{name}},</p>
+<p>Just a heads-up: your Pop-A-Licious subscription (<strong>{{frequency_label}}</strong>) renews on <strong>{{billing_date}}</strong>.</p>
+<p><strong>Your upcoming box:</strong> {{flavors}}<br>
+<strong>Bags:</strong> {{bags}}<br>
+<strong>Estimated total:</strong> {{total}} (includes estimated shipping)</p>
+<p>Want to change your flavors before we pop them fresh? Review and confirm below:</p>
+<p style="text-align:center;"><a href="{{confirm_url}}" style="display:inline-block;background:#e63946;color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:8px;font-weight:bold;">Review &amp; Confirm Your Flavors</a></p>
+<p>If everything looks good, you don't need to do a thing &mdash; we'll charge your card on file and get popping!</p>
+<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong></p>
+</body></html>"""
+
 stripe.api_key = STRIPE_SECRET_KEY
 
 app = Flask(__name__)
@@ -327,6 +344,130 @@ def init_db():
     pcols = [r["name"] for r in conn.execute("PRAGMA table_info(paypal_orders)").fetchall()]
     if "reward_code" not in pcols:
         conn.execute("ALTER TABLE paypal_orders ADD COLUMN reward_code TEXT NOT NULL DEFAULT ''")
+    # ---- Fundraising + Subscriptions tables (PART 1 & PART 2) ----
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS fundraisers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            org_name TEXT NOT NULL DEFAULT '',
+            contact_name TEXT NOT NULL DEFAULT '',
+            contact_email TEXT NOT NULL DEFAULT '',
+            goal_cents INTEGER NOT NULL DEFAULT 0,
+            start_date TEXT NOT NULL DEFAULT '',
+            end_date TEXT NOT NULL DEFAULT '',
+            event_days INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS fundraiser_teams (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fundraiser_id INTEGER NOT NULL,
+            name TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS fundraiser_sellers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fundraiser_id INTEGER NOT NULL,
+            team_id INTEGER NOT NULL DEFAULT 0,
+            name TEXT NOT NULL DEFAULT '',
+            email TEXT NOT NULL DEFAULT '',
+            referral_code TEXT UNIQUE NOT NULL,
+            video_url TEXT NOT NULL DEFAULT '',
+            personal_goal_cents INTEGER NOT NULL DEFAULT 0,
+            shared INTEGER NOT NULL DEFAULT 0,
+            nudged INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS fundraiser_stretch_goals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fundraiser_id INTEGER NOT NULL,
+            threshold_cents INTEGER NOT NULL DEFAULT 0,
+            label TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS fundraiser_sponsors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fundraiser_id INTEGER NOT NULL,
+            business_name TEXT NOT NULL DEFAULT '',
+            match_cap_cents INTEGER NOT NULL DEFAULT 0,
+            matched_cents INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS fundraiser_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fundraiser_id INTEGER NOT NULL,
+            seller_id INTEGER NOT NULL DEFAULT 0,
+            order_number TEXT UNIQUE NOT NULL,
+            customer_name TEXT NOT NULL DEFAULT '',
+            customer_email TEXT NOT NULL DEFAULT '',
+            ship_name TEXT NOT NULL DEFAULT '',
+            ship_street TEXT NOT NULL DEFAULT '',
+            ship_city TEXT NOT NULL DEFAULT '',
+            ship_state TEXT NOT NULL DEFAULT '',
+            ship_zip TEXT NOT NULL DEFAULT '',
+            items TEXT NOT NULL DEFAULT '[]',
+            subtotal_cents INTEGER NOT NULL DEFAULT 0,
+            donation_cents INTEGER NOT NULL DEFAULT 0,
+            roundup_cents INTEGER NOT NULL DEFAULT 0,
+            shipping_cents INTEGER NOT NULL DEFAULT 0,
+            total_cents INTEGER NOT NULL DEFAULT 0,
+            stripe_payment_intent_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'paid',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS fundraiser_ticker (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fundraiser_id INTEGER NOT NULL,
+            message TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            stripe_customer_id TEXT NOT NULL DEFAULT '',
+            stripe_payment_method_id TEXT NOT NULL DEFAULT '',
+            items TEXT NOT NULL DEFAULT '[]',
+            frequency TEXT NOT NULL DEFAULT 'monthly',
+            discount_percent INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            next_billing_date TEXT NOT NULL DEFAULT '',
+            ship_name TEXT NOT NULL DEFAULT '',
+            ship_street TEXT NOT NULL DEFAULT '',
+            ship_city TEXT NOT NULL DEFAULT '',
+            ship_state TEXT NOT NULL DEFAULT '',
+            ship_zip TEXT NOT NULL DEFAULT '',
+            ship_email TEXT NOT NULL DEFAULT '',
+            last_billed_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS subscription_renewals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subscription_id INTEGER NOT NULL,
+            billing_date TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            confirm_token TEXT UNIQUE,
+            reminder_sent_at TEXT NOT NULL DEFAULT '',
+            charged_at TEXT NOT NULL DEFAULT '',
+            order_id INTEGER NOT NULL DEFAULT 0,
+            amount_cents INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS subscription_email_templates (
+            name TEXT PRIMARY KEY,
+            subject TEXT NOT NULL DEFAULT '',
+            body_html TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        """
+    )
+    # Migration: Stripe customer id on users for subscription billing.
+    if "stripe_customer_id" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT NOT NULL DEFAULT ''")
+    # Seed the subscription reminder email template (only if missing —
+    # never overwrite an admin's customized template).
+    conn.execute(
+        """INSERT OR IGNORE INTO subscription_email_templates
+           (name, subject, body_html, updated_at) VALUES (?, ?, ?, ?)""",
+        ("reminder", _SUBSCRIPTION_REMINDER_SUBJECT, _SUBSCRIPTION_REMINDER_BODY,
+         datetime.now(timezone.utc).isoformat()),
+    )
     conn.commit()
     conn.close()
 
@@ -757,27 +898,14 @@ def redeem():
     conn.close()
     return jsonify(code=code, redeemed_cents=amount, new_balance_cents=new_balance)
 
-@app.post("/api/shipping/rates")
-def shipping_rates():
-    """Return the cheapest USPS/UPS/FedEx rate for a cart via Shippo.
+def _shippo_rate_options(dest_zip, total_qty, country="US"):
+    """Cheapest-first Shippo rate options (USPS/UPS/FedEx).
 
-    Body: { destination_zip, country?, items: [{quantity}] }
-    Parcel defaults: 8 oz per bag, 12x9x6 in box.
+    Returns None when Shippo is unusable (no key or request failure),
+    otherwise the (possibly empty) sorted option list.
     """
     if not SHIPPO_API_KEY:
-        return jsonify(error="shipping is not configured"), 503
-    data = request.get_json(force=True) or {}
-    dest_zip = (data.get("destination_zip") or "").strip()
-    country = (data.get("country") or "US").strip().upper()[:2] or "US"
-    try:
-        total_qty = sum(int(it.get("quantity", 0)) for it in (data.get("items") or []))
-    except (TypeError, ValueError):
-        return jsonify(error="invalid items"), 400
-    if not dest_zip:
-        return jsonify(error="destination_zip is required"), 400
-    if total_qty <= 0:
-        return jsonify(error="cart is empty"), 400
-
+        return None
     weight_oz = max(8 * total_qty, 8)
     try:
         resp = requests.post(
@@ -802,7 +930,7 @@ def shipping_rates():
         )
         resp.raise_for_status()
     except requests.RequestException:
-        return jsonify(error="could not reach the shipping service"), 502
+        return None
 
     rates = resp.json().get("rates") or []
     options = []
@@ -821,9 +949,42 @@ def shipping_rates():
             "amount_cents": cents,
             "currency": (r.get("currency") or "USD").upper(),
         })
+    options.sort(key=lambda o: o["amount_cents"])
+    return options
+
+def _cheapest_shipping_cents(dest_zip, total_qty, country="US"):
+    """Cheapest Shippo rate in cents, or None when shipping is unavailable."""
+    options = _shippo_rate_options(dest_zip, total_qty, country)
+    if not options:
+        return None
+    return options[0]["amount_cents"]
+
+@app.post("/api/shipping/rates")
+def shipping_rates():
+    """Return the cheapest USPS/UPS/FedEx rate for a cart via Shippo.
+
+    Body: { destination_zip, country?, items: [{quantity}] }
+    Parcel defaults: 8 oz per bag, 12x9x6 in box.
+    """
+    if not SHIPPO_API_KEY:
+        return jsonify(error="shipping is not configured"), 503
+    data = request.get_json(force=True) or {}
+    dest_zip = (data.get("destination_zip") or "").strip()
+    country = (data.get("country") or "US").strip().upper()[:2] or "US"
+    try:
+        total_qty = sum(int(it.get("quantity", 0)) for it in (data.get("items") or []))
+    except (TypeError, ValueError):
+        return jsonify(error="invalid items"), 400
+    if not dest_zip:
+        return jsonify(error="destination_zip is required"), 400
+    if total_qty <= 0:
+        return jsonify(error="cart is empty"), 400
+
+    options = _shippo_rate_options(dest_zip, total_qty, country)
+    if options is None:
+        return jsonify(error="could not reach the shipping service"), 502
     if not options:
         return jsonify(error="no shipping rates found"), 502
-    options.sort(key=lambda o: o["amount_cents"])
     return jsonify(cheapest=options[0], all=options[:6])
 
 @app.get("/api/discounts/validate")
@@ -3230,6 +3391,1504 @@ def reject_review(review_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- fundraising + subscriptions
+
+import calendar
+import json
+
+CRON_SECRET = os.environ.get("CRON_SECRET", "")
+
+# Fundraising flavors ($8.00/bag = 800 cents) — supporter purchases are
+# validated against these 25.
+FLAVORS = [
+    "Alien Mix", "Bacon", "Banana Pudding", "Birthday Cake", "Buffalo Ranch",
+    "Caramel", "Cheddar", "Cheddar Jalapeño", "Cheeseburger", "Churro",
+    "Cinnamon Roll", "Cookie and Cream", "Dill Pickle", "Garlic Butter",
+    "Garlic Parmesan", "Kettle Corn", "Lemonade", "Muddy Buddy", "Pizza",
+    "Salt and Vinegar", "Snickerdoodle", "Strawberry Cheesecake",
+    "Sugar Cookie", "White Cheddar", "Nashville Hot",
+]
+_FLAVOR_LOOKUP = {f.lower(): f for f in FLAVORS}
+BAG_PRICE_CENTS = 800
+
+SUB_FREQUENCIES = {
+    "biweekly": {"days": 14, "discount": 20, "label": "Every 2 weeks"},
+    "monthly": {"days": 30, "discount": 15, "label": "Every month"},
+    "bimonthly": {"days": 60, "discount": 10, "label": "Every 2 months"},
+}
+
+# ---------------- fundraising helpers ----------------
+
+def _gen_fundraiser_code(conn):
+    """Unique 6-char fundraiser code (A-Z0-9)."""
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+    for _ in range(20):
+        code = "".join(secrets.choice(alphabet) for _ in range(6))
+        if not conn.execute(
+            "SELECT 1 FROM fundraisers WHERE code = ?", (code,)
+        ).fetchone():
+            return code
+    raise RuntimeError("could not generate a unique fundraiser code")
+
+def _gen_seller_referral_code(conn):
+    for _ in range(20):
+        code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
+        if not conn.execute(
+            "SELECT 1 FROM fundraiser_sellers WHERE referral_code = ?", (code,)
+        ).fetchone():
+            return code
+    raise RuntimeError("could not generate a unique seller referral code")
+
+def _fundraiser_raised_cents(conn, fundraiser_id):
+    """Raised total = SUM(org_share over paid+in_person orders) + sponsor matched."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(CAST(subtotal_cents / 2 AS INTEGER)"
+        " + donation_cents + roundup_cents), 0) AS orders,"
+        " (SELECT COALESCE(SUM(matched_cents), 0) FROM fundraiser_sponsors"
+        " WHERE fundraiser_id = ?) AS matched"
+        " FROM fundraiser_orders"
+        " WHERE fundraiser_id = ? AND status IN ('paid', 'in_person')",
+        (fundraiser_id, fundraiser_id),
+    ).fetchone()
+    return int(row["orders"] or 0) + int(row["matched"] or 0)
+
+def _seller_raised_cents(conn, seller_id):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(CAST(subtotal_cents / 2 AS INTEGER)"
+        " + donation_cents + roundup_cents), 0) AS s"
+        " FROM fundraiser_orders"
+        " WHERE seller_id = ? AND status IN ('paid', 'in_person')",
+        (seller_id,),
+    ).fetchone()
+    return int(row["s"] or 0)
+
+def _team_raised_cents(conn, fundraiser_id, team_id):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(CAST(o.subtotal_cents / 2 AS INTEGER)"
+        " + o.donation_cents + o.roundup_cents), 0) AS s"
+        " FROM fundraiser_orders o JOIN fundraiser_sellers s ON s.id = o.seller_id"
+        " WHERE o.fundraiser_id = ? AND s.team_id = ?"
+        " AND o.status IN ('paid', 'in_person')",
+        (fundraiser_id, team_id),
+    ).fetchone()
+    return int(row["s"] or 0)
+
+def _days_left(end_date):
+    try:
+        delta = (datetime.strptime(end_date, "%Y-%m-%d").date()
+                 - datetime.now(timezone.utc).date()).days
+    except (TypeError, ValueError):
+        return 0
+    return max(delta, 0)
+
+def _fundraiser_dict(row, raised):
+    return {
+        "id": row["id"], "code": row["code"], "org_name": row["org_name"],
+        "contact_name": row["contact_name"], "contact_email": row["contact_email"],
+        "goal_cents": row["goal_cents"], "start_date": row["start_date"],
+        "end_date": row["end_date"], "event_days": row["event_days"],
+        "status": row["status"], "raised_cents": raised,
+        "days_left": _days_left(row["end_date"]),
+    }
+
+def _validate_fundraiser_items(raw):
+    """Validate [{flavor, quantity}]; qty 1..50 per line. Returns (items, err)."""
+    if not isinstance(raw, list) or not raw:
+        return None, (jsonify(error="add at least one bag"), 400)
+    items = []
+    for it in raw:
+        if not isinstance(it, dict):
+            return None, (jsonify(error="invalid items"), 400)
+        flavor = _FLAVOR_LOOKUP.get(((it.get("flavor") or "").strip()).lower())
+        try:
+            qty = int(it.get("quantity", 0))
+        except (TypeError, ValueError):
+            return None, (jsonify(error="invalid items"), 400)
+        if not flavor:
+            return None, (jsonify(error="unknown flavor"), 400)
+        if qty < 1 or qty > 50:
+            return None, (jsonify(error="quantity must be between 1 and 50 per flavor"), 400)
+        items.append({"flavor": flavor, "quantity": qty})
+    return items, None
+
+def _items_summary_str(items):
+    return ", ".join(
+        f"{it['quantity']}x {it['flavor']}" for it in items
+        if isinstance(it, dict) and it.get("flavor")
+    )
+
+def _next_fundraiser_order_number(conn):
+    """Friendly order number FR-1001, FR-1002, ... (retries on collision)."""
+    for _ in range(5):
+        count = conn.execute(
+            "SELECT COUNT(*) AS c FROM fundraiser_orders").fetchone()["c"]
+        candidate = f"FR-{1001 + count}"
+        if not conn.execute(
+            "SELECT 1 FROM fundraiser_orders WHERE order_number = ?",
+            (candidate,),
+        ).fetchone():
+            return candidate
+    raise RuntimeError("could not assign a fundraiser order number")
+
+def _clamp_event_days(start_date, event_days):
+    """Clamp event_days to 1..31, then to the days remaining in the start month."""
+    event_days = max(1, min(31, event_days))
+    days_in_month = calendar.monthrange(start_date.year, start_date.month)[1]
+    days_remaining = days_in_month - start_date.day + 1
+    return max(1, min(event_days, days_remaining))
+
+# ---------------- fundraising endpoints ----------------
+
+@app.post("/api/fundraisers")
+def create_fundraiser():
+    """Create a fundraiser (public)."""
+    data = request.get_json(force=True) or {}
+    org_name = (data.get("org_name") or "").strip()[:200]
+    contact_name = (data.get("contact_name") or "").strip()[:120]
+    contact_email = (data.get("contact_email") or "").strip().lower()[:160]
+    try:
+        goal_cents = int(data.get("goal_cents") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="goal_cents must be an integer number of cents"), 400
+    try:
+        event_days = int(data.get("event_days") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="event_days must be a number of days"), 400
+    start_str = (data.get("start_date") or "").strip()
+    if not org_name:
+        return jsonify(error="organization name is required"), 400
+    if not contact_name:
+        return jsonify(error="contact name is required"), 400
+    if not EMAIL_RE.match(contact_email):
+        return jsonify(error="a valid contact email is required"), 400
+    if goal_cents <= 0 or goal_cents > 100000000:
+        return jsonify(error="goal must be a positive amount"), 400
+    try:
+        start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return jsonify(error="start_date must be YYYY-MM-DD"), 400
+    event_days = _clamp_event_days(start_date, event_days)
+    end_date = start_date + timedelta(days=event_days - 1)
+
+    raw_teams = data.get("teams") or []
+    if not isinstance(raw_teams, list):
+        return jsonify(error="teams must be a list of names"), 400
+    teams = []
+    for t in raw_teams[:50]:
+        name = (t or "").strip()[:120] if isinstance(t, str) else ""
+        if name:
+            teams.append(name)
+    stretch = []
+    for sg in (data.get("stretch_goals") or [])[:50]:
+        if not isinstance(sg, dict):
+            continue
+        try:
+            thr = int(sg.get("threshold_cents") or 0)
+        except (TypeError, ValueError):
+            continue
+        label = (sg.get("label") or "").strip()[:200]
+        if thr > 0 and label:
+            stretch.append({"threshold_cents": thr, "label": label})
+    sponsors = []
+    for sp in (data.get("sponsors") or [])[:50]:
+        if not isinstance(sp, dict):
+            continue
+        try:
+            cap = int(sp.get("match_cap_cents") or 0)
+        except (TypeError, ValueError):
+            continue
+        biz = (sp.get("business_name") or "").strip()[:200]
+        if biz and cap > 0:
+            sponsors.append({"business_name": biz, "match_cap_cents": cap})
+
+    conn = db()
+    code = _gen_fundraiser_code(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """INSERT INTO fundraisers
+           (code, org_name, contact_name, contact_email, goal_cents,
+            start_date, end_date, event_days, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+        (code, org_name, contact_name, contact_email, goal_cents,
+         start_date.isoformat(), end_date.isoformat(), event_days, now),
+    )
+    fid = cur.lastrowid
+    for name in teams:
+        conn.execute(
+            "INSERT INTO fundraiser_teams (fundraiser_id, name) VALUES (?, ?)",
+            (fid, name))
+    for sg in stretch:
+        conn.execute(
+            "INSERT INTO fundraiser_stretch_goals (fundraiser_id, threshold_cents, label)"
+            " VALUES (?, ?, ?)",
+            (fid, sg["threshold_cents"], sg["label"]))
+    for sp in sponsors:
+        conn.execute(
+            "INSERT INTO fundraiser_sponsors (fundraiser_id, business_name, match_cap_cents)"
+            " VALUES (?, ?, ?)",
+            (fid, sp["business_name"], sp["match_cap_cents"]))
+    conn.commit()
+    conn.close()
+    return jsonify(id=fid, code=code, org_name=org_name, goal_cents=goal_cents,
+                   start_date=start_date.isoformat(),
+                   end_date=end_date.isoformat(),
+                   event_days=event_days, status="active")
+
+@app.get("/api/fundraisers/by-code/<code>")
+def fundraiser_by_code(code):
+    """Public fundraiser page data."""
+    code = (code or "").strip().upper()
+    conn = db()
+    fr = conn.execute(
+        "SELECT * FROM fundraisers WHERE code = ?", (code,)).fetchone()
+    if not fr:
+        conn.close()
+        return jsonify(error="fundraiser not found"), 404
+    raised = _fundraiser_raised_cents(conn, fr["id"])
+    teams = conn.execute(
+        "SELECT id, name FROM fundraiser_teams WHERE fundraiser_id = ? ORDER BY id",
+        (fr["id"],)).fetchall()
+    team_list = [
+        {"id": t["id"], "name": t["name"],
+         "raised_cents": _team_raised_cents(conn, fr["id"], t["id"])}
+        for t in teams
+    ]
+    sellers = conn.execute(
+        "SELECT id, name, referral_code, team_id, personal_goal_cents, video_url"
+        " FROM fundraiser_sellers WHERE fundraiser_id = ? ORDER BY name",
+        (fr["id"],)).fetchall()
+    seller_list = [
+        {"id": s["id"], "name": s["name"], "referral_code": s["referral_code"],
+         "team_id": s["team_id"] or 0,
+         "raised_cents": _seller_raised_cents(conn, s["id"]),
+         "personal_goal_cents": s["personal_goal_cents"] or 0,
+         "video_url": s["video_url"] or ""}
+        for s in sellers
+    ]
+    goals = conn.execute(
+        "SELECT threshold_cents, label FROM fundraiser_stretch_goals"
+        " WHERE fundraiser_id = ? ORDER BY threshold_cents",
+        (fr["id"],)).fetchall()
+    goal_list = [
+        {"threshold_cents": g["threshold_cents"], "label": g["label"],
+         "unlocked": raised >= (g["threshold_cents"] or 0)}
+        for g in goals
+    ]
+    sponsors = conn.execute(
+        "SELECT business_name, match_cap_cents, matched_cents FROM fundraiser_sponsors"
+        " WHERE fundraiser_id = ? ORDER BY id",
+        (fr["id"],)).fetchall()
+    sponsor_list = [
+        {"business_name": sp["business_name"],
+         "match_cap_cents": sp["match_cap_cents"],
+         "matched_cents": sp["matched_cents"]}
+        for sp in sponsors
+    ]
+    ticker = conn.execute(
+        "SELECT message, created_at FROM fundraiser_ticker"
+        " WHERE fundraiser_id = ? ORDER BY id DESC LIMIT 10",
+        (fr["id"],)).fetchall()
+    ticker_list = [
+        {"message": t["message"], "created_at": t["created_at"]} for t in ticker
+    ]
+    conn.close()
+    return jsonify(fundraiser=_fundraiser_dict(fr, raised), teams=team_list,
+                   sellers=seller_list, stretch_goals=goal_list,
+                   sponsors=sponsor_list, ticker=ticker_list)
+
+@app.post("/api/fundraisers/<int:fid>/sellers")
+def add_fundraiser_seller(fid):
+    """Add a seller to a fundraiser (public; organizer flow)."""
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    email = (data.get("email") or "").strip().lower()[:160]
+    try:
+        team_id = int(data.get("team_id") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="invalid team"), 400
+    if not name:
+        return jsonify(error="seller name is required"), 400
+    if email and not EMAIL_RE.match(email):
+        return jsonify(error="invalid email address"), 400
+    conn = db()
+    if not conn.execute(
+        "SELECT 1 FROM fundraisers WHERE id = ?", (fid,)
+    ).fetchone():
+        conn.close()
+        return jsonify(error="fundraiser not found"), 404
+    if team_id:
+        t = conn.execute(
+            "SELECT 1 FROM fundraiser_teams WHERE id = ? AND fundraiser_id = ?",
+            (team_id, fid)).fetchone()
+        if not t:
+            conn.close()
+            return jsonify(error="team not found"), 404
+    ref = _gen_seller_referral_code(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """INSERT INTO fundraiser_sellers
+           (fundraiser_id, team_id, name, email, referral_code, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (fid, team_id, name, email, ref, now))
+    sid = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return jsonify(id=sid, name=name, referral_code=ref,
+                   store_url=f"{SITE_URL}/#seller-store?code={ref}")
+
+@app.patch("/api/fundraisers/sellers/<int:seller_id>")
+def update_fundraiser_seller(seller_id):
+    """Seller tools (public)."""
+    data = request.get_json(force=True) or {}
+    updates = {}
+    if "name" in data:
+        name = (data.get("name") or "").strip()[:120]
+        if not name:
+            return jsonify(error="name cannot be blank"), 400
+        updates["name"] = name
+    if "video_url" in data:
+        updates["video_url"] = (data.get("video_url") or "").strip()[:500]
+    if "personal_goal_cents" in data:
+        try:
+            pg = int(data.get("personal_goal_cents") or 0)
+        except (TypeError, ValueError):
+            return jsonify(error="personal_goal_cents must be an integer"), 400
+        if pg < 0:
+            return jsonify(error="personal_goal_cents cannot be negative"), 400
+        updates["personal_goal_cents"] = pg
+    if not updates:
+        return jsonify(error="nothing to update"), 400
+    conn = db()
+    if not conn.execute(
+        "SELECT 1 FROM fundraiser_sellers WHERE id = ?", (seller_id,)
+    ).fetchone():
+        conn.close()
+        return jsonify(error="seller not found"), 404
+    clause = ", ".join(f"{k} = ?" for k in updates)
+    conn.execute(f"UPDATE fundraiser_sellers SET {clause} WHERE id = ?",
+                 (*updates.values(), seller_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.get("/api/fundraisers/store/<referral_code>")
+def fundraiser_store(referral_code):
+    """Seller store page data (public)."""
+    ref = (referral_code or "").strip().upper()
+    conn = db()
+    s = conn.execute(
+        "SELECT * FROM fundraiser_sellers WHERE referral_code = ?", (ref,)).fetchone()
+    if not s:
+        conn.close()
+        return jsonify(error="seller not found"), 404
+    fr = conn.execute(
+        "SELECT * FROM fundraisers WHERE id = ?", (s["fundraiser_id"],)).fetchone()
+    seller_raised = _seller_raised_cents(conn, s["id"])
+    fr_out = None
+    if fr:
+        fr_out = {"org_name": fr["org_name"], "code": fr["code"],
+                  "raised_cents": _fundraiser_raised_cents(conn, fr["id"]),
+                  "goal_cents": fr["goal_cents"],
+                  "end_date": fr["end_date"],
+                  "days_left": _days_left(fr["end_date"])}
+    conn.close()
+    return jsonify(
+        seller={"name": s["name"], "referral_code": s["referral_code"],
+                "video_url": s["video_url"] or "",
+                "personal_goal_cents": s["personal_goal_cents"] or 0,
+                "raised_cents": seller_raised},
+        fundraiser=fr_out)
+
+@app.post("/api/fundraisers/checkout")
+def fundraiser_checkout():
+    """Supporter purchase (public). Creates a Stripe PaymentIntent."""
+    data = request.get_json(force=True) or {}
+    fcode = (data.get("fundraiser_code") or "").strip().upper()
+    scode = (data.get("seller_referral_code") or "").strip().upper()
+    customer_name = (data.get("customer_name") or "").strip()[:120]
+    customer_email = (data.get("customer_email") or "").strip().lower()[:160]
+    ship_name = (data.get("ship_name") or "").strip()[:120]
+    ship_street = (data.get("ship_street") or "").strip()[:200]
+    ship_city = (data.get("ship_city") or "").strip()[:120]
+    ship_state = (data.get("ship_state") or "").strip().upper()[:2]
+    ship_zip = (data.get("ship_zip") or "").strip()[:10]
+
+    conn = db()
+    fr = conn.execute(
+        "SELECT * FROM fundraisers WHERE code = ?", (fcode,)).fetchone()
+    if not fr:
+        conn.close()
+        return jsonify(error="fundraiser not found"), 404
+    if fr["status"] != "active":
+        conn.close()
+        return jsonify(error="this fundraiser has ended"), 400
+    seller_id = 0
+    if scode:
+        s = conn.execute(
+            "SELECT id FROM fundraiser_sellers"
+            " WHERE referral_code = ? AND fundraiser_id = ?",
+            (scode, fr["id"])).fetchone()
+        if not s:
+            conn.close()
+            return jsonify(error="seller not found"), 404
+        seller_id = s["id"]
+    conn.close()
+
+    items, err = _validate_fundraiser_items(data.get("items"))
+    if err:
+        return err[0], err[1]
+    total_qty = sum(it["quantity"] for it in items)
+    subtotal = BAG_PRICE_CENTS * total_qty
+
+    if not customer_name:
+        return jsonify(error="your name is required"), 400
+    if not EMAIL_RE.match(customer_email):
+        return jsonify(error="a valid email is required"), 400
+    if not ship_name or not ship_street or not ship_city or not ship_state or not ship_zip:
+        return jsonify(error="a complete shipping address is required"), 400
+
+    try:
+        donation = int(data.get("donation_cents") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="donation_cents must be an integer"), 400
+    if donation < 0 or donation > 100000:
+        return jsonify(error="donation must be between $0 and $1,000"), 400
+    roundup = 0
+    if data.get("round_up") and subtotal % 100:
+        roundup = (subtotal // 100 + 1) * 100 - subtotal
+
+    ship_cents = _cheapest_shipping_cents(ship_zip, total_qty)
+    ship_note = ""
+    if ship_cents is None:
+        ship_cents = 0
+        ship_note = "shipping unavailable — we'll confirm shipping by email"
+    total = subtotal + donation + roundup + ship_cents
+    if total < 50:
+        return jsonify(error="order total is too small"), 400
+
+    try:
+        pi = stripe.PaymentIntent.create(
+            amount=total,
+            currency="usd",
+            metadata={
+                "type": "fundraiser_order",
+                "fundraiser_code": fcode,
+                "seller_code": scode,
+                "seller_id": str(seller_id),
+                "customer_name": customer_name,
+                "customer_email": customer_email,
+                "ship_name": ship_name,
+                "ship_street": ship_street,
+                "ship_city": ship_city,
+                "ship_state": ship_state,
+                "ship_zip": ship_zip,
+                "items": json.dumps(items)[:450],
+                "subtotal_cents": str(subtotal),
+                "donation_cents": str(donation),
+                "roundup_cents": str(roundup),
+                "shipping_cents": str(ship_cents),
+                "total_cents": str(total),
+            },
+        )
+    except stripe.error.StripeError:
+        return jsonify(error="the payment service could not start checkout"), 502
+    out = {
+        "client_secret": pi.client_secret,
+        "payment_intent_id": pi.id,
+        "breakdown": {
+            "subtotal_cents": subtotal, "donation_cents": donation,
+            "roundup_cents": roundup, "shipping_cents": ship_cents,
+            "total_cents": total,
+        },
+    }
+    if ship_note:
+        out["shipping_note"] = ship_note
+    return jsonify(out)
+
+@app.post("/api/fundraisers/orders/confirm")
+def fundraiser_order_confirm():
+    """Record a fundraiser order after Stripe confirms (public)."""
+    data = request.get_json(force=True) or {}
+    pi_id = (data.get("payment_intent_id") or "").strip()
+    if not pi_id:
+        return jsonify(error="payment_intent_id is required"), 400
+    try:
+        pi = stripe.PaymentIntent.retrieve(pi_id)
+    except stripe.error.StripeError:
+        return jsonify(error="could not verify the payment"), 502
+    if pi.get("status") != "succeeded":
+        return jsonify(error="payment has not completed yet"), 402
+    meta = pi.get("metadata") or {}
+    if meta.get("type") != "fundraiser_order":
+        return jsonify(error="not a fundraiser payment"), 400
+
+    conn = db()
+    existing = conn.execute(
+        "SELECT order_number FROM fundraiser_orders WHERE stripe_payment_intent_id = ?",
+        (pi_id,)).fetchone()
+    if existing:
+        conn.close()
+        return jsonify(ok=True, order_number=existing["order_number"], already=True)
+
+    fr = conn.execute(
+        "SELECT * FROM fundraisers WHERE code = ?",
+        (meta.get("fundraiser_code") or "",)).fetchone()
+    if not fr:
+        conn.close()
+        return jsonify(error="fundraiser not found"), 404
+    try:
+        seller_id = int(meta.get("seller_id") or 0)
+    except (TypeError, ValueError):
+        seller_id = 0
+    try:
+        items = json.loads(meta.get("items") or "[]")
+    except (TypeError, ValueError):
+        items = []
+    total_qty = sum(int(it.get("quantity", 0)) for it in items
+                    if isinstance(it, dict))
+
+    def _mi(key):
+        try:
+            return int(meta.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    subtotal = _mi("subtotal_cents") or BAG_PRICE_CENTS * total_qty
+    donation = _mi("donation_cents")
+    roundup = _mi("roundup_cents")
+    ship_cents = _mi("shipping_cents")
+    total = _mi("total_cents") or (subtotal + donation + roundup + ship_cents)
+    customer_name = (meta.get("customer_name") or "")[:120]
+    customer_email = (meta.get("customer_email") or "")[:160]
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        order_number = _next_fundraiser_order_number(conn)
+        conn.execute(
+            """INSERT INTO fundraiser_orders
+               (fundraiser_id, seller_id, order_number, customer_name, customer_email,
+                ship_name, ship_street, ship_city, ship_state, ship_zip,
+                items, subtotal_cents, donation_cents, roundup_cents,
+                shipping_cents, total_cents, stripe_payment_intent_id, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?)""",
+            (fr["id"], seller_id, order_number, customer_name, customer_email,
+             (meta.get("ship_name") or "")[:120], (meta.get("ship_street") or "")[:200],
+             (meta.get("ship_city") or "")[:120], (meta.get("ship_state") or "")[:2],
+             (meta.get("ship_zip") or "")[:10],
+             json.dumps(items), subtotal, donation, roundup, ship_cents, total,
+             pi_id, now),
+        )
+    except RuntimeError:
+        conn.close()
+        return jsonify(error="could not record the order"), 500
+
+    # Ticker entry.
+    first = customer_name.split()[0] if customer_name else "A supporter"
+    bag_word = "bag" if total_qty == 1 else "bags"
+    conn.execute(
+        "INSERT INTO fundraiser_ticker (fundraiser_id, message, created_at)"
+        " VALUES (?, ?, ?)",
+        (fr["id"], f"{first} just bought {total_qty} {bag_word}", now))
+
+    # Sponsor matching: the donation+roundup portion is matched up to each
+    # sponsor's cap, oldest sponsor first.
+    matchable = donation + roundup
+    if matchable > 0:
+        sponsors = conn.execute(
+            "SELECT id, match_cap_cents, matched_cents FROM fundraiser_sponsors"
+            " WHERE fundraiser_id = ? ORDER BY id", (fr["id"],)).fetchall()
+        remaining = matchable
+        for sp in sponsors:
+            if remaining <= 0:
+                break
+            room = (sp["match_cap_cents"] or 0) - (sp["matched_cents"] or 0)
+            take = min(room, remaining)
+            if take > 0:
+                conn.execute(
+                    "UPDATE fundraiser_sponsors SET matched_cents = matched_cents + ?"
+                    " WHERE id = ?", (take, sp["id"]))
+                remaining -= take
+    conn.commit()
+    conn.close()
+
+    summary = _items_summary_str(items)
+    dollars = lambda c: f"${c / 100:,.2f}"
+    receipt_html = (
+        '<html><body style="font-family: Arial, sans-serif; line-height: 1.6;">'
+        f"<p>Hi {customer_name or 'there'},</p>"
+        f"<p>Thanks for supporting <strong>{fr['org_name']}</strong>!"
+        " Your fundraiser order is confirmed. &#x1F37F;</p>"
+        f"<p><strong>Order:</strong> {order_number}"
+        f"<br><strong>Items:</strong> {summary}"
+        f"<br><strong>Donation:</strong> {dollars(donation)}</p>"
+        f"<p><strong>Total charged:</strong> {dollars(total)}</p>"
+        "<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong></p>"
+        "</body></html>"
+    )
+    try:
+        if customer_email:
+            send_email(customer_email,
+                       f"Thanks for supporting {fr['org_name']}!", receipt_html)
+    except Exception:
+        pass  # order is already recorded; never fail the response on email
+    shipping = ", ".join(
+        x for x in [meta.get("ship_name"), meta.get("ship_street"),
+                    meta.get("ship_city"), meta.get("ship_state"),
+                    meta.get("ship_zip")] if x)
+    notify_merchant_of_order(order_number, customer_name, customer_email,
+                             summary, total, "", 0, "", shipping)
+    return jsonify(ok=True, order_number=order_number)
+
+@app.post("/api/fundraisers/in-person-sale")
+def fundraiser_in_person_sale():
+    """QR scan mode: record a cash/card in-person sale (public)."""
+    data = request.get_json(force=True) or {}
+    scode = (data.get("seller_referral_code") or "").strip().upper()
+    try:
+        amount_cents = int(data.get("amount_cents") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="amount_cents must be an integer"), 400
+    if amount_cents <= 0:
+        return jsonify(error="amount_cents must be positive"), 400
+    items, err = _validate_fundraiser_items(data.get("items"))
+    if err:
+        return err[0], err[1]
+    conn = db()
+    s = conn.execute(
+        "SELECT * FROM fundraiser_sellers WHERE referral_code = ?",
+        (scode,)).fetchone()
+    if not s:
+        conn.close()
+        return jsonify(error="seller not found"), 404
+    fr = conn.execute(
+        "SELECT * FROM fundraisers WHERE id = ?", (s["fundraiser_id"],)).fetchone()
+    if not fr or fr["status"] != "active":
+        conn.close()
+        return jsonify(error="this fundraiser has ended"), 400
+    total_qty = sum(it["quantity"] for it in items)
+    subtotal = BAG_PRICE_CENTS * total_qty
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        order_number = _next_fundraiser_order_number(conn)
+        conn.execute(
+            """INSERT INTO fundraiser_orders
+               (fundraiser_id, seller_id, order_number, customer_name, customer_email,
+                items, subtotal_cents, total_cents, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'in_person', ?)""",
+            (fr["id"], s["id"], order_number, s["name"], s["email"] or "",
+             json.dumps(items), subtotal, amount_cents, now),
+        )
+    except RuntimeError:
+        conn.close()
+        return jsonify(error="could not record the sale"), 500
+    bag_word = "bag" if total_qty == 1 else "bags"
+    conn.execute(
+        "INSERT INTO fundraiser_ticker (fundraiser_id, message, created_at)"
+        " VALUES (?, ?, ?)",
+        (fr["id"], f"{s['name']} logged an in-person sale of {total_qty} {bag_word}",
+         now))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, order_number=order_number)
+
+@app.get("/api/fundraisers/<int:fid>/dashboard")
+def fundraiser_dashboard(fid):
+    """Organizer view (public via code knowledge)."""
+    conn = db()
+    fr = conn.execute(
+        "SELECT * FROM fundraisers WHERE id = ?", (fid,)).fetchone()
+    if not fr:
+        conn.close()
+        return jsonify(error="fundraiser not found"), 404
+    raised = _fundraiser_raised_cents(conn, fid)
+    sellers = conn.execute(
+        "SELECT id, name, email, referral_code, team_id, shared, nudged"
+        " FROM fundraiser_sellers WHERE fundraiser_id = ? ORDER BY name",
+        (fid,)).fetchall()
+    seller_list = [
+        {"id": s["id"], "name": s["name"], "email": s["email"],
+         "referral_code": s["referral_code"], "shared": bool(s["shared"]),
+         "nudged": bool(s["nudged"]),
+         "raised_cents": _seller_raised_cents(conn, s["id"]),
+         "team_id": s["team_id"] or 0}
+        for s in sellers
+    ]
+    teams = conn.execute(
+        "SELECT id, name FROM fundraiser_teams WHERE fundraiser_id = ? ORDER BY id",
+        (fid,)).fetchall()
+    team_list = [{"id": t["id"], "name": t["name"]} for t in teams]
+    orders = conn.execute(
+        "SELECT fo.order_number, fo.customer_name, fo.items, fo.total_cents,"
+        " fo.status, fo.created_at, s.name AS seller_name"
+        " FROM fundraiser_orders fo"
+        " LEFT JOIN fundraiser_sellers s ON s.id = fo.seller_id"
+        " WHERE fo.fundraiser_id = ? ORDER BY fo.id DESC LIMIT 20",
+        (fid,)).fetchall()
+    order_list = [
+        {"order_number": o["order_number"], "customer_name": o["customer_name"],
+         "items": o["items"], "total_cents": o["total_cents"],
+         "status": o["status"], "seller_name": o["seller_name"] or "",
+         "created_at": o["created_at"]}
+        for o in orders
+    ]
+    order_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM fundraiser_orders WHERE fundraiser_id = ?",
+        (fid,)).fetchone()["c"]
+    conn.close()
+    return jsonify(fundraiser=_fundraiser_dict(fr, raised), sellers=seller_list,
+                   teams=team_list, orders=order_list,
+                   totals={"raised_cents": raised, "order_count": order_count})
+
+@app.post("/api/fundraisers/<int:fid>/nudge")
+def fundraiser_nudge(fid):
+    data = request.get_json(force=True) or {}
+    try:
+        seller_id = int(data.get("seller_id") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="seller_id is required"), 400
+    conn = db()
+    if not conn.execute(
+        "SELECT 1 FROM fundraiser_sellers WHERE id = ? AND fundraiser_id = ?",
+        (seller_id, fid),
+    ).fetchone():
+        conn.close()
+        return jsonify(error="seller not found"), 404
+    conn.execute(
+        "UPDATE fundraiser_sellers SET nudged = 1 WHERE id = ?", (seller_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/fundraisers/<int:fid>/relaunch")
+def fundraiser_relaunch(fid):
+    """Clone a fundraiser: fresh code/dates, same teams/sellers/goals/sponsors."""
+    conn = db()
+    fr = conn.execute(
+        "SELECT * FROM fundraisers WHERE id = ?", (fid,)).fetchone()
+    if not fr:
+        conn.close()
+        return jsonify(error="fundraiser not found"), 404
+    today = datetime.now(timezone.utc).date()
+    event_days = _clamp_event_days(today, fr["event_days"] or 1)
+    end_date = today + timedelta(days=event_days - 1)
+    code = _gen_fundraiser_code(conn)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """INSERT INTO fundraisers
+           (code, org_name, contact_name, contact_email, goal_cents,
+            start_date, end_date, event_days, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+        (code, fr["org_name"], fr["contact_name"], fr["contact_email"],
+         fr["goal_cents"], today.isoformat(), end_date.isoformat(),
+         event_days, now))
+    new_id = cur.lastrowid
+    team_map = {}
+    for t in conn.execute(
+        "SELECT id, name FROM fundraiser_teams WHERE fundraiser_id = ?",
+        (fid,)).fetchall():
+        tc = conn.execute(
+            "INSERT INTO fundraiser_teams (fundraiser_id, name) VALUES (?, ?)",
+            (new_id, t["name"]))
+        team_map[t["id"]] = tc.lastrowid
+    for s in conn.execute(
+        "SELECT * FROM fundraiser_sellers WHERE fundraiser_id = ?",
+        (fid,)).fetchall():
+        ref = _gen_seller_referral_code(conn)
+        conn.execute(
+            """INSERT INTO fundraiser_sellers
+               (fundraiser_id, team_id, name, email, referral_code, video_url,
+                personal_goal_cents, shared, nudged, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)""",
+            (new_id, team_map.get(s["team_id"], 0), s["name"], s["email"],
+             ref, s["video_url"], s["personal_goal_cents"], now))
+    for sg in conn.execute(
+        "SELECT threshold_cents, label FROM fundraiser_stretch_goals"
+        " WHERE fundraiser_id = ?", (fid,)).fetchall():
+        conn.execute(
+            "INSERT INTO fundraiser_stretch_goals (fundraiser_id, threshold_cents, label)"
+            " VALUES (?, ?, ?)",
+            (new_id, sg["threshold_cents"], sg["label"]))
+    for sp in conn.execute(
+        "SELECT business_name, match_cap_cents FROM fundraiser_sponsors"
+        " WHERE fundraiser_id = ?", (fid,)).fetchall():
+        conn.execute(
+            "INSERT INTO fundraiser_sponsors"
+            " (fundraiser_id, business_name, match_cap_cents, matched_cents)"
+            " VALUES (?, ?, ?, 0)",
+            (new_id, sp["business_name"], sp["match_cap_cents"]))
+    conn.commit()
+    conn.close()
+    return jsonify(id=new_id, code=code)
+
+@app.post("/api/fundraisers/<int:fid>/complete")
+def fundraiser_complete(fid):
+    conn = db()
+    if not conn.execute(
+        "SELECT 1 FROM fundraisers WHERE id = ?", (fid,)
+    ).fetchone():
+        conn.close()
+        return jsonify(error="fundraiser not found"), 404
+    conn.execute(
+        "UPDATE fundraisers SET status = 'completed' WHERE id = ?", (fid,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+# ---------------- subscription helpers ----------------
+
+def _validate_subscription_items(raw):
+    """Validate [{flavor, quantity}]; 1..12 total bags. Returns (items, err)."""
+    if not isinstance(raw, list) or not raw:
+        return None, (jsonify(error="choose at least one bag"), 400)
+    items = []
+    total_qty = 0
+    for it in raw:
+        if not isinstance(it, dict):
+            return None, (jsonify(error="invalid items"), 400)
+        flavor = _FLAVOR_LOOKUP.get(((it.get("flavor") or "").strip()).lower())
+        try:
+            qty = int(it.get("quantity", 0))
+        except (TypeError, ValueError):
+            return None, (jsonify(error="invalid items"), 400)
+        if not flavor:
+            return None, (jsonify(error="unknown flavor"), 400)
+        if qty < 1 or qty > 12:
+            return None, (jsonify(error="quantity must be between 1 and 12 per flavor"), 400)
+        items.append({"flavor": flavor, "quantity": qty})
+        total_qty += qty
+    if total_qty < 1 or total_qty > 12:
+        return None, (jsonify(error="subscriptions are 1 to 12 bags per delivery"), 400)
+    return items, None
+
+def _per_delivery_cents(items, discount_percent):
+    bags = sum(it["quantity"] for it in items if isinstance(it, dict))
+    return int(round(BAG_PRICE_CENTS * bags * (1 - discount_percent / 100)))
+
+def _new_confirm_token():
+    return secrets.token_urlsafe(24)
+
+def _render_subscription_template(text, ctx):
+    out = text or ""
+    for key, val in ctx.items():
+        out = out.replace("{{" + key + "}}", str(val))
+    return out
+
+def _subscription_template(conn):
+    row = conn.execute(
+        "SELECT subject, body_html FROM subscription_email_templates WHERE name = 'reminder'"
+    ).fetchone()
+    if row and row["subject"]:
+        return row["subject"], row["body_html"]
+    return _SUBSCRIPTION_REMINDER_SUBJECT, _SUBSCRIPTION_REMINDER_BODY
+
+def _get_or_create_stripe_customer(conn, user):
+    """user is a full users row. Returns the Stripe customer id."""
+    cid = user["stripe_customer_id"] if "stripe_customer_id" in user.keys() else ""
+    cid = cid or ""
+    if cid:
+        try:
+            cust = stripe.Customer.retrieve(cid)
+            if not cust.get("deleted"):
+                return cid
+        except stripe.error.StripeError:
+            pass
+    cust = stripe.Customer.create(email=user["email"], name=user["name"] or "")
+    conn.execute(
+        "UPDATE users SET stripe_customer_id = ? WHERE id = ?",
+        (cust.id, user["id"]))
+    conn.commit()
+    return cust.id
+
+def _stripe_error_message(e):
+    # Never expose raw Stripe internals; prefer Stripe's own user-facing text.
+    return getattr(e, "user_message", None) or "the payment could not be processed"
+
+def _attempt_subscription_charge(conn, sub, renewal, items):
+    """Charge one subscription renewal off-session.
+
+    Writes the orders row, marks the renewal, and advances the billing
+    cycle — but does NOT commit (the caller commits, so cron can batch).
+    Returns (True, payload) on success, (False, (response, 402)) on failure.
+    """
+    disc = SUB_FREQUENCIES.get(sub["frequency"], {}).get(
+        "discount", sub["discount_percent"] or 0)
+    per = _per_delivery_cents(items, disc)
+    bags = sum(it["quantity"] for it in items if isinstance(it, dict))
+    ship = _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0
+    ship = ship or 0
+    amount = per + ship
+    if amount < 50:
+        return False, (jsonify(error="renewal total is too small to charge"), 402)
+    if not sub["stripe_customer_id"] or not sub["stripe_payment_method_id"]:
+        return False, (jsonify(error="no payment method on file"), 402)
+    bag_word = "bag" if bags == 1 else "bags"
+    try:
+        pi = stripe.PaymentIntent.create(
+            amount=amount,
+            currency="usd",
+            customer=sub["stripe_customer_id"],
+            payment_method=sub["stripe_payment_method_id"],
+            off_session=True,
+            confirm=True,
+            description=f"Pop-A-Licious subscription renewal ({bags} {bag_word})",
+            receipt_email=(sub["ship_email"] or None),
+        )
+    except stripe.error.StripeError as e:
+        conn.execute(
+            "UPDATE subscription_renewals SET status = 'failed' WHERE id = ?",
+            (renewal["id"],))
+        return False, (jsonify(error=_stripe_error_message(e)), 402)
+    if pi.get("status") not in ("succeeded", "processing"):
+        conn.execute(
+            "UPDATE subscription_renewals SET status = 'failed' WHERE id = ?",
+            (renewal["id"],))
+        return False, (jsonify(error="the payment could not be completed"), 402)
+
+    now = datetime.now(timezone.utc).isoformat()
+    summary = _items_summary_str(items)
+    ship_addr = ", ".join(
+        x for x in [sub["ship_name"], sub["ship_street"], sub["ship_city"],
+                    sub["ship_state"], sub["ship_zip"]] if x)
+    cur = conn.execute(
+        """INSERT INTO orders
+           (stripe_session_id, email, customer_name, shipping_address, items_summary,
+            amount_total_cents, gift_card_code, gift_card_discount_cents,
+            promo_code, reward_code, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, '', 0, '', '', ?)""",
+        (f"sub_{pi.id}", sub["ship_email"] or "", sub["ship_name"] or "",
+         ship_addr, summary, amount, now))
+    order_id = cur.lastrowid
+    # Advance the billing cycle from the later of the old billing date / today.
+    days = SUB_FREQUENCIES.get(sub["frequency"], {}).get("days", 30)
+    try:
+        base = datetime.strptime(
+            sub["next_billing_date"], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        base = datetime.now(timezone.utc).date()
+    new_next = max(base, datetime.now(timezone.utc).date()) + timedelta(days=days)
+    conn.execute(
+        "UPDATE subscription_renewals SET status = 'charged', charged_at = ?,"
+        " order_id = ?, amount_cents = ? WHERE id = ?",
+        (now, order_id, amount, renewal["id"]))
+    conn.execute(
+        "UPDATE subscriptions SET next_billing_date = ?, last_billed_at = ? WHERE id = ?",
+        (new_next.isoformat(), now, sub["id"]))
+    conn.execute(
+        "INSERT INTO subscription_renewals (subscription_id, billing_date, status, confirm_token)"
+        " VALUES (?, ?, 'pending', ?)",
+        (sub["id"], new_next.isoformat(), _new_confirm_token()))
+    # Loyalty: 1 Kernel per $1 on the subscription total.
+    if sub["user_id"]:
+        urow = conn.execute(
+            "SELECT id FROM users WHERE id = ?", (sub["user_id"],)).fetchone()
+        if urow:
+            _credit_kernels(conn, urow["id"],
+                            amount // 100 * KERNELS_PER_DOLLAR,
+                            "subscription", order_ref=f"sub_{pi.id}")
+    return True, {
+        "order_number": 1000 + order_id,
+        "payment_intent_id": pi.id,
+        "summary": summary,
+        "amount": amount,
+        "ship_addr": ship_addr,
+    }
+
+# ---------------- subscription endpoints ----------------
+
+@app.post("/api/subscriptions/setup-intent")
+def subscription_setup_intent():
+    """Create a SetupIntent for saving a card (auth required)."""
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    conn = db()
+    full = conn.execute(
+        "SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    try:
+        customer_id = _get_or_create_stripe_customer(conn, full)
+        si = stripe.SetupIntent.create(customer=customer_id, usage="off_session")
+    except stripe.error.StripeError:
+        conn.close()
+        return jsonify(error="the payment service could not start setup"), 502
+    conn.close()
+    return jsonify(client_secret=si.client_secret, customer_id=customer_id)
+
+@app.post("/api/subscriptions")
+def create_subscription():
+    """Create a subscription (auth required)."""
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    payment_method_id = (data.get("payment_method_id") or "").strip()
+    frequency = (data.get("frequency") or "").strip()
+    ship = data.get("shipping") or {}
+    if not isinstance(ship, dict):
+        return jsonify(error="invalid shipping"), 400
+    ship_name = (ship.get("name") or "").strip()[:120]
+    ship_street = (ship.get("street") or "").strip()[:200]
+    ship_city = (ship.get("city") or "").strip()[:120]
+    ship_state = (ship.get("state") or "").strip().upper()[:2]
+    ship_zip = (ship.get("zip") or "").strip()[:10]
+
+    items, err = _validate_subscription_items(data.get("items"))
+    if err:
+        return err[0], err[1]
+    if frequency not in SUB_FREQUENCIES:
+        return jsonify(error="frequency must be biweekly, monthly, or bimonthly"), 400
+    if not ship_name or not ship_street or not ship_city or not ship_state or not ship_zip:
+        return jsonify(error="a complete shipping address is required"), 400
+    if not payment_method_id:
+        return jsonify(error="payment_method_id is required"), 400
+
+    conn = db()
+    full = conn.execute(
+        "SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    try:
+        customer_id = _get_or_create_stripe_customer(conn, full)
+        stripe.PaymentMethod.attach(payment_method_id, customer=customer_id)
+        stripe.Customer.modify(
+            customer_id,
+            invoice_settings={"default_payment_method": payment_method_id})
+    except stripe.error.StripeError:
+        conn.close()
+        return jsonify(error="could not save your payment method"), 502
+
+    freq = SUB_FREQUENCIES[frequency]
+    next_billing = (datetime.now(timezone.utc).date()
+                    + timedelta(days=freq["days"])).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """INSERT INTO subscriptions
+           (user_id, stripe_customer_id, stripe_payment_method_id, items, frequency,
+            discount_percent, status, next_billing_date,
+            ship_name, ship_street, ship_city, ship_state, ship_zip, ship_email,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user["id"], customer_id, payment_method_id, json.dumps(items), frequency,
+         freq["discount"], next_billing,
+         ship_name, ship_street, ship_city, ship_state, ship_zip, full["email"],
+         now))
+    sub_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO subscription_renewals (subscription_id, billing_date, status, confirm_token)"
+        " VALUES (?, ?, 'pending', ?)",
+        (sub_id, next_billing, _new_confirm_token()))
+    conn.commit()
+    conn.close()
+    return jsonify(id=sub_id, next_billing_date=next_billing,
+                   per_delivery_cents=_per_delivery_cents(items, freq["discount"]),
+                   discount_percent=freq["discount"])
+
+@app.get("/api/subscriptions/mine")
+def my_subscriptions():
+    """The logged-in member's subscriptions (auth required)."""
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM subscriptions WHERE user_id = ? ORDER BY id DESC",
+        (user["id"],)).fetchall()
+    conn.close()
+    today = datetime.now(timezone.utc).date()
+    out = []
+    for r in rows:
+        try:
+            items = json.loads(r["items"] or "[]")
+        except (TypeError, ValueError):
+            items = []
+        freq = SUB_FREQUENCIES.get(r["frequency"], {})
+        disc = freq.get("discount", r["discount_percent"] or 0)
+        try:
+            days_until = (datetime.strptime(
+                r["next_billing_date"], "%Y-%m-%d").date() - today).days
+        except (TypeError, ValueError):
+            days_until = 0
+        out.append({
+            "id": r["id"], "items": items, "frequency": r["frequency"],
+            "frequency_label": freq.get("label", r["frequency"]),
+            "discount_percent": disc, "status": r["status"],
+            "next_billing_date": r["next_billing_date"],
+            "per_delivery_cents": _per_delivery_cents(items, disc),
+            "ship_state": r["ship_state"] or "", "ship_zip": r["ship_zip"] or "",
+            "days_until_billing": days_until,
+        })
+    return jsonify(subscriptions=out)
+
+@app.patch("/api/subscriptions/<int:sub_id>")
+def update_subscription(sub_id):
+    """Update a subscription (auth required, owner only)."""
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    conn = db()
+    sub = conn.execute(
+        "SELECT * FROM subscriptions WHERE id = ? AND user_id = ?",
+        (sub_id, user["id"])).fetchone()
+    if not sub:
+        conn.close()
+        return jsonify(error="subscription not found"), 404
+    sets = {}
+    if "items" in data:
+        items, err = _validate_subscription_items(data.get("items"))
+        if err:
+            conn.close()
+            return err[0], err[1]
+        sets["items"] = json.dumps(items)
+    if "frequency" in data:
+        frequency = (data.get("frequency") or "").strip()
+        if frequency not in SUB_FREQUENCIES:
+            conn.close()
+            return jsonify(error="frequency must be biweekly, monthly, or bimonthly"), 400
+        sets["frequency"] = frequency
+        sets["discount_percent"] = SUB_FREQUENCIES[frequency]["discount"]
+        sets["next_billing_date"] = (
+            datetime.now(timezone.utc).date()
+            + timedelta(days=SUB_FREQUENCIES[frequency]["days"])).isoformat()
+    if "status" in data:
+        st = (data.get("status") or "").strip().lower()
+        cur = sub["status"]
+        if st == "pause":
+            if cur != "active":
+                conn.close()
+                return jsonify(error="only active subscriptions can be paused"), 400
+            sets["status"] = "paused"
+        elif st == "resume":
+            if cur != "paused":
+                conn.close()
+                return jsonify(error="only paused subscriptions can be resumed"), 400
+            sets["status"] = "active"
+        elif st == "cancel":
+            sets["status"] = "cancelled"
+        else:
+            conn.close()
+            return jsonify(error="status must be pause, resume, or cancel"), 400
+    if "shipping" in data:
+        ship = data.get("shipping") or {}
+        if not isinstance(ship, dict):
+            conn.close()
+            return jsonify(error="invalid shipping"), 400
+        for key, col in (("name", "ship_name"), ("street", "ship_street"),
+                         ("city", "ship_city"), ("state", "ship_state"),
+                         ("zip", "ship_zip")):
+            if key in ship:
+                val = (ship.get(key) or "").strip()
+                if key == "state":
+                    val = val.upper()[:2]
+                sets[col] = val[:200]
+    if not sets:
+        conn.close()
+        return jsonify(error="nothing to update"), 400
+    clause = ", ".join(f"{k} = ?" for k in sets)
+    conn.execute(f"UPDATE subscriptions SET {clause} WHERE id = ?",
+                 (*sets.values(), sub_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.get("/api/subscriptions/confirm/<token>")
+def subscription_confirm_page(token):
+    """Renewal confirmation page data (public)."""
+    conn = db()
+    ren = conn.execute(
+        "SELECT * FROM subscription_renewals WHERE confirm_token = ?",
+        ((token or "").strip(),)).fetchone()
+    if not ren:
+        conn.close()
+        return jsonify(error="confirmation link not found"), 404
+    sub = conn.execute(
+        "SELECT * FROM subscriptions WHERE id = ?",
+        (ren["subscription_id"],)).fetchone()
+    if not sub:
+        conn.close()
+        return jsonify(error="subscription not found"), 404
+    # The customer opened the link — record it.
+    if ren["status"] == "reminded":
+        conn.execute(
+            "UPDATE subscription_renewals SET status = 'confirmed' WHERE id = ?",
+            (ren["id"],))
+        conn.commit()
+    user = conn.execute(
+        "SELECT name, email FROM users WHERE id = ?", (sub["user_id"],)).fetchone()
+    try:
+        items = json.loads(sub["items"] or "[]")
+    except (TypeError, ValueError):
+        items = []
+    freq = SUB_FREQUENCIES.get(sub["frequency"], {})
+    disc = freq.get("discount", sub["discount_percent"] or 0)
+    per = _per_delivery_cents(items, disc)
+    bags = sum(it["quantity"] for it in items if isinstance(it, dict))
+    ship_est = _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0
+    ship_est = ship_est or 0
+    conn.close()
+    name = ""
+    if user:
+        name = user["name"] or sub["ship_name"] or ""
+    else:
+        name = sub["ship_name"] or ""
+    return jsonify(
+        subscription_id=sub["id"], name=name, items=items,
+        frequency_label=freq.get("label", sub["frequency"]),
+        billing_date=ren["billing_date"], per_delivery_cents=per,
+        shipping_estimate_cents=ship_est, total_estimate_cents=per + ship_est,
+        ship_state=sub["ship_state"] or "", ship_zip=sub["ship_zip"] or "")
+
+@app.post("/api/subscriptions/confirm/<token>")
+def subscription_confirm_charge(token):
+    """Charge a renewal off-session (public, via the confirm link)."""
+    data = request.get_json(force=True) or {}
+    conn = db()
+    ren = conn.execute(
+        "SELECT * FROM subscription_renewals WHERE confirm_token = ?",
+        ((token or "").strip(),)).fetchone()
+    if not ren:
+        conn.close()
+        return jsonify(error="confirmation link not found"), 404
+    if ren["status"] == "charged":
+        conn.close()
+        return jsonify(ok=True, already=True)
+    sub = conn.execute(
+        "SELECT * FROM subscriptions WHERE id = ?",
+        (ren["subscription_id"],)).fetchone()
+    if not sub or sub["status"] != "active":
+        conn.close()
+        return jsonify(error="subscription is not active"), 400
+    if "items" in data and data.get("items") is not None:
+        items, err = _validate_subscription_items(data.get("items"))
+        if err:
+            conn.close()
+            return err[0], err[1]
+        conn.execute("UPDATE subscriptions SET items = ? WHERE id = ?",
+                     (json.dumps(items), sub["id"]))
+        sub = conn.execute(
+            "SELECT * FROM subscriptions WHERE id = ?", (sub["id"],)).fetchone()
+    else:
+        try:
+            items = json.loads(sub["items"] or "[]")
+        except (TypeError, ValueError):
+            items = []
+    ok, payload = _attempt_subscription_charge(conn, sub, ren, items)
+    conn.commit()
+    conn.close()
+    if not ok:
+        return payload[0], payload[1]
+    notify_merchant_of_order(
+        f"sub_{payload['payment_intent_id']}", sub["ship_name"],
+        sub["ship_email"], payload["summary"], payload["amount"],
+        "", 0, "", payload["ship_addr"])
+    return jsonify(ok=True, order_number=payload["order_number"])
+
+@app.post("/api/subscriptions/renewals/run")
+def subscription_renewals_run():
+    """Cron: send 3-day reminders and charge due renewals.
+
+    Header X-Cron-Secret must equal the CRON_SECRET env var
+    (503 when CRON_SECRET is not configured).
+    """
+    if not CRON_SECRET:
+        return jsonify(error="cron is not configured"), 503
+    if request.headers.get("X-Cron-Secret", "") != CRON_SECRET:
+        return jsonify(error="forbidden"), 403
+    today = datetime.now(timezone.utc).date()
+    today_str = today.isoformat()
+    target = (today + timedelta(days=3)).isoformat()
+    reminded = charged = failed = 0
+    conn = db()
+
+    # 1) Reminders: active subscriptions billing in 3 days.
+    subject, body = _subscription_template(conn)
+    subs = conn.execute(
+        "SELECT * FROM subscriptions WHERE status = 'active' AND next_billing_date = ?",
+        (target,)).fetchall()
+    for sub in subs:
+        ren = conn.execute(
+            "SELECT * FROM subscription_renewals"
+            " WHERE subscription_id = ? AND billing_date = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (sub["id"], target)).fetchone()
+        if ren and ren["status"] in ("reminded", "confirmed", "charged", "failed"):
+            continue
+        if not ren:
+            cur = conn.execute(
+                "INSERT INTO subscription_renewals"
+                " (subscription_id, billing_date, status, confirm_token)"
+                " VALUES (?, ?, 'pending', ?)",
+                (sub["id"], target, _new_confirm_token()))
+            ren = conn.execute(
+                "SELECT * FROM subscription_renewals WHERE id = ?",
+                (cur.lastrowid,)).fetchone()
+        to = sub["ship_email"] or ""
+        if not to:
+            continue
+        try:
+            items = json.loads(sub["items"] or "[]")
+        except (TypeError, ValueError):
+            items = []
+        bags = sum(it["quantity"] for it in items if isinstance(it, dict))
+        disc = SUB_FREQUENCIES.get(sub["frequency"], {}).get("discount", 0)
+        per = _per_delivery_cents(items, disc)
+        ship_est = _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0
+        ship_est = ship_est or 0
+        user = conn.execute(
+            "SELECT name FROM users WHERE id = ?", (sub["user_id"],)).fetchone()
+        first = ((user["name"] or "").split()[0]
+                 if user and user["name"] else "") or sub["ship_name"] or "there"
+        ctx = {
+            "name": first,
+            "flavors": _items_summary_str(items),
+            "billing_date": target,
+            "confirm_url": f"{SITE_URL}/#subscription-confirm?token={ren['confirm_token']}",
+            "bags": bags,
+            "total": f"${(per + ship_est) / 100:,.2f}",
+            "frequency_label": SUB_FREQUENCIES.get(
+                sub["frequency"], {}).get("label", sub["frequency"]),
+        }
+        try:
+            resp = requests.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                         "Content-Type": "application/json"},
+                json={
+                    "from": "Pop-A-Licious Customer Service <customerservice@pop-a-licious.com>",
+                    "to": [to],
+                    "subject": _render_subscription_template(subject, ctx),
+                    "html": _render_subscription_template(body, ctx),
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+        except Exception:
+            continue  # leave pending; the next run retries
+        conn.execute(
+            "UPDATE subscription_renewals SET status = 'reminded', reminder_sent_at = ?"
+            " WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), ren["id"]))
+        conn.commit()
+        reminded += 1
+
+    # 2) Charges: renewals past their billing date, reminded/confirmed, not charged.
+    dues = conn.execute(
+        "SELECT id FROM subscription_renewals"
+        " WHERE billing_date < ? AND status IN ('reminded', 'confirmed')",
+        (today_str,)).fetchall()
+    for d in dues:
+        ren = conn.execute(
+            "SELECT * FROM subscription_renewals WHERE id = ?", (d["id"],)).fetchone()
+        sub = conn.execute(
+            "SELECT * FROM subscriptions WHERE id = ?",
+            (ren["subscription_id"],)).fetchone()
+        if not sub or sub["status"] != "active":
+            continue
+        try:
+            items = json.loads(sub["items"] or "[]")
+        except (TypeError, ValueError):
+            items = []
+        ok, payload = _attempt_subscription_charge(conn, sub, ren, items)
+        conn.commit()
+        if ok:
+            charged += 1
+            notify_merchant_of_order(
+                f"sub_{payload['payment_intent_id']}", sub["ship_name"],
+                sub["ship_email"], payload["summary"], payload["amount"],
+                "", 0, "", payload["ship_addr"])
+        else:
+            failed += 1
+    conn.close()
+    return jsonify(reminded=reminded, charged=charged, failed=failed)
+
+# ---------------- admin: subscription email template ----------------
+
+@app.get("/api/admin/subscription-email")
+def admin_subscription_email_get():
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    subject, body = _subscription_template(conn)
+    conn.close()
+    return jsonify(subject=subject, body_html=body)
+
+@app.put("/api/admin/subscription-email")
+def admin_subscription_email_put():
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    data = request.get_json(force=True) or {}
+    subject = (data.get("subject") or "").strip()
+    body_html = data.get("body_html") or ""
+    if not subject:
+        return jsonify(error="subject is required"), 400
+    if not body_html:
+        return jsonify(error="body_html is required"), 400
+    conn = db()
+    conn.execute(
+        """INSERT INTO subscription_email_templates (name, subject, body_html, updated_at)
+           VALUES ('reminder', ?, ?, ?)
+           ON CONFLICT(name) DO UPDATE SET subject = excluded.subject,
+             body_html = excluded.body_html, updated_at = excluded.updated_at""",
+        (subject, body_html, datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/admin/subscription-email/preview")
+def admin_subscription_email_preview():
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    data = request.get_json(force=True) or {}
+    conn = db()
+    subject, body = _subscription_template(conn)
+    sub = None
+    if data.get("subscription_id") is not None:
+        try:
+            sub = conn.execute(
+                "SELECT * FROM subscriptions WHERE id = ?",
+                (int(data.get("subscription_id")),)).fetchone()
+        except (TypeError, ValueError):
+            sub = None
+    if sub:
+        ren = conn.execute(
+            "SELECT * FROM subscription_renewals WHERE subscription_id = ?"
+            " ORDER BY id DESC LIMIT 1", (sub["id"],)).fetchone()
+        token = ren["confirm_token"] if ren else "SAMPLE"
+        try:
+            items = json.loads(sub["items"] or "[]")
+        except (TypeError, ValueError):
+            items = []
+        userrow = conn.execute(
+            "SELECT name FROM users WHERE id = ?", (sub["user_id"],)).fetchone()
+        first = ((userrow["name"] or "").split()[0]
+                 if userrow and userrow["name"] else "") or sub["ship_name"] or "Alex"
+        disc = SUB_FREQUENCIES.get(sub["frequency"], {}).get("discount", 0)
+        ctx = {
+            "name": first,
+            "flavors": _items_summary_str(items) or "2x White Cheddar, 1x Caramel",
+            "billing_date": sub["next_billing_date"],
+            "confirm_url": f"{SITE_URL}/#subscription-confirm?token={token}",
+            "bags": sum(it["quantity"] for it in items if isinstance(it, dict)),
+            "total": f"${_per_delivery_cents(items, disc) / 100:,.2f}",
+            "frequency_label": SUB_FREQUENCIES.get(
+                sub["frequency"], {}).get("label", sub["frequency"]),
+        }
+    else:
+        ctx = {
+            "name": "Alex",
+            "flavors": "2x White Cheddar, 1x Caramel",
+            "billing_date": (datetime.now(timezone.utc).date()
+                             + timedelta(days=3)).isoformat(),
+            "confirm_url": f"{SITE_URL}/#subscription-confirm?token=SAMPLE",
+            "bags": 3,
+            "total": "$20.40",
+            "frequency_label": "Every month",
+        }
+    conn.close()
+    return jsonify(subject=_render_subscription_template(subject, ctx),
+                   html=_render_subscription_template(body, ctx))
 
 
 if __name__ == "__main__":
