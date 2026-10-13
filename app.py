@@ -13,6 +13,7 @@ Env vars (see .env.example):
   EMAIL_FROM, SITE_URL, DATABASE_PATH, GIFT_CARD_PRODUCT_ID
 """
 
+import json
 import os
 import re
 import secrets
@@ -157,6 +158,10 @@ def init_db():
             gift_card_discount_cents INTEGER,
             promo_code TEXT NOT NULL DEFAULT '',
             reward_code TEXT NOT NULL DEFAULT '',
+            total_qty INTEGER NOT NULL DEFAULT 0,
+            shippo_label_url TEXT NOT NULL DEFAULT '',
+            shippo_tracking_number TEXT NOT NULL DEFAULT '',
+            shippo_label_created_at TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS promo_redemptions (
@@ -177,6 +182,7 @@ def init_db():
             promo_code TEXT,
             reward_code TEXT NOT NULL DEFAULT '',
             amount_total_cents INTEGER,
+            total_qty INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
@@ -217,6 +223,19 @@ def init_db():
             item_count INTEGER NOT NULL DEFAULT 0,
             ordered INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS abandoned_carts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL,
+            session_id TEXT NOT NULL DEFAULT '',
+            items_json TEXT NOT NULL DEFAULT '[]',
+            items_summary TEXT NOT NULL DEFAULT '',
+            item_count INTEGER NOT NULL DEFAULT 0,
+            subtotal_cents INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            sent_at TEXT
         );
         CREATE TABLE IF NOT EXISTS subscription_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -301,6 +320,26 @@ def init_db():
     for col in ("customer_name", "shipping_address", "promo_code", "reward_code"):
         if col not in ocols:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    # Migration: Shippo label fields + bag count (for label weight) on orders.
+    for col in ("shippo_label_url", "shippo_tracking_number", "shippo_label_created_at"):
+        if col not in ocols:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    if "total_qty" not in ocols:
+        conn.execute("ALTER TABLE orders ADD COLUMN total_qty INTEGER NOT NULL DEFAULT 0")
+    # Migration: Shippo label fields on fundraiser orders.
+    # (Table may not exist yet on very old DBs — init_db creates it below.)
+    fexists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='fundraiser_orders'"
+    ).fetchone()
+    if fexists:
+        focols = [r["name"] for r in conn.execute("PRAGMA table_info(fundraiser_orders)").fetchall()]
+        for col in ("shippo_label_url", "shippo_tracking_number", "shippo_label_created_at"):
+            if col not in focols:
+                conn.execute(f"ALTER TABLE fundraiser_orders ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
+    # Migration: bag count on paypal_orders (for label weight).
+    pcols = [r["name"] for r in conn.execute("PRAGMA table_info(paypal_orders)").fetchall()]
+    if "total_qty" not in pcols:
+        conn.execute("ALTER TABLE paypal_orders ADD COLUMN total_qty INTEGER NOT NULL DEFAULT 0")
     # Migration: staff_id on loyalty_rewards for employee redemptions.
     lrcols = [r["name"] for r in conn.execute("PRAGMA table_info(loyalty_rewards)").fetchall()]
     if "staff_id" not in lrcols:
@@ -411,6 +450,9 @@ def init_db():
             total_cents INTEGER NOT NULL DEFAULT 0,
             stripe_payment_intent_id TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'paid',
+            shippo_label_url TEXT NOT NULL DEFAULT '',
+            shippo_tracking_number TEXT NOT NULL DEFAULT '',
+            shippo_label_created_at TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS fundraiser_ticker (
@@ -449,16 +491,26 @@ def init_db():
             order_id INTEGER NOT NULL DEFAULT 0,
             amount_cents INTEGER NOT NULL DEFAULT 0
         );
-        # Migration: failed_attempts counter for renewal retry logic.
+        """
+    )
+    # Migration: failed_attempts counter for renewal retry logic.
+    try:
+        conn.execute("ALTER TABLE subscription_renewals ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
+    # Migration: prevent duplicate renewals for the same billing date.
+    try:
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_renewals_sub_date ON subscription_renewals (subscription_id, billing_date)")
+    except sqlite3.OperationalError:
+        pass
+    # Migration: demo-mode flag on order-like tables (never billed, never shipped).
+    for _t in ("orders", "fundraiser_orders", "gift_cards", "subscriptions"):
         try:
-            conn.execute("ALTER TABLE subscription_renewals ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0")
+            conn.execute(f"ALTER TABLE {_t} ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
-        # Migration: prevent duplicate renewals for the same billing date.
-        try:
-            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_renewals_sub_date ON subscription_renewals (subscription_id, billing_date)")
-        except sqlite3.OperationalError:
-            pass
+    conn.executescript(
+        """
         CREATE TABLE IF NOT EXISTS subscription_email_templates (
             name TEXT PRIMARY KEY,
             subject TEXT NOT NULL DEFAULT '',
@@ -597,7 +649,8 @@ ORDER_NOTIFY_EMAIL = os.environ.get("ORDER_NOTIFY_EMAIL", "orders@pop-a-licious.
 
 def merchant_order_email_html(order_ref, name, email, items_summary,
                               amount_total_cents, gift_card_code,
-                              discount_cents, promo_code="", shipping=""):
+                              discount_cents, promo_code="", shipping="",
+                              label_url="", tracking_number=""):
     dollars = lambda c: f"${c / 100:,.2f}"
     rows = [
         ("Order", order_ref),
@@ -611,6 +664,11 @@ def merchant_order_email_html(order_ref, name, email, items_summary,
         rows.append(("Promo code", html.escape(promo_code)))
     if shipping:
         rows.append(("Ship to", html.escape(shipping)))
+    if tracking_number:
+        rows.append(("Tracking", html.escape(tracking_number)))
+    if label_url:
+        rows.append(("Shipping label",
+                     f'<a href="{html.escape(label_url)}">Print shipping label (PDF)</a>'))
     body = "".join(f"<p><strong>{k}:</strong> {v}</p>" for k, v in rows)
     return (
         '<html><body style="font-family: Arial, sans-serif; line-height: 1.6;">'
@@ -620,7 +678,8 @@ def merchant_order_email_html(order_ref, name, email, items_summary,
 
 def notify_merchant_of_order(order_ref, name, email, items_summary,
                              amount_total_cents, gift_card_code,
-                             discount_cents, promo_code="", shipping=""):
+                             discount_cents, promo_code="", shipping="",
+                             label_url="", tracking_number=""):
     """Email the merchant about a new order. Never raises — a failed
     notification must not break order fulfillment."""
     if not ORDER_NOTIFY_EMAIL:
@@ -631,7 +690,8 @@ def notify_merchant_of_order(order_ref, name, email, items_summary,
             f"New order {order_ref} — ${amount_total_cents / 100:,.2f}",
             merchant_order_email_html(order_ref, name, email, items_summary,
                                       amount_total_cents, gift_card_code,
-                                      discount_cents, promo_code, shipping),
+                                      discount_cents, promo_code, shipping,
+                                      label_url, tracking_number),
         )
     except Exception:
         pass
@@ -779,14 +839,39 @@ def fulfill_order(session, meta):
         )
 
     now = datetime.now(timezone.utc).isoformat()
+    # Shippo label: create from the Stripe shipping address (never blocks the
+    # order — failures leave the label fields blank for admin retry).
+    try:
+        total_qty = int(meta.get("total_qty") or 0)
+    except (TypeError, ValueError):
+        total_qty = 0
+    ship = session.get("shipping_details") or {}
+    ship_addr = ship.get("address") or {}
+    label_url, tracking_number = _create_shippo_label(
+        _shippo_address_to(
+            name=ship.get("name") or name,
+            street1=ship_addr.get("line1", ""),
+            street2=ship_addr.get("line2", ""),
+            city=ship_addr.get("city", ""),
+            state=ship_addr.get("state", ""),
+            zip_code=ship_addr.get("postal_code", ""),
+            country=ship_addr.get("country", "US"),
+        ),
+        total_qty,
+        order_ref=session_id,
+    )
+    label_created_at = now if label_url else ""
     conn.execute(
         """INSERT INTO orders
            (stripe_session_id, email, customer_name, shipping_address, items_summary,
             amount_total_cents, gift_card_code, gift_card_discount_cents,
-            promo_code, reward_code, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            promo_code, reward_code, total_qty,
+            shippo_label_url, shippo_tracking_number, shippo_label_created_at,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (session_id, email, name, shipping_address, items_summary, amount_total,
-         code, discount, promo, rcode, now),
+         code, discount, promo, rcode, total_qty,
+         label_url or "", tracking_number or "", label_created_at, now),
     )
     # Loyalty: mark a redeemed reward code as used (single use).
     if rcode:
@@ -823,7 +908,8 @@ def fulfill_order(session, meta):
         ] if x
     )
     notify_merchant_of_order(session_id, name, email, items_summary,
-                             amount_total, code, discount, promo, shipping)
+                             amount_total, code, discount, promo, shipping,
+                             label_url or "", tracking_number or "")
 
 def fulfill_gift_card(session, meta):
     session_id = session["id"]
@@ -972,6 +1058,100 @@ def _cheapest_shipping_cents(dest_zip, total_qty, country="US"):
     if not options:
         return None
     return options[0]["amount_cents"]
+
+def _create_shippo_label(address_to, total_qty, order_ref=""):
+    """Create and purchase a Shippo shipping label.
+
+    address_to: dict with name, street1, street2, city, state, zip, country.
+    Returns (label_url, tracking_number); (None, None) on any failure.
+    NEVER raises — a label failure must never break order completion.
+    """
+    if not SHIPPO_API_KEY:
+        return None, None
+    try:
+        total_qty = int(total_qty or 0)
+    except (TypeError, ValueError):
+        total_qty = 0
+    if total_qty <= 0:
+        return None, None
+    if not (address_to.get("zip") or "").strip():
+        return None, None
+    weight_oz = max(8 * total_qty, 8)
+    parcel = {
+        "length": "12", "width": "9", "height": "6",
+        "distance_unit": "in",
+        "weight": str(weight_oz), "mass_unit": "oz",
+    }
+    try:
+        resp = requests.post(
+            "https://api.goshippo.com/shipments/",
+            headers={
+                "Authorization": f"ShippoToken {SHIPPO_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "address_from": SHIP_FROM,
+                "address_to": address_to,
+                "parcels": [parcel],
+                "async": False,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        rates = resp.json().get("rates") or []
+        best_rate_id = None
+        best_cents = None
+        for r in rates:
+            provider = (r.get("provider") or "").lower()
+            if provider not in {"usps", "ups", "fedex"}:
+                continue
+            try:
+                cents = int(round(float(r.get("amount", 0)) * 100))
+            except (TypeError, ValueError):
+                continue
+            if best_cents is None or cents < best_cents:
+                best_cents = cents
+                best_rate_id = r.get("object_id")
+        if not best_rate_id:
+            print(f"[shippo] no purchasable rates for order {order_ref}")
+            return None, None
+        tx = requests.post(
+            "https://api.goshippo.com/transactions/",
+            headers={
+                "Authorization": f"ShippoToken {SHIPPO_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"rate": best_rate_id, "label_file_type": "PDF", "async": False},
+            timeout=30,
+        )
+        tx.raise_for_status()
+        tdata = tx.json()
+        if tdata.get("status") != "SUCCESS":
+            print(f"[shippo] transaction not successful for order {order_ref}: "
+                  f"{tdata.get('messages')}")
+            return None, None
+        return tdata.get("label_url"), tdata.get("tracking_number")
+    except Exception as e:
+        print(f"[shippo] label creation failed for order {order_ref}: {e}")
+        return None, None
+
+def _shippo_address_to(name="", street1="", street2="", city="", state="",
+                       zip_code="", country="US"):
+    """Build a Shippo address_to dict, dropping blank fields."""
+    addr = {"country": (country or "US").strip().upper()[:2] or "US"}
+    if (name or "").strip():
+        addr["name"] = name.strip()
+    if (street1 or "").strip():
+        addr["street1"] = street1.strip()
+    if (street2 or "").strip():
+        addr["street2"] = street2.strip()
+    if (city or "").strip():
+        addr["city"] = city.strip()
+    if (state or "").strip():
+        addr["state"] = state.strip()
+    if (zip_code or "").strip():
+        addr["zip"] = zip_code.strip()
+    return addr
 
 @app.post("/api/shipping/rates")
 def shipping_rates():
@@ -1213,6 +1393,7 @@ def create_order_checkout():
     order, err = _compute_order(data)
     if err:
         return err[0], err[1]
+    mark_abandoned_converted(data.get("email"))
 
     discounts = []
     try:
@@ -1290,6 +1471,7 @@ def create_order_checkout():
             metadata={
                 "type": "order",
                 "items_summary": order["summary"],
+                "total_qty": str(sum(it["quantity"] for it in order["items"])),
                 "gift_card_code": order["gift_card_code"],
                 "gift_card_discount_cents": str(order["gift_card_discount_cents"]),
                 "promo_code": order["promo_code"],
@@ -1317,6 +1499,7 @@ def paypal_create_order():
     order, err = _compute_order(data)
     if err:
         return err[0], err[1]
+    mark_abandoned_converted(data.get("email"))
 
     merch = order["merchandise_total"]
     ship = order["shipping_cents"]
@@ -1382,11 +1565,13 @@ def paypal_create_order():
     conn.execute(
         """INSERT INTO paypal_orders
            (paypal_order_id, email, items_summary, gift_card_code,
-            gift_card_discount_cents, promo_code, reward_code, amount_total_cents, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            gift_card_discount_cents, promo_code, reward_code, amount_total_cents,
+            total_qty, status, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             pp["id"], order["email"], order["summary"], order["gift_card_code"],
             order["gift_card_discount_cents"], order["promo_code"], order["reward_code"], grand,
+            sum(it["quantity"] for it in order["items"]),
             "created", now,
         ),
     )
@@ -1481,9 +1666,29 @@ def paypal_capture_order():
         )
     except Exception:
         pass
+    # Shippo label from the PayPal shipping address (never blocks the order).
+    pu0 = (pp.get("purchase_units") or [{}])[0]
+    psh = pu0.get("shipping") or {}
+    psh_name = psh.get("name")
+    psh_name = psh_name.get("full_name") if isinstance(psh_name, dict) else psh_name
+    paddr = psh.get("address") or {}
+    label_url, tracking_number = _create_shippo_label(
+        _shippo_address_to(
+            name=psh_name or name,
+            street1=paddr.get("address_line_1", ""),
+            street2=paddr.get("address_line_2", ""),
+            city=paddr.get("admin_area_2", ""),
+            state=paddr.get("admin_area_1", ""),
+            zip_code=paddr.get("postal_code", ""),
+            country=paddr.get("country_code", "US"),
+        ),
+        row["total_qty"] or 0,
+        order_ref=f"paypal:{order_id}",
+    )
+    label_created_at = now if label_url else ""
     notify_merchant_of_order(order_id, name, email, row["items_summary"],
                              row["amount_total_cents"], code, discount,
-                             promo, shipping)
+                             promo, shipping, label_url or "", tracking_number or "")
 
     conn.execute("UPDATE paypal_orders SET status = 'captured' WHERE paypal_order_id = ?", (order_id,))
     prcode = row["reward_code"] or ""
@@ -1491,10 +1696,14 @@ def paypal_capture_order():
         """INSERT INTO orders
            (stripe_session_id, email, customer_name, shipping_address, items_summary,
             amount_total_cents, gift_card_code, gift_card_discount_cents,
-            promo_code, reward_code, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            promo_code, reward_code, total_qty,
+            shippo_label_url, shippo_tracking_number, shippo_label_created_at,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (f"paypal:{order_id}", email, name, shipping, row["items_summary"],
-         row["amount_total_cents"], code, discount, promo, prcode, now),
+         row["amount_total_cents"], code, discount, promo, prcode,
+         row["total_qty"] or 0, label_url or "", tracking_number or "",
+         label_created_at, now),
     )
     # Loyalty: mark a redeemed reward code as used (single use).
     rcode = prcode
@@ -2769,6 +2978,162 @@ def track_cart():
     conn.close()
     return jsonify(ok=True)
 
+def abandoned_cart_email_html(items, subtotal_cents):
+    dollars = lambda c: f"${c / 100:,.2f}"
+    rows = "".join(
+        f"<tr><td style=\"padding:6px 10px;border-bottom:1px solid #eee;\">{html.escape(str(it.get('name') or 'Popcorn'))}</td>"
+        f"<td style=\"padding:6px 10px;border-bottom:1px solid #eee;text-align:center;\">{int(it.get('quantity') or 1)}</td>"
+        f"<td style=\"padding:6px 10px;border-bottom:1px solid #eee;text-align:right;\">{dollars(int(it.get('amount_cents') or 0) * int(it.get('quantity') or 1))}</td></tr>"
+        for it in items
+    )
+    checkout_url = SITE_URL + "/#shop"
+    return f"""\
+<html><body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+<p style="text-align:center;"><img src="https://pop-a-licious.com/logo.png" alt="Pop-A-Licious" style="max-width:220px;"></p>
+<p>Hi there,</p>
+<p>You left popcorn in your cart! &#x1F37F; Your Pop-A-Licious favorites are still waiting for you:</p>
+<table style="border-collapse:collapse;width:100%;max-width:480px;">
+<tr><th style="text-align:left;padding:6px 10px;">Item</th><th style="padding:6px 10px;">Qty</th><th style="text-align:right;padding:6px 10px;">Price</th></tr>
+{rows}
+<tr><td colspan="2" style="padding:8px 10px;"><strong>Subtotal</strong></td><td style="padding:8px 10px;text-align:right;"><strong>{dollars(subtotal_cents)}</strong></td></tr>
+</table>
+<p>Psst — orders of $50 or more ship FREE with code <strong>FREESHIP50</strong>.</p>
+<p style="text-align:center;"><a href="{checkout_url}" style="display:inline-block;background:#e63946;color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:8px;font-weight:bold;">Complete Your Order</a></p>
+<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong><br><em>*It&rsquo;s Not Just Butter &amp; Salt!</em> &#x1F37F;</p>
+<p style="font-size:12px;color:#888;">You received this one-time reminder because you entered your email at checkout on pop-a-licious.com. We only send this reminder once per cart. If you no longer wish to receive emails from Pop-A-Licious, reply to this email with "unsubscribe" and we will remove you from our mailing list.</p>
+</body></html>"""
+
+
+def mark_abandoned_converted(email):
+    """Mark any pending abandoned-cart snapshots for an email as converted
+    (the customer went on to check out, so no reminder should be sent)."""
+    email = (email or "").strip().lower()
+    if not email or not EMAIL_RE.match(email):
+        return
+    try:
+        conn = db()
+        conn.execute(
+            "UPDATE abandoned_carts SET status = 'converted', updated_at = ? WHERE email = ? AND status = 'pending'",
+            (datetime.now(timezone.utc).isoformat(), email),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+@app.post("/api/cart/abandoned")
+def save_abandoned_cart():
+    """Save (or refresh) the pending abandoned-cart snapshot for an email.
+
+    Body: { email, session_id?, items: [{name, amount_cents, quantity}],
+            subtotal_cents? }
+    One pending snapshot per email: repeat saves update the items and the
+    updated_at timestamp, which is what the 2-hour inactivity window keys
+    off. A snapshot already emailed (status 'sent') is never revived.
+    """
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not EMAIL_RE.match(email):
+        return jsonify(error="valid email required"), 400
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        return jsonify(ok=True)
+    items = []
+    item_count = 0
+    subtotal = 0
+    for raw in raw_items[:50]:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            qty = max(1, min(999, int(raw.get("quantity") or 1)))
+            cents = max(0, int(raw.get("amount_cents") or 0))
+        except (TypeError, ValueError):
+            continue
+        name = str(raw.get("name") or "Popcorn")[:120]
+        items.append({"name": name, "quantity": qty, "amount_cents": cents})
+        item_count += qty
+        subtotal += qty * cents
+    if not items:
+        return jsonify(ok=True)
+    try:
+        provided_subtotal = int(data.get("subtotal_cents"))
+    except (TypeError, ValueError):
+        provided_subtotal = subtotal
+    if provided_subtotal > 0:
+        subtotal = provided_subtotal
+    summary = ", ".join(f"{it['quantity']}x {it['name']}" for it in items)[:500]
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    existing = conn.execute(
+        "SELECT id FROM abandoned_carts WHERE email = ? AND status = 'pending' ORDER BY id DESC LIMIT 1",
+        (email,),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE abandoned_carts SET session_id = ?, items_json = ?, items_summary = ?, item_count = ?, subtotal_cents = ?, updated_at = ? WHERE id = ?",
+            ((data.get("session_id") or "")[:64], json.dumps(items), summary, item_count, subtotal, now, existing["id"]),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO abandoned_carts (email, session_id, items_json, items_summary, item_count, subtotal_cents, status, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (email, (data.get("session_id") or "")[:64], json.dumps(items), summary, item_count, subtotal, now, now),
+        )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/cart/abandoned/run")
+def abandoned_cart_run():
+    """Cron: email customers whose saved cart has been inactive for 2+ hours.
+
+    Header X-Cron-Secret must equal the CRON_SECRET env var
+    (503 when CRON_SECRET is not configured). Each pending cart is emailed
+    exactly once: the row is marked 'sent' before/after a successful send
+    and is never picked up again.
+    """
+    if not CRON_SECRET:
+        return jsonify(error="cron is not configured"), 503
+    if request.headers.get("X-Cron-Secret", "") != CRON_SECRET:
+        return jsonify(error="forbidden"), 403
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM abandoned_carts WHERE status = 'pending' AND updated_at <= ? ORDER BY updated_at ASC LIMIT 200",
+        (cutoff,),
+    ).fetchall()
+    sent = skipped = 0
+    for row in rows:
+        try:
+            items = json.loads(row["items_json"] or "[]")
+        except (TypeError, ValueError):
+            items = []
+        if not items:
+            conn.execute("UPDATE abandoned_carts SET status = 'converted' WHERE id = ?", (row["id"],))
+            skipped += 1
+            continue
+        try:
+            send_email(
+                row["email"],
+                "You left popcorn in your cart 🍿",
+                abandoned_cart_email_html(items, int(row["subtotal_cents"] or 0)),
+            )
+        except Exception:
+            # Leave the row pending so the next cron run retries it.
+            skipped += 1
+            continue
+        conn.execute(
+            "UPDATE abandoned_carts SET status = 'sent', sent_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), row["id"]),
+        )
+        sent += 1
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, sent=sent, skipped=skipped)
+
+
 @app.post("/api/subscriptions/request")
 def subscription_request():
     """Log a Subscribe & Save request (in addition to the email the site sends)."""
@@ -2928,7 +3293,8 @@ def admin_order_detail(order_id):
         r = conn.execute(
             "SELECT id, stripe_session_id, email, customer_name, shipping_address,"
             " items_summary, amount_total_cents, gift_card_code,"
-            " gift_card_discount_cents, promo_code, reward_code, created_at"
+            " gift_card_discount_cents, promo_code, reward_code, total_qty,"
+            " shippo_label_url, shippo_tracking_number, shippo_label_created_at, created_at"
             " FROM orders WHERE id = ?",
             (int(order_id) - 1000,),
         ).fetchone()
@@ -2936,7 +3302,8 @@ def admin_order_detail(order_id):
         r = conn.execute(
             "SELECT id, stripe_session_id, email, customer_name, shipping_address,"
             " items_summary, amount_total_cents, gift_card_code,"
-            " gift_card_discount_cents, promo_code, reward_code, created_at"
+            " gift_card_discount_cents, promo_code, reward_code, total_qty,"
+            " shippo_label_url, shippo_tracking_number, shippo_label_created_at, created_at"
             " FROM orders WHERE stripe_session_id = ?",
             (order_id,),
         ).fetchone()
@@ -2978,9 +3345,128 @@ def admin_order_detail(order_id):
         gift_card_code=r["gift_card_code"] or "",
         gift_card_discount_cents=r["gift_card_discount_cents"] or 0,
         promo_code=r["promo_code"] or "", reward_code=r["reward_code"] or "",
+        total_qty=r["total_qty"] or 0,
+        shippo_label_url=r["shippo_label_url"] or "",
+        shippo_tracking_number=r["shippo_tracking_number"] or "",
+        shippo_label_created_at=r["shippo_label_created_at"] or "",
         payment_method="PayPal" if r["stripe_session_id"].startswith("paypal:") else "Stripe",
         created_at=r["created_at"],
     )
+
+@app.get("/api/admin/orders/<order_id>/label")
+def admin_order_label(order_id):
+    """Return the Shippo label info for an order (admin)."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    r = _admin_find_order(conn, order_id)
+    conn.close()
+    if not r:
+        return jsonify(error="order not found"), 404
+    return jsonify(
+        label_url=r["shippo_label_url"] or "",
+        tracking_number=r["shippo_tracking_number"] or "",
+        label_created_at=r["shippo_label_created_at"] or "",
+    )
+
+@app.post("/api/admin/orders/<order_id>/create-label")
+def admin_order_create_label(order_id):
+    """Retry Shippo label creation for an order missing one (admin).
+
+    Rebuilds the destination address from the best available source:
+    subscription record (sub_ orders), Stripe session shipping details,
+    or the stored shipping address string as a last resort.
+    """
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    r = _admin_find_order(conn, order_id)
+    if not r:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    if r["shippo_label_url"]:
+        conn.close()
+        return jsonify(ok=True, already=True,
+                       label_url=r["shippo_label_url"],
+                       tracking_number=r["shippo_tracking_number"] or "")
+    stripe_id = r["stripe_session_id"] or ""
+    total_qty = r["total_qty"] or 0
+    address_to = None
+
+    # sub_ orders: the subscription holds the structured address.
+    if stripe_id.startswith("sub_"):
+        ren = conn.execute(
+            "SELECT subscription_id FROM subscription_renewals WHERE order_id = ?",
+            (r["id"],)).fetchone()
+        if ren:
+            sub = conn.execute(
+                "SELECT ship_name, ship_street, ship_city, ship_state, ship_zip"
+                " FROM subscriptions WHERE id = ?",
+                (ren["subscription_id"],)).fetchone()
+            if sub:
+                address_to = _shippo_address_to(
+                    name=sub["ship_name"] or "", street1=sub["ship_street"] or "",
+                    city=sub["ship_city"] or "", state=sub["ship_state"] or "",
+                    zip_code=sub["ship_zip"] or "")
+
+    # Stripe orders: re-fetch shipping details from the Stripe session.
+    if address_to is None and not stripe_id.startswith("paypal:"):
+        try:
+            session = stripe.checkout.Session.retrieve(stripe_id)
+            ship = session.get("shipping_details") or {}
+            saddr = ship.get("address") or {}
+            address_to = _shippo_address_to(
+                name=ship.get("name") or r["customer_name"] or "",
+                street1=saddr.get("line1", ""), street2=saddr.get("line2", ""),
+                city=saddr.get("city", ""), state=saddr.get("state", ""),
+                zip_code=saddr.get("postal_code", ""),
+                country=saddr.get("country", "US"))
+        except Exception:
+            address_to = None
+
+    # Last resort: parse the stored "line1, line2, city, state, zip, country"
+    # shipping address string.
+    if address_to is None:
+        parts = [p.strip() for p in (r["shipping_address"] or "").split(",")]
+        if len(parts) >= 5:
+            address_to = _shippo_address_to(
+                name=parts[0], street1="",
+                city=parts[-4], state=parts[-3], zip_code=parts[-2],
+                country=parts[-1] if len(parts) >= 6 else "US")
+    if address_to is None:
+        conn.close()
+        return jsonify(error="could not determine the shipping address"), 400
+
+    label_url, tracking_number = _create_shippo_label(
+        address_to, total_qty, order_ref=stripe_id)
+    if not label_url:
+        conn.close()
+        return jsonify(error="Shippo could not create a label for this order"), 502
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE orders SET shippo_label_url = ?, shippo_tracking_number = ?,"
+        " shippo_label_created_at = ? WHERE id = ?",
+        (label_url, tracking_number or "", now, r["id"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, label_url=label_url,
+                   tracking_number=tracking_number or "")
+
+def _admin_find_order(conn, order_id):
+    """Fetch an order row by friendly number or session ID (for admin label endpoints)."""
+    if order_id.isdigit():
+        return conn.execute(
+            "SELECT id, stripe_session_id, customer_name, shipping_address,"
+            " total_qty, shippo_label_url, shippo_tracking_number,"
+            " shippo_label_created_at FROM orders WHERE id = ?",
+            (int(order_id) - 1000,)).fetchone()
+    return conn.execute(
+        "SELECT id, stripe_session_id, customer_name, shipping_address,"
+        " total_qty, shippo_label_url, shippo_tracking_number,"
+        " shippo_label_created_at FROM orders WHERE stripe_session_id = ?",
+        (order_id,)).fetchone()
 
 @app.get("/api/admin/orders")
 def admin_orders():
@@ -3007,7 +3493,7 @@ def admin_orders():
         "SELECT o.id, o.stripe_session_id, o.email, o.customer_name, o.shipping_address,"
         " o.items_summary, o.amount_total_cents,"
         " o.gift_card_code, o.gift_card_discount_cents,"
-        " o.promo_code, o.reward_code, o.created_at"
+        " o.promo_code, o.reward_code, o.is_demo, o.created_at"
         f" FROM orders o {where} ORDER BY o.id DESC LIMIT ? OFFSET ?",
         params + [limit, offset],
     ).fetchall()
@@ -3022,6 +3508,7 @@ def admin_orders():
          "gift_card_code": r["gift_card_code"] or "",
          "gift_card_discount_cents": r["gift_card_discount_cents"] or 0,
          "promo_code": r["promo_code"] or "", "reward_code": r["reward_code"] or "",
+         "is_demo": bool(r["is_demo"]),
          "created_at": r["created_at"]}
         for r in rows
     ])
@@ -4007,19 +4494,34 @@ def fundraiser_order_confirm():
 
     try:
         order_number = _next_fundraiser_order_number(conn)
+        # Shippo label (never blocks the order — blank fields = admin retry).
+        label_url, tracking_number = _create_shippo_label(
+            _shippo_address_to(
+                name=(meta.get("ship_name") or "")[:120] or customer_name,
+                street1=(meta.get("ship_street") or "")[:200],
+                city=(meta.get("ship_city") or "")[:120],
+                state=(meta.get("ship_state") or "")[:2],
+                zip_code=(meta.get("ship_zip") or "")[:10],
+            ),
+            total_qty,
+            order_ref=order_number,
+        )
+        label_created_at = now if label_url else ""
         conn.execute(
             """INSERT INTO fundraiser_orders
                (fundraiser_id, seller_id, order_number, customer_name, customer_email,
                 ship_name, ship_street, ship_city, ship_state, ship_zip,
                 items, subtotal_cents, donation_cents, roundup_cents,
-                shipping_cents, total_cents, stripe_payment_intent_id, status, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?)""",
+                shipping_cents, total_cents, stripe_payment_intent_id, status,
+                shippo_label_url, shippo_tracking_number, shippo_label_created_at,
+                created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', ?, ?, ?, ?)""",
             (fr["id"], seller_id, order_number, customer_name, customer_email,
              (meta.get("ship_name") or "")[:120], (meta.get("ship_street") or "")[:200],
              (meta.get("ship_city") or "")[:120], (meta.get("ship_state") or "")[:2],
              (meta.get("ship_zip") or "")[:10],
              json.dumps(items), subtotal, donation, roundup, ship_cents, total,
-             pi_id, now),
+             pi_id, label_url or "", tracking_number or "", label_created_at, now),
         )
     except RuntimeError:
         conn.close()
@@ -4079,7 +4581,8 @@ def fundraiser_order_confirm():
                     meta.get("ship_city"), meta.get("ship_state"),
                     meta.get("ship_zip")] if x)
     notify_merchant_of_order(order_number, customer_name, customer_email,
-                             summary, total, "", 0, "", shipping)
+                             summary, total, "", 0, "", shipping,
+                             label_url or "", tracking_number or "")
     return jsonify(ok=True, order_number=order_number)
 
 @app.post("/api/fundraisers/in-person-sale")
@@ -4432,14 +4935,30 @@ def _attempt_subscription_charge(conn, sub, renewal, items):
     ship_addr = ", ".join(
         x for x in [sub["ship_name"], sub["ship_street"], sub["ship_city"],
                     sub["ship_state"], sub["ship_zip"]] if x)
+    # Shippo label (never blocks the charge — blank fields = admin retry).
+    label_url, tracking_number = _create_shippo_label(
+        _shippo_address_to(
+            name=sub["ship_name"] or "",
+            street1=sub["ship_street"] or "",
+            city=sub["ship_city"] or "",
+            state=sub["ship_state"] or "",
+            zip_code=sub["ship_zip"] or "",
+        ),
+        bags,
+        order_ref=f"sub_{pi.id}",
+    )
+    label_created_at = now if label_url else ""
     cur = conn.execute(
         """INSERT INTO orders
            (stripe_session_id, email, customer_name, shipping_address, items_summary,
             amount_total_cents, gift_card_code, gift_card_discount_cents,
-            promo_code, reward_code, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, '', 0, '', '', ?)""",
+            promo_code, reward_code, total_qty,
+            shippo_label_url, shippo_tracking_number, shippo_label_created_at,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, '', 0, '', '', ?, ?, ?, ?, ?)""",
         (f"sub_{pi.id}", sub["ship_email"] or "", sub["ship_name"] or "",
-         ship_addr, summary, amount, now))
+         ship_addr, summary, amount, bags,
+         label_url or "", tracking_number or "", label_created_at, now))
     order_id = cur.lastrowid
     # Advance the billing cycle from the later of the old billing date / today.
     days = SUB_FREQUENCIES.get(sub["frequency"], {}).get("days", 30)
@@ -4474,6 +4993,8 @@ def _attempt_subscription_charge(conn, sub, renewal, items):
         "summary": summary,
         "amount": amount,
         "ship_addr": ship_addr,
+        "label_url": label_url or "",
+        "tracking_number": tracking_number or "",
     }
 
 # ---------------- subscription endpoints ----------------
@@ -4559,6 +5080,9 @@ def create_subscription():
         (sub_id, next_billing, _new_confirm_token()))
     conn.commit()
     conn.close()
+    # Welcome email (never blocks the response if sending fails).
+    _send_subscription_welcome_email(
+        full["name"] or ship_name, full["email"], items, frequency, next_billing)
     return jsonify(id=sub_id, next_billing_date=next_billing,
                    per_delivery_cents=_per_delivery_cents(items, freq["discount"]),
                    discount_percent=freq["discount"])
@@ -4760,7 +5284,8 @@ def subscription_confirm_charge(token):
     notify_merchant_of_order(
         f"sub_{payload['payment_intent_id']}", sub["ship_name"],
         sub["ship_email"], payload["summary"], payload["amount"],
-        "", 0, "", payload["ship_addr"])
+        "", 0, "", payload["ship_addr"],
+        payload.get("label_url", ""), payload.get("tracking_number", ""))
     return jsonify(ok=True, order_number=payload["order_number"])
 
 @app.post("/api/subscriptions/renewals/run")
@@ -4876,7 +5401,8 @@ def subscription_renewals_run():
             notify_merchant_of_order(
                 f"sub_{payload['payment_intent_id']}", sub["ship_name"],
                 sub["ship_email"], payload["summary"], payload["amount"],
-                "", 0, "", payload["ship_addr"])
+                "", 0, "", payload["ship_addr"],
+                payload.get("label_url", ""), payload.get("tracking_number", ""))
         else:
             failed += 1
     conn.close()
@@ -4971,6 +5497,424 @@ def admin_subscription_email_preview():
     conn.close()
     return jsonify(subject=_render_subscription_template(subject, ctx),
                    html=_render_subscription_template(body, ctx))
+
+
+# ---------------- demo mode + subscription welcome email ----------------
+
+SUBSCRIPTION_WELCOME_SUBJECT = "Welcome to the Pop-A-Licious Subscribe & Save Club! \U0001F37F"
+_SUBSCRIPTION_WELCOME_FROM = "Pop-A-Licious Customer Service <customerservice@pop-a-licious.com>"
+_FREQUENCY_EVERY = {"biweekly": "2 weeks", "monthly": "month", "bimonthly": "2 months"}
+
+def _subscription_welcome_html(name, items, frequency, first_delivery_date):
+    bags = sum(it["quantity"] for it in items if isinstance(it, dict))
+    flavors = _items_summary_str(items)
+    every = _FREQUENCY_EVERY.get(frequency, "month")
+    try:
+        d = datetime.fromisoformat(first_delivery_date).date()
+        date_str = d.strftime("%B %d, %Y")
+    except (TypeError, ValueError):
+        date_str = first_delivery_date
+    return f"""\
+<html><body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+<p style="text-align:center;"><img src="https://pop-a-licious.com/logo.png" alt="Pop-A-Licious" style="max-width:220px;"></p>
+<p>Hi {html.escape(name or 'there')},</p>
+<p>Welcome to the <strong>Pop-A-Licious Subscribe &amp; Save Club</strong>! \U0001F37F<br>
+Your popcorn is officially on autopilot.</p>
+<p><strong>Your plan:</strong><br>
+Bags per delivery: <strong>{bags}</strong><br>
+Flavors: <strong>{html.escape(flavors)}</strong><br>
+Frequency: <strong>{html.escape(SUB_FREQUENCIES.get(frequency, {}).get('label', frequency))}</strong></p>
+<p>You'll receive your popcorn <strong>every {every} starting {html.escape(date_str)}</strong>.</p>
+<p><strong>3 days before each delivery</strong>, we'll email you to confirm your flavors
+&mdash; you can swap them anytime before we bill. No surprises, just popcorn.</p>
+<p style="text-align:center;"><a href="{SITE_URL}/#my-subscriptions" style="display:inline-block;background:#e63946;color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:8px;font-weight:bold;">Manage Your Subscription</a></p>
+<p>Questions? Just reply to this email or write to us at customerservice@pop-a-licious.com.</p>
+<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong><br>
+2013 Angel Falls Dr., Henderson, NV 89074</p>
+</body></html>"""
+
+def _send_subscription_welcome_email(name, email, items, frequency, first_delivery_date):
+    """Welcome email for a new subscription (real or demo). Never raises."""
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={
+                "from": _SUBSCRIPTION_WELCOME_FROM,
+                "to": [email],
+                "subject": SUBSCRIPTION_WELCOME_SUBJECT,
+                "html": _subscription_welcome_html(name, items, frequency,
+                                                   first_delivery_date),
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except Exception:
+        pass
+
+def _demo_ref():
+    return "demo_" + secrets.token_urlsafe(12)
+
+@app.post("/api/demo/checkout")
+def demo_checkout():
+    """Demo-mode store checkout: same validation as the real checkout, but no
+    Stripe, no Shippo label, no balance consumption. Order is saved with
+    is_demo=1 and [DEMO] emails are sent."""
+    data = request.get_json(force=True) or {}
+    order, err = _compute_order(data)
+    if err:
+        return err[0], err[1]
+    mark_abandoned_converted(data.get("email"))
+    # Demo never consumes promo/gift-card/reward balances.
+    total = order["merchandise_total"] + order["shipping_cents"]
+    total -= order["gift_card_discount_cents"]
+    total -= order["reward_discount_cents"]
+    if order["promo_percent_off"]:
+        total = int(round(total * (100 - order["promo_percent_off"]) / 100))
+    total = max(total, 0)
+
+    name = (data.get("name") or "").strip()[:120]
+    shipping_address = (data.get("shipping_address") or "").strip()[:300]
+    email = order["email"]
+    session_ref = _demo_ref()
+    now = datetime.now(timezone.utc).isoformat()
+    total_qty = sum(it["quantity"] for it in order["items"])
+
+    conn = db()
+    cur = conn.execute(
+        """INSERT INTO orders
+           (stripe_session_id, email, customer_name, shipping_address, items_summary,
+            amount_total_cents, gift_card_code, gift_card_discount_cents,
+            promo_code, reward_code, total_qty, is_demo, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+        (session_ref, email, name, shipping_address, order["summary"], total,
+         order["gift_card_code"], order["gift_card_discount_cents"],
+         order["promo_code"], order["reward_code"], total_qty, now),
+    )
+    order_id = cur.lastrowid
+    if email:
+        urow = conn.execute(
+            "SELECT id FROM users WHERE email = ?", (email,)).fetchone()
+        if urow:
+            _credit_kernels(conn, urow["id"],
+                            total // 100 * KERNELS_PER_DOLLAR,
+                            "purchase", order_ref=session_ref)
+    conn.commit()
+    conn.close()
+
+    try:
+        if email:
+            send_email(
+                email, "[DEMO] Your Pop-A-Licious order is confirmed!",
+                order_email_html(name, order["summary"], total,
+                                 order["gift_card_code"],
+                                 order["gift_card_discount_cents"],
+                                 order["promo_code"]))
+    except Exception:
+        pass
+    try:
+        notify_merchant_of_order("[DEMO] " + session_ref, name, email,
+                                 order["summary"], total,
+                                 order["gift_card_code"],
+                                 order["gift_card_discount_cents"],
+                                 order["promo_code"], shipping_address, "", "")
+    except Exception:
+        pass
+    return jsonify(ok=True, demo=True, order_number=1000 + order_id,
+                   order_ref=session_ref, total_cents=total)
+
+@app.post("/api/demo/gift-card")
+def demo_gift_card():
+    """Demo-mode gift card purchase: validated like the real flow, no Stripe."""
+    data = request.get_json(force=True) or {}
+    try:
+        amount = int(data.get("amount_cents", 0))
+    except (TypeError, ValueError):
+        return jsonify(error="amount_cents must be an integer number of cents"), 400
+    purchaser_name = (data.get("purchaser_name") or "").strip()
+    purchaser_email = (data.get("purchaser_email") or "").strip()
+    recipient_name = (data.get("recipient_name") or "").strip()
+    recipient_email = (data.get("recipient_email") or "").strip()
+    message = (data.get("message") or "").strip()[:500]
+    non_refundable_ok = bool(data.get("non_refundable_ack"))
+
+    min_allowed = 50 if (ALLOW_TEST_AMOUNTS and amount == 50) else MIN_AMOUNT_CENTS
+    if not (min_allowed <= amount <= MAX_AMOUNT_CENTS):
+        min_str = "$0.50" if min_allowed == 50 else f"${min_allowed // 100}"
+        return jsonify(error=f"amount must be between {min_str} and ${MAX_AMOUNT_CENTS // 100}"), 400
+    if not purchaser_name or not EMAIL_RE.match(purchaser_email):
+        return jsonify(error="valid purchaser name and email are required"), 400
+    if not recipient_name or not EMAIL_RE.match(recipient_email):
+        return jsonify(error="valid recipient name and email are required"), 400
+    if not non_refundable_ok:
+        return jsonify(error="please acknowledge the gift card is non-refundable"), 400
+
+    code = issue_unique_code()
+    session_ref = _demo_ref()
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        """INSERT INTO gift_cards
+           (code, amount_cents, balance_cents, purchaser_name, purchaser_email,
+            recipient_name, recipient_email, message, stripe_session_id,
+            is_demo, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+        (code, amount, amount, purchaser_name, purchaser_email,
+         recipient_name, recipient_email, message, session_ref, now),
+    )
+    conn.commit()
+    conn.close()
+    try:
+        requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"from": EMAIL_FROM, "to": [recipient_email],
+                  "subject": f"[DEMO] {purchaser_name} sent you a Pop-A-Licious gift card!",
+                  "html": gift_card_email_html(purchaser_name, recipient_name,
+                                               code, message)},
+            timeout=15,
+        ).raise_for_status()
+    except Exception:
+        pass
+    return jsonify(ok=True, demo=True, code=code, amount_cents=amount)
+
+@app.post("/api/demo/fundraiser-order")
+def demo_fundraiser_order():
+    """Demo-mode fundraiser supporter purchase: validated like the real flow,
+    but no Stripe, no Shippo, no ticker entry, no sponsor matching."""
+    data = request.get_json(force=True) or {}
+    fcode = (data.get("fundraiser_code") or "").strip().upper()
+    scode = (data.get("seller_referral_code") or "").strip().upper()
+    customer_name = (data.get("customer_name") or "").strip()[:120]
+    customer_email = (data.get("customer_email") or "").strip().lower()[:160]
+    ship_name = (data.get("ship_name") or "").strip()[:120]
+    ship_street = (data.get("ship_street") or "").strip()[:200]
+    ship_city = (data.get("ship_city") or "").strip()[:120]
+    ship_state = (data.get("ship_state") or "").strip().upper()[:2]
+    ship_zip = (data.get("ship_zip") or "").strip()[:10]
+
+    conn = db()
+    fr = conn.execute(
+        "SELECT * FROM fundraisers WHERE code = ?", (fcode,)).fetchone()
+    if not fr:
+        conn.close()
+        return jsonify(error="fundraiser not found"), 404
+    if fr["status"] != "active":
+        conn.close()
+        return jsonify(error="this fundraiser has ended"), 400
+    seller_id = 0
+    if scode:
+        s = conn.execute(
+            "SELECT id FROM fundraiser_sellers"
+            " WHERE referral_code = ? AND fundraiser_id = ?",
+            (scode, fr["id"])).fetchone()
+        if not s:
+            conn.close()
+            return jsonify(error="seller not found"), 404
+        seller_id = s["id"]
+    conn.close()
+
+    items, err = _validate_fundraiser_items(data.get("items"))
+    if err:
+        return err[0], err[1]
+    total_qty = sum(it["quantity"] for it in items)
+    subtotal = BAG_PRICE_CENTS * total_qty
+
+    if not customer_name:
+        return jsonify(error="your name is required"), 400
+    if not EMAIL_RE.match(customer_email):
+        return jsonify(error="a valid email is required"), 400
+    if not ship_name or not ship_street or not ship_city or not ship_state or not ship_zip:
+        return jsonify(error="a complete shipping address is required"), 400
+
+    try:
+        donation = int(data.get("donation_cents") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="donation_cents must be an integer"), 400
+    if donation < 0 or donation > 100000:
+        return jsonify(error="donation must be between $0 and $1,000"), 400
+    roundup = 0
+    if data.get("round_up") and subtotal % 100:
+        roundup = (subtotal // 100 + 1) * 100 - subtotal
+
+    ship_cents = _cheapest_shipping_cents(ship_zip, total_qty)
+    if ship_cents is None:
+        ship_cents = 0
+    total = subtotal + donation + roundup + ship_cents
+    if total < 50:
+        return jsonify(error="order total is too small"), 400
+
+    conn = db()
+    try:
+        order_number = _next_fundraiser_order_number(conn)
+        session_ref = _demo_ref()
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """INSERT INTO fundraiser_orders
+               (fundraiser_id, seller_id, order_number, customer_name, customer_email,
+                ship_name, ship_street, ship_city, ship_state, ship_zip,
+                items, subtotal_cents, donation_cents, roundup_cents,
+                shipping_cents, total_cents, stripe_payment_intent_id, status,
+                is_demo, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paid', 1, ?)""",
+            (fr["id"], seller_id, order_number, customer_name, customer_email,
+             ship_name, ship_street, ship_city, ship_state, ship_zip,
+             json.dumps(items), subtotal, donation, roundup, ship_cents, total,
+             session_ref, now),
+        )
+    except RuntimeError:
+        conn.close()
+        return jsonify(error="could not record the order"), 500
+    conn.commit()
+    conn.close()
+
+    dollars = lambda c: f"${c / 100:,.2f}"
+    summary = _items_summary_str(items)
+    try:
+        if customer_email:
+            send_email(
+                customer_email,
+                f"[DEMO] Thanks for supporting {fr['org_name']}!",
+                '<html><body style="font-family: Arial, sans-serif; line-height: 1.6;">'
+                f"<p>Hi {html.escape(customer_name) or 'there'},</p>"
+                f"<p>Thanks for supporting <strong>{html.escape(fr['org_name'])}</strong>!"
+                " Your fundraiser order is confirmed. &#x1F37F;</p>"
+                f"<p><strong>Order:</strong> {html.escape(order_number)}"
+                f"<br><strong>Items:</strong> {html.escape(summary)}"
+                f"<br><strong>Donation:</strong> {dollars(donation)}</p>"
+                f"<p><strong>Total charged:</strong> {dollars(total)}</p>"
+                "<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong></p>"
+                "</body></html>")
+    except Exception:
+        pass
+    try:
+        shipping = ", ".join(
+            x for x in [ship_name, ship_street, ship_city, ship_state, ship_zip] if x)
+        notify_merchant_of_order("[DEMO] " + order_number, customer_name,
+                                 customer_email, summary, total, "", 0, "",
+                                 shipping, "", "")
+    except Exception:
+        pass
+    return jsonify(ok=True, demo=True, order_number=order_number)
+
+@app.post("/api/demo/subscription")
+def demo_subscription():
+    """Demo-mode subscription signup: validated like the real flow, but no
+    Stripe customer/payment-method calls. Sends the welcome email."""
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    frequency = (data.get("frequency") or "").strip()
+    ship = data.get("shipping") or {}
+    if not isinstance(ship, dict):
+        return jsonify(error="invalid shipping"), 400
+    ship_name = (ship.get("name") or "").strip()[:120]
+    ship_street = (ship.get("street") or "").strip()[:200]
+    ship_city = (ship.get("city") or "").strip()[:120]
+    ship_state = (ship.get("state") or "").strip().upper()[:2]
+    ship_zip = (ship.get("zip") or "").strip()[:10]
+
+    items, err = _validate_subscription_items(data.get("items"))
+    if err:
+        return err[0], err[1]
+    if frequency not in SUB_FREQUENCIES:
+        return jsonify(error="frequency must be biweekly, monthly, or bimonthly"), 400
+    if not ship_name or not ship_street or not ship_city or not ship_state or not ship_zip:
+        return jsonify(error="a complete shipping address is required"), 400
+
+    conn = db()
+    full = conn.execute(
+        "SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    freq = SUB_FREQUENCIES[frequency]
+    next_billing = (datetime.now(timezone.utc).date()
+                    + timedelta(days=freq["days"])).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """INSERT INTO subscriptions
+           (user_id, stripe_customer_id, stripe_payment_method_id, items, frequency,
+            discount_percent, status, next_billing_date,
+            ship_name, ship_street, ship_city, ship_state, ship_zip, ship_email,
+            is_demo, created_at)
+           VALUES (?, 'demo', 'demo', ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, 1, ?)""",
+        (user["id"], json.dumps(items), frequency, freq["discount"], next_billing,
+         ship_name, ship_street, ship_city, ship_state, ship_zip, full["email"],
+         now))
+    sub_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO subscription_renewals (subscription_id, billing_date, status, confirm_token)"
+        " VALUES (?, ?, 'pending', ?)",
+        (sub_id, next_billing, _new_confirm_token()))
+    conn.commit()
+    conn.close()
+    _send_subscription_welcome_email(
+        full["name"] or ship_name, full["email"], items, frequency, next_billing)
+    return jsonify(id=sub_id, demo=True, next_billing_date=next_billing,
+                   per_delivery_cents=_per_delivery_cents(items, freq["discount"]),
+                   discount_percent=freq["discount"])
+
+@app.get("/api/admin/demo/orders")
+def admin_demo_orders():
+    """List all demo-mode rows for the owner (admin only)."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    orders = conn.execute(
+        "SELECT id, stripe_session_id, email, customer_name, items_summary,"
+        " amount_total_cents, created_at FROM orders WHERE is_demo = 1"
+        " ORDER BY id DESC").fetchall()
+    fr_orders = conn.execute(
+        "SELECT id, order_number, customer_email, total_cents, created_at"
+        " FROM fundraiser_orders WHERE is_demo = 1 ORDER BY id DESC").fetchall()
+    gift_cards = conn.execute(
+        "SELECT code, amount_cents, purchaser_email, recipient_email, created_at"
+        " FROM gift_cards WHERE is_demo = 1 ORDER BY created_at DESC").fetchall()
+    subs = conn.execute(
+        "SELECT id, frequency, next_billing_date, ship_email, created_at"
+        " FROM subscriptions WHERE is_demo = 1 ORDER BY id DESC").fetchall()
+    conn.close()
+    return jsonify(
+        orders=[dict(r) for r in orders],
+        fundraiser_orders=[dict(r) for r in fr_orders],
+        gift_cards=[dict(r) for r in gift_cards],
+        subscriptions=[dict(r) for r in subs],
+    )
+
+@app.delete("/api/admin/demo/orders")
+def admin_demo_cleanup():
+    """Delete every demo-mode row (admin only). Real data is never touched."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    counts = {}
+    counts["orders"] = conn.execute(
+        "DELETE FROM orders WHERE is_demo = 1").rowcount
+    counts["fundraiser_orders"] = conn.execute(
+        "DELETE FROM fundraiser_orders WHERE is_demo = 1").rowcount
+    counts["gift_cards"] = conn.execute(
+        "DELETE FROM gift_cards WHERE is_demo = 1").rowcount
+    sub_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM subscriptions WHERE is_demo = 1").fetchall()]
+    if sub_ids:
+        q = ",".join("?" for _ in sub_ids)
+        counts["subscription_renewals"] = conn.execute(
+            f"DELETE FROM subscription_renewals WHERE subscription_id IN ({q})",
+            sub_ids).rowcount
+    else:
+        counts["subscription_renewals"] = 0
+    counts["subscriptions"] = conn.execute(
+        "DELETE FROM subscriptions WHERE is_demo = 1").rowcount
+    # Demo-credited Kernels (tagged with the demo order ref).
+    counts["kernel_transactions"] = conn.execute(
+        "DELETE FROM kernel_transactions WHERE order_ref LIKE 'demo\\_%' ESCAPE '\\'"
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, deleted=counts)
 
 
 if __name__ == "__main__":
