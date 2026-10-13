@@ -449,6 +449,16 @@ def init_db():
             order_id INTEGER NOT NULL DEFAULT 0,
             amount_cents INTEGER NOT NULL DEFAULT 0
         );
+        # Migration: failed_attempts counter for renewal retry logic.
+        try:
+            conn.execute("ALTER TABLE subscription_renewals ADD COLUMN failed_attempts INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+        # Migration: prevent duplicate renewals for the same billing date.
+        try:
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_renewals_sub_date ON subscription_renewals (subscription_id, billing_date)")
+        except sqlite3.OperationalError:
+            pass
         CREATE TABLE IF NOT EXISTS subscription_email_templates (
             name TEXT PRIMARY KEY,
             subject TEXT NOT NULL DEFAULT '',
@@ -728,13 +738,13 @@ def fulfill_order(session, meta):
     except (TypeError, ValueError):
         discount = 0
     if code and discount > 0:
-        row = conn.execute(
-            "SELECT balance_cents FROM gift_cards WHERE code = ?", (code,)
-        ).fetchone()
-        if row and row["balance_cents"] >= discount:
-            new_bal = row["balance_cents"] - discount
+        cur = conn.execute(
+            "UPDATE gift_cards SET balance_cents = balance_cents - ?"
+            " WHERE code = ? AND balance_cents >= ?",
+            (discount, code, discount),
+        )
+        if cur.rowcount:
             now = datetime.now(timezone.utc).isoformat()
-            conn.execute("UPDATE gift_cards SET balance_cents = ? WHERE code = ?", (new_bal, code))
             conn.execute(
                 "INSERT INTO redemptions (code, amount_cents, order_ref, created_at) VALUES (?, ?, ?, ?)",
                 (code, discount, session_id, now),
@@ -883,18 +893,22 @@ def redeem():
     if not row or not row["active"]:
         conn.close()
         return jsonify(error="gift card not found"), 404
-    if row["balance_cents"] < amount:
-        conn.close()
-        return jsonify(error="insufficient balance", balance_cents=row["balance_cents"]), 402
 
-    new_balance = row["balance_cents"] - amount
     now = datetime.now(timezone.utc).isoformat()
-    conn.execute("UPDATE gift_cards SET balance_cents = ? WHERE code = ?", (new_balance, code))
+    cur = conn.execute(
+        "UPDATE gift_cards SET balance_cents = balance_cents - ?"
+        " WHERE code = ? AND balance_cents >= ?",
+        (amount, code, amount),
+    )
+    if not cur.rowcount:
+        conn.close()
+        return jsonify(error="insufficient balance"), 402
     conn.execute(
         "INSERT INTO redemptions (code, amount_cents, order_ref, created_at) VALUES (?, ?, ?, ?)",
         (code, amount, order_ref, now),
     )
     conn.commit()
+    new_balance = row["balance_cents"] - amount
     conn.close()
     return jsonify(code=code, redeemed_cents=amount, new_balance_cents=new_balance)
 
@@ -1004,10 +1018,20 @@ def validate_discount():
     row = conn.execute(
         "SELECT balance_cents, active FROM gift_cards WHERE code = ?", (code,)
     ).fetchone()
+    if row and row["active"]:
+        conn.close()
+        return jsonify(type="gift_card", code=code, balance_cents=row["balance_cents"])
+    # Loyalty reward codes (KERN-...).
+    rrow = conn.execute(
+        "SELECT reward_type, used FROM loyalty_rewards WHERE code = ?", (code,)
+    ).fetchone()
     conn.close()
-    if not row or not row["active"]:
-        return jsonify(error="code not found"), 404
-    return jsonify(type="gift_card", code=code, balance_cents=row["balance_cents"])
+    if rrow and not rrow["used"]:
+        disc = REWARD_DISCOUNT_CENTS.get(rrow["reward_type"], 0)
+        label = rrow["reward_type"].replace("_", " ").title()
+        return jsonify(type="reward", code=code, label=label,
+                       discount_cents=disc if isinstance(disc, int) else 0)
+    return jsonify(error="code not found"), 404
 
 # ---------------------------------------------------------------- paypal
 
@@ -1077,6 +1101,8 @@ def _compute_order(data):
     items = []
     total = 0
     for it in raw_items:
+        if not isinstance(it, dict):
+            return None, (jsonify(error="invalid items"), 400)
         try:
             qty = int(it.get("quantity", 0))
             amt = int(it.get("amount_cents", 0))
@@ -1189,35 +1215,38 @@ def create_order_checkout():
         return err[0], err[1]
 
     discounts = []
-    if order["discount_kind"] == "promo" and order["promo_percent_off"]:
-        coupon = stripe.Coupon.create(
-            percent_off=order["promo_percent_off"],
-            duration="once",
-            max_redemptions=1,
-            redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
-            metadata={"promo_code": order["promo_code"]},
-        )
-        discounts = [{"coupon": coupon.id}]
-    elif order["discount_kind"] == "gift_card":
-        coupon = stripe.Coupon.create(
-            amount_off=order["gift_card_discount_cents"],
-            currency="usd",
-            duration="once",
-            max_redemptions=1,
-            redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
-            metadata={"gift_card_code": order["gift_card_code"]},
-        )
-        discounts = [{"coupon": coupon.id}]
-    elif order["discount_kind"] == "reward" and order["reward_discount_cents"]:
-        coupon = stripe.Coupon.create(
-            amount_off=order["reward_discount_cents"],
-            currency="usd",
-            duration="once",
-            max_redemptions=1,
-            redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
-            metadata={"reward_code": order["reward_code"]},
-        )
-        discounts = [{"coupon": coupon.id}]
+    try:
+        if order["discount_kind"] == "promo" and order["promo_percent_off"]:
+            coupon = stripe.Coupon.create(
+                percent_off=order["promo_percent_off"],
+                duration="once",
+                max_redemptions=1,
+                redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
+                metadata={"promo_code": order["promo_code"]},
+            )
+            discounts = [{"coupon": coupon.id}]
+        elif order["discount_kind"] == "gift_card":
+            coupon = stripe.Coupon.create(
+                amount_off=order["gift_card_discount_cents"],
+                currency="usd",
+                duration="once",
+                max_redemptions=1,
+                redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
+                metadata={"gift_card_code": order["gift_card_code"]},
+            )
+            discounts = [{"coupon": coupon.id}]
+        elif order["discount_kind"] == "reward" and order["reward_discount_cents"]:
+            coupon = stripe.Coupon.create(
+                amount_off=order["reward_discount_cents"],
+                currency="usd",
+                duration="once",
+                max_redemptions=1,
+                redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
+                metadata={"reward_code": order["reward_code"]},
+            )
+            discounts = [{"coupon": coupon.id}]
+    except stripe.error.StripeError as e:
+        return jsonify(error=_stripe_error_message(e)), 502
 
     line_items = [
         {
@@ -1404,14 +1433,12 @@ def paypal_capture_order():
     code = row["gift_card_code"] or ""
     discount = row["gift_card_discount_cents"] or 0
     if code and discount > 0:
-        gc = conn.execute(
-            "SELECT balance_cents FROM gift_cards WHERE code = ?", (code,)
-        ).fetchone()
-        if gc and gc["balance_cents"] >= discount:
-            conn.execute(
-                "UPDATE gift_cards SET balance_cents = ? WHERE code = ?",
-                (gc["balance_cents"] - discount, code),
-            )
+        cur = conn.execute(
+            "UPDATE gift_cards SET balance_cents = balance_cents - ?"
+            " WHERE code = ? AND balance_cents >= ?",
+            (discount, code, discount),
+        )
+        if cur.rowcount:
             conn.execute(
                 "INSERT INTO redemptions (code, amount_cents, order_ref, created_at) VALUES (?, ?, ?, ?)",
                 (code, discount, order_id, now),
@@ -1592,6 +1619,7 @@ def auth_signup():
         # Deactivated account: remove it and its old tokens so the email
         # re-registers completely fresh, like a new address.
         conn.execute("DELETE FROM verification_tokens WHERE user_id = ?", (existing["id"],))
+        conn.execute("DELETE FROM password_reset_tokens WHERE user_id = ?", (existing["id"],))
         conn.execute("DELETE FROM users WHERE id = ?", (existing["id"],))
         conn.commit()
     now = datetime.now(timezone.utc).isoformat()
@@ -1713,9 +1741,9 @@ def auth_forgot_password():
     email = (data.get("email") or "").strip().lower()
     conn = db()
     row = conn.execute(
-        "SELECT id, name FROM users WHERE email = ?", (email,)
+        "SELECT id, name, active FROM users WHERE email = ?", (email,)
     ).fetchone()
-    if row:
+    if row and row["active"]:
         token = secrets.token_urlsafe(32)
         expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
         conn.execute(
@@ -1917,7 +1945,7 @@ def google_callback():
     else:
         cur = conn.execute(
             "INSERT INTO users (email, name, password_hash, verified, google_id, created_at)"
-            " VALUES (?, '', 1, ?, ?)",
+            " VALUES (?, ?, '', 1, ?, ?)",
             (email, name, google_id, now),
         )
         user_id = cur.lastrowid
@@ -2006,15 +2034,15 @@ def _credit_kernels(conn, user_id, kernels, reason, order_ref="", staff_id=None)
     )
     return kernels
 
-def _debit_kernels(conn, user_id, kernels, reason, order_ref=""):
+def _debit_kernels(conn, user_id, kernels, reason, order_ref="", staff_id=None):
     if kernels <= 0:
         return False
     if _kernel_balance(conn, user_id) < kernels:
         return False
     conn.execute(
-        "INSERT INTO kernel_transactions (user_id, kernels, reason, order_ref, created_at)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (user_id, -kernels, reason, order_ref,
+        "INSERT INTO kernel_transactions (user_id, kernels, reason, order_ref, staff_id, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, -kernels, reason, order_ref, staff_id,
          datetime.now(timezone.utc).isoformat()),
     )
     return True
@@ -2034,7 +2062,7 @@ def _maybe_grant_birthday_reward(conn, user_id):
         month = int(bday.split("-")[1])
     except (IndexError, ValueError):
         return None
-    if month != datetime.now().month:
+    if month != datetime.now(timezone.utc).month:
         return None
     year = str(datetime.now().year)
     exists = conn.execute(
@@ -2331,9 +2359,13 @@ def staff_credit_kernels():
         return jsonify(error="invalid input"), 400
     kernels = max(amount_cents // 100 * KERNELS_PER_DOLLAR, 0)
     conn = db()
-    if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+    mrow = conn.execute("SELECT active FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not mrow:
         conn.close()
         return jsonify(error="member not found"), 404
+    if not mrow["active"]:
+        conn.close()
+        return jsonify(error="member account is deactivated"), 403
     _credit_kernels(conn, user_id, kernels, "in_person",
                     order_ref=(data.get("note") or "")[:120], staff_id=staff["id"])
     conn.commit()
@@ -2357,18 +2389,22 @@ def staff_redeem_for_member():
     if user_id <= 0 or not tier:
         return jsonify(error="invalid input"), 400
     conn = db()
-    if not conn.execute("SELECT 1 FROM users WHERE id = ?", (user_id,)).fetchone():
+    mrow = conn.execute("SELECT active FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not mrow:
         conn.close()
         return jsonify(error="member not found"), 404
+    if not mrow["active"]:
+        conn.close()
+        return jsonify(error="member account is deactivated"), 403
     code = _new_reward_code()
     if not _debit_kernels(conn, user_id, tier["kernels"], "redemption_in_person",
                           order_ref=code, staff_id=staff["id"]):
         conn.close()
         return jsonify(error="not enough Kernels"), 402
     conn.execute(
-        "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent, created_at)"
-        " VALUES (?, ?, ?, ?, ?)",
-        (user_id, reward_type, code, tier["kernels"],
+        "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent, staff_id, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, reward_type, code, tier["kernels"], staff["id"],
          datetime.now(timezone.utc).isoformat()),
     )
     conn.commit()
@@ -3023,7 +3059,7 @@ def admin_customers():
         "SELECT u.id, u.name, u.email, u.verified, u.birthday, u.active, u.created_at,"
         " COALESCE((SELECT SUM(kernels) FROM kernel_transactions k WHERE k.user_id = u.id), 0) AS kernels,"
         " (SELECT COUNT(*) FROM orders o WHERE o.email = u.email) AS orders"
-        " FROM users u WHERE u.active = 1 ORDER BY u.created_at DESC LIMIT 1000"
+        " FROM users u ORDER BY u.active DESC, u.created_at DESC LIMIT 1000"
     ).fetchall()
     conn.close()
     return jsonify(customers=[
@@ -3761,11 +3797,16 @@ def update_fundraiser_seller(seller_id):
     if not updates:
         return jsonify(error="nothing to update"), 400
     conn = db()
-    if not conn.execute(
-        "SELECT 1 FROM fundraiser_sellers WHERE id = ?", (seller_id,)
-    ).fetchone():
+    seller = conn.execute(
+        "SELECT * FROM fundraiser_sellers WHERE id = ?", (seller_id,)
+    ).fetchone()
+    if not seller:
         conn.close()
         return jsonify(error="seller not found"), 404
+    # Require the seller's own referral code (their secret) to modify.
+    if (data.get("referral_code") or "").strip().upper() != (seller["referral_code"] or "").upper():
+        conn.close()
+        return jsonify(error="not authorized"), 403
     clause = ", ".join(f"{k} = ?" for k in updates)
     conn.execute(f"UPDATE fundraiser_sellers SET {clause} WHERE id = ?",
                  (*updates.values(), seller_id))
@@ -4095,10 +4136,11 @@ def fundraiser_in_person_sale():
 
 @app.get("/api/fundraisers/<int:fid>/dashboard")
 def fundraiser_dashboard(fid):
-    """Organizer view (public via code knowledge)."""
+    """Organizer view — requires the secret fundraiser code."""
+    code = (request.args.get("code") or "").strip().upper()
     conn = db()
     fr = conn.execute(
-        "SELECT * FROM fundraisers WHERE id = ?", (fid,)).fetchone()
+        "SELECT * FROM fundraisers WHERE id = ? AND code = ?", (fid, code)).fetchone()
     if not fr:
         conn.close()
         return jsonify(error="fundraiser not found"), 404
@@ -4141,6 +4183,15 @@ def fundraiser_dashboard(fid):
                    teams=team_list, orders=order_list,
                    totals={"raised_cents": raised, "order_count": order_count})
 
+def _verify_fundraiser_code(conn, fid, code):
+    """Return the fundraiser row if the secret code matches, else None."""
+    code = (code or "").strip().upper()
+    if not code:
+        return None
+    return conn.execute(
+        "SELECT * FROM fundraisers WHERE id = ? AND code = ?", (fid, code)
+    ).fetchone()
+
 @app.post("/api/fundraisers/<int:fid>/nudge")
 def fundraiser_nudge(fid):
     data = request.get_json(force=True) or {}
@@ -4149,6 +4200,9 @@ def fundraiser_nudge(fid):
     except (TypeError, ValueError):
         return jsonify(error="seller_id is required"), 400
     conn = db()
+    if not _verify_fundraiser_code(conn, fid, data.get("code")):
+        conn.close()
+        return jsonify(error="fundraiser not found"), 404
     if not conn.execute(
         "SELECT 1 FROM fundraiser_sellers WHERE id = ? AND fundraiser_id = ?",
         (seller_id, fid),
@@ -4164,9 +4218,9 @@ def fundraiser_nudge(fid):
 @app.post("/api/fundraisers/<int:fid>/relaunch")
 def fundraiser_relaunch(fid):
     """Clone a fundraiser: fresh code/dates, same teams/sellers/goals/sponsors."""
+    data = request.get_json(force=True) or {}
     conn = db()
-    fr = conn.execute(
-        "SELECT * FROM fundraisers WHERE id = ?", (fid,)).fetchone()
+    fr = _verify_fundraiser_code(conn, fid, data.get("code"))
     if not fr:
         conn.close()
         return jsonify(error="fundraiser not found"), 404
@@ -4224,10 +4278,9 @@ def fundraiser_relaunch(fid):
 
 @app.post("/api/fundraisers/<int:fid>/complete")
 def fundraiser_complete(fid):
+    data = request.get_json(force=True) or {}
     conn = db()
-    if not conn.execute(
-        "SELECT 1 FROM fundraisers WHERE id = ?", (fid,)
-    ).fetchone():
+    if not _verify_fundraiser_code(conn, fid, data.get("code")):
         conn.close()
         return jsonify(error="fundraiser not found"), 404
     conn.execute(
@@ -4305,6 +4358,32 @@ def _stripe_error_message(e):
     # Never expose raw Stripe internals; prefer Stripe's own user-facing text.
     return getattr(e, "user_message", None) or "the payment could not be processed"
 
+def _notify_renewal_failure(conn, sub, renewal, reason):
+    """Email customer + merchant when a subscription renewal charge fails."""
+    attempts = (renewal["failed_attempts"] or 0) + 1
+    # After 3 failed attempts, mark the subscription past_due so it stops retrying silently.
+    if attempts >= 3:
+        conn.execute(
+            "UPDATE subscriptions SET status = 'past_due' WHERE id = ?",
+            (sub["id"],))
+    cust_email = sub["ship_email"] or ""
+    cust_name = (sub["ship_name"] or "there").split()[0]
+    subject = "Action needed: your Pop-A-Licious subscription payment failed"
+    html = f"""<p>Hi {cust_name},</p>
+<p>We tried to charge your Pop-A-Licious subscription renewal but the payment failed ({reason}).</p>
+<p>Please update your payment method or confirm your flavors here:<br>
+<a href="{SITE_URL}/#my-subscriptions">Manage your subscription</a></p>
+<p>We'll try again tomorrow. After 3 failed attempts your subscription will be paused.</p>
+<p>— Pop-A-Licious</p>"""
+    try:
+        if cust_email:
+            _send_email(cust_email, subject, html)
+        _send_email(ORDER_NOTIFY_EMAIL,
+                    f"Subscription renewal FAILED (sub #{sub['id']})",
+                    f"<p>Renewal {renewal['id']} for subscription {sub['id']} ({cust_email}) failed: {reason}. Attempt {attempts}.</p>")
+    except Exception:
+        pass
+
 def _attempt_subscription_charge(conn, sub, renewal, items):
     """Charge one subscription renewal off-session.
 
@@ -4337,13 +4416,15 @@ def _attempt_subscription_charge(conn, sub, renewal, items):
         )
     except stripe.error.StripeError as e:
         conn.execute(
-            "UPDATE subscription_renewals SET status = 'failed' WHERE id = ?",
+            "UPDATE subscription_renewals SET status = 'failed', failed_attempts = failed_attempts + 1 WHERE id = ?",
             (renewal["id"],))
+        _notify_renewal_failure(conn, sub, renewal, _stripe_error_message(e))
         return False, (jsonify(error=_stripe_error_message(e)), 402)
     if pi.get("status") not in ("succeeded", "processing"):
         conn.execute(
-            "UPDATE subscription_renewals SET status = 'failed' WHERE id = ?",
+            "UPDATE subscription_renewals SET status = 'failed', failed_attempts = failed_attempts + 1 WHERE id = ?",
             (renewal["id"],))
+        _notify_renewal_failure(conn, sub, renewal, "the payment could not be completed")
         return False, (jsonify(error="the payment could not be completed"), 402)
 
     now = datetime.now(timezone.utc).isoformat()
@@ -4770,10 +4851,11 @@ def subscription_renewals_run():
         conn.commit()
         reminded += 1
 
-    # 2) Charges: renewals past their billing date, reminded/confirmed, not charged.
+    # 2) Charges: renewals on/past their billing date, reminded/confirmed/failed (retry), not charged.
     dues = conn.execute(
         "SELECT id FROM subscription_renewals"
-        " WHERE billing_date < ? AND status IN ('reminded', 'confirmed')",
+        " WHERE billing_date <= ? AND status IN ('reminded', 'confirmed', 'failed')"
+        " AND failed_attempts < 3",
         (today_str,)).fetchall()
     for d in dues:
         ren = conn.execute(
