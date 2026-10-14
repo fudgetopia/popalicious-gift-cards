@@ -3771,6 +3771,43 @@ def admin_dashboard():
         ],
     )
 
+@app.get("/api/admin/fundraising")
+def admin_fundraising():
+    """Aggregate fundraising stats for the admin dashboard."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    total_raised = conn.execute(
+        "SELECT COALESCE(SUM(total_cents), 0) AS s FROM fundraiser_orders"
+        " WHERE status = 'paid'").fetchone()["s"]
+    total_donations = conn.execute(
+        "SELECT COALESCE(SUM(donation_cents + roundup_cents), 0) AS s"
+        " FROM fundraiser_orders WHERE status = 'paid'").fetchone()["s"]
+    fundraiser_orders = conn.execute(
+        "SELECT COUNT(*) AS c FROM fundraiser_orders"
+        " WHERE status = 'paid'").fetchone()["c"]
+    active_fundraisers = conn.execute(
+        "SELECT COUNT(*) AS c FROM fundraisers WHERE status = 'active'").fetchone()["c"]
+    completed_fundraisers = conn.execute(
+        "SELECT COUNT(*) AS c FROM fundraisers WHERE status != 'active'").fetchone()["c"]
+    # Revenue by day for the last 30 days (chart).
+    chart = conn.execute(
+        "SELECT substr(created_at, 1, 10) AS day,"
+        " COALESCE(SUM(total_cents), 0) AS total"
+        " FROM fundraiser_orders WHERE status = 'paid'"
+        " AND created_at >= date('now', '-30 days')"
+        " GROUP BY day ORDER BY day").fetchall()
+    conn.close()
+    return jsonify(
+        total_raised_cents=total_raised,
+        total_donations_cents=total_donations,
+        fundraiser_orders=fundraiser_orders,
+        active_fundraisers=active_fundraisers,
+        completed_fundraisers=completed_fundraisers,
+        revenue_chart=[{"day": r["day"], "total_cents": r["total"]} for r in chart],
+    )
+
 @app.get("/api/admin/staff")
 def admin_list_staff():
     user = _current_member()
