@@ -321,6 +321,11 @@ def init_db():
     # Migration: active flag for admin customer deactivation.
     if "active" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+    # Migration: anniversary kernels + login kernel notifications.
+    if "anniversary_credited_year" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN anniversary_credited_year INTEGER NOT NULL DEFAULT 0")
+    if "last_notified_balance" not in ucols:
+        conn.execute("ALTER TABLE users ADD COLUMN last_notified_balance INTEGER NOT NULL DEFAULT 0")
     # Migration: richer order details for the admin order view.
     ocols = [r["name"] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
     for col in ("customer_name", "shipping_address", "promo_code", "reward_code"):
@@ -2013,23 +2018,59 @@ def auth_login():
     password = data.get("password") or ""
     conn = db()
     row = conn.execute(
-        "SELECT id, name, email, password_hash, verified, active FROM users WHERE email = ?",
+        "SELECT id, name, email, password_hash, verified, active, created_at,"
+        " anniversary_credited_year, last_notified_balance FROM users WHERE email = ?",
         (email,),
     ).fetchone()
-    conn.close()
     if not row or not row["password_hash"] or not check_password_hash(
         row["password_hash"], password
     ):
+        conn.close()
         return jsonify(error="email or password is incorrect"), 401
     if not row["active"]:
+        conn.close()
         return jsonify(error="this account has been deactivated"), 403
     if not row["verified"]:
+        conn.close()
         return jsonify(
             error="please verify your email before logging in — check your inbox",
             needs_verification=True,
         ), 403
+    # Anniversary kernels: 10 Kernels every year on the member's join date.
+    anniversary_credited = False
+    try:
+        joined = datetime.fromisoformat(row["created_at"])
+        now = datetime.now(timezone.utc)
+        if (joined.month, joined.day) == (now.month, now.day):
+            if (row["anniversary_credited_year"] or 0) < now.year:
+                _credit_kernels(conn, row["id"], 10, "anniversary",
+                                order_ref=f"{now.year} anniversary")
+                conn.execute(
+                    "UPDATE users SET anniversary_credited_year = ? WHERE id = ?",
+                    (now.year, row["id"]),
+                )
+                anniversary_credited = True
+    except Exception:
+        pass
+    # Kernel notification: how many earned since last login.
+    # First tracked login seeds the baseline silently (no retroactive blast).
+    balance = _kernel_balance(conn, row["id"])
+    last_notified = row["last_notified_balance"] or 0
+    if last_notified == 0 and balance > 0:
+        # Existing users pre-feature: seed silently, notify on future earnings.
+        kernels_earned = 0
+    else:
+        kernels_earned = max(balance - last_notified, 0)
+    conn.execute(
+        "UPDATE users SET last_notified_balance = ? WHERE id = ?",
+        (balance, row["id"]),
+    )
+    conn.commit()
+    conn.close()
     token = _issue_auth_token(row["id"])
-    resp = jsonify(name=row["name"], email=row["email"], token=token)
+    resp = jsonify(name=row["name"], email=row["email"], token=token,
+                   kernels_earned=kernels_earned,
+                   anniversary_credited=anniversary_credited)
     return _set_session_cookie(resp, token)
 
 @app.get("/api/admin/is-admin")
@@ -2368,7 +2409,7 @@ def loyalty_status():
     balance = _kernel_balance(conn, user["id"])
     lifetime = _lifetime_kernels(conn, user["id"])
     brow = conn.execute(
-        "SELECT birthday FROM users WHERE id = ?", (user["id"],)
+        "SELECT birthday, created_at FROM users WHERE id = ?", (user["id"],)
     ).fetchone()
     rewards = conn.execute(
         "SELECT reward_type, code, created_at FROM loyalty_rewards"
@@ -2381,6 +2422,7 @@ def loyalty_status():
         lifetime_kernels=lifetime,
         tier=_loyalty_tier(lifetime),
         birthday=(brow["birthday"] or "") if brow else "",
+        member_since=(brow["created_at"] or "") if brow else "",
         kernels_per_dollar=KERNELS_PER_DOLLAR,
         reward_tiers={k: v["kernels"] for k, v in REWARD_TIERS.items()},
         available_rewards=[
@@ -5583,8 +5625,30 @@ def subscription_renewals_run():
                 payload.get("label_url", ""), payload.get("tracking_number", ""))
         else:
             failed += 1
+    # 3) Anniversary kernels: 10 Kernels for members on their join-date anniversary.
+    anniversaries = 0
+    members = conn.execute(
+        "SELECT id, created_at, anniversary_credited_year FROM users"
+        " WHERE active = 1 AND verified = 1"
+    ).fetchall()
+    for m in members:
+        try:
+            joined = datetime.fromisoformat(m["created_at"])
+        except Exception:
+            continue
+        if (joined.month, joined.day) == (today.month, today.day):
+            if (m["anniversary_credited_year"] or 0) < today.year:
+                _credit_kernels(conn, m["id"], 10, "anniversary",
+                                order_ref=f"{today.year} anniversary")
+                conn.execute(
+                    "UPDATE users SET anniversary_credited_year = ? WHERE id = ?",
+                    (today.year, m["id"]),
+                )
+                anniversaries += 1
+    conn.commit()
     conn.close()
-    return jsonify(reminded=reminded, charged=charged, failed=failed)
+    return jsonify(reminded=reminded, charged=charged, failed=failed,
+                   anniversaries=anniversaries)
 
 # ---------------- admin: subscription email template ----------------
 
