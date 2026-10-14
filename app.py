@@ -2844,17 +2844,71 @@ def staff_profile():
         " WHERE staff_id = ? ORDER BY id DESC LIMIT 50",
         (staff["id"],),
     ).fetchall()
+    # Work stats: this employee's customer-facing activity, aggregated from
+    # the customer kernel ledger (kernel_transactions.staff_id) — the same
+    # queries the admin staff-detail endpoint uses. The My Profile stat
+    # boxes (Kernels Credited / Credits Given / Kernels Redeemed /
+    # Redemptions) read these fields; without them the endpoint returned
+    # no counters at all and the boxes could only ever paint 0.
+    credited = conn.execute(
+        "SELECT COALESCE(SUM(kernels), 0) AS total, COUNT(*) AS n"
+        " FROM kernel_transactions WHERE staff_id = ? AND kernels > 0",
+        (staff["id"],),
+    ).fetchone()
+    redeemed = conn.execute(
+        "SELECT COALESCE(SUM(-kernels), 0) AS total, COUNT(*) AS n"
+        " FROM kernel_transactions WHERE staff_id = ? AND kernels < 0",
+        (staff["id"],),
+    ).fetchone()
+    staff_rewards = conn.execute(
+        "SELECT code, reward_type, created_at FROM loyalty_rewards"
+        " WHERE staff_id = ? AND used = 0 ORDER BY created_at DESC",
+        (staff["id"],),
+    ).fetchall()
+    staff_gift_cards = conn.execute(
+        "SELECT code, amount_cents, balance_cents, created_at FROM gift_cards"
+        " WHERE stripe_session_id = ? AND active = 1 AND balance_cents > 0"
+        " ORDER BY created_at DESC",
+        (f"staff:{staff['id']}",),
+    ).fetchall()
     conn.close()
+    work_stats = {
+        "kernels_credited": credited["total"] or 0,
+        "credit_count": credited["n"] or 0,
+        "kernels_redeemed": redeemed["total"] or 0,
+        "redeem_count": redeemed["n"] or 0,
+    }
     return jsonify(
         id=row["id"], name=row["name"], email=row["email"],
         headshot=row["headshot"] or "", kernels=row["kernels"] or 0,
+        staff_kernels=row["kernels"] or 0,
         birthday=row["birthday"] or "", hire_date=row["hire_date"] or "",
         referral_code=row["referral_code"] or "",
         created_at=row["created_at"],
+        # The four work-stat counters, top-level AND nested under stats /
+        # work_stats so every client payload shape reads the same numbers.
+        kernels_credited=work_stats["kernels_credited"],
+        credit_count=work_stats["credit_count"],
+        kernels_redeemed=work_stats["kernels_redeemed"],
+        redeem_count=work_stats["redeem_count"],
+        stats=work_stats,
+        work_stats=work_stats,
+        available_rewards=[
+            {"code": rw["code"],
+             "label": STAFF_REWARD_TIERS.get(rw["reward_type"], {}).get("label", rw["reward_type"]),
+             "created_at": rw["created_at"]}
+            for rw in staff_rewards
+        ],
+        available_gift_cards=[
+            {"code": g["code"], "amount_cents": g["amount_cents"],
+             "balance_cents": g["balance_cents"], "created_at": g["created_at"]}
+            for g in staff_gift_cards
+        ],
         reward_tiers={k: v["kernels"] for k, v in STAFF_REWARD_TIERS.items()},
         reward_labels={k: v["label"] for k, v in STAFF_REWARD_TIERS.items()},
         history=[
             {"kernels": h["kernels"], "reason": h["reason"], "ref": h["ref"] or "",
+             "note": h["ref"] or "",
              "created_at": h["created_at"]}
             for h in history
         ],
