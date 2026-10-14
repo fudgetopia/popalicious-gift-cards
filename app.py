@@ -2982,10 +2982,15 @@ def staff_redeem():
         if not choice:
             conn.close()
             return jsonify(error="please choose which gift card you want"), 400
-        # Visa prepaid cards start at $25 — not available for the $10 tier.
+        # Visa prepaid cards start at $25 and DoorDash digital cards start at $15 —
+        # neither is available for the $10 tier.
         if tier.get("amount_cents", 0) < 2500 and "visa" in choice.lower():
             conn.close()
             return jsonify(error="Visa prepaid cards start at $25 — please pick"
+                                  " another gift card for the $10 reward"), 400
+        if tier.get("amount_cents", 0) < 1500 and "doordash" in choice.lower():
+            conn.close()
+            return jsonify(error="DoorDash gift cards start at $15 — please pick"
                                   " another gift card for the $10 reward"), 400
         code = "GC-" + secrets.token_hex(3).upper()
         _credit_staff_kernels(conn, staff["id"], -tier["kernels"], "redemption",
