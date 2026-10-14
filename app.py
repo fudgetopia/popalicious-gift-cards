@@ -291,6 +291,12 @@ def init_db():
             staff_id INTEGER NOT NULL,
             expires_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS staff_password_reset_tokens (
+            token TEXT PRIMARY KEY,
+            staff_id INTEGER NOT NULL,
+            expires_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS loyalty_rewards (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
@@ -2449,6 +2455,77 @@ def loyalty_birthday():
 
 # ---------------- staff loyalty endpoints ----------------
 
+def _send_staff_password_reset_email(name, email, token):
+    link = f"{SITE_URL}/#staff-reset-password?token={token}"
+    first = (name or "").split(" ")[0] or "there"
+    html = (
+        "<html><body style=\"font-family:Arial,sans-serif\">"
+        f"<p>Hi {first},</p>"
+        "<p>Someone requested a password reset for your Pop-A-Licious staff account. "
+        "Click the link below to choose a new password:</p>"
+        f"<p><a href=\"{link}\">Reset my staff password</a></p>"
+        "<p>This link expires in 1 hour. If you didn't request this, just ignore this email.</p>"
+        "<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong></p>"
+        "</body></html>"
+    )
+    send_email(email, "Reset your Pop-A-Licious staff password", html)
+
+@app.post("/api/loyalty/staff/forgot-password")
+def staff_forgot_password():
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    conn = db()
+    row = conn.execute(
+        "SELECT id, name, active FROM staff WHERE email = ?", (email,)
+    ).fetchone()
+    if row and row["active"]:
+        token = secrets.token_urlsafe(32)
+        expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        conn.execute(
+            "INSERT INTO staff_password_reset_tokens (token, staff_id, expires_at) VALUES (?, ?, ?)",
+            (token, row["id"], expires),
+        )
+        conn.commit()
+        try:
+            _send_staff_password_reset_email(row["name"], email, token)
+        except Exception:
+            pass  # never reveal whether the email exists or sending failed
+    conn.close()
+    return jsonify(ok=True)
+
+@app.post("/api/loyalty/staff/reset-password")
+def staff_reset_password():
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    token = data.get("token") or ""
+    password = data.get("password") or ""
+    if len(password) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+    conn = db()
+    row = conn.execute(
+        "SELECT staff_id, expires_at, used FROM staff_password_reset_tokens WHERE token = ?",
+        (token,),
+    ).fetchone()
+    if not row or row["used"]:
+        conn.close()
+        return jsonify(error="this reset link is invalid or already used"), 400
+    if datetime.fromisoformat(row["expires_at"]) < datetime.now(timezone.utc):
+        conn.close()
+        return jsonify(error="this reset link has expired — request a new one"), 400
+    conn.execute(
+        "UPDATE staff SET password_hash = ? WHERE id = ?",
+        (generate_password_hash(password), row["staff_id"]),
+    )
+    conn.execute("UPDATE staff_password_reset_tokens SET used = 1 WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
 @app.post("/api/loyalty/staff/login")
 def staff_login():
     err = _require_auth_ready()
@@ -2905,6 +2982,11 @@ def staff_redeem():
         if not choice:
             conn.close()
             return jsonify(error="please choose which gift card you want"), 400
+        # Visa prepaid cards start at $25 — not available for the $10 tier.
+        if tier.get("amount_cents", 0) < 2500 and "visa" in choice.lower():
+            conn.close()
+            return jsonify(error="Visa prepaid cards start at $25 — please pick"
+                                  " another gift card for the $10 reward"), 400
         code = "GC-" + secrets.token_hex(3).upper()
         _credit_staff_kernels(conn, staff["id"], -tier["kernels"], "redemption",
                               ref=f"{code} ({choice})")
@@ -3546,7 +3628,7 @@ def admin_customers():
         "SELECT u.id, u.name, u.email, u.verified, u.birthday, u.active, u.created_at,"
         " COALESCE((SELECT SUM(kernels) FROM kernel_transactions k WHERE k.user_id = u.id), 0) AS kernels,"
         " (SELECT COUNT(*) FROM orders o WHERE o.email = u.email) AS orders"
-        " FROM users u ORDER BY u.active DESC, u.created_at DESC LIMIT 1000"
+        " FROM users u WHERE u.active = 1 ORDER BY u.created_at DESC LIMIT 1000"
     ).fetchall()
     conn.close()
     return jsonify(customers=[
