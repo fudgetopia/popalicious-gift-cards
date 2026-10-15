@@ -19,6 +19,9 @@ import re
 import secrets
 import sqlite3
 import string
+import hmac
+import hashlib
+import base64
 import html
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
@@ -44,6 +47,8 @@ GIFT_CARD_PRODUCT_ID = os.environ.get("GIFT_CARD_PRODUCT_ID", "prod_VPQOMcf52Y1m
 
 # Shippo (cheapest-rate shipping lookup)
 SHIPPO_API_KEY = os.environ.get("SHIPPO_API_KEY", "")
+# Printful (merch POD fulfillment)
+PRINTFUL_API_KEY = os.environ.get("PRINTFUL_API_KEY", "")
 SHIP_FROM = {
     "name": "Pop-A-Licious",
     "street1": os.environ.get("SHIP_FROM_STREET1", "2013 Angel Falls Dr."),
@@ -337,6 +342,10 @@ def init_db():
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     if "total_qty" not in ocols:
         conn.execute("ALTER TABLE orders ADD COLUMN total_qty INTEGER NOT NULL DEFAULT 0")
+    # Migration: Printful merch fulfillment fields on orders.
+    for col in ("printful_order_id", "printful_status", "printful_tracking", "printful_carrier"):
+        if col not in ocols:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} TEXT NOT NULL DEFAULT ''")
     # Migration: Shippo label fields on fundraiser orders.
     # (Table may not exist yet on very old DBs — init_db creates it below.)
     fexists = conn.execute(
@@ -527,6 +536,18 @@ def init_db():
             subject TEXT NOT NULL DEFAULT '',
             body_html TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS marketing_unsubscribes (
+            email TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS marketing_campaigns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL,
+            audience TEXT NOT NULL DEFAULT 'all',
+            recipient_count INTEGER NOT NULL DEFAULT 0,
+            sent_at TEXT NOT NULL
         );
         """
     )
@@ -890,6 +911,31 @@ def fulfill_order(session, meta):
             "UPDATE loyalty_rewards SET used = 1, used_at = ? WHERE code = ? AND used = 0",
             (now, rcode),
         )
+    # Printful: forward any merch items to Printful for POD fulfillment.
+    # Never blocks the order — failures leave the fields blank for admin retry.
+    merch_items = _parse_merch_items(items_summary)
+    printful_order_id, printful_error = "", ""
+    if merch_items:
+        pf_recipient = {
+            "name": ship.get("name") or name,
+            "address1": ship_addr.get("line1", ""),
+            "address2": ship_addr.get("line2", ""),
+            "city": ship_addr.get("city", ""),
+            "state_code": ship_addr.get("state", ""),
+            "country_code": ship_addr.get("country", "US"),
+            "zip": ship_addr.get("postal_code", ""),
+            "email": email,
+        }
+        pf_id, pf_err = submit_printful_order(pf_recipient, merch_items, order_ref=session_id)
+        if pf_id:
+            printful_order_id = str(pf_id)
+            conn.execute(
+                "UPDATE orders SET printful_order_id = ?, printful_status = 'submitted'"
+                " WHERE stripe_session_id = ?",
+                (printful_order_id, session_id),
+            )
+        else:
+            printful_error = pf_err or "unknown error"
     # Analytics: this shopper's cart converted — not abandoned.
     if email:
         conn.execute(
@@ -1218,11 +1264,582 @@ def validate_discount():
     ).fetchone()
     conn.close()
     if rrow and not rrow["used"]:
-        disc = REWARD_DISCOUNT_CENTS.get(rrow["reward_type"], 0)
-        label = rrow["reward_type"].replace("_", " ").title()
+        rtype = rrow["reward_type"]
+        if rtype.startswith("merch:"):
+            # Merch reward: discount = the item's price (customer pays shipping only)
+            _, sku, size = rtype.split(":", 2)
+            prod = PRINTFUL_MERCH.get(sku, {})
+            disc = prod.get("price_cents", 0)
+            label = f"Free {prod.get('name', 'Merch')} ({size})"
+        else:
+            disc = REWARD_DISCOUNT_CENTS.get(rtype, 0)
+            label = rtype.replace("_", " ").title()
         return jsonify(type="reward", code=code, label=label,
-                       discount_cents=disc if isinstance(disc, int) else 0)
+                       discount_cents=disc if isinstance(disc, int) else 0,
+                       merch_sku=sku if rtype.startswith("merch:") else None,
+                       merch_size=size if rtype.startswith("merch:") else None)
     return jsonify(error="code not found"), 404
+
+# ---------------- Printful merch fulfillment ----------------
+# Maps site merch SKUs to Printful catalog variant IDs + uploaded file IDs.
+# SKU format: MERCH-{product}-{size} (e.g. MERCH-TEE-M, MERCH-HAT-OS).
+PRINTFUL_MERCH = {
+    "MERCH-TEE": {  # Big Flavor Staple Tee (Bella+Canvas 3001, Black)
+        "name": "Big Flavor Staple Tee", "price_cents": 2800,
+        "file_id": "1086595717", "file_type": "default",
+        "variants": {"XS": 9527, "S": 4016, "M": 4017, "L": 4018, "XL": 4019,
+                     "2XL": 4020, "3XL": 5295, "4XL": 5310, "5XL": 12871},
+    },
+    "MERCH-HOODIE": {  # Neon Nights Hoodie (Cotton Heritage M2580, Black)
+        "name": "Neon Nights Hoodie", "price_cents": 5500,
+        "file_id": "1086601850", "file_type": "default",
+        "variants": {"XS": 53488, "S": 10779, "M": 10780, "L": 10781,
+                     "XL": 10782, "2XL": 10783, "3XL": 13416, "4XL": 53493},
+    },
+    "MERCH-VINTAGE-TEE": {  # Vintage Crunch Tee (Comfort Colors 1717, Blue Spruce)
+        "name": "Vintage Crunch Heavyweight Tee", "price_cents": 3400,
+        "file_id": "1086603315", "file_type": "default",
+        "variants": {"S": 17686, "M": 17687, "L": 17688, "XL": 17689,
+                     "2XL": 17690, "3XL": 17691, "4XL": 17692},
+    },
+    "MERCH-HAT": {  # Signature Script Dad Hat (Yupoong 6245CM, Black) — embroidery
+        "name": "Signature Script Dad Hat", "price_cents": 3200,
+        "file_id": "1086604100", "file_type": "embroidery_front_large",
+        "variants": {"OS": 7854},
+    },
+    "MERCH-MUG": {  # But First, Popcorn Mug (White Glossy 11oz)
+        "name": "But First, Popcorn Mug", "price_cents": 1800,
+        "file_id": "1086605611", "file_type": "default",
+        "variants": {"11OZ": 1320},
+    },
+    "MERCH-TOTE": {  # Pop It Like It's Hot Eco Tote (Econscious EC8000, Oyster)
+        "name": "Pop It Like It's Hot Eco Tote", "price_cents": 2800,
+        "file_id": "1086609725", "file_type": "default",
+        "variants": {"OS": 10458},
+    },
+    "MERCH-BACKPACK": {  # Kernel Chaos All-Over Backpack
+        "name": "Kernel Chaos All-Over Backpack", "price_cents": 6500,
+        "file_id": "1086619935", "file_type": "default",
+        "variants": {"OS": 9063},
+    },
+    "MERCH-UTIL-BACKPACK": {  # Midnight Pop Utility Backpack (Black)
+        "name": "Midnight Pop Utility Backpack", "price_cents": 7200,
+        "file_id": "1086621108", "file_type": "default",
+        "variants": {"OS": 24563},
+    },
+    "MERCH-SOCKS": {  # Popcorn Party Crew Socks
+        "name": "Popcorn Party Crew Socks", "price_cents": 1600,
+        "file_id": "1086613804", "file_type": "socks",
+        "variants": {"S": 22786, "M": 22787, "L": 22788},
+    },
+    "MERCH-STICKERS": {  # Pop Pack Sticker Set (3x3)
+        "name": "Pop Pack Sticker Set", "price_cents": 800,
+        "file_id": "1086612480", "file_type": "default",
+        "variants": {"3X3": 10163},
+    },
+    "MERCH-MAGSAFE": {  # Neon Nights MagSafe iPhone Case
+        "name": "Neon Nights MagSafe iPhone Case", "price_cents": 3000,
+        "file_id": "1086636957", "file_type": "default",
+        "variants": {
+            "IP14": 20687, "IP14PLUS": 20691, "IP14PRO": 20689,
+            "IP14PROMAX": 20693, "IP15": 20319, "IP15PLUS": 20323,
+            "IP15PRO": 20321, "IP15PROMAX": 20325, "IP16": 20327,
+            "IP16PLUS": 20333, "IP16PRO": 20329, "IP16PROMAX": 20331,
+            "IP17": 34001, "IP17AIR": 34003, "IP17PRO": 34005,
+            "IP17PROMAX": 34007, "IP18PRO": 53188, "IP18PROMAX": 53190,
+        },
+    },
+    "MERCH-IPHONE-CASE": {  # Big Flavor Tough iPhone Case
+        "name": "Big Flavor Tough iPhone Case", "price_cents": 2800,
+        "file_id": "1086637891", "file_type": "default",
+        "variants": {
+            "IP11": 15381, "IP11PRO": 15382, "IP11PROMAX": 15383,
+            "IP12": 15384, "IP12MINI": 15385, "IP12PRO": 15386,
+            "IP12PROMAX": 15387, "IP13": 15388, "IP13MINI": 15389,
+            "IP13PRO": 15390, "IP13PROMAX": 15391, "IP14": 16124,
+            "IP14PLUS": 16128, "IP14PRO": 16126, "IP14PROMAX": 16130,
+            "IP15": 17714, "IP15PLUS": 17716, "IP15PRO": 17718,
+            "IP15PROMAX": 17720, "IP16": 20302, "IP16PLUS": 20303,
+            "IP16PRO": 20304, "IP16PROMAX": 20305, "IP17": 33985,
+            "IP17AIR": 33986, "IP17PRO": 33987, "IP17PROMAX": 33988,
+            "IP18PRO": 52384, "IP18PROMAX": 52386,
+        },
+    },
+    "MERCH-SAMSUNG-CASE": {  # But First, Popcorn Tough Samsung Case
+        "name": "But First, Popcorn Tough Samsung Case", "price_cents": 2800,
+        "file_id": "1086638309", "file_type": "default",
+        "variants": {
+            "S20": 16981, "S20FE": 16975, "S20PLUS": 16977,
+            "S20ULTRA": 16979, "S21": 16989, "S21FE": 16983,
+            "S21PLUS": 16985, "S21ULTRA": 16987, "S22": 16995,
+            "S22PLUS": 16991, "S22ULTRA": 16993, "S23": 17001,
+            "S23PLUS": 16997, "S23ULTRA": 16999, "S24": 18743,
+            "S24PLUS": 18744, "S24ULTRA": 18745, "S25": 21469,
+            "S25PLUS": 21471, "S25ULTRA": 21473, "S26": 49327,
+            "S26PLUS": 49328, "S26ULTRA": 49329,
+        },
+    },
+    # Shoe file IDs verified from the Printful dashboard.
+    "MERCH-HIGHTOP-M": {  # Neon Nights Men's High-Top Canvas Shoes
+        "name": "Neon Nights Men's High-Top Canvas Shoes", "price_cents": 7500,
+        "file_id": "1086642392", "file_type": "default",
+        "variants": {
+            "5": 17450, "6": 17452, "7": 17454, "8": 17456,
+            "9": 17458, "10": 17460, "11": 17462, "12": 17464,
+            "13": 17466, "55": 17451, "65": 17453, "75": 17455,
+            "85": 17457, "95": 17459, "105": 17461, "115": 17463,
+            "125": 17465,
+        },
+    },
+    "MERCH-HIGHTOP-W": {  # Neon Nights Women's High-Top Canvas Shoes
+        "name": "Neon Nights Women's High-Top Canvas Shoes", "price_cents": 7500,
+        "file_id": "1086642392", "file_type": "default",
+        "variants": {
+            "5": 17467, "6": 17469, "7": 17470, "8": 17473,
+            "9": 17475, "10": 17477, "11": 17479, "12": 17481,
+            "55": 17468, "65": 17471, "75": 17472, "85": 17474,
+            "95": 17476, "105": 17478, "115": 17480,
+        },
+    },
+    "MERCH-SLIPON-M": {  # Popcorn Party Men's Slip-On Canvas Shoes
+        "name": "Popcorn Party Men's Slip-On Canvas Shoes", "price_cents": 6800,
+        "file_id": "1086613804", "file_type": "default",
+        "variants": {
+            "5": 14736, "6": 14738, "7": 14740, "8": 14742,
+            "9": 14744, "10": 14746, "11": 14748, "12": 14750,
+            "13": 14752, "55": 14737, "65": 14739, "75": 14741,
+            "85": 14743, "95": 14745, "105": 14747, "115": 14749,
+            "125": 14751,
+        },
+    },
+    "MERCH-SLIPON-W": {  # Popcorn Party Women's Slip-On Canvas Shoes
+        "name": "Popcorn Party Women's Slip-On Canvas Shoes", "price_cents": 6800,
+        "file_id": "1086613804", "file_type": "default",
+        "variants": {
+            "5": 14721, "6": 14723, "7": 14725, "8": 14727,
+            "9": 14729, "10": 14731, "11": 14733, "12": 14735,
+            "55": 14722, "65": 14724, "75": 14726, "85": 14728,
+            "95": 14730, "105": 14732, "115": 14734,
+        },
+    },
+    "MERCH-LACEUP-M": {  # Neon Nights Men's Lace-Up Canvas Shoes
+        "name": "Neon Nights Men's Lace-Up Canvas Shoes", "price_cents": 7000,
+        "file_id": "1086649031", "file_type": "default",
+        "variants": {
+            "5": 20920, "6": 20922, "7": 20924, "8": 20926,
+            "9": 20928, "10": 20930, "11": 20932, "12": 20934,
+            "13": 20936, "55": 20921, "65": 20923, "75": 20925,
+            "85": 20927, "95": 20929, "105": 20931, "115": 20933,
+            "125": 20935,
+        },
+    },
+    "MERCH-LACEUP-W": {  # Neon Nights Women's Lace-Up Canvas Shoes
+        "name": "Neon Nights Women's Lace-Up Canvas Shoes", "price_cents": 7000,
+        "file_id": "1086649031", "file_type": "default",
+        "variants": {
+            "5": 20937, "6": 20939, "7": 20941, "8": 20943,
+            "9": 20945, "10": 20947, "11": 20949, "12": 20951,
+            "55": 20938, "65": 20940, "75": 20942, "85": 20944,
+            "95": 20946, "105": 20948, "115": 20950,
+        },
+    },
+    "MERCH-STRAW-TUMBLER": {  # Insulated Tumbler with Straw (20 oz)
+        "name": "Pop-A-Licious Insulated Straw Tumbler", "price_cents": 3200,
+        "file_id": "1086601850", "file_type": "default",
+        "variants": {"BLACK": 19107, "MINT": 19108, "NAVY": 19109,
+                     "PINK": 19110, "WHITE": 19111},
+    },
+    "MERCH-STEEL-TUMBLER": {  # Tapered Stainless Steel Tumbler (20 oz)
+        "name": "Big Flavor Steel Tumbler", "price_cents": 3500,
+        "file_id": "1086692382", "file_type": "default",
+        "variants": {"WHITE": 23470},
+    },
+    "MERCH-XMAS-TUMBLER": {  # Merry Popmas Tumbler (Christmas 2026)
+        "name": "Merry Popmas Tumbler", "price_cents": 3500,
+        "file_id": "1086696410", "file_type": "default",
+        "variants": {"WHITE": 23470},
+    },
+}
+
+
+def _printful_headers():
+    return {"Authorization": f"Bearer {PRINTFUL_API_KEY}"}
+
+
+def submit_printful_order(recipient, merch_items, order_ref=""):
+    """Submit merch items to Printful. Returns (printful_order_id, error).
+
+    recipient: dict with name, address1, address2, city, state_code,
+               country_code, zip, email, phone (optional).
+    merch_items: list of (sku_base, size, quantity), e.g.
+                 ("MERCH-TEE", "M", 2).
+    """
+    if not PRINTFUL_API_KEY:
+        return None, "PRINTFUL_API_KEY not set"
+    items = []
+    for sku_base, size, qty in merch_items:
+        prod = PRINTFUL_MERCH.get(sku_base)
+        if not prod:
+            return None, f"unknown merch SKU {sku_base}"
+        variant_id = prod["variants"].get(size)
+        if not variant_id:
+            return None, f"unknown size {size} for {sku_base}"
+        items.append({
+            "variant_id": variant_id,
+            "quantity": int(qty) or 1,
+            "files": [{"id": prod["file_id"], "type": prod["file_type"]}],
+        })
+    if not items:
+        return None, "no merch items"
+    payload = {
+        "external_id": order_ref or None,
+        "recipient": {
+            "name": recipient.get("name", ""),
+            "address1": recipient.get("address1", ""),
+            "address2": recipient.get("address2", ""),
+            "city": recipient.get("city", ""),
+            "state_code": recipient.get("state_code", ""),
+            "country_code": recipient.get("country_code", "US"),
+            "zip": recipient.get("zip", ""),
+            "email": recipient.get("email", ""),
+            "phone": recipient.get("phone", ""),
+        },
+        "items": items,
+    }
+    try:
+        r = requests.post("https://api.printful.com/orders",
+                          headers=_printful_headers(), json=payload, timeout=30)
+        data = r.json()
+    except Exception as e:
+        return None, f"printful request failed: {e}"
+    if r.status_code not in (200, 201):
+        return None, f"printful error {r.status_code}: {str(data)[:300]}"
+    result = data.get("result") or {}
+    return result.get("id"), None
+
+
+def _parse_merch_items(items_summary):
+    """Extract merch (sku_base, size, qty) triples from the order items summary.
+
+    The site cart encodes merch SKUs in the product name as MERCH-{product}-{size}.
+    The summary format is "{qty}x {name}" (e.g. "2x MERCH-TEE-M Big Flavor Tee (M)").
+    Returns a list of (sku_base, size, qty).
+    """
+    found = []
+    if not items_summary:
+        return found
+    # Match longest SKU bases first so MERCH-VINTAGE-TEE wins over MERCH-TEE.
+    bases = sorted(PRINTFUL_MERCH.keys(), key=len, reverse=True)
+    for chunk in re.split(r"[;\n,]", items_summary):
+        # Find qty prefix like "2x " at the start of the chunk.
+        qm = re.match(r"\s*(\d+)\s*[x×]\s*", chunk)
+        qty = int(qm.group(1)) if qm else 1
+        for base in bases:
+            m = re.search(re.escape(base) + r"-([A-Z0-9]+)\b", chunk)
+            if m:
+                size = m.group(1)
+                if size in PRINTFUL_MERCH[base]["variants"]:
+                    found.append((base, size, qty))
+                break
+    return found
+
+
+@app.route("/api/printful/webhook", methods=["POST"])
+def printful_webhook():
+    data = request.get_json(force=True, silent=True) or {}
+    event_type = data.get("type", "")
+    payload = data.get("data") or {}
+    order_info = payload.get("order") or {}
+    pf_id = order_info.get("id") or payload.get("id")
+    if not pf_id:
+        return jsonify(ok=False, error="no order id"), 400
+    conn = db()
+    try:
+        if event_type == "package_shipped":
+            shipment = payload.get("shipment") or {}
+            tracking = shipment.get("tracking_number", "")
+            carrier = shipment.get("carrier", "")
+            conn.execute(
+                "UPDATE orders SET printful_tracking = ?, printful_carrier = ?,"
+                " printful_status = 'shipped' WHERE printful_order_id = ?",
+                (tracking, carrier, str(pf_id)),
+            )
+            # Email the customer their merch tracking number.
+            row = conn.execute(
+                "SELECT email, customer_name FROM orders WHERE printful_order_id = ?",
+                (str(pf_id),),
+            ).fetchone()
+            if row and row["email"] and tracking:
+                send_email(
+                    row["email"],
+                    "Your Pop-A-Licious merch has shipped! 📦",
+                    f"<p>Hi {html.escape(row['customer_name'] or 'there')},</p>"
+                    f"<p>Your merch order is on its way via {html.escape(carrier or 'carrier')}.</p>"
+                    f"<p><strong>Tracking:</strong> {html.escape(tracking)}</p>"
+                    "<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong></p>",
+                )
+        else:
+            status = event_type.replace("order_", "") or event_type
+            conn.execute(
+                "UPDATE orders SET printful_status = ? WHERE printful_order_id = ?",
+                (status, str(pf_id)),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/merch/catalog")
+def merch_catalog():
+    """Public merch catalog for the site shop (name, price, sizes)."""
+    items = []
+    for sku, prod in PRINTFUL_MERCH.items():
+        items.append({
+            "sku": sku,
+            "name": prod["name"],
+            "price_cents": prod["price_cents"],
+            "sizes": sorted(prod["variants"].keys()),
+        })
+    return jsonify(items=items)
+
+
+# Merch loyalty rewards — specific items only, each with its own kernel cost.
+# Customer gets a MCH- code for free merch (pays Printful shipping only).
+# Employee redemptions notify admins with a Printful link.
+MERCH_REWARDS = [
+    {"sku": "MERCH-STICKERS", "kernels": 300},
+    {"sku": "MERCH-MUG", "kernels": 400},
+    {"sku": "MERCH-TEE", "kernels": 500},
+    {"sku": "MERCH-STRAW-TUMBLER", "kernels": 600},
+    {"sku": "MERCH-STEEL-TUMBLER", "kernels": 700},
+    {"sku": "MERCH-HOODIE", "kernels": 900},
+]
+
+
+def merch_rewards_for_balance(kernel_balance):
+    """Return list of {kernels, sku, name, price_cents, sizes}
+    for merch rewards the balance unlocks, ordered by kernel cost."""
+    eligible = []
+    for reward in MERCH_REWARDS:
+        if kernel_balance < reward["kernels"]:
+            continue
+        prod = PRINTFUL_MERCH.get(reward["sku"])
+        if not prod:
+            continue
+        eligible.append({
+            "kernels": reward["kernels"],
+            "sku": reward["sku"],
+            "name": prod["name"],
+            "price_cents": prod["price_cents"],
+            "sizes": sorted(prod["variants"].keys()),
+        })
+    eligible.sort(key=lambda x: x["kernels"])
+    return eligible
+
+
+def merch_reward_for_sku(sku, kernel_balance):
+    """Find the merch reward for a SKU if the balance covers it, else None."""
+    for reward in MERCH_REWARDS:
+        if reward["sku"] == sku and kernel_balance >= reward["kernels"]:
+            return reward
+    return None
+
+
+def _new_merch_code():
+    return "MCH-" + secrets.token_hex(4).upper()
+
+
+def _merch_template_id(sku):
+    """Map SKU to Printful template ID for the admin order link."""
+    return {
+        "MERCH-TEE": "108855676", "MERCH-HOODIE": "108855917",
+        "MERCH-VINTAGE-TEE": "108855976", "MERCH-HAT": "108856083",
+        "MERCH-MUG": "108856325", "MERCH-TOTE": "108856420",
+        "MERCH-BACKPACK": "108856811", "MERCH-UTIL-BACKPACK": "108856913",
+        "MERCH-SOCKS": "108856731", "MERCH-STICKERS": "108856645",
+        "MERCH-MAGSAFE": "108858113", "MERCH-IPHONE-CASE": "108858228",
+        "MERCH-SAMSUNG-CASE": "108858203",
+        "MERCH-HIGHTOP-M": "108858519", "MERCH-HIGHTOP-W": "108858565",
+        "MERCH-SLIPON-M": "108858466", "MERCH-SLIPON-W": "108858622",
+        "MERCH-STRAW-TUMBLER": "108861051", "MERCH-STEEL-TUMBLER": "108861085",
+        "MERCH-XMAS-TUMBLER": "108861512",
+    }.get(sku)
+
+
+@app.get("/api/loyalty/merch-rewards")
+def loyalty_merch_rewards():
+    """List merch rewards available for the logged-in customer's kernel balance."""
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else None
+    user = _auth_user_from_token(token or _session_token_from_request())
+    if not user:
+        return jsonify(error="login required"), 401
+    with _db() as conn:
+        balance = _kernel_balance(conn, user["id"])
+    return jsonify(rewards=merch_rewards_for_balance(balance), balance=balance)
+
+
+@app.post("/api/loyalty/redeem-merch")
+def loyalty_redeem_merch():
+    """Customer redeems kernels for a merch promo code (free item, pays shipping)."""
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else None
+    user = _auth_user_from_token(token or _session_token_from_request())
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True, silent=True) or {}
+    sku = data.get("sku", "")
+    size = data.get("size", "")
+    prod = PRINTFUL_MERCH.get(sku)
+    if not prod or size not in prod["variants"]:
+        return jsonify(error="invalid merch selection"), 400
+    with _db() as conn:
+        balance = _kernel_balance(conn, user["id"])
+    reward = merch_reward_for_sku(sku, balance)
+    if not reward:
+        return jsonify(error="not enough kernels for this item"), 400
+    code = _new_merch_code()
+    now = _now_iso()
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (user["id"], f"merch:{sku}:{size}", code, reward["kernels"], now),
+        )
+        _add_kernels(conn, user["id"], -reward["kernels"], f"Redeemed merch: {prod['name']} ({size})")
+    return jsonify(code=code, kernels_spent=reward["kernels"],
+                   item=f"{prod['name']} ({size})")
+
+
+@app.post("/api/staff/redeem-merch")
+def staff_redeem_merch():
+    """Employee redeems kernels for merch. Deducts kernels, emails admins
+    with a Printful link to manually place the order."""
+    staff, err = _require_staff()
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    sku = data.get("sku", "")
+    size = data.get("size", "")
+    prod = PRINTFUL_MERCH.get(sku)
+    if not prod or size not in prod["variants"]:
+        return jsonify(error="invalid merch selection"), 400
+    with _db() as conn:
+        row = conn.execute("SELECT kernels FROM staff WHERE id = ?", (staff["id"],)).fetchone()
+        balance = row["kernels"] if row else 0
+    reward = merch_reward_for_sku(sku, balance)
+    if not reward:
+        return jsonify(error="not enough kernels for this item"), 400
+    now = _now_iso()
+    with _db() as conn:
+        conn.execute(
+            "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent, staff_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (0, f"merch:{sku}:{size}", "STAFF-" + secrets.token_hex(4).upper(),
+             reward["kernels"], staff["id"], now),
+        )
+        _credit_staff_kernels(conn, staff["id"], -reward["kernels"],
+                           f"Redeemed merch: {prod['name']} ({size})")
+    template_id = _merch_template_id(sku)
+    printful_url = (f"https://www.printful.com/dashboard/stores/18907610/products/templates/{template_id}"
+                    if template_id else "https://www.printful.com/dashboard")
+    try:
+        for admin_email in ADMIN_EMAILS:
+            send_email(
+                admin_email,
+                f"Employee merch redemption: {staff['name']}",
+                f"<p><b>{staff['name']}</b> ({staff['email']}) redeemed "
+                f"<b>{prod['name']} ({size})</b> for {reward['kernels']} kernels.</p>"
+                f"<p>Place the order in Printful:<br>"
+                f"<a href='{printful_url}'>{printful_url}</a></p>"
+                f"<p>Ship to the employee's address on file.</p>",
+            )
+    except Exception:
+        pass
+    return jsonify(ok=True, kernels_spent=reward["kernels"],
+                   item=f"{prod['name']} ({size})",
+                   message="Kernels deducted. Admins have been notified to place your order.")
+    """Public merch catalog for the site shop (name, price, sizes)."""
+    items = []
+    for sku, prod in PRINTFUL_MERCH.items():
+        items.append({
+            "sku": sku,
+            "name": prod["name"],
+            "price_cents": prod["price_cents"],
+            "sizes": sorted(prod["variants"].keys(),
+                            key=lambda s: ({"XS": 0, "S": 1, "M": 2, "L": 3, "XL": 4,
+                                            "2XL": 5, "3XL": 6, "4XL": 7, "5XL": 8,
+                                            "OS": 9, "11OZ": 10, "3X3": 11}.get(s, 99), s)),
+        })
+    return jsonify(items=items)
+
+
+@app.post("/api/printful/shipping-rates")
+def printful_shipping_rates():
+    """Quote Printful's actual shipping for merch items at checkout.
+
+    Request: {recipient: {address1, city, state_code, country_code, zip},
+              items: [{sku, size, quantity}]}
+    Returns: {rates: [{id, name, rate_cents, ...}], cheapest_cents}
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    recipient = data.get("recipient") or {}
+    req_items = data.get("items") or []
+    if not PRINTFUL_API_KEY:
+        return jsonify(error="merch shipping unavailable"), 503
+    pf_items = []
+    for it in req_items:
+        sku = it.get("sku", "")
+        size = it.get("size", "")
+        qty = int(it.get("quantity") or 1)
+        prod = PRINTFUL_MERCH.get(sku)
+        if not prod:
+            continue
+        variant_id = prod["variants"].get(size)
+        if not variant_id:
+            continue
+        pf_items.append({"variant_id": variant_id, "quantity": qty})
+    if not pf_items:
+        return jsonify(error="no valid merch items"), 400
+    try:
+        r = requests.post(
+            "https://api.printful.com/shipping/rates",
+            headers=_printful_headers(),
+            json={
+                "store_id": int(os.environ.get("PRINTFUL_STORE_ID", "18907610")),
+                "recipient": {
+                    "address1": recipient.get("address1", ""),
+                    "city": recipient.get("city", ""),
+                    "country_code": recipient.get("country_code", "US"),
+                    "state_code": recipient.get("state_code", ""),
+                    "zip": recipient.get("zip", ""),
+                },
+                "items": pf_items,
+            },
+            timeout=20,
+        )
+        resp = r.json()
+    except Exception as e:
+        return jsonify(error=f"printful rates failed: {e}"), 502
+    if r.status_code != 200:
+        return jsonify(error=f"printful error {r.status_code}"), 502
+    rates = []
+    for rate in (resp.get("result") or []):
+        try:
+            cents = int(float(rate.get("rate", 0)) * 100)
+        except (TypeError, ValueError):
+            continue
+        rates.append({
+            "id": rate.get("id", ""),
+            "name": rate.get("name", ""),
+            "rate_cents": cents,
+            "currency": rate.get("currency", "USD"),
+        })
+    rates.sort(key=lambda x: x["rate_cents"])
+    cheapest = rates[0]["rate_cents"] if rates else 0
+    return jsonify(rates=rates, cheapest_cents=cheapest)
+
 
 # ---------------------------------------------------------------- paypal
 
@@ -1368,6 +1985,12 @@ def _compute_order(data):
             if reward["reward_type"] == "free_shipping":
                 order["shipping_cents"] = 0
                 order["shipping_label"] = f"FREE ({code})"
+            elif reward["reward_type"].startswith("merch:"):
+                _, sku, size = reward["reward_type"].split(":", 2)
+                prod = PRINTFUL_MERCH.get(sku, {})
+                order["reward_discount_cents"] = prod.get("price_cents", 0)
+                order["reward_merch_sku"] = sku
+                order["reward_merch_size"] = size
             else:
                 order["reward_discount_cents"] = REWARD_DISCOUNT_CENTS.get(
                     reward["reward_type"], 0)
@@ -1723,6 +2346,27 @@ def paypal_capture_order():
             "UPDATE loyalty_rewards SET used = 1, used_at = ? WHERE code = ? AND used = 0",
             (now, rcode),
         )
+    # Printful: forward any merch items to Printful for POD fulfillment.
+    merch_items = _parse_merch_items(row["items_summary"])
+    if merch_items:
+        pf_recipient = {
+            "name": psh_name or name,
+            "address1": paddr.get("address_line_1", ""),
+            "address2": paddr.get("address_line_2", ""),
+            "city": paddr.get("admin_area_2", ""),
+            "state_code": paddr.get("admin_area_1", ""),
+            "country_code": paddr.get("country_code", "US"),
+            "zip": paddr.get("postal_code", ""),
+            "email": email,
+        }
+        pf_id, pf_err = submit_printful_order(pf_recipient, merch_items,
+                                              order_ref=f"paypal:{order_id}")
+        if pf_id:
+            conn.execute(
+                "UPDATE orders SET printful_order_id = ?, printful_status = 'submitted'"
+                " WHERE stripe_session_id = ?",
+                (str(pf_id), f"paypal:{order_id}"),
+            )
     # Analytics: this shopper's cart converted — not abandoned.
     if email:
         conn.execute(
@@ -3820,6 +4464,282 @@ def admin_create_staff():
     except Exception:
         pass
     return jsonify(ok=True)
+
+# ---------------- Marketing emails (promos + merch drops) ----------------
+# Audience = deduplicated: active+verified users + order emails (Stripe +
+# PayPal), minus unsubscribes. Admin-gated sends. Every email carries a
+# one-click unsubscribe link (HMAC-signed) + the business address.
+
+MARKETING_FROM = os.environ.get("EMAIL_FROM", "Pop-A-Licious <noreply@pop-a-licious.com>")
+MARKETING_ADDRESS_HTML = ("Pop-A-Licious, 2013 Angel Falls Dr., Henderson, NV 89074")
+
+def _unsub_token(email):
+    sig = hmac.new(RESEND_API_KEY.encode(), email.lower().encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(sig).decode().rstrip("=")
+
+def _verify_unsub_token(email, token):
+    try:
+        return hmac.compare_digest(_unsub_token(email), token)
+    except Exception:
+        return False
+
+def _marketing_audience(conn):
+    """Deduplicated marketing audience: one email per address."""
+    emails = {}
+    for row in conn.execute(
+            "SELECT email, name FROM users WHERE active = 1 AND verified = 1 AND email != ''"):
+        emails[row["email"].lower()] = {"email": row["email"], "name": row["name"] or ""}
+    for row in conn.execute(
+            "SELECT DISTINCT email FROM orders WHERE email IS NOT NULL AND email != ''"):
+        emails.setdefault(row["email"].lower(), {"email": row["email"], "name": ""})
+    for row in conn.execute(
+            "SELECT DISTINCT email FROM paypal_orders WHERE email IS NOT NULL AND email != ''"):
+        emails.setdefault(row["email"].lower(), {"email": row["email"], "name": ""})
+    unsub = {r["email"] for r in conn.execute("SELECT email FROM marketing_unsubscribes")}
+    return [v for k, v in emails.items() if k not in unsub]
+
+def _marketing_email_html(body_html, email):
+    token = _unsub_token(email)
+    qs = urlencode({"email": email, "token": token})
+    unsub_url = f"https://pop-a-licious.com/api/marketing/unsubscribe?{qs}"
+    return f"""{body_html}
+<hr style="border:none;border-top:1px solid #ddd;margin:24px 0;">
+<p style="font-size:12px;color:#888;">You're receiving this because you're a Pop-A-Licious customer.<br>
+<a href="{unsub_url}" style="color:#888;">Unsubscribe</a> &nbsp;|&nbsp; {MARKETING_ADDRESS_HTML}</p>"""
+
+def _send_marketing_batch(batch):
+    """batch: list of dicts {to, subject, html}. Uses Resend batch endpoint (max 100)."""
+    resp = requests.post(
+        "https://api.resend.com/emails/batch",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+        json=[
+            {
+                "from": MARKETING_FROM,
+                "to": [item["to"]],
+                "subject": item["subject"],
+                "html": item["html"],
+                "headers": {"List-Unsubscribe": f"<{item['unsub_url']}>"},
+            }
+            for item in batch
+        ],
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+@app.post("/api/admin/marketing/audience")
+def admin_marketing_audience():
+    """Return the deduplicated marketing audience count (admin preview before sending)."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    audience = _marketing_audience(conn)
+    conn.close()
+    return jsonify(count=len(audience))
+
+@app.post("/api/admin/marketing/send")
+def admin_marketing_send():
+    """Send a marketing email to the deduplicated audience. Admin only.
+    Body: {name, subject, html_body}. html_body is the inner content; footer
+    with unsubscribe + address is appended automatically."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()[:120]
+    subject = (data.get("subject") or "").strip()
+    html_body = data.get("html_body") or ""
+    if not subject or not html_body:
+        return jsonify(error="subject and html_body are required"), 400
+    conn = db()
+    audience = _marketing_audience(conn)
+    sent = 0
+    for i in range(0, len(audience), 100):
+        chunk = audience[i:i + 100]
+        batch = []
+        for person in chunk:
+            email = person["email"]
+            token = _unsub_token(email)
+            qs = urlencode({"email": email, "token": token})
+            unsub_url = f"https://pop-a-licious.com/api/marketing/unsubscribe?{qs}"
+            batch.append({
+                "to": email,
+                "subject": subject,
+                "html": _marketing_email_html(html_body, email),
+                "unsub_url": unsub_url,
+            })
+        try:
+            _send_marketing_batch(batch)
+            sent += len(batch)
+        except Exception as e:
+            conn.close()
+            return jsonify(error=f"send failed after {sent} emails: {e}"), 502
+    conn.execute(
+        "INSERT INTO marketing_campaigns (name, subject, audience, recipient_count, sent_at)"
+        " VALUES (?, ?, 'all', ?, ?)",
+        (name, subject, sent, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, sent=sent, campaign=name)
+
+@app.get("/api/admin/marketing/campaigns")
+def admin_marketing_campaigns():
+    """List past marketing campaigns (admin)."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, name, subject, recipient_count, sent_at FROM marketing_campaigns"
+        " ORDER BY id DESC LIMIT 50").fetchall()
+    conn.close()
+    return jsonify(campaigns=[dict(r) for r in rows])
+
+@app.get("/api/marketing/unsubscribe")
+def marketing_unsubscribe():
+    """One-click unsubscribe (signed link from marketing emails)."""
+    email = (request.args.get("email") or "").strip()
+    token = request.args.get("token") or ""
+    if not email or not _verify_unsub_token(email, token):
+        return ("<html><body style='font-family:sans-serif;text-align:center;padding:60px;'>"
+                "<h2>Invalid unsubscribe link</h2>"
+                "<p>Please use the link from your Pop-A-Licious email.</p></body></html>"), 400
+    conn = db()
+    conn.execute(
+        "INSERT OR IGNORE INTO marketing_unsubscribes (email, created_at) VALUES (?, ?)",
+        (email.lower(), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return ("<html><body style='font-family:sans-serif;text-align:center;padding:60px;'>"
+            "<h2>You're unsubscribed</h2>"
+            "<p>You won't receive Pop-A-Licious promo or merch emails anymore.</p>"
+            "<p><a href='https://pop-a-licious.com'>Back to pop-a-licious.com</a></p></body></html>")
+
+# ---------------- Scheduled marketing campaigns (cron-secret protected) ----------------
+# Pre-defined campaigns sent by cron-job.org on the retail calendar dates.
+# Body: {"campaign_key": "<key>"} — each key sends once (tracked in
+# marketing_campaigns; re-sending the same key is a no-op).
+
+SCHEDULED_CAMPAIGNS = {
+    "xmas2026_launch": {
+        "name": "Holiday 2026 merch drop + MERRYPOP15",
+        "subject": "🎄 Our Holiday Merch Drop Is Here + 15% Off Everything",
+        "html_body": """<h2 style="color:#c0392b;">Merry Popmas! 🎄🍿</h2>
+<p>Our <strong>Holiday 2026 merch drop</strong> just landed — cozy, festive, and
+only here for the season:</p>
+<ul>
+<li><strong>"Merry Popmas" Hoodie</strong> — $55</li>
+<li><strong>"Ugly Sweater" Holiday Tee</strong> — $28</li>
+<li><strong>"Pop! Pop! Hooray!" Holiday Mug</strong> — $18</li>
+<li><strong>"Popcorn Garland" Holiday Socks</strong> — $16</li>
+</ul>
+<p>Plus take <strong>15% off everything</strong> with code
+<strong style="font-size:18px;">MERRYPOP15</strong> at checkout — now through Dec 26.</p>
+<p><a href="https://pop-a-licious.com" style="background:#c0392b;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;">Shop the Drop</a></p>
+<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong><br><em>It's Not Just Butter &amp; Salt!</em> 🍿</p>""",
+    },
+    "xmas2026_blackfriday": {
+        "name": "Black Friday 2026 — BLACKPOP25",
+        "subject": "🖤 Black Friday: 25% Off Everything — Today Only-ish",
+        "html_body": """<h2 style="color:#111;">Black Friday Is Poppin' 🖤🍿</h2>
+<p>Our biggest sale of the year: <strong>25% off EVERYTHING</strong> — popcorn,
+merch, all of it.</p>
+<p>Use code <strong style="font-size:20px;">BLACKPOP25</strong> at checkout.</p>
+<p>Sale runs Nov 27 – Nov 29. When it's gone, it's gone.</p>
+<p><a href="https://pop-a-licious.com" style="background:#111;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;">Shop Black Friday</a></p>
+<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong><br><em>It's Not Just Butter &amp; Salt!</em> 🍿</p>""",
+    },
+    "xmas2026_cybermonday": {
+        "name": "Cyber Monday 2026 — CYBERPOP25",
+        "subject": "💻 Cyber Monday: 25% Off Ends Tonight",
+        "html_body": """<h2 style="color:#111;">Cyber Monday — Last Call 💻🍿</h2>
+<p><strong>25% off EVERYTHING</strong> ends tonight at midnight.</p>
+<p>Use code <strong style="font-size:20px;">CYBERPOP25</strong> at checkout.</p>
+<p>After tonight, our holiday sale drops back to 15% off — don't miss the big one.</p>
+<p><a href="https://pop-a-licious.com" style="background:#111;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;">Shop Cyber Monday</a></p>
+<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong><br><em>It's Not Just Butter &amp; Salt!</em> 🍿</p>""",
+    },
+    "xmas2026_shipping_deadline": {
+        "name": "Christmas 2026 shipping deadlines",
+        "subject": "🎄 Last Days to Order for Christmas Delivery",
+        "html_body": """<h2 style="color:#c0392b;">Don't Miss Christmas Delivery 🎄🍿</h2>
+<p>Want Pop-A-Licious under the tree? Here are the last days to order:</p>
+<ul>
+<li><strong>Merch (hoodies, tees, mugs & more):</strong> order by <strong>Dec 10</strong></li>
+<li><strong>Popcorn:</strong> order by <strong>Dec 16</strong></li>
+</ul>
+<p>After those dates we can't guarantee Christmas delivery — order early!</p>
+<p><a href="https://pop-a-licious.com" style="background:#c0392b;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;">Order Now</a></p>
+<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong><br><em>It's Not Just Butter &amp; Salt!</em> 🍿</p>""",
+    },
+    "xmas2026_last_call": {
+        "name": "Christmas 2026 last call — popcorn",
+        "subject": "⏰ Tomorrow's the Last Day for Christmas Popcorn Delivery",
+        "html_body": """<h2 style="color:#c0392b;">Last Call for Christmas Popcorn ⏰🍿</h2>
+<p><strong>Tomorrow (Dec 16)</strong> is the last day to order popcorn for
+guaranteed Christmas delivery.</p>
+<p>Merch orders have closed for Christmas — but popcorn can still make it!</p>
+<p>Use code <strong>MERRYPOP15</strong> for 15% off.</p>
+<p><a href="https://pop-a-licious.com" style="background:#c0392b;color:#fff;padding:12px 24px;text-decoration:none;border-radius:6px;">Order Popcorn Now</a></p>
+<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong><br><em>It's Not Just Butter &amp; Salt!</em> 🍿</p>""",
+    },
+}
+
+@app.post("/api/cron/marketing/send")
+def cron_marketing_send():
+    """Cron: send a pre-defined marketing campaign to the deduplicated audience.
+
+    Header X-Cron-Secret must equal the CRON_SECRET env var.
+    Body: {"campaign_key": "<key from SCHEDULED_CAMPAIGNS>"}.
+    Each key sends at most once (tracked in marketing_campaigns).
+    """
+    if not CRON_SECRET:
+        return jsonify(error="cron is not configured"), 503
+    if request.headers.get("X-Cron-Secret", "") != CRON_SECRET:
+        return jsonify(error="forbidden"), 403
+    data = request.get_json(force=True) or {}
+    key = (data.get("campaign_key") or "").strip()
+    campaign = SCHEDULED_CAMPAIGNS.get(key)
+    if not campaign:
+        return jsonify(error="unknown campaign_key"), 400
+    conn = db()
+    already = conn.execute(
+        "SELECT id FROM marketing_campaigns WHERE name = ?", (campaign["name"],)).fetchone()
+    if already:
+        conn.close()
+        return jsonify(ok=True, sent=0, note="already sent")
+    audience = _marketing_audience(conn)
+    sent = 0
+    for i in range(0, len(audience), 100):
+        chunk = audience[i:i + 100]
+        batch = []
+        for person in chunk:
+            email = person["email"]
+            qs = urlencode({"email": email, "token": _unsub_token(email)})
+            unsub_url = f"https://pop-a-licious.com/api/marketing/unsubscribe?{qs}"
+            batch.append({
+                "to": email,
+                "subject": campaign["subject"],
+                "html": _marketing_email_html(campaign["html_body"], email),
+                "unsub_url": unsub_url,
+            })
+        try:
+            _send_marketing_batch(batch)
+            sent += len(batch)
+        except Exception as e:
+            conn.close()
+            return jsonify(error=f"send failed after {sent} emails: {e}"), 502
+    conn.execute(
+        "INSERT INTO marketing_campaigns (name, subject, audience, recipient_count, sent_at)"
+        " VALUES (?, ?, 'all', ?, ?)",
+        (campaign["name"], campaign["subject"], sent, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, sent=sent, campaign=campaign["name"])
 
 @app.get("/api/admin/dashboard")
 def admin_dashboard():
