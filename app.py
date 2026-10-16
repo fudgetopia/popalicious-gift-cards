@@ -562,6 +562,99 @@ def init_db():
         ("reminder", _SUBSCRIPTION_REMINDER_SUBJECT, _SUBSCRIPTION_REMINDER_BODY,
          datetime.now(timezone.utc).isoformat()),
     )
+    # ---------------- ERP Phase 1 tables ----------------
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS erp_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sku TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            unit TEXT NOT NULL DEFAULT 'each',
+            track_lots INTEGER NOT NULL DEFAULT 0,
+            avg_cost_cents INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_locations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS erp_stock_ledger (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            location_id INTEGER NOT NULL,
+            qty_change REAL NOT NULL,
+            movement_type TEXT NOT NULL,
+            ref_type TEXT NOT NULL DEFAULT '',
+            ref_id TEXT NOT NULL DEFAULT '',
+            lot_code TEXT NOT NULL DEFAULT '',
+            unit_cost_cents INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_ledger_item_loc ON erp_stock_ledger (item_id, location_id);
+        CREATE TABLE IF NOT EXISTS erp_lots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lot_code TEXT NOT NULL,
+            item_id INTEGER NOT NULL,
+            supplier_lot TEXT NOT NULL DEFAULT '',
+            received_date TEXT NOT NULL DEFAULT '',
+            expiry_date TEXT NOT NULL DEFAULT '',
+            location_id INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS erp_vendors (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            contact_name TEXT NOT NULL DEFAULT '',
+            email TEXT NOT NULL DEFAULT '',
+            phone TEXT NOT NULL DEFAULT '',
+            payment_terms TEXT NOT NULL DEFAULT '',
+            lead_time_days INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_purchase_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            po_number TEXT UNIQUE NOT NULL,
+            vendor_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft',
+            order_date TEXT NOT NULL,
+            expected_date TEXT NOT NULL DEFAULT '',
+            freight_cents INTEGER NOT NULL DEFAULT 0,
+            tax_cents INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_po_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            po_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            qty_ordered REAL NOT NULL,
+            qty_received REAL NOT NULL DEFAULT 0,
+            unit_cost_cents INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_reorder_rules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            location_id INTEGER NOT NULL,
+            reorder_point REAL NOT NULL,
+            reorder_qty REAL NOT NULL DEFAULT 0,
+            preferred_vendor_id INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        INSERT OR IGNORE INTO erp_locations (code, name, type, active) VALUES
+         ('HEND', 'Henderson Warehouse', 'warehouse', 1),
+         ('EVT', 'Events / Mobile', 'mobile', 1),
+         ('PFUL', 'Printful (virtual)', 'virtual', 1);
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -4801,6 +4894,13 @@ def admin_dashboard():
         "SELECT COUNT(*) AS c FROM reviews WHERE approved = 0").fetchone()["c"]
     active_staff = conn.execute(
         "SELECT COUNT(*) AS c FROM staff WHERE active = 1").fetchone()["c"]
+    erp_inventory_value = conn.execute(
+        "SELECT COALESCE(SUM(l.q * i.avg_cost_cents), 0) AS v FROM"
+        " (SELECT item_id, SUM(qty_change) AS q FROM erp_stock_ledger GROUP BY item_id) l"
+        " JOIN erp_items i ON i.id = l.item_id").fetchone()["v"]
+    erp_open_pos = conn.execute(
+        "SELECT COUNT(*) AS c FROM erp_purchase_orders"
+        " WHERE status IN ('draft', 'sent', 'partial')").fetchone()["c"]
     recent_orders = conn.execute(
         "SELECT email, items_summary, amount_total_cents, created_at FROM orders"
         " ORDER BY id DESC LIMIT 10").fetchall()
@@ -4812,6 +4912,8 @@ def admin_dashboard():
         gift_cards_outstanding_cents=gift_cards_outstanding,
         loyalty_members=members, kernels_issued=kernels_issued,
         pending_reviews=pending_reviews, active_staff=active_staff,
+        inventory_value_cents=int(erp_inventory_value or 0),
+        open_purchase_orders=erp_open_pos,
         recent_orders=[
             {"email": r["email"], "items": r["items_summary"] or "",
              "total_cents": r["amount_total_cents"] or 0, "created_at": r["created_at"]}
@@ -7110,6 +7212,859 @@ def admin_demo_cleanup():
     conn.close()
     return jsonify(ok=True, deleted=counts)
 
+
+
+# ---------------- Pop-A-Licious ERP — Phase 1: Inventory + Purchasing ----------------
+# Made-to-order operation: finished popcorn is produced per order, so Phase 1
+# tracks only ingredients, bags, front labels, and back labels. Every stock
+# change is an immutable row in erp_stock_ledger; on-hand is SUM(qty_change).
+
+ERP_ITEM_TYPES = ("ingredient", "bag", "front_label", "back_label")
+ERP_ITEM_UNITS = ("lb", "oz", "bag", "each", "roll")
+ERP_ADJUST_REASONS = ("count_correction", "damage", "spoilage", "sample",
+                      "wholesale_shipment")
+ERP_PO_STATUSES = ("draft", "sent", "partial", "received", "closed", "cancelled")
+# Receiving auto-advances sent -> partial -> received; /status only handles
+# the explicit human steps (send, cancel, close).
+ERP_PO_TRANSITIONS = {
+    "draft": ("sent", "cancelled"),
+    "sent": ("cancelled",),
+    "partial": ("cancelled",),
+    "received": ("closed",),
+    "closed": (),
+    "cancelled": (),
+}
+
+
+def _erp_actor():
+    """Identifies who performs an ERP action: admin email or 'staff:<name>'."""
+    user = _current_member()
+    if user and _is_admin(user):
+        return user["email"]
+    staff, _ = _require_staff()
+    if staff:
+        return "staff:" + (staff["name"] or staff["email"] or str(staff["id"]))
+    return ""
+
+
+def _require_erp():
+    """Admin member OR staff. Returns (actor, None) or (None, (resp, code))."""
+    user = _current_member()
+    if user and _is_admin(user):
+        return user["email"], None
+    staff, _ = _require_staff()
+    if staff:
+        return "staff:" + (staff["name"] or staff["email"] or str(staff["id"])), None
+    if user:
+        return None, (jsonify(error="admin or staff required"), 403)
+    return None, (jsonify(error="login required"), 401)
+
+
+def _require_erp_admin():
+    """Admin member only (master data, POs, seed, reorder rules)."""
+    user = _current_member()
+    if user and _is_admin(user):
+        return user["email"], None
+    staff, _ = _require_staff()
+    if user or staff:
+        # Authenticated (customer or staff) but not an admin.
+        return None, (jsonify(error="admin required"), 403)
+    return None, (jsonify(error="login required"), 401)
+
+
+def _erp_fmt_qty(q):
+    s = ("%.4f" % float(q)).rstrip("0").rstrip(".")
+    return s if s else "0"
+
+
+def _erp_get_item(conn, item_id):
+    try:
+        item_id = int(item_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_items WHERE id = ?", (item_id,)).fetchone()
+
+
+def _erp_get_location(conn, location_id):
+    try:
+        location_id = int(location_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_locations WHERE id = ?", (location_id,)).fetchone()
+
+
+def _erp_get_location_by_code(conn, code):
+    return conn.execute(
+        "SELECT * FROM erp_locations WHERE code = ?", ((code or "").strip(),)).fetchone()
+
+
+def _erp_on_hand(conn, item_id, location_id=None):
+    if location_id is None:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(qty_change), 0) AS q FROM erp_stock_ledger WHERE item_id = ?",
+            (item_id,)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COALESCE(SUM(qty_change), 0) AS q FROM erp_stock_ledger"
+            " WHERE item_id = ? AND location_id = ?",
+            (item_id, location_id)).fetchone()
+    return float(row["q"] or 0)
+
+
+def _erp_post_movement(conn, item_id, location_id, qty_change, movement_type, actor,
+                       ref_type="", ref_id="", lot_code="", unit_cost_cents=0, note=""):
+    conn.execute(
+        "INSERT INTO erp_stock_ledger (item_id, location_id, qty_change, movement_type,"
+        " ref_type, ref_id, lot_code, unit_cost_cents, created_by, created_at, note)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (item_id, location_id, float(qty_change), movement_type, ref_type, str(ref_id),
+         lot_code, int(unit_cost_cents), actor,
+         datetime.now(timezone.utc).isoformat(), note),
+    )
+
+
+def _erp_new_avg_cost(conn, item_id, received_qty, landed_unit_cost_cents):
+    """Weighted-average cost, company-wide.
+
+    new_avg = (old_qty * old_avg + received_qty * landed) / (old_qty + received_qty).
+    Call BEFORE posting the receipt movement (reads current on-hand).
+    """
+    item = _erp_get_item(conn, item_id)
+    old_avg = int(item["avg_cost_cents"] or 0)
+    old_qty = _erp_on_hand(conn, item_id)
+    denom = old_qty + received_qty
+    if denom <= 0:
+        return int(landed_unit_cost_cents)
+    return int(round((old_qty * old_avg + received_qty * landed_unit_cost_cents) / denom))
+
+
+def _erp_po_summary(conn, po):
+    lines = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(qty_ordered * unit_cost_cents), 0) AS ordered,"
+        " COALESCE(SUM(qty_received * unit_cost_cents), 0) AS received"
+        " FROM erp_po_lines WHERE po_id = ?", (po["id"],)).fetchone()
+    vendor = conn.execute(
+        "SELECT name FROM erp_vendors WHERE id = ?", (po["vendor_id"],)).fetchone()
+    d = dict(po)
+    d["vendor_name"] = vendor["name"] if vendor else ""
+    d["line_count"] = lines["n"]
+    d["total_ordered_cents"] = int(lines["ordered"] or 0)
+    d["total_received_cents"] = int(lines["received"] or 0)
+    return d
+
+
+@app.get("/api/erp/locations")
+def erp_list_locations():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_locations WHERE active = 1 ORDER BY id").fetchall()
+    conn.close()
+    return jsonify(locations=[dict(r) for r in rows])
+
+
+@app.get("/api/erp/items")
+def erp_list_items():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    if request.args.get("include_inactive") == "1":
+        rows = conn.execute("SELECT * FROM erp_items ORDER BY type, name").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_items WHERE active = 1 ORDER BY type, name").fetchall()
+    conn.close()
+    return jsonify(items=[dict(r) for r in rows])
+
+
+@app.post("/api/erp/items")
+def erp_create_item():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    sku = (data.get("sku") or "").strip()
+    name = (data.get("name") or "").strip()
+    itype = (data.get("type") or "").strip()
+    unit = (data.get("unit") or "each").strip()
+    track_lots = 1 if data.get("track_lots") else 0
+    if not sku or not name:
+        return jsonify(error="sku and name are required"), 400
+    if itype not in ERP_ITEM_TYPES:
+        return jsonify(error="type must be one of: " + ", ".join(ERP_ITEM_TYPES)), 400
+    if unit not in ERP_ITEM_UNITS:
+        return jsonify(error="unit must be one of: " + ", ".join(ERP_ITEM_UNITS)), 400
+    conn = db()
+    if conn.execute("SELECT 1 FROM erp_items WHERE sku = ?", (sku,)).fetchone():
+        conn.close()
+        return jsonify(error="sku already exists"), 400
+    cur = conn.execute(
+        "INSERT INTO erp_items (sku, name, type, unit, track_lots, avg_cost_cents,"
+        " active, created_at) VALUES (?, ?, ?, ?, ?, 0, 1, ?)",
+        (sku, name, itype, unit, track_lots, datetime.now(timezone.utc).isoformat()),
+    )
+    item_id = cur.lastrowid
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_items WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+    return jsonify(item=dict(row)), 201
+
+
+@app.get("/api/erp/items/<int:item_id>")
+def erp_get_item(item_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    item = _erp_get_item(conn, item_id)
+    if not item:
+        conn.close()
+        return jsonify(error="item not found"), 404
+    locs = conn.execute(
+        "SELECT * FROM erp_locations WHERE active = 1 ORDER BY id").fetchall()
+    stock = [
+        {"location_id": loc["id"], "location_code": loc["code"],
+         "location_name": loc["name"],
+         "on_hand": _erp_on_hand(conn, item["id"], loc["id"])}
+        for loc in locs
+    ]
+    ledger = conn.execute(
+        "SELECT l.*, loc.code AS location_code FROM erp_stock_ledger l"
+        " LEFT JOIN erp_locations loc ON loc.id = l.location_id"
+        " WHERE l.item_id = ? ORDER BY l.id DESC LIMIT 50",
+        (item["id"],)).fetchall()
+    conn.close()
+    d = dict(item)
+    d["stock_by_location"] = stock
+    d["on_hand_total"] = sum(s["on_hand"] for s in stock)
+    d["ledger"] = [dict(r) for r in ledger]
+    return jsonify(item=d)
+
+
+@app.get("/api/erp/stock")
+def erp_stock():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    type_filter = (request.args.get("type") or "").strip()
+    loc_filter = (request.args.get("location_id") or "").strip()
+    items = conn.execute(
+        "SELECT * FROM erp_items WHERE active = 1 ORDER BY type, name").fetchall()
+    locs = conn.execute(
+        "SELECT * FROM erp_locations WHERE active = 1 ORDER BY id").fetchall()
+    rows = []
+    for it in items:
+        if type_filter and it["type"] != type_filter:
+            continue
+        avg = int(it["avg_cost_cents"] or 0)
+        for loc in locs:
+            if loc_filter and str(loc["id"]) != loc_filter:
+                continue
+            q = _erp_on_hand(conn, it["id"], loc["id"])
+            rows.append({
+                "item_id": it["id"], "sku": it["sku"], "name": it["name"],
+                "type": it["type"], "unit": it["unit"], "avg_cost_cents": avg,
+                "location_id": loc["id"], "location_code": loc["code"],
+                "location_name": loc["name"], "on_hand": q,
+                "value_cents": int(round(q * avg)),
+            })
+    conn.close()
+    return jsonify(stock=rows)
+
+
+@app.get("/api/erp/ledger")
+def erp_ledger():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    clauses, params = [], []
+    item_id = request.args.get("item_id")
+    location_id = request.args.get("location_id")
+    if item_id:
+        clauses.append("l.item_id = ?")
+        params.append(int(item_id))
+    if location_id:
+        clauses.append("l.location_id = ?")
+        params.append(int(location_id))
+    try:
+        limit = min(int(request.args.get("limit", 100)), 500)
+    except (TypeError, ValueError):
+        limit = 100
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = conn.execute(
+        "SELECT l.*, i.sku, i.name AS item_name, loc.code AS location_code"
+        " FROM erp_stock_ledger l"
+        " LEFT JOIN erp_items i ON i.id = l.item_id"
+        " LEFT JOIN erp_locations loc ON loc.id = l.location_id"
+        + where + " ORDER BY l.id DESC LIMIT ?",
+        params + [limit]).fetchall()
+    conn.close()
+    return jsonify(movements=[dict(r) for r in rows])
+
+
+@app.post("/api/erp/adjust")
+def erp_adjust():
+    actor, err = _require_erp()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    item = _erp_get_item(conn, data.get("item_id"))
+    if not item or not item["active"]:
+        conn.close()
+        return jsonify(error="valid item_id is required"), 400
+    loc = _erp_get_location(conn, data.get("location_id"))
+    if not loc or not loc["active"]:
+        conn.close()
+        return jsonify(error="valid location_id is required"), 400
+    try:
+        qty = float(data.get("qty_change") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="qty_change must be a number"), 400
+    if qty == 0:
+        conn.close()
+        return jsonify(error="qty_change cannot be zero"), 400
+    reason = (data.get("reason") or "").strip()
+    if reason not in ERP_ADJUST_REASONS:
+        conn.close()
+        return jsonify(error="reason must be one of: " + ", ".join(ERP_ADJUST_REASONS)), 400
+    note = (data.get("note") or "").strip()
+    _erp_post_movement(conn, item["id"], loc["id"], qty, "adjustment", actor,
+                       ref_type="reason", ref_id=reason,
+                       unit_cost_cents=int(item["avg_cost_cents"] or 0), note=note)
+    conn.commit()
+    on_hand = _erp_on_hand(conn, item["id"], loc["id"])
+    conn.close()
+    return jsonify(ok=True, item_id=item["id"], location_id=loc["id"],
+                   on_hand=on_hand, reason=reason)
+
+
+@app.post("/api/erp/transfer")
+def erp_transfer():
+    actor, err = _require_erp()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    item = _erp_get_item(conn, data.get("item_id"))
+    if not item or not item["active"]:
+        conn.close()
+        return jsonify(error="valid item_id is required"), 400
+    src = _erp_get_location(conn, data.get("from_location_id"))
+    dst = _erp_get_location(conn, data.get("to_location_id"))
+    if not src or not src["active"] or not dst or not dst["active"]:
+        conn.close()
+        return jsonify(error="valid from_location_id and to_location_id are required"), 400
+    if src["id"] == dst["id"]:
+        conn.close()
+        return jsonify(error="source and destination must differ"), 400
+    try:
+        qty = float(data.get("qty") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="qty must be a number"), 400
+    if qty <= 0:
+        conn.close()
+        return jsonify(error="qty must be greater than zero"), 400
+    available = _erp_on_hand(conn, item["id"], src["id"])
+    if available + 1e-9 < qty:
+        conn.close()
+        return jsonify(error="insufficient stock at %s (have %s, need %s)"
+                              % (src["code"], _erp_fmt_qty(available), _erp_fmt_qty(qty))), 400
+    group = "TR-" + secrets.token_hex(4).upper()
+    avg = int(item["avg_cost_cents"] or 0)
+    note = (data.get("note") or "").strip()
+    _erp_post_movement(conn, item["id"], src["id"], -qty, "transfer_out", actor,
+                       ref_type="transfer", ref_id=group, unit_cost_cents=avg, note=note)
+    _erp_post_movement(conn, item["id"], dst["id"], qty, "transfer_in", actor,
+                       ref_type="transfer", ref_id=group, unit_cost_cents=avg, note=note)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, transfer_ref=group, item_id=item["id"],
+                   from_location_id=src["id"], to_location_id=dst["id"], qty=qty)
+
+
+@app.get("/api/erp/vendors")
+def erp_list_vendors():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    if request.args.get("include_inactive") == "1":
+        rows = conn.execute("SELECT * FROM erp_vendors ORDER BY name").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_vendors WHERE active = 1 ORDER BY name").fetchall()
+    conn.close()
+    return jsonify(vendors=[dict(r) for r in rows])
+
+
+@app.post("/api/erp/vendors")
+def erp_create_vendor():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    try:
+        lead_time = int(data.get("lead_time_days") or 0)
+    except (TypeError, ValueError):
+        lead_time = 0
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_vendors (name, contact_name, email, phone, payment_terms,"
+        " lead_time_days, notes, active, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+        (name, (data.get("contact_name") or "").strip(),
+         (data.get("email") or "").strip(), (data.get("phone") or "").strip(),
+         (data.get("payment_terms") or "").strip(), max(lead_time, 0),
+         (data.get("notes") or "").strip(), datetime.now(timezone.utc).isoformat()),
+    )
+    vendor_id = cur.lastrowid
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_vendors WHERE id = ?", (vendor_id,)).fetchone()
+    conn.close()
+    return jsonify(vendor=dict(row)), 201
+
+
+@app.post("/api/erp/vendors/<int:vendor_id>/deactivate")
+def erp_deactivate_vendor(vendor_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    vendor = conn.execute(
+        "SELECT * FROM erp_vendors WHERE id = ?", (vendor_id,)).fetchone()
+    if not vendor:
+        conn.close()
+        return jsonify(error="vendor not found"), 404
+    conn.execute("UPDATE erp_vendors SET active = 0 WHERE id = ?", (vendor_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, vendor_id=vendor_id)
+
+
+@app.get("/api/erp/purchase-orders")
+def erp_list_pos():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    status = (request.args.get("status") or "").strip()
+    if status and status in ERP_PO_STATUSES:
+        rows = conn.execute(
+            "SELECT * FROM erp_purchase_orders WHERE status = ? ORDER BY id DESC",
+            (status,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_purchase_orders ORDER BY id DESC").fetchall()
+    result = [_erp_po_summary(conn, po) for po in rows]
+    conn.close()
+    return jsonify(purchase_orders=result)
+
+
+@app.post("/api/erp/purchase-orders")
+def erp_create_po():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    try:
+        vendor_id = int(data.get("vendor_id") or 0)
+    except (TypeError, ValueError):
+        vendor_id = 0
+    vendor = conn.execute(
+        "SELECT * FROM erp_vendors WHERE id = ?", (vendor_id,)).fetchone()
+    if not vendor or not vendor["active"]:
+        conn.close()
+        return jsonify(error="valid vendor_id is required"), 400
+    raw_lines = data.get("lines") or []
+    if not raw_lines:
+        conn.close()
+        return jsonify(error="at least one line is required"), 400
+    clean = []
+    for entry in raw_lines:
+        item = _erp_get_item(conn, (entry or {}).get("item_id"))
+        if not item or not item["active"]:
+            conn.close()
+            return jsonify(error="every line needs a valid item_id"), 400
+        try:
+            qty = float(entry.get("qty_ordered") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        try:
+            cost = int(entry.get("unit_cost_cents") or 0)
+        except (TypeError, ValueError):
+            cost = 0
+        if qty <= 0:
+            conn.close()
+            return jsonify(error="qty_ordered must be greater than zero"), 400
+        if cost < 0:
+            conn.close()
+            return jsonify(error="unit_cost_cents cannot be negative"), 400
+        clean.append((item["id"], qty, cost))
+    try:
+        freight = int(data.get("freight_cents") or 0)
+        tax = int(data.get("tax_cents") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="freight_cents and tax_cents must be whole cents"), 400
+    if freight < 0 or tax < 0:
+        conn.close()
+        return jsonify(error="freight_cents and tax_cents cannot be negative"), 400
+    count = conn.execute("SELECT COUNT(*) AS c FROM erp_purchase_orders").fetchone()["c"]
+    po_number = "PO-%d" % (1001 + int(count))
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_purchase_orders (po_number, vendor_id, status, order_date,"
+        " expected_date, freight_cents, tax_cents, notes, created_by, created_at)"
+        " VALUES (?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)",
+        (po_number, vendor["id"], now[:10],
+         (data.get("expected_date") or "").strip(), freight, tax,
+         (data.get("notes") or "").strip(), actor, now),
+    )
+    po_id = cur.lastrowid
+    for item_id, qty, cost in clean:
+        conn.execute(
+            "INSERT INTO erp_po_lines (po_id, item_id, qty_ordered, qty_received,"
+            " unit_cost_cents) VALUES (?, ?, ?, 0, ?)",
+            (po_id, item_id, qty, cost),
+        )
+    conn.commit()
+    po = conn.execute(
+        "SELECT * FROM erp_purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    result = _erp_po_summary(conn, po)
+    conn.close()
+    return jsonify(purchase_order=result), 201
+
+
+@app.get("/api/erp/purchase-orders/<int:po_id>")
+def erp_get_po(po_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    po = conn.execute(
+        "SELECT * FROM erp_purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    if not po:
+        conn.close()
+        return jsonify(error="purchase order not found"), 404
+    vendor = conn.execute(
+        "SELECT * FROM erp_vendors WHERE id = ?", (po["vendor_id"],)).fetchone()
+    lines = conn.execute(
+        "SELECT l.*, i.sku, i.name AS item_name, i.type AS item_type, i.unit AS item_unit"
+        " FROM erp_po_lines l JOIN erp_items i ON i.id = l.item_id"
+        " WHERE l.po_id = ? ORDER BY l.id", (po_id,)).fetchall()
+    summary = _erp_po_summary(conn, po)
+    conn.close()
+    return jsonify(purchase_order=summary, vendor=dict(vendor) if vendor else None,
+                   lines=[dict(l) for l in lines])
+
+
+@app.post("/api/erp/purchase-orders/<int:po_id>/receive")
+def erp_po_receive(po_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    po = conn.execute(
+        "SELECT * FROM erp_purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    if not po:
+        conn.close()
+        return jsonify(error="purchase order not found"), 404
+    if po["status"] not in ("sent", "partial"):
+        conn.close()
+        return jsonify(
+            error="PO must be sent before receiving (status: %s)" % po["status"]), 400
+    lines = conn.execute(
+        "SELECT * FROM erp_po_lines WHERE po_id = ? ORDER BY id",
+        (po_id,)).fetchall()
+    by_id = {l["id"]: l for l in lines}
+    req_lines = data.get("lines") or []
+    if not req_lines:
+        conn.close()
+        return jsonify(error="lines is required"), 400
+    location_id = data.get("location_id")
+    if location_id is None:
+        hend = _erp_get_location_by_code(conn, "HEND")
+        location_id = hend["id"] if hend else None
+    loc = _erp_get_location(conn, location_id)
+    if not loc or not loc["active"]:
+        conn.close()
+        return jsonify(error="valid location_id is required"), 400
+    lot_code_in = (data.get("lot_code") or "").strip()
+    expiry_date = (data.get("expiry_date") or "").strip()
+    # Validate everything before writing (all-or-nothing).
+    todo = []
+    for entry in req_lines:
+        try:
+            line_id = int((entry or {}).get("line_id") or 0)
+        except (TypeError, ValueError):
+            line_id = 0
+        line = by_id.get(line_id)
+        if not line:
+            conn.close()
+            return jsonify(error="PO line not found"), 400
+        try:
+            qty = float(entry.get("qty_received") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="qty_received must be a number"), 400
+        remaining = float(line["qty_ordered"]) - float(line["qty_received"])
+        if qty <= 0 or qty > remaining + 1e-9:
+            conn.close()
+            return jsonify(
+                error="qty_received for line %d must be between 0 and %s"
+                      % (line["id"], _erp_fmt_qty(remaining))), 400
+        todo.append((line, qty))
+    total_ordered_value = sum(
+        float(l["qty_ordered"]) * int(l["unit_cost_cents"]) for l in lines)
+    total_receipt_qty = sum(qty for _, qty in todo)
+    freight = int(po["freight_cents"] or 0)
+    today = datetime.now(timezone.utc).date().isoformat()
+    received = []
+    for line, qty in todo:
+        unit_cost = int(line["unit_cost_cents"])
+        if total_ordered_value > 0:
+            alloc = freight * (qty * unit_cost) / total_ordered_value
+        elif total_receipt_qty > 0:
+            alloc = freight * qty / total_receipt_qty
+        else:
+            alloc = 0
+        landed = unit_cost + int(round(alloc / qty)) if qty else unit_cost
+        new_avg = _erp_new_avg_cost(conn, line["item_id"], qty, landed)
+        lot_code = lot_code_in or ("%s-L%d" % (po["po_number"], line["id"]))
+        _erp_post_movement(conn, line["item_id"], loc["id"], qty, "purchase_receipt",
+                           actor, ref_type="po", ref_id=po["po_number"],
+                           lot_code=lot_code, unit_cost_cents=landed,
+                           note="PO %s receive" % po["po_number"])
+        conn.execute("UPDATE erp_items SET avg_cost_cents = ? WHERE id = ?",
+                     (new_avg, line["item_id"]))
+        conn.execute("UPDATE erp_po_lines SET qty_received = qty_received + ? WHERE id = ?",
+                     (qty, line["id"]))
+        if lot_code or expiry_date:
+            conn.execute(
+                "INSERT INTO erp_lots (lot_code, item_id, supplier_lot, received_date,"
+                " expiry_date, location_id) VALUES (?, ?, '', ?, ?, ?)",
+                (lot_code, line["item_id"], today, expiry_date, loc["id"]),
+            )
+        received.append({"line_id": line["id"], "qty_received": qty,
+                         "landed_unit_cost_cents": landed,
+                         "new_avg_cost_cents": new_avg})
+    remaining_total = conn.execute(
+        "SELECT COALESCE(SUM(qty_ordered - qty_received), 0) AS r"
+        " FROM erp_po_lines WHERE po_id = ?", (po_id,)).fetchone()["r"]
+    new_status = "received" if float(remaining_total or 0) <= 1e-9 else "partial"
+    conn.execute("UPDATE erp_purchase_orders SET status = ? WHERE id = ?",
+                 (new_status, po_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, po_id=po_id, status=new_status, received=received)
+
+
+@app.post("/api/erp/purchase-orders/<int:po_id>/status")
+def erp_po_status(po_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    new_status = (data.get("status") or "").strip()
+    if new_status not in ERP_PO_STATUSES:
+        return jsonify(error="status must be one of: " + ", ".join(ERP_PO_STATUSES)), 400
+    conn = db()
+    po = conn.execute(
+        "SELECT * FROM erp_purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    if not po:
+        conn.close()
+        return jsonify(error="purchase order not found"), 404
+    allowed = ERP_PO_TRANSITIONS.get(po["status"], ())
+    if new_status not in allowed:
+        conn.close()
+        return jsonify(error="cannot move PO from %s to %s" % (po["status"], new_status)), 400
+    conn.execute("UPDATE erp_purchase_orders SET status = ? WHERE id = ?",
+                 (new_status, po_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, po_id=po_id, status=new_status)
+
+
+@app.get("/api/erp/reorder-rules")
+def erp_list_reorder_rules():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT r.*, i.sku, i.name AS item_name, l.code AS location_code,"
+        " v.name AS vendor_name FROM erp_reorder_rules r"
+        " JOIN erp_items i ON i.id = r.item_id"
+        " JOIN erp_locations l ON l.id = r.location_id"
+        " LEFT JOIN erp_vendors v ON v.id = r.preferred_vendor_id"
+        " ORDER BY i.name").fetchall()
+    conn.close()
+    return jsonify(reorder_rules=[dict(r) for r in rows])
+
+
+@app.post("/api/erp/reorder-rules")
+def erp_upsert_reorder_rule():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    item = _erp_get_item(conn, data.get("item_id"))
+    loc = _erp_get_location(conn, data.get("location_id"))
+    if not item or not item["active"] or not loc or not loc["active"]:
+        conn.close()
+        return jsonify(error="valid item_id and location_id are required"), 400
+    try:
+        reorder_point = float(data.get("reorder_point"))
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="reorder_point must be a number"), 400
+    try:
+        reorder_qty = float(data.get("reorder_qty") or 0)
+    except (TypeError, ValueError):
+        reorder_qty = 0
+    vendor_id = data.get("preferred_vendor_id") or 0
+    try:
+        vendor_id = int(vendor_id)
+    except (TypeError, ValueError):
+        vendor_id = 0
+    if vendor_id and not conn.execute(
+            "SELECT 1 FROM erp_vendors WHERE id = ?", (vendor_id,)).fetchone():
+        conn.close()
+        return jsonify(error="preferred_vendor_id not found"), 400
+    existing = conn.execute(
+        "SELECT id FROM erp_reorder_rules WHERE item_id = ? AND location_id = ?",
+        (item["id"], loc["id"])).fetchone()
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        conn.execute(
+            "UPDATE erp_reorder_rules SET reorder_point = ?, reorder_qty = ?,"
+            " preferred_vendor_id = ? WHERE id = ?",
+            (reorder_point, reorder_qty, vendor_id, existing["id"]))
+        rule_id = existing["id"]
+    else:
+        cur = conn.execute(
+            "INSERT INTO erp_reorder_rules (item_id, location_id, reorder_point,"
+            " reorder_qty, preferred_vendor_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (item["id"], loc["id"], reorder_point, reorder_qty, vendor_id, now))
+        rule_id = cur.lastrowid
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_reorder_rules WHERE id = ?", (rule_id,)).fetchone()
+    conn.close()
+    return jsonify(reorder_rule=dict(row))
+
+
+@app.get("/api/erp/alerts/low-stock")
+def erp_low_stock():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    rules = conn.execute(
+        "SELECT r.*, i.sku, i.name AS item_name, i.unit, l.code AS location_code"
+        " FROM erp_reorder_rules r"
+        " JOIN erp_items i ON i.id = r.item_id"
+        " JOIN erp_locations l ON l.id = r.location_id").fetchall()
+    alerts = []
+    for r in rules:
+        on_hand = _erp_on_hand(conn, r["item_id"], r["location_id"])
+        if on_hand <= float(r["reorder_point"]):
+            alerts.append({
+                "item_id": r["item_id"], "sku": r["sku"], "item_name": r["item_name"],
+                "unit": r["unit"], "location_id": r["location_id"],
+                "location_code": r["location_code"], "on_hand": on_hand,
+                "reorder_point": float(r["reorder_point"]),
+                "reorder_qty": float(r["reorder_qty"]),
+                "preferred_vendor_id": r["preferred_vendor_id"],
+            })
+    conn.close()
+    return jsonify(alerts=alerts, count=len(alerts))
+
+
+@app.post("/api/erp/seed")
+def erp_seed():
+    """One-time import of opening balances. Refuses to run twice."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    already = conn.execute(
+        "SELECT 1 FROM erp_stock_ledger WHERE movement_type = 'opening_balance'"
+        " LIMIT 1").fetchone()
+    if already:
+        conn.close()
+        return jsonify(error="opening balances have already been seeded"), 400
+    rows = data.get("rows") or []
+    if not rows:
+        conn.close()
+        return jsonify(error="rows is required"), 400
+    # Validate everything before writing (all-or-nothing).
+    plan = []
+    for n, entry in enumerate(rows, 1):
+        entry = entry or {}
+        item = conn.execute(
+            "SELECT * FROM erp_items WHERE sku = ?", ((entry.get("sku") or "").strip(),)
+        ).fetchone()
+        if not item or not item["active"]:
+            conn.close()
+            return jsonify(error="row %d: unknown sku '%s'" % (n, entry.get("sku"))), 400
+        loc = _erp_get_location_by_code(conn, entry.get("location_code"))
+        if not loc or not loc["active"]:
+            conn.close()
+            return jsonify(error="row %d: unknown location_code '%s'"
+                                 % (n, entry.get("location_code"))), 400
+        try:
+            qty = float(entry.get("qty") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="row %d: qty must be a number" % n), 400
+        if qty <= 0:
+            conn.close()
+            return jsonify(error="row %d: qty must be greater than zero" % n), 400
+        try:
+            cost = int(entry.get("unit_cost_cents") or 0)
+        except (TypeError, ValueError):
+            cost = 0
+        plan.append((item, loc, qty,
+                     (entry.get("lot_code") or "").strip(),
+                     (entry.get("expiry_date") or "").strip(), cost))
+    today = datetime.now(timezone.utc).date().isoformat()
+    for item, loc, qty, lot_code, expiry_date, cost in plan:
+        if cost > 0:
+            new_avg = _erp_new_avg_cost(conn, item["id"], qty, cost)
+        else:
+            new_avg = None
+        _erp_post_movement(conn, item["id"], loc["id"], qty, "opening_balance", actor,
+                           unit_cost_cents=cost, lot_code=lot_code,
+                           note="Opening balance seed")
+        if new_avg is not None:
+            conn.execute("UPDATE erp_items SET avg_cost_cents = ? WHERE id = ?",
+                         (new_avg, item["id"]))
+        if lot_code or expiry_date:
+            conn.execute(
+                "INSERT INTO erp_lots (lot_code, item_id, supplier_lot, received_date,"
+                " expiry_date, location_id) VALUES (?, ?, '', ?, ?, ?)",
+                (lot_code, item["id"], today, expiry_date, loc["id"]),
+            )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, imported=len(plan))
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
