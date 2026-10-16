@@ -1616,6 +1616,16 @@ MERCH_REWARDS = [
     {"sku": "MERCH-HOODIE", "kernels": 900},
 ]
 
+# Employee merch pricing — same items, lower kernel costs.
+STAFF_MERCH_REWARDS = [
+    {"sku": "MERCH-STICKERS", "kernels": 100},
+    {"sku": "MERCH-MUG", "kernels": 200},
+    {"sku": "MERCH-TEE", "kernels": 300},
+    {"sku": "MERCH-STRAW-TUMBLER", "kernels": 400},
+    {"sku": "MERCH-STEEL-TUMBLER", "kernels": 500},
+    {"sku": "MERCH-HOODIE", "kernels": 600},
+]
+
 
 def merch_rewards_for_balance(kernel_balance):
     """Return list of {kernels, sku, name, price_cents, sizes}
@@ -1641,6 +1651,14 @@ def merch_rewards_for_balance(kernel_balance):
 def merch_reward_for_sku(sku, kernel_balance):
     """Find the merch reward for a SKU if the balance covers it, else None."""
     for reward in MERCH_REWARDS:
+        if reward["sku"] == sku and kernel_balance >= reward["kernels"]:
+            return reward
+    return None
+
+
+def staff_merch_reward_for_sku(sku, kernel_balance):
+    """Find the staff merch reward for a SKU if the balance covers it, else None."""
+    for reward in STAFF_MERCH_REWARDS:
         if reward["sku"] == sku and kernel_balance >= reward["kernels"]:
             return reward
     return None
@@ -1696,7 +1714,7 @@ def loyalty_redeem_merch():
         return jsonify(error="invalid merch selection"), 400
     with _db() as conn:
         balance = _kernel_balance(conn, user["id"])
-    reward = merch_reward_for_sku(sku, balance)
+    reward = staff_merch_reward_for_sku(sku, balance)
     if not reward:
         return jsonify(error="not enough kernels for this item"), 400
     code = _new_merch_code()
@@ -1728,7 +1746,7 @@ def staff_redeem_merch():
     with _db() as conn:
         row = conn.execute("SELECT kernels FROM staff WHERE id = ?", (staff["id"],)).fetchone()
         balance = row["kernels"] if row else 0
-    reward = merch_reward_for_sku(sku, balance)
+    reward = staff_merch_reward_for_sku(sku, balance)
     if not reward:
         return jsonify(error="not enough kernels for this item"), 400
     now = _now_iso()
@@ -1927,17 +1945,21 @@ def _compute_order(data):
         return None, (jsonify(error="invalid email"), 400)
     try:
         shipping_cents = int(data.get("shipping_cents") or 0)
+        merch_shipping_cents = int(data.get("merch_shipping_cents") or 0)
     except (TypeError, ValueError):
         return None, (jsonify(error="invalid shipping"), 400)
     shipping_label = (data.get("shipping_label") or "").strip()[:120]
     if shipping_cents < 0 or shipping_cents > 100000:
         return None, (jsonify(error="invalid shipping"), 400)
+    if merch_shipping_cents < 0 or merch_shipping_cents > 100000:
+        return None, (jsonify(error="invalid merch shipping"), 400)
 
     order = {
         "items": items,
         "merchandise_total": total,
         "email": email,
         "shipping_cents": shipping_cents,
+        "merch_shipping_cents": merch_shipping_cents,
         "shipping_label": shipping_label,
         "discount_kind": None,
         "promo_code": "",
@@ -2083,6 +2105,17 @@ def create_order_checkout():
                     "product_data": {
                         "name": f"Shipping{f' ({order['shipping_label']})' if order['shipping_label'] else ''}"
                     },
+                },
+                "quantity": 1,
+            }
+        )
+    if order.get("merch_shipping_cents", 0) > 0:
+        line_items.append(
+            {
+                "price_data": {
+                    "currency": "usd",
+                    "unit_amount": order["merch_shipping_cents"],
+                    "product_data": {"name": "Merch shipping (Printful)"},
                 },
                 "quantity": 1,
             }
@@ -2876,8 +2909,8 @@ LOYALTY_TIER_BUTTERY_AT = int(os.environ.get("LOYALTY_TIER_BUTTERY_AT", "300"))
 LOYALTY_TIER_GOLDEN_AT = int(os.environ.get("LOYALTY_TIER_GOLDEN_AT", "1000"))
 
 REWARD_TIERS = {
-    "free_shipping": {"kernels": 25, "label": "Free shipping on one order"},
     "free_bag": {"kernels": 50, "label": "Free single bag"},
+    "free_shipping": {"kernels": 100, "label": "Free shipping on one order"},
     "free_3pack": {"kernels": 150, "label": "Free 3-pack"},
     "free_6pack": {"kernels": 300, "label": "Free 6-pack"},
 }
@@ -2888,7 +2921,6 @@ STAFF_REWARD_TIERS = {
     "free_6pack": {"kernels": 50, "label": "Free 6-pack", "kind": "popcorn"},
     "giftcard_10": {"kernels": 75, "label": "$10 gift card of your choice",
                     "kind": "giftcard_choice", "amount_cents": 1000},
-    "merch_item": {"kernels": 100, "label": "Free merch item", "kind": "merch"},
     "giftcard_25": {"kernels": 150, "label": "$25 gift card of your choice",
                     "kind": "giftcard_choice", "amount_cents": 2500},
 }
