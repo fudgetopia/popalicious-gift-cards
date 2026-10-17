@@ -649,6 +649,56 @@ def init_db():
             preferred_vendor_id INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS erp_recipes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            batch_size_bags REAL NOT NULL DEFAULT 0,
+            version INTEGER NOT NULL DEFAULT 1,
+            active INTEGER NOT NULL DEFAULT 1,
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_recipe_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipe_id INTEGER NOT NULL,
+            recipe_version INTEGER NOT NULL DEFAULT 1,
+            item_id INTEGER NOT NULL,
+            qty_per_batch REAL NOT NULL,
+            unit TEXT NOT NULL DEFAULT 'each',
+            notes TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_recipe_lines ON erp_recipe_lines (recipe_id, recipe_version);
+        CREATE TABLE IF NOT EXISTS erp_production_batches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_number TEXT UNIQUE NOT NULL,
+            recipe_id INTEGER NOT NULL,
+            recipe_version INTEGER NOT NULL DEFAULT 1,
+            planned_qty_bags REAL NOT NULL,
+            actual_qty_bags REAL NOT NULL DEFAULT 0,
+            waste_qty_bags REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'planned',
+            lot_code TEXT NOT NULL DEFAULT '',
+            expiry_date TEXT NOT NULL DEFAULT '',
+            location_id INTEGER NOT NULL,
+            order_ref TEXT NOT NULL DEFAULT '',
+            total_cost_cents INTEGER NOT NULL DEFAULT 0,
+            produced_by TEXT NOT NULL DEFAULT '',
+            started_at TEXT NOT NULL DEFAULT '',
+            completed_at TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_batch_ingredients (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            lot_code TEXT NOT NULL DEFAULT '',
+            qty_used REAL NOT NULL,
+            unit TEXT NOT NULL DEFAULT 'each',
+            unit_cost_cents INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_batch_ingredients ON erp_batch_ingredients (batch_id);
         INSERT OR IGNORE INTO erp_locations (code, name, type, active) VALUES
          ('HEND', 'Henderson Warehouse', 'warehouse', 1),
          ('EVT', 'Events / Mobile', 'mobile', 1),
@@ -8065,6 +8115,646 @@ def erp_seed():
     conn.commit()
     conn.close()
     return jsonify(ok=True, imported=len(plan))
+
+
+# ---------------- ERP Phase 2: Production ----------------
+# Recipes, production batches, lot traceability. Builds on the Phase 1
+# immutable ledger: completing a batch posts production_out movements.
+# (Tables are created in init_db() above.)
+
+ERP_BATCH_STATUSES = ("planned", "in_progress", "completed", "cancelled",
+                      "reversed")
+
+
+def _erp_get_recipe(conn, recipe_id):
+    try:
+        recipe_id = int(recipe_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
+                        (recipe_id,)).fetchone()
+
+
+def _erp_recipe_lines(conn, recipe_id, version):
+    return conn.execute(
+        "SELECT rl.*, i.sku, i.name AS item_name, i.type AS item_type,"
+        " i.unit AS item_unit FROM erp_recipe_lines rl"
+        " JOIN erp_items i ON i.id = rl.item_id"
+        " WHERE rl.recipe_id = ? AND rl.recipe_version = ? ORDER BY rl.id",
+        (recipe_id, version)).fetchall()
+
+
+def _erp_get_batch(conn, batch_id):
+    try:
+        batch_id = int(batch_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_production_batches WHERE id = ?",
+                        (batch_id,)).fetchone()
+
+
+def _erp_lot_balances(conn, item_id, location_id):
+    """FIFO-ordered lot balances for an item at a location, from the ledger.
+
+    Returns [(lot_code, on_hand, first_seen), ...], oldest first.
+    Stock without a lot code is not listed here (handled as remainder).
+    """
+    rows = conn.execute(
+        "SELECT lot_code, COALESCE(SUM(qty_change), 0) AS q,"
+        " MIN(created_at) AS first_seen FROM erp_stock_ledger"
+        " WHERE item_id = ? AND location_id = ? AND lot_code != ''"
+        " GROUP BY lot_code HAVING q > 1e-9 ORDER BY first_seen",
+        (item_id, location_id)).fetchall()
+    return [(r["lot_code"], float(r["q"]), r["first_seen"]) for r in rows]
+
+
+def _erp_expiry_plus_months(date_str, months):
+    """'YYYY-MM-DD' + months -> 'YYYY-MM-DD', day clamped to month end."""
+    import calendar
+    y, m, d = (int(x) for x in date_str.split("-"))
+    m += months
+    y += (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    d = min(d, calendar.monthrange(y, m)[1])
+    return "%04d-%02d-%02d" % (y, m, d)
+
+
+def _erp_validate_recipe_lines(conn, lines):
+    """Validate recipe lines. Returns (clean_lines, error)."""
+    clean = []
+    seen = set()
+    for n, ln in enumerate(lines or [], 1):
+        ln = ln or {}
+        item = _erp_get_item(conn, ln.get("item_id"))
+        if not item or not item["active"]:
+            return None, "line %d: valid item_id is required" % n
+        if item["id"] in seen:
+            return None, "line %d: duplicate item '%s'" % (n, item["sku"])
+        seen.add(item["id"])
+        try:
+            qty = float(ln.get("qty_per_batch") or 0)
+        except (TypeError, ValueError):
+            return None, "line %d: qty_per_batch must be a number" % n
+        if qty <= 0:
+            return None, "line %d: qty_per_batch must be greater than zero" % n
+        unit = (ln.get("unit") or item["unit"] or "each").strip()
+        clean.append({"item_id": item["id"], "qty_per_batch": qty,
+                      "unit": unit, "notes": (ln.get("notes") or "").strip()})
+    if not clean:
+        return None, "at least one recipe line is required"
+    return clean, None
+
+
+def _erp_batch_shortfalls(conn, lines, planned_qty, batch_size, location_id):
+    """Check ingredient availability for a planned batch.
+
+    Returns [(sku, item_name, unit, required, on_hand), ...] for shortfalls.
+    """
+    short = []
+    if batch_size <= 0:
+        return short
+    scale = float(planned_qty) / float(batch_size)
+    for ln in lines:
+        required = float(ln["qty_per_batch"]) * scale
+        on_hand = _erp_on_hand(conn, ln["item_id"], location_id)
+        if on_hand + 1e-9 < required:
+            item = _erp_get_item(conn, ln["item_id"])
+            short.append({"item_id": ln["item_id"], "sku": item["sku"],
+                          "item_name": item["name"], "unit": ln["unit"],
+                          "required": required, "on_hand": on_hand})
+    return short
+
+
+@app.get("/api/erp/recipes")
+def erp_list_recipes():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT r.*, (SELECT COUNT(*) FROM erp_recipe_lines rl"
+        " WHERE rl.recipe_id = r.id AND rl.recipe_version = r.version) AS line_count,"
+        " (SELECT COUNT(DISTINCT recipe_version) FROM erp_recipe_lines rl"
+        " WHERE rl.recipe_id = r.id) AS versions"
+        " FROM erp_recipes r WHERE r.active = 1 ORDER BY r.name").fetchall()
+    conn.close()
+    return jsonify(recipes=[dict(r) for r in rows])
+
+
+@app.post("/api/erp/recipes")
+def erp_create_recipe():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    try:
+        batch_size = float(data.get("batch_size_bags") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="batch_size_bags must be a number"), 400
+    if batch_size <= 0:
+        return jsonify(error="batch_size_bags must be greater than zero"), 400
+    conn = db()
+    clean, err_msg = _erp_validate_recipe_lines(conn, data.get("lines"))
+    if err_msg:
+        conn.close()
+        return jsonify(error=err_msg), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_recipes (name, batch_size_bags, version, active, notes,"
+        " created_by, created_at) VALUES (?, ?, 1, 1, ?, ?, ?)",
+        (name, batch_size, (data.get("notes") or "").strip(), actor, now))
+    recipe_id = cur.lastrowid
+    for ln in clean:
+        conn.execute(
+            "INSERT INTO erp_recipe_lines (recipe_id, recipe_version, item_id,"
+            " qty_per_batch, unit, notes) VALUES (?, 1, ?, ?, ?, ?)",
+            (recipe_id, ln["item_id"], ln["qty_per_batch"], ln["unit"],
+             ln["notes"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
+                       (recipe_id,)).fetchone()
+    lines = _erp_recipe_lines(conn, recipe_id, 1)
+    conn.close()
+    return jsonify(recipe=dict(row), lines=[dict(l) for l in lines]), 201
+
+
+@app.get("/api/erp/recipes/<int:recipe_id>")
+def erp_get_recipe(recipe_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    version = request.args.get("version")
+    try:
+        version = int(version) if version else recipe["version"]
+    except (TypeError, ValueError):
+        version = recipe["version"]
+    lines = _erp_recipe_lines(conn, recipe_id, version)
+    versions = [r["recipe_version"] for r in conn.execute(
+        "SELECT DISTINCT recipe_version FROM erp_recipe_lines"
+        " WHERE recipe_id = ? ORDER BY recipe_version", (recipe_id,)).fetchall()]
+    conn.close()
+    return jsonify(recipe=dict(recipe), version=version,
+                   lines=[dict(l) for l in lines], versions=versions)
+
+
+@app.put("/api/erp/recipes/<int:recipe_id>")
+def erp_update_recipe(recipe_id):
+    """Edit a recipe by creating a new version. Old batches keep the old version."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    new_version = int(recipe["version"]) + 1
+    name = (data.get("name") or "").strip() or recipe["name"]
+    try:
+        batch_size = float(data.get("batch_size_bags") or recipe["batch_size_bags"])
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="batch_size_bags must be a number"), 400
+    if batch_size <= 0:
+        conn.close()
+        return jsonify(error="batch_size_bags must be greater than zero"), 400
+    if "lines" in data:
+        clean, err_msg = _erp_validate_recipe_lines(conn, data.get("lines"))
+        if err_msg:
+            conn.close()
+            return jsonify(error=err_msg), 400
+    else:
+        old_lines = _erp_recipe_lines(conn, recipe_id, recipe["version"])
+        clean = [{"item_id": l["item_id"], "qty_per_batch": float(l["qty_per_batch"]),
+                  "unit": l["unit"], "notes": l["notes"]} for l in old_lines]
+    notes = data.get("notes")
+    notes = recipe["notes"] if notes is None else (notes or "").strip()
+    conn.execute(
+        "UPDATE erp_recipes SET name = ?, batch_size_bags = ?, version = ?,"
+        " notes = ? WHERE id = ?",
+        (name, batch_size, new_version, notes, recipe_id))
+    for ln in clean:
+        conn.execute(
+            "INSERT INTO erp_recipe_lines (recipe_id, recipe_version, item_id,"
+            " qty_per_batch, unit, notes) VALUES (?, ?, ?, ?, ?, ?)",
+            (recipe_id, new_version, ln["item_id"], ln["qty_per_batch"],
+             ln["unit"], ln["notes"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
+                       (recipe_id,)).fetchone()
+    lines = _erp_recipe_lines(conn, recipe_id, new_version)
+    conn.close()
+    return jsonify(recipe=dict(row), lines=[dict(l) for l in lines])
+
+
+@app.post("/api/erp/recipes/import")
+def erp_import_recipes():
+    """CSV import of recipes. Columns: recipe_name, batch_size_bags, sku,
+    qty_per_batch, unit, notes. One row per recipe line; rows sharing a
+    recipe_name belong to the same recipe (first batch_size_bags wins)."""
+    import csv
+    import io
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    text = data.get("csv") or ""
+    if not text.strip():
+        return jsonify(error="csv text is required"), 400
+    conn = db()
+    reader = csv.DictReader(io.StringIO(text))
+    grouped = {}
+    order = []
+    for n, row in enumerate(reader, 2):
+        row = { (k or "").strip(): (v or "").strip() for k, v in row.items() }
+        rname = row.get("recipe_name") or ""
+        if not rname:
+            conn.close()
+            return jsonify(error="row %d: recipe_name is required" % n), 400
+        try:
+            batch_size = float(row.get("batch_size_bags") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="row %d: batch_size_bags must be a number" % n), 400
+        if batch_size <= 0:
+            conn.close()
+            return jsonify(error="row %d: batch_size_bags must be > 0" % n), 400
+        item = conn.execute("SELECT * FROM erp_items WHERE sku = ?",
+                            (row.get("sku") or "",)).fetchone()
+        if not item or not item["active"]:
+            conn.close()
+            return jsonify(error="row %d: unknown sku '%s'" % (n, row.get("sku"))), 400
+        try:
+            qty = float(row.get("qty_per_batch") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="row %d: qty_per_batch must be a number" % n), 400
+        if qty <= 0:
+            conn.close()
+            return jsonify(error="row %d: qty_per_batch must be > 0" % n), 400
+        if rname not in grouped:
+            grouped[rname] = {"batch_size_bags": batch_size,
+                              "notes": row.get("notes") or "", "lines": []}
+            order.append(rname)
+        grouped[rname]["lines"].append({
+            "item_id": item["id"], "qty_per_batch": qty,
+            "unit": row.get("unit") or item["unit"] or "each", "notes": ""})
+    if not grouped:
+        conn.close()
+        return jsonify(error="no recipe rows found"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    created = 0
+    for rname in order:
+        g = grouped[rname]
+        clean, err_msg = _erp_validate_recipe_lines(conn, g["lines"])
+        if err_msg:
+            conn.close()
+            return jsonify(error="recipe '%s': %s" % (rname, err_msg)), 400
+        cur = conn.execute(
+            "INSERT INTO erp_recipes (name, batch_size_bags, version, active,"
+            " notes, created_by, created_at) VALUES (?, ?, 1, 1, ?, ?, ?)",
+            (rname, g["batch_size_bags"], g["notes"], actor, now))
+        rid = cur.lastrowid
+        for ln in clean:
+            conn.execute(
+                "INSERT INTO erp_recipe_lines (recipe_id, recipe_version, item_id,"
+                " qty_per_batch, unit, notes) VALUES (?, 1, ?, ?, ?, ?)",
+                (rid, ln["item_id"], ln["qty_per_batch"], ln["unit"], ln["notes"]))
+        created += 1
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, imported=created)
+
+
+def _erp_batch_dict(conn, batch):
+    d = dict(batch)
+    recipe = _erp_get_recipe(conn, batch["recipe_id"])
+    d["recipe_name"] = recipe["name"] if recipe else ""
+    loc = _erp_get_location(conn, batch["location_id"])
+    d["location_code"] = loc["code"] if loc else ""
+    if batch["total_cost_cents"] and batch["actual_qty_bags"]:
+        d["cost_per_bag_cents"] = int(round(
+            float(batch["total_cost_cents"]) / float(batch["actual_qty_bags"])))
+    else:
+        d["cost_per_bag_cents"] = None
+    return d
+
+
+@app.get("/api/erp/batches")
+def erp_list_batches():
+    actor, err = _require_erp()
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    conn = db()
+    if status and status in ERP_BATCH_STATUSES:
+        rows = conn.execute(
+            "SELECT * FROM erp_production_batches WHERE status = ?"
+            " ORDER BY id DESC", (status,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_production_batches ORDER BY id DESC").fetchall()
+    out = [_erp_batch_dict(conn, b) for b in rows]
+    conn.close()
+    return jsonify(batches=out)
+
+
+@app.post("/api/erp/batches")
+def erp_create_batch():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    recipe = _erp_get_recipe(conn, data.get("recipe_id"))
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="valid recipe_id is required"), 400
+    try:
+        planned = float(data.get("planned_qty_bags") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="planned_qty_bags must be a number"), 400
+    if planned <= 0:
+        conn.close()
+        return jsonify(error="planned_qty_bags must be greater than zero"), 400
+    loc = _erp_get_location(conn, data.get("location_id"))
+    if not loc:
+        loc = _erp_get_location_by_code(conn, "HEND")
+    if not loc or not loc["active"]:
+        conn.close()
+        return jsonify(error="valid location_id is required"), 400
+    lines = _erp_recipe_lines(conn, recipe["id"], recipe["version"])
+    if not lines:
+        conn.close()
+        return jsonify(error="recipe has no lines"), 400
+    shortfalls = _erp_batch_shortfalls(
+        conn, [{"item_id": l["item_id"], "qty_per_batch": float(l["qty_per_batch"]),
+                "unit": l["unit"]} for l in lines],
+        planned, float(recipe["batch_size_bags"]), loc["id"])
+    count = conn.execute("SELECT COUNT(*) AS c FROM erp_production_batches").fetchone()["c"]
+    batch_number = "B-%d" % (1001 + int(count))
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_production_batches (batch_number, recipe_id, recipe_version,"
+        " planned_qty_bags, status, location_id, order_ref, produced_by, notes,"
+        " created_at) VALUES (?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?)",
+        (batch_number, recipe["id"], recipe["version"], planned, loc["id"],
+         (data.get("order_ref") or "").strip(), actor,
+         (data.get("notes") or "").strip(), now))
+    batch_id = cur.lastrowid
+    conn.commit()
+    batch = conn.execute("SELECT * FROM erp_production_batches WHERE id = ?",
+                         (batch_id,)).fetchone()
+    out = _erp_batch_dict(conn, batch)
+    out["shortfalls"] = shortfalls
+    conn.close()
+    return jsonify(batch=out), 201
+
+
+@app.get("/api/erp/batches/<int:batch_id>")
+def erp_get_batch(batch_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    lines = _erp_recipe_lines(conn, batch["recipe_id"], batch["recipe_version"])
+    scale = 0
+    if float(batch["recipe_id"] or 0):
+        recipe = _erp_get_recipe(conn, batch["recipe_id"])
+        bs = float(recipe["batch_size_bags"]) if recipe else 0
+        base_qty = float(batch["actual_qty_bags"] or batch["planned_qty_bags"])
+        scale = (base_qty / bs) if bs > 0 else 0
+    scaled = []
+    for l in lines:
+        d = dict(l)
+        d["qty_for_batch"] = float(l["qty_per_batch"]) * scale
+        d["on_hand"] = _erp_on_hand(conn, l["item_id"], batch["location_id"])
+        scaled.append(d)
+    used = [dict(r) for r in conn.execute(
+        "SELECT bi.*, i.sku, i.name AS item_name FROM erp_batch_ingredients bi"
+        " JOIN erp_items i ON i.id = bi.item_id"
+        " WHERE bi.batch_id = ? ORDER BY bi.id", (batch_id,)).fetchall()]
+    out = _erp_batch_dict(conn, batch)
+    conn.close()
+    out["recipe_lines"] = scaled
+    out["ingredients_used"] = used
+    return jsonify(batch=out)
+
+
+@app.post("/api/erp/batches/<int:batch_id>/start")
+def erp_batch_start(batch_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    if batch["status"] != "planned":
+        conn.close()
+        return jsonify(error="only planned batches can be started"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_production_batches SET status = 'in_progress', started_at = ?,"
+        " produced_by = ? WHERE id = ?", (now, actor, batch_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, batch_id=batch_id, status="in_progress")
+
+
+@app.post("/api/erp/batches/<int:batch_id>/complete")
+def erp_batch_complete(batch_id):
+    """Complete a batch: consume ingredients (FIFO lots) via production_out
+    movements, snapshot costs, stamp lot code + 6-month expiry. All-or-nothing."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    if batch["status"] != "in_progress":
+        conn.close()
+        return jsonify(error="only in-progress batches can be completed"), 400
+    try:
+        actual = float(data.get("actual_qty_bags") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="actual_qty_bags must be a number"), 400
+    if actual <= 0:
+        conn.close()
+        return jsonify(error="actual_qty_bags must be greater than zero"), 400
+    try:
+        waste = float(data.get("waste_qty_bags") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="waste_qty_bags must be a number"), 400
+    if waste < 0:
+        conn.close()
+        return jsonify(error="waste_qty_bags cannot be negative"), 400
+    recipe = _erp_get_recipe(conn, batch["recipe_id"])
+    batch_size = float(recipe["batch_size_bags"]) if recipe else 0
+    if batch_size <= 0:
+        conn.close()
+        return jsonify(error="recipe has invalid batch size"), 400
+    lines = _erp_recipe_lines(conn, batch["recipe_id"], batch["recipe_version"])
+    if not lines:
+        conn.close()
+        return jsonify(error="recipe has no lines"), 400
+    # Validate stock for everything BEFORE writing (all-or-nothing).
+    scale = actual / batch_size
+    plan = []
+    for l in lines:
+        need = float(l["qty_per_batch"]) * scale
+        on_hand = _erp_on_hand(conn, l["item_id"], batch["location_id"])
+        if on_hand + 1e-9 < need:
+            conn.close()
+            return jsonify(error="insufficient stock of %s (have %s %s, need %s %s)"
+                           % (l["sku"], _erp_fmt_qty(on_hand), l["unit"],
+                              _erp_fmt_qty(need), l["unit"])), 400
+        plan.append((l, need))
+    # Consume FIFO lots, post movements, snapshot costs.
+    total_cost = 0
+    today = datetime.now(timezone.utc).date()
+    today_s = today.isoformat()
+    lot_code = "%s-%s" % (today_s.replace("-", ""), batch["batch_number"])
+    expiry = _erp_expiry_plus_months(today_s, 6)
+    for l, need in plan:
+        item = _erp_get_item(conn, l["item_id"])
+        avg = int(item["avg_cost_cents"] or 0)
+        remaining = need
+        if item["track_lots"]:
+            for lcode, lqty, _ in _erp_lot_balances(conn, item["id"],
+                                                    batch["location_id"]):
+                if remaining <= 1e-9:
+                    break
+                take = min(lqty, remaining)
+                _erp_post_movement(conn, item["id"], batch["location_id"], -take,
+                                   "production_out", actor, ref_type="batch",
+                                   ref_id=batch["batch_number"], lot_code=lcode,
+                                   unit_cost_cents=avg,
+                                   note="Batch %s" % batch["batch_number"])
+                conn.execute(
+                    "INSERT INTO erp_batch_ingredients (batch_id, item_id, lot_code,"
+                    " qty_used, unit, unit_cost_cents) VALUES (?, ?, ?, ?, ?, ?)",
+                    (batch_id, item["id"], lcode, take, l["unit"], avg))
+                total_cost += take * avg
+                remaining -= take
+        if remaining > 1e-9:
+            _erp_post_movement(conn, item["id"], batch["location_id"], -remaining,
+                               "production_out", actor, ref_type="batch",
+                               ref_id=batch["batch_number"], lot_code="",
+                               unit_cost_cents=avg,
+                               note="Batch %s" % batch["batch_number"])
+            conn.execute(
+                "INSERT INTO erp_batch_ingredients (batch_id, item_id, lot_code,"
+                " qty_used, unit, unit_cost_cents) VALUES (?, ?, '', ?, ?, ?)",
+                (batch_id, item["id"], remaining, l["unit"], avg))
+            total_cost += remaining * avg
+    total_cost_cents = int(round(total_cost))
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_production_batches SET status = 'completed',"
+        " actual_qty_bags = ?, waste_qty_bags = ?, lot_code = ?, expiry_date = ?,"
+        " total_cost_cents = ?, completed_at = ?, produced_by = ? WHERE id = ?",
+        (actual, waste, lot_code, expiry, total_cost_cents, now, actor, batch_id))
+    conn.commit()
+    batch = conn.execute("SELECT * FROM erp_production_batches WHERE id = ?",
+                         (batch_id,)).fetchone()
+    out = _erp_batch_dict(conn, batch)
+    conn.close()
+    return jsonify(batch=out)
+
+
+@app.post("/api/erp/batches/<int:batch_id>/cancel")
+def erp_batch_cancel(batch_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    if batch["status"] not in ("planned", "in_progress"):
+        conn.close()
+        return jsonify(error="only planned or in-progress batches can be cancelled"), 400
+    conn.execute("UPDATE erp_production_batches SET status = 'cancelled' WHERE id = ?",
+                 (batch_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, batch_id=batch_id, status="cancelled")
+
+
+@app.post("/api/erp/batches/<int:batch_id>/reverse")
+def erp_batch_reverse(batch_id):
+    """Reverse a completed batch: post compensating production_reversal movements
+    (stock back in) and mark the batch reversed. Never edits history."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    if batch["status"] != "completed":
+        conn.close()
+        return jsonify(error="only completed batches can be reversed"), 400
+    used = conn.execute(
+        "SELECT * FROM erp_batch_ingredients WHERE batch_id = ?",
+        (batch_id,)).fetchall()
+    for u in used:
+        _erp_post_movement(conn, u["item_id"], batch["location_id"],
+                           float(u["qty_used"]), "production_reversal", actor,
+                           ref_type="batch", ref_id=batch["batch_number"],
+                           lot_code=u["lot_code"],
+                           unit_cost_cents=int(u["unit_cost_cents"] or 0),
+                           note="Reversal of batch %s" % batch["batch_number"])
+    conn.execute("UPDATE erp_production_batches SET status = 'reversed' WHERE id = ?",
+                 (batch_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, batch_id=batch_id, status="reversed")
+
+
+@app.get("/api/erp/batches/<int:batch_id>/trace")
+def erp_batch_trace(batch_id):
+    """Lot traceability: finished lot -> ingredient lots used."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    used = [dict(r) for r in conn.execute(
+        "SELECT bi.*, i.sku, i.name AS item_name FROM erp_batch_ingredients bi"
+        " JOIN erp_items i ON i.id = bi.item_id"
+        " WHERE bi.batch_id = ? ORDER BY bi.id", (batch_id,)).fetchall()]
+    conn.close()
+    return jsonify(batch_number=batch["batch_number"], lot_code=batch["lot_code"],
+                   expiry_date=batch["expiry_date"], status=batch["status"],
+                   ingredients=used)
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
