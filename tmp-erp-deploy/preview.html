@@ -183,6 +183,14 @@ button { font-family: inherit; }
       .ws-progress { font-weight: 800; margin: 10px 0; }
       .ws-empty { color: var(--muted); padding: 24px 0; text-align: center; }
       .ws-error { color: var(--red-dark); font-weight: 700; margin: 10px 0; }
+      .pw-wrap { position: relative; display: block; }
+      .pw-wrap input { width: 100%; padding-right: 44px; box-sizing: border-box; }
+      .pw-eye { position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+        background: none; border: none; cursor: pointer; font-size: 19px; line-height: 1; padding: 8px; }
+      .forgot-wrap { margin: 2px 0 10px; text-align: right; }
+      .link-btn { background: none; border: none; color: var(--teal); font-weight: 700;
+        cursor: pointer; padding: 4px 2px; font-size: 14px; text-decoration: underline; }
+      .login-note { color: var(--teal); font-weight: 700; margin: 10px 0; }
 
 </style>
 </head>
@@ -198,7 +206,9 @@ button { font-family: inherit; }
     </div>
     <form id="loginForm">
       <label>Email<input type="email" id="loginEmail" required autocomplete="username"></label>
-      <label>Password<input type="password" id="loginPass" required autocomplete="current-password"></label>
+      <label>Password<span class="pw-wrap"><input type="password" id="loginPass" required autocomplete="current-password"><button type="button" class="pw-eye" data-pw="loginPass" aria-label="Show password">👁</button></span></label>
+      <p class="forgot-wrap" id="forgotWrap" hidden><button type="button" id="forgotBtn" class="link-btn">Forgot password?</button></p>
+      <p id="loginNote" class="login-note" hidden></p>
       <p id="loginError" class="login-error" hidden></p>
       <button type="submit" id="loginSubmit">Log in</button>
     </form>
@@ -209,8 +219,8 @@ button { font-family: inherit; }
     <h1>Set your password</h1>
     <p class="login-sub">Wholesale ordering account</p>
     <form id="setupForm">
-      <label>New password (8+ characters)<input type="password" id="setupPass" required autocomplete="new-password" minlength="8"></label>
-      <label>Confirm password<input type="password" id="setupPass2" required autocomplete="new-password" minlength="8"></label>
+      <label>New password (8+ characters)<span class="pw-wrap"><input type="password" id="setupPass" required autocomplete="new-password" minlength="8"><button type="button" class="pw-eye" data-pw="setupPass" aria-label="Show password">👁</button></span></label>
+      <label>Confirm password<span class="pw-wrap"><input type="password" id="setupPass2" required autocomplete="new-password" minlength="8"><button type="button" class="pw-eye" data-pw="setupPass2" aria-label="Show password">👁</button></span></label>
       <p id="setupError" class="login-error" hidden></p>
       <button type="submit" id="setupSubmit">Set password &amp; log in</button>
     </form>
@@ -295,7 +305,9 @@ function setLoginMode(mode) {
   document.getElementById("tabAdmin").classList.toggle("active", mode === "admin");
   document.getElementById("tabStaff").classList.toggle("active", mode === "staff");
   document.getElementById("tabWholesale").classList.toggle("active", mode === "wholesale");
+  document.getElementById("forgotWrap").hidden = mode !== "wholesale";
   document.getElementById("loginError").hidden = true;
+  loginNote("");
 }
 function loginError(msg) {
   var el = document.getElementById("loginError");
@@ -998,6 +1010,43 @@ document.getElementById("tabStaff").addEventListener("click", function () { setL
 document.getElementById("tabWholesale").addEventListener("click", function () { setLoginMode("wholesale"); });
 document.getElementById("loginForm").addEventListener("submit", doLogin);
 document.getElementById("setupForm").addEventListener("submit", doWholesaleSetup);
+/* password visibility toggles */
+document.querySelectorAll(".pw-eye").forEach(function (btn) {
+  btn.addEventListener("click", function () {
+    var input = document.getElementById(btn.getAttribute("data-pw"));
+    if (!input) return;
+    var show = input.type === "password";
+    input.type = show ? "text" : "password";
+    btn.textContent = show ? "🙈" : "👁";
+    btn.setAttribute("aria-label", show ? "Hide password" : "Show password");
+  });
+});
+/* wholesale forgot password */
+function loginNote(msg) {
+  var el = document.getElementById("loginNote");
+  el.textContent = msg;
+  el.hidden = !msg;
+}
+document.getElementById("forgotBtn").addEventListener("click", async function () {
+  var email = document.getElementById("loginEmail").value.trim();
+  document.getElementById("loginError").hidden = true;
+  loginNote("");
+  if (!email) { loginError("Enter your email above first, then tap Forgot password?"); return; }
+  var btn = document.getElementById("forgotBtn");
+  btn.disabled = true;
+  try {
+    await fetch(API_BASE + "/api/wholesale/forgot-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email, portal_url: location.origin + location.pathname })
+    });
+    loginNote("If that email is registered, a reset link is on its way.");
+  } catch (e) {
+    loginError("We couldn't send the reset email — please try again.");
+  } finally {
+    btn.disabled = false;
+  }
+});
 document.getElementById("logoutBtn").addEventListener("click", function () { doLogout(); });
 if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { enterApp(); } else { showLogin(); }
 
