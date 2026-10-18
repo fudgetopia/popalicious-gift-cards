@@ -9818,6 +9818,44 @@ def wholesale_set_password():
                    account_name=acct["name"] if acct else "")
 
 
+def _send_wholesale_reset_email(to_email, business_name, link):
+    return send_email(
+        to_email,
+        "Reset your Pop-A-Licious wholesale password",
+        "<p>Hi%s,</p>"
+        "<p>We got a request to reset the password for your wholesale ordering account%s.</p>"
+        "<p><a href=\"%s\">Click here to set a new password</a>. "
+        "This link expires in 1 hour. If you didn't ask for this, just ignore this email.</p>"
+        "<p>— Pop-A-Licious</p>"
+        % (", " + business_name if business_name else "",
+           (" (" + business_name + ")") if business_name else "",
+           link))
+
+
+@app.post("/api/wholesale/forgot-password")
+def wholesale_forgot_password():
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    # Always return ok — never reveal whether an email is registered.
+    if email and EMAIL_RE.match(email):
+        conn = db()
+        user = conn.execute("SELECT * FROM erp_wholesale_users WHERE email = ? AND active = 1",
+                            (email,)).fetchone()
+        if user:
+            token = secrets.token_urlsafe(32)
+            expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+            conn.execute("UPDATE erp_wholesale_users SET invite_token = ?,"
+                         " invite_expires_at = ? WHERE id = ?",
+                         (token, expires, user["id"]))
+            conn.commit()
+            acct = conn.execute("SELECT name FROM erp_wholesale_accounts WHERE id = ?",
+                                (user["account_id"],)).fetchone()
+            link = _wholesale_portal_url(data) + "/#/wholesale-setup?token=" + token
+            _send_wholesale_reset_email(email, acct["name"] if acct else "", link)
+        conn.close()
+    return jsonify(ok=True)
+
+
 def _wholesale_me_dict(conn, user):
     acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
                         (user["account_id"],)).fetchone()
