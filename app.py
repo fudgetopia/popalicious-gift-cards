@@ -789,6 +789,41 @@ def init_db():
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_erp_edi_docs ON erp_edi_documents (partner_id, direction, doc_type, status);
+        CREATE TABLE IF NOT EXISTS erp_qb_oauth (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            access_token TEXT NOT NULL DEFAULT '',
+            refresh_token TEXT NOT NULL DEFAULT '',
+            expires_at INTEGER NOT NULL DEFAULT 0,
+            realm_id TEXT NOT NULL DEFAULT '',
+            company_name TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_qb_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER NOT NULL,
+            qb_object TEXT NOT NULL,
+            qb_id TEXT NOT NULL,
+            pushed_at TEXT NOT NULL,
+            pushed_by TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_qb_links ON erp_qb_links (entity_type, entity_id, qb_object);
+        CREATE TABLE IF NOT EXISTS erp_qb_config (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_sales_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            channel TEXT NOT NULL DEFAULT 'online',
+            total_cents INTEGER NOT NULL DEFAULT 0,
+            order_count INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'draft',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_sales_summaries ON erp_sales_summaries (period_start, period_end, channel);
         INSERT OR IGNORE INTO erp_locations (code, name, type, active) VALUES
          ('HEND', 'Henderson Warehouse', 'warehouse', 1),
          ('EVT', 'Events / Mobile', 'mobile', 1),
@@ -7387,29 +7422,66 @@ def _erp_actor():
     return ""
 
 
-def _require_erp():
-    """Admin member OR staff. Returns (actor, None) or (None, (resp, code))."""
+# ---- ERP permission model (Phase 4 formalization; spec section 6) ----
+# Two roles. "admin" (Matt/DJ) can do everything. "staff" can read inventory,
+# recipes, batches, orders, wholesale accounts and EDI documents, and can
+# perform inventory adjust/transfer/receive. Everything else — vendors, POs,
+# costing, recipe/batch writes, wholesale writes, EDI writes, reports,
+# QuickBooks — is admin-only.
+# Behavior is unchanged from Phases 1-3; the matrix below just documents it
+# in one place and every gate now routes through _erp_check_perm().
+_ERP_PERMS = {
+    "admin": frozenset({"*"}),
+    "staff": frozenset({
+        "erp.access",
+        "inventory.read", "inventory.adjust", "inventory.transfer",
+        "inventory.receive",
+        "recipes.read", "batches.read",
+        "orders.read", "accounts.read", "edi.read",
+    }),
+}
+
+
+def _erp_role():
+    """'admin', 'staff', or None for the current request."""
     user = _current_member()
     if user and _is_admin(user):
-        return user["email"], None
+        return "admin"
     staff, _ = _require_staff()
     if staff:
-        return "staff:" + (staff["name"] or staff["email"] or str(staff["id"])), None
+        return "staff"
+    return None
+
+
+def _erp_check_perm(perm):
+    """Single permission gate for ERP endpoints.
+
+    Returns (actor, None) when allowed, else (None, (resp, code)).
+    "admin" grants every permission. Status codes/messages match the
+    pre-Phase-4 gates exactly (401 anon, 403 customer/staff as before).
+    """
+    role = _erp_role()
+    if role == "admin":
+        return _erp_actor(), None
+    if role == "staff":
+        if perm in _ERP_PERMS["staff"]:
+            return _erp_actor(), None
+        return None, (jsonify(error="admin required"), 403)
+    user = _current_member()
     if user:
-        return None, (jsonify(error="admin or staff required"), 403)
+        msg = "admin or staff required" if perm == "erp.access" else "admin required"
+        return None, (jsonify(error=msg), 403)
     return None, (jsonify(error="login required"), 401)
+
+
+def _require_erp():
+    """Admin member OR staff. Returns (actor, None) or (None, (resp, code))."""
+    return _erp_check_perm("erp.access")
 
 
 def _require_erp_admin():
     """Admin member only (master data, POs, seed, reorder rules)."""
-    user = _current_member()
-    if user and _is_admin(user):
-        return user["email"], None
-    staff, _ = _require_staff()
-    if user or staff:
-        # Authenticated (customer or staff) but not an admin.
-        return None, (jsonify(error="admin required"), 403)
-    return None, (jsonify(error="login required"), 401)
+    return _erp_check_perm("admin")
 
 
 def _erp_fmt_qty(q):
@@ -9069,6 +9141,8 @@ def erp_order_detail(source, order_id):
         order["order_date"] = w["order_date"]
         order["tracking_number"] = ""
         order["shipping_address"] = acct["address"] if acct else ""
+        qb_link = _qb_pushed(conn, "wholesale_order", order_id, "invoice")
+        order["qb_invoice_id"] = qb_link["qb_id"] if qb_link else None
     else:
         order = _erp_online_order(conn, source, order_id)
         if not order:
@@ -10473,6 +10547,962 @@ def erp_edi_webhook(partner_key):
         resp["order"] = mapped_order
     return jsonify(resp), 201
 
+
+# ================= ERP Phase 4: Reporting + QuickBooks bridge =================
+# Spec: files/phase-4-spec.md. All endpoints admin-only (spec section 6).
+
+# ---------- report helpers ----------
+
+def _erp_report_dates(args):
+    """Returns (date_from, date_to) as YYYY-MM-DD strings or ('','')."""
+    df = (args.get("from") or "").strip()[:10]
+    dt = (args.get("to") or "").strip()[:10]
+    for d in (df, dt):
+        if d and not re.match(r"^\d{4}-\d{2}-\d{2}$", d):
+            return None, None
+    return df, dt
+
+
+def _erp_date_where(df, dt, col="created_at"):
+    where = []
+    params = []
+    if df:
+        where.append("substr(%s, 1, 10) >= ?" % col)
+        params.append(df)
+    if dt:
+        where.append("substr(%s, 1, 10) <= ?" % col)
+        params.append(dt)
+    return (" AND ".join(where), params)
+
+
+def _erp_parse_summary_flavors(items_summary):
+    """Best-effort parse of '2x Cheddar, 1x Caramel' into [(qty, name)].
+
+    Skips shipping chunks. Names are kept as-is (variety packs, merch).
+    """
+    out = []
+    for chunk in re.split(r"[;\n]", items_summary or ""):
+        for part in chunk.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            m = re.match(r"^(\d+)\s*x\s+(.+)$", part, re.IGNORECASE)
+            if not m:
+                continue
+            name = m.group(2).strip()
+            if not name or name.lower().startswith("shipping"):
+                continue
+            try:
+                out.append((int(m.group(1)), name[:120]))
+            except ValueError:
+                pass
+    return out
+
+
+def _erp_csv_response(filename, header, rows):
+    import csv
+    import io
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(header)
+    for r in rows:
+        w.writerow(r)
+    resp = app.response_class(buf.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = "attachment; filename=%s" % filename
+    return resp
+
+
+# ---------- report: sales by flavor/channel ----------
+
+@app.get("/api/erp/reports/sales")
+def erp_report_sales():
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    df, dt = _erp_report_dates(request.args)
+    if df is None:
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    channel = (request.args.get("channel") or "all").strip().lower()
+    if channel not in ("all", "online", "wholesale"):
+        return jsonify(error="channel must be all, online, or wholesale"), 400
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    where, params = _erp_date_where(df, dt)
+    online = {"order_count": 0, "total_cents": 0, "flavors": []}
+    wholesale = {"order_count": 0, "total_cents": 0, "flavors": []}
+    csv_rows = []
+    if channel in ("all", "online"):
+        q = ("SELECT id, 'stripe' AS src, email, customer_name, items_summary,"
+             " amount_total_cents, total_qty, created_at FROM orders"
+             + (" WHERE " + where if where else "")
+             + " UNION ALL SELECT id, 'paypal' AS src, email, '' AS customer_name,"
+             " items_summary, amount_total_cents, total_qty, created_at"
+             " FROM paypal_orders WHERE status = 'captured'"
+             + (" AND " + where if where else ""))
+        p = params + params
+        rows = conn.execute(q, p).fetchall()
+        flavors = {}
+        for r in rows:
+            online["order_count"] += 1
+            online["total_cents"] += int(r["amount_total_cents"] or 0)
+            for qty, name in _erp_parse_summary_flavors(r["items_summary"]):
+                flavors[name] = flavors.get(name, 0) + qty
+            if fmt == "csv":
+                csv_rows.append(["online", r["src"], "%s-%d" % (r["src"], r["id"]),
+                                (r["created_at"] or "")[:10], r["email"] or "",
+                                r["items_summary"] or "", r["total_qty"] or 0,
+                                r["amount_total_cents"] or 0])
+        online["flavors"] = [{"flavor": k, "bags": v}
+                             for k, v in sorted(flavors.items(), key=lambda kv: -kv[1])]
+    if channel in ("all", "wholesale"):
+        q = ("SELECT o.id, o.order_number, o.created_at, a.name AS account_name,"
+             " COALESCE(SUM(l.line_total_cents), 0) AS total_cents,"
+             " COALESCE(SUM(l.qty_bags), 0) AS bags"
+             " FROM erp_wholesale_orders o"
+             " JOIN erp_wholesale_accounts a ON a.id = o.account_id"
+             " LEFT JOIN erp_wholesale_order_lines l ON l.order_id = o.id"
+             + (" WHERE " + where.replace("created_at", "o.created_at") if where else "")
+             + " GROUP BY o.id ORDER BY o.id")
+        rows = conn.execute(q, params).fetchall()
+        flavors = {}
+        for r in rows:
+            wholesale["order_count"] += 1
+            wholesale["total_cents"] += int(r["total_cents"] or 0)
+            for ln in conn.execute(
+                    "SELECT flavor_name, qty_bags, line_total_cents"
+                    " FROM erp_wholesale_order_lines WHERE order_id = ?",
+                    (r["id"],)).fetchall():
+                f = flavors.setdefault(ln["flavor_name"], {"bags": 0, "total_cents": 0})
+                f["bags"] += float(ln["qty_bags"] or 0)
+                f["total_cents"] += int(ln["line_total_cents"] or 0)
+            if fmt == "csv":
+                csv_rows.append(["wholesale", "wholesale", r["order_number"],
+                                (r["created_at"] or "")[:10], r["account_name"] or "",
+                                "", r["bags"] or 0, r["total_cents"] or 0])
+        wholesale["flavors"] = [{"flavor": k, "bags": v["bags"], "total_cents": v["total_cents"]}
+                                for k, v in sorted(flavors.items(), key=lambda kv: -kv[1]["bags"])]
+    conn.close()
+    if fmt == "csv":
+        return _erp_csv_response(
+            "erp-sales-%s-%s.csv" % (df or "all", dt or "all"),
+            ["channel", "source", "order_ref", "date", "customer",
+             "items_summary", "bags", "total_cents"],
+            csv_rows)
+    return jsonify({
+        "from": df, "to": dt, "channel": channel,
+        "online": online, "wholesale": wholesale,
+        "order_count": online["order_count"] + wholesale["order_count"],
+        "total_cents": online["total_cents"] + wholesale["total_cents"],
+    })
+
+
+# ---------- report: inventory valuation ----------
+
+@app.get("/api/erp/reports/inventory-valuation")
+def erp_report_inventory_valuation():
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    rows = conn.execute(
+        "SELECT i.id, i.sku, i.name, i.type, l.code AS location_code,"
+        " l.name AS location_name, SUM(s.qty_change) AS on_hand,"
+        " i.avg_cost_cents"
+        " FROM erp_stock_ledger s"
+        " JOIN erp_items i ON i.id = s.item_id"
+        " JOIN erp_locations l ON l.id = s.location_id"
+        " GROUP BY i.id, l.id HAVING on_hand != 0"
+        " ORDER BY i.type, i.name, l.code").fetchall()
+    items = []
+    total_cents = 0
+    for r in rows:
+        on_hand = float(r["on_hand"] or 0)
+        avg = int(r["avg_cost_cents"] or 0)
+        value_cents = int(round(on_hand * avg))
+        total_cents += value_cents
+        items.append({
+            "sku": r["sku"], "name": r["name"], "type": r["type"],
+            "location_code": r["location_code"], "location_name": r["location_name"],
+            "on_hand": on_hand, "avg_cost_cents": avg, "value_cents": value_cents,
+        })
+    conn.close()
+    if fmt == "csv":
+        return _erp_csv_response(
+            "erp-inventory-valuation.csv",
+            ["sku", "name", "type", "location", "on_hand",
+             "avg_cost_cents", "value_cents"],
+            [[i["sku"], i["name"], i["type"], i["location_code"],
+              i["on_hand"], i["avg_cost_cents"], i["value_cents"]] for i in items])
+    return jsonify({"items": items, "total_cents": total_cents,
+                    "item_count": len(items)})
+
+
+# ---------- report: production cost & margin ----------
+
+@app.get("/api/erp/reports/production-margin")
+def erp_report_production_margin():
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    fmt = (request.args.get("format") or "json").strip().lower()
+    df, dt = _erp_report_dates(request.args)
+    if df is None:
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    where, params = _erp_date_where(df, dt, "b.completed_at")
+    conn = db()
+    rows = conn.execute(
+        "SELECT r.id AS recipe_id, r.name AS flavor, r.batch_size_bags,"
+        " COUNT(b.id) AS batches, COALESCE(SUM(b.actual_qty_bags), 0) AS bags,"
+        " COALESCE(SUM(b.total_cost_cents), 0) AS cost_cents"
+        " FROM erp_production_batches b"
+        " JOIN erp_recipes r ON r.id = b.recipe_id"
+        " WHERE b.status = 'completed' AND b.actual_qty_bags > 0"
+        + (" AND " + where if where else "")
+        + " GROUP BY r.id ORDER BY r.name", params).fetchall()
+    flavors = []
+    for r in rows:
+        bags = float(r["bags"] or 0)
+        cost_cents = int(r["cost_cents"] or 0)
+        cpb = (cost_cents / bags) if bags else 0
+        flavors.append({
+            "flavor": r["flavor"], "batches": r["batches"],
+            "bags_produced": bags,
+            "cost_per_bag_cents": round(cpb, 2),
+            "retail_price_cents": 800,
+            "retail_margin_cents": round(800 - cpb, 2),
+            "retail_margin_pct": round((800 - cpb) / 800 * 100, 1) if cpb else 100.0,
+            "wholesale_price_cents": 400,
+            "wholesale_margin_cents": round(400 - cpb, 2),
+            "wholesale_margin_pct": round((400 - cpb) / 400 * 100, 1) if cpb else 100.0,
+        })
+    conn.close()
+    note = ("Wholesale price uses the default $4.00/bag; per-account prices may vary. "
+            "Retail is $8.00/bag.")
+    if fmt == "csv":
+        return _erp_csv_response(
+            "erp-production-margin.csv",
+            ["flavor", "batches", "bags_produced", "cost_per_bag_cents",
+             "retail_price_cents", "retail_margin_cents", "retail_margin_pct",
+             "wholesale_price_cents", "wholesale_margin_cents",
+             "wholesale_margin_pct"],
+            [[f["flavor"], f["batches"], f["bags_produced"],
+              f["cost_per_bag_cents"], f["retail_price_cents"],
+              f["retail_margin_cents"], f["retail_margin_pct"],
+              f["wholesale_price_cents"], f["wholesale_margin_cents"],
+              f["wholesale_margin_pct"]] for f in flavors])
+    return jsonify({"from": df, "to": dt, "flavors": flavors, "note": note})
+
+
+# ---------- report: wholesale account performance ----------
+
+@app.get("/api/erp/reports/wholesale-performance")
+def erp_report_wholesale_performance():
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    rows = conn.execute(
+        "SELECT a.id, a.name, a.email, a.phone, a.price_per_bag_cents,"
+        " COUNT(DISTINCT o.id) AS order_count,"
+        " COALESCE(SUM(l.line_total_cents), 0) AS revenue_cents,"
+        " MAX(o.created_at) AS last_order_at"
+        " FROM erp_wholesale_accounts a"
+        " LEFT JOIN erp_wholesale_orders o ON o.account_id = a.id"
+        " LEFT JOIN erp_wholesale_order_lines l ON l.order_id = o.id"
+        " GROUP BY a.id ORDER BY revenue_cents DESC").fetchall()
+    accounts = []
+    for r in rows:
+        n = int(r["order_count"] or 0)
+        rev = int(r["revenue_cents"] or 0)
+        accounts.append({
+            "id": r["id"], "name": r["name"], "email": r["email"],
+            "phone": r["phone"], "price_per_bag_cents": r["price_per_bag_cents"],
+            "order_count": n, "revenue_cents": rev,
+            "avg_order_cents": int(round(rev / n)) if n else 0,
+            "last_order_at": r["last_order_at"],
+        })
+    conn.close()
+    if fmt == "csv":
+        return _erp_csv_response(
+            "erp-wholesale-performance.csv",
+            ["account", "email", "phone", "price_per_bag_cents",
+             "order_count", "revenue_cents", "avg_order_cents",
+             "last_order_at"],
+            [[a["name"], a["email"], a["phone"], a["price_per_bag_cents"],
+              a["order_count"], a["revenue_cents"], a["avg_order_cents"],
+              a["last_order_at"] or ""] for a in accounts])
+    return jsonify({"accounts": accounts,
+                    "total_revenue_cents": sum(a["revenue_cents"] for a in accounts)})
+
+
+# ---------- sales summaries (weekly online rollups for QuickBooks) ----------
+
+def _erp_build_summary(conn, period_start, period_end):
+    """Sums ONLINE (Stripe + captured PayPal) sales in [start, end].
+    Wholesale is excluded: it reaches QuickBooks as invoices (no double count)."""
+    total_cents = 0
+    order_count = 0
+    for tbl, extra in (("orders", ""), ("paypal_orders", "AND status = 'captured'")):
+        r = conn.execute(
+            "SELECT COALESCE(SUM(amount_total_cents), 0) AS t, COUNT(*) AS c"
+            " FROM %s WHERE substr(created_at, 1, 10) >= ?"
+            " AND substr(created_at, 1, 10) <= ? %s" % (tbl, extra),
+            (period_start, period_end)).fetchone()
+        total_cents += int(r["t"] or 0)
+        order_count += int(r["c"] or 0)
+    return total_cents, order_count
+
+
+@app.get("/api/erp/sales-summaries")
+def erp_list_sales_summaries():
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT s.*, q.qb_id AS qb_sales_receipt_id FROM erp_sales_summaries s"
+        " LEFT JOIN erp_qb_links q ON q.entity_type = 'sales_summary'"
+        " AND q.entity_id = s.id AND q.qb_object = 'salesreceipt'"
+        " ORDER BY s.period_start DESC").fetchall()
+    out = [dict(r) for r in rows]
+    conn.close()
+    return jsonify({"summaries": out})
+
+
+@app.post("/api/erp/sales-summaries")
+def erp_create_sales_summary():
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    ps = (data.get("period_start") or "").strip()[:10]
+    pe = (data.get("period_end") or "").strip()[:10]
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", ps) or not re.match(r"^\d{4}-\d{2}-\d{2}$", pe):
+        return jsonify(error="period_start and period_end (YYYY-MM-DD) are required"), 400
+    if pe < ps:
+        return jsonify(error="period_end is before period_start"), 400
+    conn = db()
+    if conn.execute(
+            "SELECT 1 FROM erp_sales_summaries"
+            " WHERE period_start = ? AND period_end = ? AND channel = 'online'",
+            (ps, pe)).fetchone():
+        conn.close()
+        return jsonify(error="a summary already exists for this period"), 409
+    total_cents, order_count = _erp_build_summary(conn, ps, pe)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_sales_summaries (period_start, period_end, channel,"
+        " total_cents, order_count, status, created_by, created_at)"
+        " VALUES (?, ?, 'online', ?, ?, 'draft', ?, ?)",
+        (ps, pe, total_cents, order_count, actor, now))
+    sid = cur.lastrowid
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_sales_summaries WHERE id = ?", (sid,)).fetchone()
+    conn.close()
+    return jsonify({"summary": dict(row)}), 201
+
+
+@app.get("/api/erp/sales-summaries/<int:summary_id>")
+def erp_get_sales_summary(summary_id):
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_sales_summaries WHERE id = ?",
+                       (summary_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="summary not found"), 404
+    link = conn.execute(
+        "SELECT qb_id, pushed_at FROM erp_qb_links WHERE entity_type = 'sales_summary'"
+        " AND entity_id = ? AND qb_object = 'salesreceipt'",
+        (summary_id,)).fetchone()
+    out = dict(row)
+    out["qb_sales_receipt_id"] = link["qb_id"] if link else None
+    out["qb_pushed_at"] = link["pushed_at"] if link else None
+    conn.close()
+    return jsonify({"summary": out})
+
+
+# ================= QuickBooks bridge =================
+# Backend-held Intuit OAuth + QBO REST v3. The local quickbooks CLI is NOT
+# available to this backend; all calls go through _QBOClient below.
+# Invoices have no draft state in QuickBooks: every push is preview-first
+# and idempotent (erp_qb_links UNIQUE guard + pre-checks).
+
+_QB_AUTH_URL = "https://appcenter.intuit.com/connect/oauth2"
+_QB_TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+_QB_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
+
+# Test hook: tests assign backend._QBO_TEST_DOUBLE to a fake implementing
+# find_customer / create_customer / create_invoice / create_sales_receipt.
+# The suite must NEVER make live Intuit calls.
+_QBO_TEST_DOUBLE = None
+
+
+class _QBOError(Exception):
+    def __init__(self, message, status=502):
+        super().__init__(message)
+        self.status = status
+
+
+class _QBOUnauthorized(_QBOError):
+    pass
+
+
+class _QBOClient:
+    """Minimal QBO REST v3 client. `http` is injectable (tests assert no
+    real network by injecting a recording fake)."""
+
+    def __init__(self, access_token, realm_id, http=None):
+        self.access_token = access_token
+        self.realm_id = realm_id
+        self.http = http or requests
+
+    def _url(self, path):
+        return "%s/%s/%s" % (_QB_API_BASE, self.realm_id, path)
+
+    def _headers(self):
+        return {"Authorization": "Bearer " + self.access_token,
+                "Accept": "application/json",
+                "Content-Type": "application/json"}
+
+    def _call(self, method, path, params=None, payload=None):
+        url = self._url(path)
+        try:
+            if method == "get":
+                r = self.http.get(url, headers=self._headers(),
+                                  params=params, timeout=25)
+            else:
+                r = self.http.post(url, headers=self._headers(), params=params,
+                                   data=json.dumps(payload or {}), timeout=25)
+        except Exception as e:
+            raise _QBOError("QuickBooks request failed: %s" % e)
+        if r.status_code == 401:
+            raise _QBOUnauthorized("QuickBooks token expired")
+        if r.status_code >= 400:
+            detail = ""
+            try:
+                errs = (r.json().get("Fault") or {}).get("Error") or []
+                detail = (errs[0] or {}).get("Detail", "") if errs else ""
+            except Exception:
+                detail = ""
+            raise _QBOError("QuickBooks error %s: %s"
+                            % (r.status_code, detail or r.text[:200]))
+        try:
+            return r.json()
+        except Exception:
+            raise _QBOError("QuickBooks returned a non-JSON response")
+
+    def query(self, qbo_query):
+        return self._call("get", "query",
+                          params={"query": qbo_query, "minorversion": "65"})
+
+    def find_customer(self, display_name):
+        safe = (display_name or "").replace("'", "''")
+        data = self.query("select * from Customer where DisplayName = '%s'" % safe)
+        custs = ((data.get("QueryResponse") or {}).get("Customer") or [])
+        return custs[0] if custs else None
+
+    def create_customer(self, display_name, email=""):
+        payload = {"DisplayName": display_name}
+        if email:
+            payload["PrimaryEmailAddr"] = {"Address": email}
+        return self._call("post", "customer",
+                          params={"minorversion": "65"}, payload=payload).get("Customer") or {}
+
+    def create_invoice(self, payload):
+        return self._call("post", "invoice",
+                          params={"minorversion": "65"}, payload=payload).get("Invoice") or {}
+
+    def create_sales_receipt(self, payload):
+        return self._call("post", "salesreceipt",
+                          params={"minorversion": "65"}, payload=payload).get("SalesReceipt") or {}
+
+
+def _qb_creds():
+    return (os.environ.get("QB_CLIENT_ID") or "",
+            os.environ.get("QB_CLIENT_SECRET") or "")
+
+
+def _qb_redirect_uri():
+    return (os.environ.get("QB_REDIRECT_URI") or
+            "https://popalicious-gift-cards-production.up.railway.app"
+            "/api/erp/quickbooks/callback")
+
+
+def _qb_frontend_url():
+    return os.environ.get("QB_FRONTEND_URL") or "https://erp.pop-a-licious.com"
+
+
+def _qb_state_token(email):
+    s = URLSafeTimedSerializer(AUTH_SECRET, salt="popalicious-qb-oauth")
+    return s.dumps({"email": email})
+
+
+def _qb_state_email(state, max_age=600):
+    s = URLSafeTimedSerializer(AUTH_SECRET, salt="popalicious-qb-oauth")
+    try:
+        return s.loads(state, max_age=max_age).get("email")
+    except (BadSignature, SignatureExpired):
+        return None
+
+
+def _qb_tokens(conn):
+    return conn.execute("SELECT * FROM erp_qb_oauth WHERE id = 1").fetchone()
+
+
+def _qb_connected(conn):
+    if _QBO_TEST_DOUBLE is not None:
+        return True
+    tok = _qb_tokens(conn)
+    return bool(tok and tok["access_token"] and tok["realm_id"])
+
+
+def _qb_config(conn, key, default=""):
+    row = conn.execute("SELECT value FROM erp_qb_config WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def _qb_pushed(conn, entity_type, entity_id, qb_object):
+    return conn.execute(
+        "SELECT qb_id FROM erp_qb_links WHERE entity_type = ? AND entity_id = ?"
+        " AND qb_object = ?", (entity_type, entity_id, qb_object)).fetchone()
+
+
+def _qb_store_tokens(conn, access_token, refresh_token, expires_in, realm_id,
+                     company_name=""):
+    now = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT OR REPLACE INTO erp_qb_oauth (id, access_token, refresh_token,"
+        " expires_at, realm_id, company_name, updated_at)"
+        " VALUES (1, ?, ?, ?, ?, ?, ?)",
+        (access_token, refresh_token,
+         int(now.timestamp()) + int(expires_in or 3600),
+         realm_id, company_name, now.isoformat()))
+    conn.commit()
+
+
+def _qb_refresh_tokens(conn):
+    tok = _qb_tokens(conn)
+    if not tok or not tok["refresh_token"]:
+        return False
+    cid, csec = _qb_creds()
+    try:
+        r = requests.post(_QB_TOKEN_URL,
+                          data={"grant_type": "refresh_token",
+                                "refresh_token": tok["refresh_token"]},
+                          auth=(cid, csec), timeout=25)
+    except Exception:
+        return False
+    if r.status_code != 200:
+        return False
+    try:
+        data = r.json()
+    except Exception:
+        return False
+    _qb_store_tokens(conn, data.get("access_token", ""),
+                     data.get("refresh_token", tok["refresh_token"]),
+                     data.get("expires_in", 3600), tok["realm_id"],
+                     tok["company_name"])
+    return True
+
+
+def _qb_call_with_refresh(conn, fn):
+    """Runs fn(client), refreshing the OAuth token once on expiry.
+
+    With the test double set, fn runs against the fake and no network
+    is touched. Raises _QBOError on failure; never retries a push.
+    """
+    if _QBO_TEST_DOUBLE is not None:
+        return fn(_QBO_TEST_DOUBLE)
+    tok = _qb_tokens(conn)
+    if not tok or not tok["access_token"]:
+        raise _QBOError("QuickBooks not connected", status=400)
+    client = _QBOClient(tok["access_token"], tok["realm_id"])
+    try:
+        return fn(client)
+    except _QBOUnauthorized:
+        if _qb_refresh_tokens(conn):
+            tok = _qb_tokens(conn)
+            return fn(_QBOClient(tok["access_token"], tok["realm_id"]))
+        conn.execute("UPDATE erp_qb_oauth SET access_token = '' WHERE id = 1")
+        conn.commit()
+        raise _QBOError("QuickBooks session expired - please reconnect", status=400)
+
+
+@app.get("/api/erp/quickbooks/status")
+def erp_qb_status():
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    cid, csec = _qb_creds()
+    conn = db()
+    tok = _qb_tokens(conn)
+    connected = (_QBO_TEST_DOUBLE is not None
+                 or bool(tok and tok["access_token"] and tok["realm_id"]))
+    conn.close()
+    return jsonify({
+        "configured": bool(cid and csec),
+        "connected": connected,
+        "realm_id": (tok["realm_id"] if tok else "") or "",
+        "company_name": (tok["company_name"] if tok else "") or "",
+    })
+
+
+@app.get("/api/erp/quickbooks/connect")
+def erp_qb_connect():
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    cid, csec = _qb_creds()
+    if not cid or not csec:
+        return jsonify(error="QuickBooks is not configured:"
+                              " set QB_CLIENT_ID and QB_CLIENT_SECRET"), 400
+    params = {
+        "client_id": cid,
+        "response_type": "code",
+        "scope": "com.intuit.quickbooks.accounting",
+        "redirect_uri": _qb_redirect_uri(),
+        "state": _qb_state_token(actor),
+    }
+    return jsonify({"authorize_url": _QB_AUTH_URL + "?" + urlencode(params)})
+
+
+@app.get("/api/erp/quickbooks/callback")
+def erp_qb_callback():
+    # Browser redirect from Intuit; no Bearer token. The signed `state`
+    # binds this callback to the admin who started the flow.
+    email = _qb_state_email(request.args.get("state") or "")
+    if not email:
+        return redirect(_qb_frontend_url() + "/#/settings?qb=error")
+    code = request.args.get("code") or ""
+    realm_id = request.args.get("realmId") or ""
+    if not code or not realm_id:
+        return redirect(_qb_frontend_url() + "/#/settings?qb=error")
+    cid, csec = _qb_creds()
+    try:
+        r = requests.post(_QB_TOKEN_URL,
+                          data={"grant_type": "authorization_code",
+                                "code": code,
+                                "redirect_uri": _qb_redirect_uri()},
+                          auth=(cid, csec), timeout=25)
+        data = r.json() if r.status_code == 200 else {}
+    except Exception:
+        data = {}
+    if not data.get("access_token"):
+        return redirect(_qb_frontend_url() + "/#/settings?qb=error")
+    conn = db()
+    _qb_store_tokens(conn, data.get("access_token", ""),
+                     data.get("refresh_token", ""),
+                     data.get("expires_in", 3600), realm_id)
+    # Best-effort company name for the settings card.
+    try:
+        info = _QBOClient(data["access_token"], realm_id).query(
+            "select * from CompanyInfo")
+        name = (((info.get("QueryResponse") or {}).get("CompanyInfo") or [{}])[0]
+                .get("CompanyName", ""))
+        if name:
+            conn.execute("UPDATE erp_qb_oauth SET company_name = ? WHERE id = 1",
+                         (name,))
+            conn.commit()
+    except _QBOError:
+        pass
+    conn.close()
+    return redirect(_qb_frontend_url() + "/#/settings?qb=connected")
+
+
+@app.post("/api/erp/quickbooks/disconnect")
+def erp_qb_disconnect():
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    conn.execute("DELETE FROM erp_qb_oauth WHERE id = 1")
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True, "connected": False})
+
+
+@app.get("/api/erp/quickbooks/config")
+def erp_qb_config_get():
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    out = {k: _qb_config(conn, k) for k in
+           ("wholesale_item_id", "wholesale_item_name", "sales_item_id")}
+    conn.close()
+    return jsonify({"config": out})
+
+
+@app.post("/api/erp/quickbooks/config")
+def erp_qb_config_set():
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    conn = db()
+    for key in ("wholesale_item_id", "wholesale_item_name", "sales_item_id"):
+        if key in data:
+            conn.execute("INSERT OR REPLACE INTO erp_qb_config (key, value)"
+                         " VALUES (?, ?)", (key, str(data[key] or "").strip()))
+    conn.commit()
+    out = {k: _qb_config(conn, k) for k in
+           ("wholesale_item_id", "wholesale_item_name", "sales_item_id")}
+    conn.close()
+    return jsonify({"config": out})
+
+
+def _qb_invoice_payload(order, lines, customer_qb_id, item_id):
+    qb_lines = []
+    for ln in lines:
+        qty = float(ln["qty_bags"] or 0)
+        unit_dollars = round((int(ln["unit_price_cents"] or 0)) / 100.0, 2)
+        qb_lines.append({
+            "Amount": round(qty * unit_dollars, 2),
+            "DetailType": "SalesItemLineDetail",
+            "Description": "%s popcorn (%s bags)" % (
+                ln["flavor_name"], _erp_fmt_qty(qty)),
+            "SalesItemLineDetail": {
+                "ItemRef": {"value": str(item_id)},
+                "Qty": qty,
+                "UnitPrice": unit_dollars,
+            },
+        })
+    txn_date = (order["order_date"] or "")[:10]
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", txn_date):
+        txn_date = datetime.now(timezone.utc).date().isoformat()
+    return {
+        "CustomerRef": {"value": str(customer_qb_id)},
+        "DocNumber": order["order_number"],
+        "TxnDate": txn_date,
+        "PrivateNote": "Pop-A-Licious ERP wholesale order %s" % order["order_number"],
+        "Line": qb_lines,
+    }
+
+
+def _qb_load_wholesale_order(conn, order_id):
+    order = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                         (order_id,)).fetchone()
+    if not order:
+        return None, None, None
+    account = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                           (order["account_id"],)).fetchone()
+    lines = conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
+        (order_id,)).fetchall()
+    return order, account, lines
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/quickbooks-preview")
+def erp_qb_invoice_preview(order_id):
+    """No side effects: shows exactly what a push would send."""
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    order, account, lines = _qb_load_wholesale_order(conn, order_id)
+    if not order:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    if _qb_pushed(conn, "wholesale_order", order_id, "invoice"):
+        conn.close()
+        return jsonify(error="already pushed to QuickBooks"), 409
+    if not _qb_connected(conn):
+        conn.close()
+        return jsonify(error="QuickBooks not connected"), 400
+    if not lines:
+        conn.close()
+        return jsonify(error="order has no lines"), 400
+    item_id = _qb_config(conn, "wholesale_item_id")
+    try:
+        customer = _qb_call_with_refresh(
+            conn, lambda c: c.find_customer(account["name"]))
+    except _QBOError as e:
+        conn.close()
+        return jsonify(error=str(e)), e.status
+    total_cents = sum(int(ln["line_total_cents"] or 0) for ln in lines)
+    preview = {
+        "order_id": order_id,
+        "order_number": order["order_number"],
+        "customer": {
+            "name": account["name"],
+            "email": account["email"] or "",
+            "qb_id": (customer or {}).get("Id"),
+            "will_create": customer is None,
+        },
+        "lines": [{"flavor": ln["flavor_name"], "qty_bags": ln["qty_bags"],
+                   "unit_price_cents": ln["unit_price_cents"],
+                   "line_total_cents": ln["line_total_cents"]} for ln in lines],
+        "total_cents": total_cents,
+        "item_configured": bool(item_id),
+        "item_id": item_id or None,
+        "item_name": _qb_config(conn, "wholesale_item_name") or None,
+    }
+    conn.close()
+    return jsonify(preview)
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/quickbooks-push")
+def erp_qb_invoice_push(order_id):
+    """Creates the QuickBooks invoice. Idempotent: second push -> 409."""
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    order, account, lines = _qb_load_wholesale_order(conn, order_id)
+    if not order:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    if _qb_pushed(conn, "wholesale_order", order_id, "invoice"):
+        conn.close()
+        return jsonify(error="already pushed to QuickBooks"), 409
+    if not _qb_connected(conn):
+        conn.close()
+        return jsonify(error="QuickBooks not connected"), 400
+    if not lines:
+        conn.close()
+        return jsonify(error="order has no lines"), 400
+    item_id = _qb_config(conn, "wholesale_item_id")
+    if not item_id:
+        conn.close()
+        return jsonify(error="configure the QuickBooks wholesale item first"), 400
+    try:
+        def do_push(client):
+            customer = client.find_customer(account["name"])
+            if not customer:
+                customer = client.create_customer(account["name"],
+                                                 account["email"] or "")
+                if not customer.get("Id"):
+                    raise _QBOError("QuickBooks did not return a customer id")
+            payload = _qb_invoice_payload(order, lines, customer["Id"], item_id)
+            invoice = client.create_invoice(payload)
+            if not invoice.get("Id"):
+                raise _QBOError("QuickBooks did not return an invoice id")
+            return customer, invoice
+        customer, invoice = _qb_call_with_refresh(conn, do_push)
+    except _QBOError as e:
+        conn.close()
+        return jsonify(error=str(e)), e.status
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.execute(
+            "INSERT INTO erp_qb_links (entity_type, entity_id, qb_object,"
+            " qb_id, pushed_at, pushed_by)"
+            " VALUES ('wholesale_order', ?, 'invoice', ?, ?, ?)",
+            (order_id, str(invoice["Id"]), now, actor))
+        conn.execute(
+            "INSERT OR IGNORE INTO erp_qb_links (entity_type, entity_id,"
+            " qb_object, qb_id, pushed_at, pushed_by)"
+            " VALUES ('wholesale_account', ?, 'customer', ?, ?, ?)",
+            (account["id"], str(customer["Id"]), now, actor))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        conn.close()
+        return jsonify(error="already pushed to QuickBooks"), 409
+    conn.close()
+    return jsonify({"ok": True, "qb_invoice_id": str(invoice["Id"])}), 201
+
+
+def _qb_receipt_payload(summary, item_id):
+    total_dollars = round(int(summary["total_cents"] or 0) / 100.0, 2)
+    return {
+        "PrivateNote": "Pop-A-Licious ERP online sales summary %s to %s"
+                       % (summary["period_start"], summary["period_end"]),
+        "Line": [{
+            "Amount": total_dollars,
+            "DetailType": "SalesItemLineDetail",
+            "Description": "Online store sales %s to %s (%d orders)" % (
+                summary["period_start"], summary["period_end"],
+                int(summary["order_count"] or 0)),
+            "SalesItemLineDetail": {"ItemRef": {"value": str(item_id)}},
+        }],
+    }
+
+
+@app.post("/api/erp/sales-summaries/<int:summary_id>/quickbooks-preview")
+def erp_qb_receipt_preview(summary_id):
+    """No side effects: shows exactly what a push would send."""
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    summary = conn.execute("SELECT * FROM erp_sales_summaries WHERE id = ?",
+                           (summary_id,)).fetchone()
+    if not summary:
+        conn.close()
+        return jsonify(error="summary not found"), 404
+    if _qb_pushed(conn, "sales_summary", summary_id, "salesreceipt"):
+        conn.close()
+        return jsonify(error="already pushed to QuickBooks"), 409
+    if not _qb_connected(conn):
+        conn.close()
+        return jsonify(error="QuickBooks not connected"), 400
+    item_id = _qb_config(conn, "sales_item_id") or _qb_config(conn, "wholesale_item_id")
+    preview = {
+        "summary_id": summary_id,
+        "period_start": summary["period_start"],
+        "period_end": summary["period_end"],
+        "channel": summary["channel"],
+        "order_count": summary["order_count"],
+        "total_cents": summary["total_cents"],
+        "item_configured": bool(item_id),
+        "item_id": item_id or None,
+    }
+    conn.close()
+    return jsonify(preview)
+
+
+@app.post("/api/erp/sales-summaries/<int:summary_id>/quickbooks-push")
+def erp_qb_receipt_push(summary_id):
+    """Creates the QuickBooks sales receipt. Idempotent: second push -> 409."""
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    summary = conn.execute("SELECT * FROM erp_sales_summaries WHERE id = ?",
+                           (summary_id,)).fetchone()
+    if not summary:
+        conn.close()
+        return jsonify(error="summary not found"), 404
+    if _qb_pushed(conn, "sales_summary", summary_id, "salesreceipt"):
+        conn.close()
+        return jsonify(error="already pushed to QuickBooks"), 409
+    if not _qb_connected(conn):
+        conn.close()
+        return jsonify(error="QuickBooks not connected"), 400
+    item_id = _qb_config(conn, "sales_item_id") or _qb_config(conn, "wholesale_item_id")
+    if not item_id:
+        conn.close()
+        return jsonify(error="configure the QuickBooks sales item first"), 400
+    try:
+        payload = _qb_receipt_payload(summary, item_id)
+        receipt = _qb_call_with_refresh(conn, lambda c: c.create_sales_receipt(payload))
+        if not receipt.get("Id"):
+            raise _QBOError("QuickBooks did not return a sales receipt id")
+    except _QBOError as e:
+        conn.close()
+        return jsonify(error=str(e)), e.status
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        conn.execute(
+            "INSERT INTO erp_qb_links (entity_type, entity_id, qb_object,"
+            " qb_id, pushed_at, pushed_by)"
+            " VALUES ('sales_summary', ?, 'salesreceipt', ?, ?, ?)",
+            (summary_id, str(receipt["Id"]), now, actor))
+        conn.execute("UPDATE erp_sales_summaries SET status = 'pushed' WHERE id = ?",
+                     (summary_id,))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        conn.close()
+        return jsonify(error="already pushed to QuickBooks"), 409
+    conn.close()
+    return jsonify({"ok": True, "qb_sales_receipt_id": str(receipt["Id"])}), 201
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
