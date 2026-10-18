@@ -4325,11 +4325,11 @@ function renderErpAccountDetail(body) {
       inviteBtn.addEventListener("click", function () {
         inviteBtn.disabled = true;
         setAdminDetailStatus("Sending invitation…");
-        erpPost("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id)) + "/invite", {
+        erpPost("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id)) + "/invite?reveal=1", {
           portal_url: location.origin + location.pathname
         }).then(function (res) {
           setAdminDetailStatus("Invitation sent to " + res.email + "." +
-            (res.invite_link ? " Link: " + res.invite_link : ""));
+            (res.invite_link ? " Invite link (copy to customer): " + res.invite_link : ""));
         }).catch(function (error) {
           setAdminDetailStatus(error.message, true);
         }).finally(function () { inviteBtn.disabled = false; });
