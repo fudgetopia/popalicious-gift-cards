@@ -165,6 +165,8 @@ button { font-family: inherit; }
       <a href="#/production" data-route="production">Production</a>
       <a href="#/orders" data-route="orders">Order hub</a>
       <a href="#/edi" data-route="edi">EDI</a>
+      <a href="#/reports" data-route="reports">Reports</a>
+      <a href="#/settings" data-route="settings">Settings</a>
     </nav>
     <div class="app-user"><span id="userLabel"></span><button type="button" id="logoutBtn">Log out</button></div>
   </header>
@@ -324,6 +326,8 @@ function currentRoute() {
   if (h.indexOf("#/production") === 0) return "production";
   if (h.indexOf("#/orders") === 0) return "orders";
   if (h.indexOf("#/edi") === 0) return "edi";
+  if (h.indexOf("#/reports") === 0) return "reports";
+  if (h.indexOf("#/settings") === 0) return "settings";
   return "home";
 }
 function renderRoute() {
@@ -336,6 +340,11 @@ function renderRoute() {
   var links = document.querySelectorAll(".app-nav a");
   links.forEach(function (a) {
     a.classList.toggle("active", a.getAttribute("data-route") === r);
+    // Phase 4: Reports and Settings are admin-only (permission matrix).
+    var dr = a.getAttribute("data-route");
+    if (dr === "reports" || dr === "settings") {
+      a.style.display = erpIsAdmin() ? "" : "none";
+    }
   });
   if (r === "inventory") {
     document.title = "Inventory \u00b7 Pop-A-Licious ERP";
@@ -375,6 +384,14 @@ function renderRoute() {
       erpState.ediPostDoc = null;
     }
     loadErpEdiDetail();
+  } else if (r === "reports") {
+    document.title = "Reports \u00b7 Pop-A-Licious ERP";
+    if (!erpIsAdmin()) { location.hash = "#/"; return; }
+    loadErpReportsDetail();
+  } else if (r === "settings") {
+    document.title = "Settings \u00b7 Pop-A-Licious ERP";
+    if (!erpIsAdmin()) { location.hash = "#/"; return; }
+    loadErpSettingsDetail();
   } else {
     document.title = "Dashboard \u00b7 Pop-A-Licious ERP";
     renderHome();
@@ -2829,6 +2846,11 @@ function renderErpOrderDetail(body) {
       body.appendChild(fform);
     }
 
+    // QuickBooks (Phase 4: wholesale orders only, admin only)
+    if (source === "wholesale" && erpIsAdmin()) {
+      renderErpOrderQbSection(body, o, id, function () { renderErpOrderDetail(body); });
+    }
+
     // linked batches
     var bh = document.createElement("h3");
     bh.textContent = "Linked batches";
@@ -4633,6 +4655,574 @@ function erpEditEdiPartnerForm(p) {
     });
   });
   return form;
+}
+
+/* ================= ERP Phase 4: Reporting + QuickBooks bridge ================= */
+erpState.reportsView = "sales";
+erpState.reportFilters = {from: "", to: "", channel: "all"};
+erpState.reportData = null;
+erpState.qbStatus = null;
+
+async function erpDownloadCsv(path, filename) {
+  setAdminDetailStatus("Preparing export…");
+  try {
+    var response = await authFetch(path);
+    if (!response.ok) {
+      var data = await response.json().catch(function () { return {}; });
+      throw new Error(authMessage(data, "Export failed."));
+    }
+    var blob = await response.blob();
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+    setAdminDetailStatus("");
+  } catch (error) {
+    setAdminDetailStatus(error.message, true);
+  }
+}
+
+function erpReportTable(headers, rows) {
+  var wrap = document.createElement("div");
+  wrap.className = "admin-orders-wrap";
+  var table = document.createElement("table");
+  table.className = "admin-orders-table";
+  var thead = document.createElement("thead");
+  var htr = document.createElement("tr");
+  headers.forEach(function (h) {
+    var th = document.createElement("th");
+    th.textContent = h;
+    htr.appendChild(th);
+  });
+  thead.appendChild(htr);
+  table.appendChild(thead);
+  var tbody = document.createElement("tbody");
+  rows.forEach(function (r) {
+    var tr = document.createElement("tr");
+    r.forEach(function (c) {
+      var td = document.createElement("td");
+      td.textContent = (c === null || c === undefined || c === "") ? "—" : String(c);
+      tr.appendChild(td);
+    });
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  return wrap;
+}
+
+function erpReportQuery(extra) {
+  var q = [];
+  if (erpState.reportFilters.from) q.push("from=" + encodeURIComponent(erpState.reportFilters.from));
+  if (erpState.reportFilters.to) q.push("to=" + encodeURIComponent(erpState.reportFilters.to));
+  if (extra) q.push(extra);
+  return q.length ? "?" + q.join("&") : "";
+}
+
+function erpReportFilterBar(onApply, showChannel) {
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  var fromInput = erpTextInput("from", "YYYY-MM-DD");
+  fromInput.value = erpState.reportFilters.from || "";
+  fromInput.style.width = "130px";
+  var toInput = erpTextInput("to", "YYYY-MM-DD");
+  toInput.value = erpState.reportFilters.to || "";
+  toInput.style.width = "130px";
+  bar.appendChild(erpField("From", fromInput));
+  bar.appendChild(erpField("To", toInput));
+  var channelSel = null;
+  if (showChannel) {
+    channelSel = document.createElement("select");
+    [["all", "All channels"], ["online", "Online"], ["wholesale", "Wholesale"]].forEach(function (opt) {
+      var o = document.createElement("option");
+      o.value = opt[0];
+      o.textContent = opt[1];
+      if ((erpState.reportFilters.channel || "all") === opt[0]) o.selected = true;
+      channelSel.appendChild(o);
+    });
+    bar.appendChild(erpField("Channel", channelSel));
+  }
+  var apply = document.createElement("button");
+  apply.type = "button";
+  apply.textContent = "Apply";
+  apply.addEventListener("click", function () {
+    erpState.reportFilters.from = fromInput.value.trim();
+    erpState.reportFilters.to = toInput.value.trim();
+    if (channelSel) erpState.reportFilters.channel = channelSel.value;
+    onApply();
+  });
+  bar.appendChild(apply);
+  return bar;
+}
+
+function erpCsvButton(label, pathFn) {
+  var b = document.createElement("button");
+  b.type = "button";
+  b.textContent = label;
+  b.addEventListener("click", function () {
+    var q = erpReportQuery("format=csv");
+    erpDownloadCsv(pathFn() + q, label.toLowerCase().replace(/[^a-z0-9]+/g, "-") + ".csv");
+  });
+  return b;
+}
+
+/* ---------------- Reports ---------------- */
+async function loadErpReportsDetail() {
+  setAdminDetailStatus("");
+  renderErpReportsDetail();
+}
+
+function renderErpReportsDetail() {
+  var els = adminDetailEls();
+  els.body.replaceChildren();
+  var h2 = document.createElement("h2");
+  h2.textContent = "Reports";
+  els.body.appendChild(h2);
+  var tabs = document.createElement("div");
+  tabs.className = "erp-subtabs";
+  [["sales", "Sales"], ["valuation", "Inventory valuation"],
+   ["margin", "Production margin"], ["wholesale", "Wholesale performance"],
+   ["summaries", "Sales summaries"]].forEach(function (t) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = t[1];
+    if (erpState.reportsView === t[0]) b.classList.add("active");
+    b.addEventListener("click", function () {
+      erpState.reportsView = t[0];
+      erpState.reportData = null;
+      renderErpReportsDetail();
+    });
+    tabs.appendChild(b);
+  });
+  els.body.appendChild(tabs);
+  var v = erpState.reportsView;
+  if (v === "sales") renderErpSalesReport(els.body);
+  else if (v === "valuation") renderErpValuationReport(els.body);
+  else if (v === "margin") renderErpMarginReport(els.body);
+  else if (v === "wholesale") renderErpWholesalePerfReport(els.body);
+  else renderErpSummariesView(els.body);
+}
+
+function renderErpSalesReport(body) {
+  body.appendChild(erpReportFilterBar(function () { renderErpReportsDetail(); }, true));
+  var out = document.createElement("div");
+  body.appendChild(out);
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  bar.appendChild(erpCsvButton("Export CSV", function () {
+    return "/api/erp/reports/sales" + erpReportQuery(
+      "channel=" + encodeURIComponent(erpState.reportFilters.channel || "all") + "&format=csv");
+  }));
+  body.appendChild(bar);
+  out.textContent = "Loading…";
+  var q = erpReportQuery("channel=" + encodeURIComponent(erpState.reportFilters.channel || "all"));
+  erpGet("/api/erp/reports/sales" + q).then(function (res) {
+    out.replaceChildren();
+    var sum = document.createElement("p");
+    sum.innerHTML = "<strong>Total:</strong> " + erpMoney(res.total_cents) +
+      " across " + res.order_count + " orders" +
+      (res.from || res.to ? " (" + (res.from || "…") + " to " + (res.to || "…") + ")" : "");
+    out.appendChild(sum);
+    if (res.channel !== "wholesale") {
+      var h3 = document.createElement("h3");
+      h3.textContent = "Online — " + erpMoney(res.online.total_cents) + " (" + res.online.order_count + " orders)";
+      out.appendChild(h3);
+      out.appendChild(erpReportTable(["Flavor", "Bags"],
+        res.online.flavors.map(function (f) { return [f.flavor, f.bags]; })));
+    }
+    if (res.channel !== "online") {
+      var h4 = document.createElement("h3");
+      h4.textContent = "Wholesale — " + erpMoney(res.wholesale.total_cents) + " (" + res.wholesale.order_count + " orders)";
+      out.appendChild(h4);
+      out.appendChild(erpReportTable(["Flavor", "Bags", "Revenue"],
+        res.wholesale.flavors.map(function (f) { return [f.flavor, f.bags, erpMoney(f.total_cents)]; })));
+    }
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+function renderErpValuationReport(body) {
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  bar.appendChild(erpCsvButton("Export CSV", function () { return "/api/erp/reports/inventory-valuation?format=csv"; }));
+  body.appendChild(bar);
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  erpGet("/api/erp/reports/inventory-valuation").then(function (res) {
+    out.replaceChildren();
+    var sum = document.createElement("p");
+    sum.innerHTML = "<strong>Total inventory value:</strong> " + erpMoney(res.total_cents) +
+      " (" + res.item_count + " item/location rows)";
+    out.appendChild(sum);
+    out.appendChild(erpReportTable(
+      ["SKU", "Item", "Type", "Location", "On hand", "Avg cost", "Value"],
+      res.items.map(function (i) {
+        return [i.sku, i.name, i.type, i.location_code, i.on_hand,
+                erpMoney(i.avg_cost_cents), erpMoney(i.value_cents)];
+      })));
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+function renderErpMarginReport(body) {
+  body.appendChild(erpReportFilterBar(function () { renderErpReportsDetail(); }, false));
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  bar.appendChild(erpCsvButton("Export CSV", function () {
+    return "/api/erp/reports/production-margin" + erpReportQuery("format=csv");
+  }));
+  body.appendChild(bar);
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  erpGet("/api/erp/reports/production-margin" + erpReportQuery()).then(function (res) {
+    out.replaceChildren();
+    if (res.note) {
+      var n = document.createElement("p");
+      n.style.color = "var(--muted)";
+      n.textContent = res.note;
+      out.appendChild(n);
+    }
+    out.appendChild(erpReportTable(
+      ["Flavor", "Batches", "Bags", "Cost/bag", "Retail $8 margin", "Retail %", "Wholesale $4 margin", "Wholesale %"],
+      res.flavors.map(function (f) {
+        return [f.flavor, f.batches, f.bags_produced, erpMoney(f.cost_per_bag_cents),
+                erpMoney(f.retail_margin_cents), f.retail_margin_pct + "%",
+                erpMoney(f.wholesale_margin_cents), f.wholesale_margin_pct + "%"];
+      })));
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+function renderErpWholesalePerfReport(body) {
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  bar.appendChild(erpCsvButton("Export CSV", function () { return "/api/erp/reports/wholesale-performance?format=csv"; }));
+  body.appendChild(bar);
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  erpGet("/api/erp/reports/wholesale-performance").then(function (res) {
+    out.replaceChildren();
+    var sum = document.createElement("p");
+    sum.innerHTML = "<strong>Total wholesale revenue:</strong> " + erpMoney(res.total_revenue_cents);
+    out.appendChild(sum);
+    out.appendChild(erpReportTable(
+      ["Account", "Orders", "Revenue", "Avg order", "Last order"],
+      res.accounts.map(function (a) {
+        return [a.name, a.order_count, erpMoney(a.revenue_cents),
+                erpMoney(a.avg_order_cents), a.last_order_at ? erpFmtDate(a.last_order_at) : "—"];
+      })));
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+/* ---------------- Sales summaries ---------------- */
+function renderErpSummariesView(body) {
+  var note = document.createElement("p");
+  note.style.color = "var(--muted)";
+  note.textContent = "Weekly online-sales rollups for QuickBooks. Wholesale is excluded — it goes to QuickBooks as invoices.";
+  body.appendChild(note);
+  var form = document.createElement("div");
+  form.className = "erp-form erp-form-inline";
+  var fromInput = erpTextInput("from", "Start (YYYY-MM-DD)");
+  fromInput.style.width = "150px";
+  var toInput = erpTextInput("to", "End (YYYY-MM-DD)");
+  toInput.style.width = "150px";
+  form.appendChild(erpField("Period start", fromInput));
+  form.appendChild(erpField("Period end", toInput));
+  var gen = document.createElement("button");
+  gen.type = "button";
+  gen.textContent = "Generate summary";
+  gen.addEventListener("click", function () {
+    gen.disabled = true;
+    setAdminDetailStatus("Generating…");
+    erpPost("/api/erp/sales-summaries",
+      {period_start: fromInput.value.trim(), period_end: toInput.value.trim()}
+    ).then(function () {
+      setAdminDetailStatus("");
+      renderErpReportsDetail();
+    }).catch(function (error) {
+      gen.disabled = false;
+      setAdminDetailStatus(error.message, true);
+    });
+  });
+  form.appendChild(gen);
+  body.appendChild(form);
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  erpGet("/api/erp/sales-summaries").then(function (res) {
+    out.replaceChildren();
+    if (!res.summaries.length) {
+      out.textContent = "No summaries yet.";
+      return;
+    }
+    out.appendChild(erpReportTable(
+      ["Period", "Orders", "Total", "Status", "QuickBooks", ""],
+      res.summaries.map(function (s) {
+        return [s.period_start + " to " + s.period_end, s.order_count,
+                erpMoney(s.total_cents), s.status,
+                s.qb_sales_receipt_id ? "Receipt " + s.qb_sales_receipt_id : "—",
+                ""];
+      })));
+    // attach push buttons to draft rows
+    var tb = out.querySelector("tbody");
+    res.summaries.forEach(function (s, idx) {
+      if (s.status === "pushed") return;
+      var tr = tb.children[idx];
+      var cell = tr.lastChild;
+      var b = document.createElement("button");
+      b.type = "button";
+      b.textContent = "Send to QuickBooks";
+      b.addEventListener("click", function () {
+        erpShowQbPushModal({
+          title: "Send sales summary to QuickBooks",
+          previewPath: "/api/erp/sales-summaries/" + s.id + "/quickbooks-preview",
+          pushPath: "/api/erp/sales-summaries/" + s.id + "/quickbooks-push",
+          renderPreview: erpRenderReceiptPreview,
+          confirmLabel: "Create sales receipt in QuickBooks",
+          onDone: function () { renderErpReportsDetail(); }
+        });
+      });
+      cell.appendChild(b);
+    });
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+/* ---------------- QuickBooks push modal (shared) ---------------- */
+function erpShowQbPushModal(opts) {
+  var modal = erpOpenModal(opts.title);
+  var status = document.createElement("div");
+  status.style.marginBottom = "8px";
+  modal.body.appendChild(status);
+  status.textContent = "Loading preview…";
+  erpGet(opts.previewPath).then(function (pv) {
+    status.textContent = "";
+    opts.renderPreview(modal.body, pv);
+    if (pv.item_configured === false) {
+      var warn = document.createElement("p");
+      warn.style.color = "#c92e29";
+      warn.textContent = "No QuickBooks item is configured. Set it in Settings → QuickBooks first.";
+      modal.body.appendChild(warn);
+      return;
+    }
+    var note = document.createElement("p");
+    note.style.color = "var(--muted)";
+    note.textContent = "QuickBooks invoices and sales receipts go live immediately — there is no draft state. This cannot be undone from here.";
+    modal.body.appendChild(note);
+    var row = document.createElement("div");
+    row.className = "erp-toolbar";
+    var confirm = document.createElement("button");
+    confirm.type = "button";
+    confirm.textContent = opts.confirmLabel;
+    confirm.addEventListener("click", function () {
+      confirm.disabled = true;
+      status.textContent = "Pushing to QuickBooks…";
+      erpPost(opts.pushPath, {}).then(function (res) {
+        modal.close();
+        setAdminDetailStatus("Pushed to QuickBooks.");
+        if (opts.onDone) opts.onDone(res);
+      }).catch(function (error) {
+        confirm.disabled = false;
+        status.textContent = error.message;
+      });
+    });
+    row.appendChild(confirm);
+    modal.body.appendChild(row);
+  }).catch(function (error) {
+    status.textContent = error.message;
+  });
+}
+
+function erpRenderInvoicePreview(body, pv) {
+  var meta = document.createElement("div");
+  meta.className = "erp-detail-meta";
+  var c = document.createElement("span");
+  c.textContent = "Customer: " + pv.customer.name +
+    (pv.customer.will_create ? " (will be created in QuickBooks)"
+     : " (QuickBooks ID " + pv.customer.qb_id + ")");
+  meta.appendChild(c);
+  var t = document.createElement("span");
+  t.textContent = "Total: " + erpMoney(pv.total_cents);
+  meta.appendChild(t);
+  var it = document.createElement("span");
+  it.textContent = "Item: " + (pv.item_name || pv.item_id || "not configured");
+  meta.appendChild(it);
+  body.appendChild(meta);
+  body.appendChild(erpReportTable(
+    ["Flavor", "Bags", "Unit price", "Line total"],
+    pv.lines.map(function (l) {
+      return [l.flavor, l.qty_bags, erpMoney(l.unit_price_cents), erpMoney(l.line_total_cents)];
+    })));
+}
+
+function erpRenderReceiptPreview(body, pv) {
+  var meta = document.createElement("div");
+  meta.className = "erp-detail-meta";
+  var p = document.createElement("span");
+  p.textContent = "Period: " + pv.period_start + " to " + pv.period_end;
+  meta.appendChild(p);
+  var o = document.createElement("span");
+  o.textContent = "Orders: " + pv.order_count;
+  meta.appendChild(o);
+  var t = document.createElement("span");
+  t.textContent = "Total: " + erpMoney(pv.total_cents);
+  meta.appendChild(t);
+  body.appendChild(meta);
+}
+
+/* QuickBooks section on the wholesale order detail page */
+function renderErpOrderQbSection(body, o, orderId, refresh) {
+  var h3 = document.createElement("h3");
+  h3.textContent = "QuickBooks";
+  body.appendChild(h3);
+  var wrap = document.createElement("div");
+  wrap.className = "erp-toolbar";
+  if (o.qb_invoice_id) {
+    var s = document.createElement("span");
+    s.textContent = "Pushed to QuickBooks as invoice " + o.qb_invoice_id + ".";
+    wrap.appendChild(s);
+  } else {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = "Send to QuickBooks";
+    b.addEventListener("click", function () {
+      erpShowQbPushModal({
+        title: "Send order " + o.number + " to QuickBooks",
+        previewPath: "/api/erp/wholesale-orders/" + encodeURIComponent(String(orderId)) + "/quickbooks-preview",
+        pushPath: "/api/erp/wholesale-orders/" + encodeURIComponent(String(orderId)) + "/quickbooks-push",
+        renderPreview: erpRenderInvoicePreview,
+        confirmLabel: "Create invoice in QuickBooks",
+        onDone: refresh
+      });
+    });
+    wrap.appendChild(b);
+  }
+  body.appendChild(wrap);
+}
+
+/* ---------------- Settings (QuickBooks) ---------------- */
+async function loadErpSettingsDetail() {
+  setAdminDetailStatus("Loading…");
+  try {
+    var res = await erpGet("/api/erp/quickbooks/status");
+    erpState.qbStatus = res;
+    setAdminDetailStatus("");
+  } catch (error) {
+    setAdminDetailStatus(error.message, true);
+    erpState.qbStatus = null;
+  }
+  renderErpSettingsDetail();
+}
+
+function renderErpSettingsDetail() {
+  var els = adminDetailEls();
+  els.body.replaceChildren();
+  var h2 = document.createElement("h2");
+  h2.textContent = "Settings";
+  els.body.appendChild(h2);
+  var st = erpState.qbStatus;
+  var card = document.createElement("div");
+  card.className = "admin-orders-wrap";
+  var h3 = document.createElement("h3");
+  h3.textContent = "QuickBooks";
+  card.appendChild(h3);
+  var p = document.createElement("p");
+  if (!st) {
+    p.textContent = "Could not load QuickBooks status.";
+  } else if (!st.configured) {
+    p.textContent = "Not configured. Set QB_CLIENT_ID and QB_CLIENT_SECRET on the backend, then connect.";
+    p.style.color = "#c92e29";
+  } else if (st.connected) {
+    p.textContent = "Connected" + (st.company_name ? " to " + st.company_name : "") + ".";
+  } else {
+    p.textContent = "Not connected.";
+  }
+  card.appendChild(p);
+  if (typeof location !== "undefined" && location.hash.indexOf("qb=connected") >= 0) {
+    var ok = document.createElement("p");
+    ok.style.color = "#1a8d83";
+    ok.textContent = "QuickBooks connected successfully.";
+    card.appendChild(ok);
+  }
+  if (st && st.configured) {
+    var row = document.createElement("div");
+    row.className = "erp-toolbar";
+    if (st.connected) {
+      var dis = document.createElement("button");
+      dis.type = "button";
+      dis.textContent = "Disconnect";
+      dis.addEventListener("click", function () {
+        if (!window.confirm("Disconnect QuickBooks? Pushed invoices stay in QuickBooks.")) return;
+        erpPost("/api/erp/quickbooks/disconnect", {}).then(function () {
+          loadErpSettingsDetail();
+        }).catch(function (error) { setAdminDetailStatus(error.message, true); });
+      });
+      row.appendChild(dis);
+    } else {
+      var conn = document.createElement("button");
+      conn.type = "button";
+      conn.textContent = "Connect QuickBooks";
+      conn.addEventListener("click", function () {
+        conn.disabled = true;
+        erpGet("/api/erp/quickbooks/connect").then(function (res) {
+          window.location = res.authorize_url;
+        }).catch(function (error) {
+          conn.disabled = false;
+          setAdminDetailStatus(error.message, true);
+        });
+      });
+      row.appendChild(conn);
+    }
+    card.appendChild(row);
+    // item mapping config
+    var h4 = document.createElement("h4");
+    h4.textContent = "Item mapping";
+    card.appendChild(h4);
+    var note = document.createElement("p");
+    note.style.color = "var(--muted)";
+    note.textContent = "The QuickBooks item used on invoice and sales-receipt lines. Find the item ID in QuickBooks (Items list).";
+    card.appendChild(note);
+    var form = document.createElement("div");
+    form.className = "erp-form erp-form-inline";
+    var itemInput = erpTextInput("wholesale_item_id", "Wholesale item ID");
+    itemInput.style.width = "120px";
+    var nameInput = erpTextInput("wholesale_item_name", "Item name (label)");
+    nameInput.style.width = "200px";
+    var salesInput = erpTextInput("sales_item_id", "Sales summary item ID (optional)");
+    salesInput.style.width = "200px";
+    form.appendChild(erpField("Wholesale item ID", itemInput));
+    form.appendChild(erpField("Item name", nameInput));
+    form.appendChild(erpField("Summary item ID", salesInput));
+    var save = document.createElement("button");
+    save.type = "button";
+    save.textContent = "Save mapping";
+    save.addEventListener("click", function () {
+      save.disabled = true;
+      erpPost("/api/erp/quickbooks/config", {
+        wholesale_item_id: itemInput.value.trim(),
+        wholesale_item_name: nameInput.value.trim(),
+        sales_item_id: salesInput.value.trim()
+      }).then(function (res) {
+        save.disabled = false;
+        setAdminDetailStatus("Mapping saved.");
+        itemInput.value = res.config.wholesale_item_id || "";
+        nameInput.value = res.config.wholesale_item_name || "";
+        salesInput.value = res.config.sales_item_id || "";
+      }).catch(function (error) {
+        save.disabled = false;
+        setAdminDetailStatus(error.message, true);
+      });
+    });
+    form.appendChild(save);
+    card.appendChild(form);
+    erpGet("/api/erp/quickbooks/config").then(function (res) {
+      itemInput.value = res.config.wholesale_item_id || "";
+      nameInput.value = res.config.wholesale_item_name || "";
+      salesInput.value = res.config.sales_item_id || "";
+    }).catch(function () {});
+  }
+  els.body.appendChild(card);
 }
 </script>
 </body>
