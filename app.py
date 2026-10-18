@@ -699,6 +699,96 @@ def init_db():
             unit_cost_cents INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_erp_batch_ingredients ON erp_batch_ingredients (batch_id);
+        CREATE TABLE IF NOT EXISTS erp_wholesale_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            contact_name TEXT NOT NULL DEFAULT '',
+            email TEXT NOT NULL DEFAULT '',
+            phone TEXT NOT NULL DEFAULT '',
+            address TEXT NOT NULL DEFAULT '',
+            price_per_bag_cents INTEGER NOT NULL DEFAULT 400,
+            payment_terms TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_wholesale_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_number TEXT UNIQUE NOT NULL,
+            account_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new',
+            order_date TEXT NOT NULL DEFAULT '',
+            due_date TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            via_edi INTEGER NOT NULL DEFAULT 0,
+            edi_document_id INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_wholesale_order_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            flavor_name TEXT NOT NULL,
+            qty_bags REAL NOT NULL,
+            unit_price_cents INTEGER NOT NULL,
+            line_total_cents INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_wholesale_lines ON erp_wholesale_order_lines (order_id);
+        CREATE TABLE IF NOT EXISTS erp_order_fulfillment (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_source TEXT NOT NULL,
+            order_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new',
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_fulfillment ON erp_order_fulfillment (order_source, order_id);
+        CREATE TABLE IF NOT EXISTS erp_fulfillment_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_source TEXT NOT NULL,
+            order_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_fulfillment_hist ON erp_fulfillment_history (order_source, order_id);
+        CREATE TABLE IF NOT EXISTS erp_batch_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id INTEGER NOT NULL,
+            order_source TEXT NOT NULL,
+            order_id INTEGER NOT NULL,
+            qty_bags REAL NOT NULL,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_batch_orders_batch ON erp_batch_orders (batch_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_batch_orders_order ON erp_batch_orders (order_source, order_id);
+        CREATE TABLE IF NOT EXISTS erp_edi_partners (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT '',
+            transport TEXT NOT NULL DEFAULT 'manual-file',
+            config_json TEXT NOT NULL DEFAULT '{}',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_edi_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            partner_id INTEGER NOT NULL DEFAULT 0,
+            direction TEXT NOT NULL,
+            doc_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'received',
+            raw_text TEXT NOT NULL DEFAULT '',
+            parsed_json TEXT NOT NULL DEFAULT '{}',
+            order_source TEXT NOT NULL DEFAULT '',
+            order_id INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_edi_docs ON erp_edi_documents (partner_id, direction, doc_type, status);
         INSERT OR IGNORE INTO erp_locations (code, name, type, active) VALUES
          ('HEND', 'Henderson Warehouse', 'warehouse', 1),
          ('EVT', 'Events / Mobile', 'mobile', 1),
@@ -8754,6 +8844,1634 @@ def erp_batch_trace(batch_id):
     return jsonify(batch_number=batch["batch_number"], lot_code=batch["lot_code"],
                    expiry_date=batch["expiry_date"], status=batch["status"],
                    ingredients=used)
+
+
+# ---------------- ERP Phase 3: Order hub + wholesale CRM ----------------
+
+_ERP_FULFILLMENT_STATUSES = ("new", "in_production", "ready", "shipped",
+                             "picked_up", "cancelled")
+_ERP_ORDER_SOURCES = ("stripe", "paypal", "wholesale")
+
+
+def _erp_get_fulfillment(conn, source, order_id):
+    return conn.execute(
+        "SELECT * FROM erp_order_fulfillment WHERE order_source = ? AND order_id = ?",
+        (source, order_id)).fetchone()
+
+
+def _erp_set_fulfillment(conn, source, order_id, status, actor, note=""):
+    """Write fulfillment status (side table + history). For wholesale also
+    mirrors onto erp_wholesale_orders.status so the order row stays truthful."""
+    if status not in _ERP_FULFILLMENT_STATUSES:
+        return "unknown status '%s'" % status
+    now = datetime.now(timezone.utc).isoformat()
+    existing = _erp_get_fulfillment(conn, source, order_id)
+    if existing:
+        conn.execute(
+            "UPDATE erp_order_fulfillment SET status = ?, updated_by = ?,"
+            " updated_at = ?, note = ? WHERE id = ?",
+            (status, actor, now, note or "", existing["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO erp_order_fulfillment (order_source, order_id, status,"
+            " updated_by, updated_at, note) VALUES (?, ?, ?, ?, ?, ?)",
+            (source, order_id, status, actor, now, note or ""))
+    conn.execute(
+        "INSERT INTO erp_fulfillment_history (order_source, order_id, status,"
+        " updated_by, updated_at, note) VALUES (?, ?, ?, ?, ?, ?)",
+        (source, order_id, status, actor, now, note or ""))
+    if source == "wholesale":
+        conn.execute("UPDATE erp_wholesale_orders SET status = ? WHERE id = ?",
+                     (status, order_id))
+    return None
+
+
+def _erp_fulfillment_dict(conn, source, order_id):
+    row = _erp_get_fulfillment(conn, source, order_id)
+    status = row["status"] if row else "new"
+    hist = [dict(h) for h in conn.execute(
+        "SELECT status, updated_by, updated_at, note FROM erp_fulfillment_history"
+        " WHERE order_source = ? AND order_id = ? ORDER BY id",
+        (source, order_id)).fetchall()]
+    return {"status": status, "history": hist}
+
+
+def _erp_online_order(conn, source, order_id):
+    """Read-only view of a checkout order. Returns dict or None."""
+    if source == "stripe":
+        r = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+        if not r:
+            return None
+        return {"source": "stripe", "id": r["id"],
+                "number": "#%d" % (1000 + r["id"]),
+                "customer_name": r["customer_name"] or "",
+                "email": r["email"] or "",
+                "shipping_address": r["shipping_address"] or "",
+                "items_summary": r["items_summary"] or "",
+                "total_cents": r["amount_total_cents"] or 0,
+                "total_qty": r["total_qty"] or 0,
+                "tracking_number": r["shippo_tracking_number"] or "",
+                "created_at": r["created_at"]}
+    if source == "paypal":
+        r = conn.execute("SELECT * FROM paypal_orders WHERE id = ?",
+                         (order_id,)).fetchone()
+        if not r:
+            return None
+        return {"source": "paypal", "id": r["id"],
+                "number": "#%d" % (1000 + r["id"]),
+                "customer_name": "",
+                "email": r["email"] or "",
+                "shipping_address": "",
+                "items_summary": r["items_summary"] or "",
+                "total_cents": r["amount_total_cents"] or 0,
+                "total_qty": r["total_qty"] or 0,
+                "tracking_number": "",
+                "created_at": r["created_at"]}
+    return None
+
+
+def _erp_wholesale_account_dict(conn, a):
+    n = conn.execute("SELECT COUNT(*) AS c FROM erp_wholesale_orders"
+                     " WHERE account_id = ?", (a["id"],)).fetchone()["c"]
+    d = dict(a)
+    d["order_count"] = n
+    return d
+
+
+def _erp_wholesale_order_totals(conn, order_id):
+    rows = conn.execute("SELECT qty_bags, line_total_cents FROM erp_wholesale_order_lines"
+                        " WHERE order_id = ?", (order_id,)).fetchall()
+    return (sum(float(r["qty_bags"]) for r in rows),
+            sum(int(r["line_total_cents"]) for r in rows))
+
+
+def _erp_wholesale_order_brief(conn, w):
+    acct = conn.execute("SELECT name FROM erp_wholesale_accounts WHERE id = ?",
+                        (w["account_id"],)).fetchone()
+    qty, total = _erp_wholesale_order_totals(conn, w["id"])
+    return {"source": "wholesale", "id": w["id"], "number": w["order_number"],
+            "order_number": w["order_number"],
+            "customer_name": acct["name"] if acct else "",
+            "account_name": acct["name"] if acct else "",
+            "account_id": w["account_id"],
+            "email": "", "items_summary": "",
+            "total_cents": total, "total_qty": qty,
+            "status": w["status"], "created_at": w["created_at"],
+            "due_date": w["due_date"], "via_edi": bool(w["via_edi"])}
+
+
+def _erp_order_brief(conn, source, order_id):
+    """Queue/link representation of any order, or None if it doesn't exist."""
+    if source in ("stripe", "paypal"):
+        o = _erp_online_order(conn, source, order_id)
+        if not o:
+            return None
+        o["due_date"] = ""
+        o["via_edi"] = False
+        o["account_name"] = ""
+        return o
+    if source == "wholesale":
+        w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                         (order_id,)).fetchone()
+        if not w:
+            return None
+        return _erp_wholesale_order_brief(conn, w)
+    return None
+
+
+def _erp_batch_link_dict(conn, link):
+    b = conn.execute("SELECT batch_number, lot_code, status FROM erp_production_batches"
+                     " WHERE id = ?", (link["batch_id"],)).fetchone()
+    o = _erp_order_brief(conn, link["order_source"], link["order_id"])
+    return {"id": link["id"], "link_id": link["id"], "batch_id": link["batch_id"],
+            "batch_number": b["batch_number"] if b else "",
+            "lot_code": b["lot_code"] if b else "",
+            "batch_status": b["status"] if b else "",
+            "order_source": link["order_source"], "order_id": link["order_id"],
+            "order_number": o["number"] if o else "",
+            "customer_name": o["customer_name"] if o else "",
+            "qty_bags": link["qty_bags"], "created_by": link["created_by"],
+            "created_at": link["created_at"]}
+
+
+def _erp_order_links(conn, source, order_id):
+    links = conn.execute(
+        "SELECT * FROM erp_batch_orders WHERE order_source = ? AND order_id = ?"
+        " ORDER BY id", (source, order_id)).fetchall()
+    return [_erp_batch_link_dict(conn, l) for l in links]
+
+
+@app.get("/api/erp/orders")
+def erp_order_queue():
+    """Unified order queue: stripe + paypal (read-only) + wholesale."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    source = (request.args.get("source") or "").strip()
+    status = (request.args.get("status") or "").strip()
+    q = (request.args.get("q") or "").strip().lower()
+    if source and source not in _ERP_ORDER_SOURCES:
+        return jsonify(error="unknown source"), 400
+    if status and status not in _ERP_FULFILLMENT_STATUSES:
+        return jsonify(error="unknown status"), 400
+    conn = db()
+    orders = []
+    if not source or source == "stripe":
+        for r in conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall():
+            orders.append(_erp_order_brief(conn, "stripe", r["id"]))
+    if not source or source == "paypal":
+        for r in conn.execute("SELECT * FROM paypal_orders ORDER BY id DESC").fetchall():
+            orders.append(_erp_order_brief(conn, "paypal", r["id"]))
+    if not source or source == "wholesale":
+        for w in conn.execute(
+                "SELECT * FROM erp_wholesale_orders ORDER BY id DESC").fetchall():
+            orders.append(_erp_wholesale_order_brief(conn, w))
+    fulf = {(f["order_source"], f["order_id"]): f["status"]
+            for f in conn.execute("SELECT order_source, order_id, status"
+                                  " FROM erp_order_fulfillment").fetchall()}
+    for o in orders:
+        o["status"] = fulf.get((o["source"], o["id"]), "new")
+    if status:
+        orders = [o for o in orders if o["status"] == status]
+    if q:
+        orders = [o for o in orders
+                  if q in (o["number"] or "").lower()
+                  or q in (o["customer_name"] or "").lower()
+                  or q in (o["email"] or "").lower()
+                  or q in (o["items_summary"] or "").lower()]
+    orders.sort(key=lambda o: o["created_at"] or "", reverse=True)
+    conn.close()
+    return jsonify(orders=orders)
+
+
+@app.get("/api/erp/orders/<source>/<int:order_id>")
+def erp_order_detail(source, order_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    if source not in _ERP_ORDER_SOURCES:
+        return jsonify(error="unknown source"), 404
+    conn = db()
+    if source == "wholesale":
+        w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                         (order_id,)).fetchone()
+        if not w:
+            conn.close()
+            return jsonify(error="order not found"), 404
+        order = _erp_wholesale_order_brief(conn, w)
+        order["lines"] = [dict(l) for l in conn.execute(
+            "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
+            (order_id,)).fetchall()]
+        acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                            (w["account_id"],)).fetchone()
+        order["account"] = dict(acct) if acct else None
+        order["notes"] = w["notes"]
+        order["order_date"] = w["order_date"]
+        order["tracking_number"] = ""
+        order["shipping_address"] = acct["address"] if acct else ""
+    else:
+        order = _erp_online_order(conn, source, order_id)
+        if not order:
+            conn.close()
+            return jsonify(error="order not found"), 404
+        order["due_date"] = ""
+        order["via_edi"] = False
+        order["account_name"] = ""
+        order["account"] = None
+        order["lines"] = None
+        order["notes"] = ""
+        order["order_date"] = ""
+    fulf = _erp_fulfillment_dict(conn, source, order_id)
+    order["status"] = fulf["status"]
+    order["fulfillment"] = fulf
+    order["linked_batches"] = _erp_order_links(conn, source, order_id)
+    conn.close()
+    return jsonify(order=order)
+
+
+@app.post("/api/erp/orders/<source>/<int:order_id>/status")
+def erp_order_set_status(source, order_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    if source not in _ERP_ORDER_SOURCES:
+        return jsonify(error="unknown source"), 404
+    data = request.get_json(force=True) or {}
+    status = (data.get("status") or "").strip()
+    note = (data.get("note") or "").strip()
+    conn = db()
+    if not _erp_order_brief(conn, source, order_id):
+        conn.close()
+        return jsonify(error="order not found"), 404
+    err_msg = _erp_set_fulfillment(conn, source, order_id, status, actor, note)
+    if err_msg:
+        conn.close()
+        return jsonify(error=err_msg), 400
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, status=status)
+
+
+# ---------------- wholesale accounts ----------------
+
+@app.get("/api/erp/wholesale-accounts")
+def erp_list_wholesale_accounts():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute("SELECT * FROM erp_wholesale_accounts ORDER BY name").fetchall()
+    out = [_erp_wholesale_account_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(accounts=out)
+
+
+@app.post("/api/erp/wholesale-accounts")
+def erp_create_wholesale_account():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        conn = None
+        return jsonify(error="name is required"), 400
+    try:
+        price = int(data.get("price_per_bag_cents", 400) or 400)
+    except (TypeError, ValueError):
+        return jsonify(error="price_per_bag_cents must be a number"), 400
+    if price <= 0:
+        return jsonify(error="price_per_bag_cents must be greater than zero"), 400
+    conn = db()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
+        " price_per_bag_cents, payment_terms, notes, active, created_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        (name, (data.get("contact_name") or "").strip(),
+         (data.get("email") or "").strip(), (data.get("phone") or "").strip(),
+         (data.get("address") or "").strip(), price,
+         (data.get("payment_terms") or "").strip(),
+         (data.get("notes") or "").strip(), actor, now))
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (cur.lastrowid,)).fetchone()
+    out = _erp_wholesale_account_dict(conn, acct)
+    conn.commit()
+    conn.close()
+    return jsonify(account=out), 201
+
+
+@app.get("/api/erp/wholesale-accounts/<int:account_id>")
+def erp_get_wholesale_account(account_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="account not found"), 404
+    orders = [_erp_wholesale_order_brief(conn, w) for w in conn.execute(
+        "SELECT * FROM erp_wholesale_orders WHERE account_id = ? ORDER BY id DESC",
+        (account_id,)).fetchall()]
+    out = _erp_wholesale_account_dict(conn, acct)
+    conn.close()
+    return jsonify(account=out, orders=orders)
+
+
+@app.put("/api/erp/wholesale-accounts/<int:account_id>")
+def erp_update_wholesale_account(account_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="account not found"), 404
+    fields = {}
+    for key in ("name", "contact_name", "email", "phone", "address",
+                "payment_terms", "notes"):
+        if key in data:
+            fields[key] = (data.get(key) or "").strip()
+    if "price_per_bag_cents" in data:
+        try:
+            price = int(data.get("price_per_bag_cents") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="price_per_bag_cents must be a number"), 400
+        if price <= 0:
+            conn.close()
+            return jsonify(error="price_per_bag_cents must be greater than zero"), 400
+        fields["price_per_bag_cents"] = price
+    if "active" in data:
+        fields["active"] = 1 if data.get("active") else 0
+    if "name" in fields and not fields["name"]:
+        conn.close()
+        return jsonify(error="name is required"), 400
+    if fields:
+        sets = ", ".join("%s = ?" % k for k in fields)
+        conn.execute("UPDATE erp_wholesale_accounts SET %s WHERE id = ?" % sets,
+                     tuple(fields.values()) + (account_id,))
+        conn.commit()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    out = _erp_wholesale_account_dict(conn, acct)
+    conn.close()
+    return jsonify(account=out)
+
+
+@app.post("/api/erp/wholesale-accounts/import")
+def erp_import_wholesale_accounts():
+    """CSV import. Columns: name, contact_name, email, phone, address,
+    price_per_bag_cents, payment_terms, notes. Fail-fast with row numbers,
+    same pattern as the recipe import."""
+    import csv
+    import io
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    text = data.get("csv") or ""
+    if not text.strip():
+        return jsonify(error="csv text is required"), 400
+    conn = db()
+    reader = csv.DictReader(io.StringIO(text))
+    rows = []
+    for n, row in enumerate(reader, 2):
+        row = {(k or "").strip(): (v or "").strip() for k, v in row.items()}
+        name = row.get("name") or ""
+        if not name:
+            conn.close()
+            return jsonify(error="row %d: name is required" % n), 400
+        try:
+            price = int(row.get("price_per_bag_cents") or 400)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="row %d: price_per_bag_cents must be a number" % n), 400
+        if price <= 0:
+            conn.close()
+            return jsonify(error="row %d: price_per_bag_cents must be > 0" % n), 400
+        rows.append({"name": name, "contact_name": row.get("contact_name") or "",
+                     "email": row.get("email") or "", "phone": row.get("phone") or "",
+                     "address": row.get("address") or "", "price_per_bag_cents": price,
+                     "payment_terms": row.get("payment_terms") or "",
+                     "notes": row.get("notes") or ""})
+    if not rows:
+        conn.close()
+        return jsonify(error="no account rows found"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    for r in rows:
+        conn.execute(
+            "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
+            " price_per_bag_cents, payment_terms, notes, active, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (r["name"], r["contact_name"], r["email"], r["phone"], r["address"],
+             r["price_per_bag_cents"], r["payment_terms"], r["notes"], actor, now))
+    conn.commit()
+    conn.close()
+    return jsonify(imported=len(rows))
+
+
+# ---------------- wholesale orders ----------------
+
+def _erp_next_wholesale_number(conn):
+    count = conn.execute("SELECT COUNT(*) AS c FROM erp_wholesale_orders").fetchone()["c"]
+    return "W-%d" % (1001 + int(count))
+
+
+@app.get("/api/erp/wholesale-orders")
+def erp_list_wholesale_orders():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute("SELECT * FROM erp_wholesale_orders ORDER BY id DESC").fetchall()
+    out = [_erp_wholesale_order_brief(conn, w) for w in rows]
+    conn.close()
+    return jsonify(orders=out)
+
+
+@app.post("/api/erp/wholesale-orders")
+def erp_create_wholesale_order():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (data.get("account_id"),)).fetchone()
+    if not acct or not acct["active"]:
+        conn.close()
+        return jsonify(error="valid account_id is required"), 400
+    lines_in = data.get("lines") or []
+    if not lines_in:
+        conn.close()
+        return jsonify(error="at least one order line is required"), 400
+    lines = []
+    for i, li in enumerate(lines_in, 1):
+        flavor = ((li or {}).get("flavor_name") or "").strip()
+        if not flavor:
+            conn.close()
+            return jsonify(error="line %d: flavor_name is required" % i), 400
+        try:
+            qty = float((li or {}).get("qty_bags") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="line %d: qty_bags must be a number" % i), 400
+        if qty <= 0:
+            conn.close()
+            return jsonify(error="line %d: qty_bags must be greater than zero" % i), 400
+        try:
+            unit = int((li or {}).get("unit_price_cents") or acct["price_per_bag_cents"])
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="line %d: unit_price_cents must be a number" % i), 400
+        if unit <= 0:
+            conn.close()
+            return jsonify(error="line %d: unit_price_cents must be greater than zero" % i), 400
+        lines.append({"flavor_name": flavor, "qty_bags": qty,
+                      "unit_price_cents": unit,
+                      "line_total_cents": int(round(qty * unit))})
+    now = datetime.now(timezone.utc).isoformat()
+    order_number = _erp_next_wholesale_number(conn)
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_orders (order_number, account_id, status, order_date,"
+        " due_date, notes, via_edi, edi_document_id, created_by, created_at)"
+        " VALUES (?, ?, 'new', ?, ?, ?, ?, ?, ?, ?)",
+        (order_number, acct["id"], (data.get("order_date") or "").strip(),
+         (data.get("due_date") or "").strip(), (data.get("notes") or "").strip(),
+         1 if data.get("via_edi") else 0, int(data.get("edi_document_id") or 0),
+         actor, now))
+    order_id = cur.lastrowid
+    for li in lines:
+        conn.execute(
+            "INSERT INTO erp_wholesale_order_lines (order_id, flavor_name, qty_bags,"
+            " unit_price_cents, line_total_cents) VALUES (?, ?, ?, ?, ?)",
+            (order_id, li["flavor_name"], li["qty_bags"],
+             li["unit_price_cents"], li["line_total_cents"]))
+    _erp_set_fulfillment(conn, "wholesale", order_id, "new", actor, "order created")
+    conn.commit()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    out = _erp_wholesale_order_brief(conn, w)
+    out["lines"] = [dict(l) for l in conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
+        (order_id,)).fetchall()]
+    conn.close()
+    return jsonify(order=out), 201
+
+
+@app.get("/api/erp/wholesale-orders/<int:order_id>")
+def erp_get_wholesale_order(order_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    order = _erp_wholesale_order_brief(conn, w)
+    order["lines"] = [dict(l) for l in conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
+        (order_id,)).fetchall()]
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (w["account_id"],)).fetchone()
+    order["account"] = dict(acct) if acct else None
+    order["notes"] = w["notes"]
+    order["order_date"] = w["order_date"]
+    order["tracking_number"] = ""
+    order["shipping_address"] = acct["address"] if acct else ""
+    order["email"] = acct["email"] if acct else ""
+    fulf = _erp_fulfillment_dict(conn, "wholesale", order_id)
+    order["status"] = fulf["status"]
+    order["fulfillment"] = fulf
+    order["linked_batches"] = _erp_order_links(conn, "wholesale", order_id)
+    conn.close()
+    return jsonify(order=order)
+
+
+# ---------------- batch <-> order links ----------------
+
+@app.get("/api/erp/batches/<int:batch_id>/orders")
+def erp_batch_order_links(batch_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    links = [_erp_batch_link_dict(conn, l) for l in conn.execute(
+        "SELECT * FROM erp_batch_orders WHERE batch_id = ? ORDER BY id",
+        (batch_id,)).fetchall()]
+    conn.close()
+    return jsonify(links=links)
+
+
+@app.post("/api/erp/batches/<int:batch_id>/orders")
+def erp_link_batch_order(batch_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    source = (data.get("order_source") or "").strip()
+    order_id = data.get("order_id")
+    if source not in _ERP_ORDER_SOURCES:
+        return jsonify(error="valid order_source is required"), 400
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    if batch["status"] in ("completed", "reversed", "cancelled"):
+        conn.close()
+        return jsonify(error="cannot link orders to a %s batch" % batch["status"]), 400
+    order = _erp_order_brief(conn, source, order_id)
+    if not order:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    try:
+        qty = float(data.get("qty_bags") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="qty_bags must be a number"), 400
+    if qty <= 0:
+        conn.close()
+        return jsonify(error="qty_bags must be greater than zero"), 400
+    dup = conn.execute("SELECT id FROM erp_batch_orders WHERE batch_id = ?"
+                       " AND order_source = ? AND order_id = ?",
+                       (batch_id, source, order_id)).fetchone()
+    if dup:
+        conn.close()
+        return jsonify(error="batch is already linked to this order"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_batch_orders (batch_id, order_source, order_id, qty_bags,"
+        " created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (batch_id, source, order_id, qty, actor, now))
+    link = conn.execute("SELECT * FROM erp_batch_orders WHERE id = ?",
+                        (cur.lastrowid,)).fetchone()
+    out = _erp_batch_link_dict(conn, link)
+    conn.commit()
+    conn.close()
+    return jsonify(link=out), 201
+
+
+@app.delete("/api/erp/batches/<int:batch_id>/orders/<int:link_id>")
+def erp_unlink_batch_order(batch_id, link_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    if batch["status"] in ("completed", "reversed", "cancelled"):
+        conn.close()
+        return jsonify(error="cannot unlink orders from a %s batch;"
+                              " post a correcting entry instead" % batch["status"]), 400
+    link = conn.execute("SELECT * FROM erp_batch_orders WHERE id = ? AND batch_id = ?",
+                        (link_id, batch_id)).fetchone()
+    if not link:
+        conn.close()
+        return jsonify(error="link not found"), 404
+    conn.execute("DELETE FROM erp_batch_orders WHERE id = ?", (link_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/orders/<source>/<int:order_id>/trace")
+def erp_order_trace(source, order_id):
+    """Traceability: order -> production batches -> ingredient lots."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    if source not in _ERP_ORDER_SOURCES:
+        return jsonify(error="unknown source"), 404
+    conn = db()
+    order = _erp_order_brief(conn, source, order_id)
+    if not order:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    batches = []
+    for l in conn.execute("SELECT * FROM erp_batch_orders WHERE order_source = ?"
+                          " AND order_id = ? ORDER BY id",
+                          (source, order_id)).fetchall():
+        b = conn.execute("SELECT * FROM erp_production_batches WHERE id = ?",
+                         (l["batch_id"],)).fetchone()
+        if not b:
+            continue
+        ingredients = [dict(r) for r in conn.execute(
+            "SELECT bi.*, i.sku, i.name AS item_name FROM erp_batch_ingredients bi"
+            " JOIN erp_items i ON i.id = bi.item_id"
+            " WHERE bi.batch_id = ? ORDER BY bi.id", (b["id"],)).fetchall()]
+        batches.append({"batch_id": b["id"], "batch_number": b["batch_number"],
+                        "lot_code": b["lot_code"], "expiry_date": b["expiry_date"],
+                        "batch_status": b["status"], "qty_bags": l["qty_bags"],
+                        "ingredients": ingredients})
+    conn.close()
+    return jsonify(order=order, batches=batches)
+
+
+# ---------------- ERP Phase 3: EDI module (provider-agnostic) ----------------
+# Minimal X12 engine for the grocery subset: parse inbound 850, generate
+# outbound 856 + 810, record 997 functional acks. Secrets never touch the DB:
+# partner config holds refs only; webhook keys are stored as hashes.
+
+_EDI_TRANSPORTS = ("manual-file", "sftp", "api", "webhook")
+_EDI_DOC_TYPES = ("850", "855", "856", "810", "997")
+_EDI_DOC_STATUSES = ("received", "parsed", "mapped", "queued", "sent",
+                     "acked", "failed")
+_EDI_CONFIG_FORBIDDEN = ("password", "secret", "private_key", "api_key",
+                         "passphrase", "webhook_key")
+
+
+def _edi_sanitize_config(cfg):
+    """Drop anything that looks like a secret from partner config before
+    storage. Keys ending in _hash (e.g. webhook_key_hash) are digests, not
+    secrets, and are kept."""
+    if not isinstance(cfg, dict):
+        return {}
+    clean = {}
+    for k, v in cfg.items():
+        kl = str(k).lower()
+        if kl.endswith("_hash"):
+            clean[k] = v
+            continue
+        if any(frag in kl for frag in _EDI_CONFIG_FORBIDDEN):
+            continue
+        if isinstance(v, dict):
+            clean[k] = _edi_sanitize_config(v)
+        else:
+            clean[k] = v
+    return clean
+
+
+def _edi_config(conn, partner):
+    try:
+        cfg = json.loads(partner["config_json"] or "{}")
+    except (TypeError, ValueError):
+        cfg = {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _edi_partner_public(conn, p):
+    cfg = _edi_config(conn, p)
+    return {"id": p["id"], "name": p["name"], "provider": p["provider"],
+            "transport": p["transport"], "active": bool(p["active"]),
+            "has_webhook_key": bool(cfg.get("webhook_key_hash")),
+            "created_at": p["created_at"]}
+
+
+def _edi_partner_detail(conn, p):
+    d = _edi_partner_public(conn, p)
+    cfg = _edi_config(conn, p)
+    cfg = dict(cfg)
+    cfg.pop("webhook_key_hash", None)
+    d["config"] = cfg
+    return d
+
+
+def _edi_new_webhook_key():
+    return "edip_" + secrets.token_urlsafe(24)
+
+
+def _edi_key_hash(key):
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+# ----- X12 parsing -----
+
+def _x12_split_segments(text):
+    t = (text or "").strip()
+    if not t:
+        return []
+    if "~" in t:
+        parts = t.split("~")
+    else:
+        parts = re.split(r"[\r\n]+", t)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _x12_parse_850(text):
+    """Parse an X12 850 purchase order (grocery subset).
+    Returns (parsed_dict, errors). Non-empty errors => reject the document."""
+    errors = []
+    segs = _x12_split_segments(text)
+    if not segs:
+        return None, ["empty document"]
+    if not segs[0].startswith("ISA"):
+        return None, ["document must start with an ISA segment"]
+    sep = segs[0][3:4] or "*"
+    isa = segs[0].split(sep)
+    if len(isa) < 16:
+        return None, ["malformed ISA segment (expected 16 elements)"]
+
+    def is_seg(s, tag):
+        return s.startswith(tag + sep)
+
+    idx = {s.split(sep)[0]: i for i, s in enumerate(segs)}
+    st_i = next((i for i, s in enumerate(segs) if is_seg(s, "ST")), None)
+    if st_i is None:
+        return None, ["missing ST segment"]
+    st = segs[st_i].split(sep)
+    if len(st) < 2 or st[1] != "850":
+        return None, ["not an 850 transaction (ST01=%s)" % (st[1] if len(st) > 1 else "?")]
+    se_i = next((i for i in range(st_i + 1, len(segs)) if is_seg(segs[i], "SE")), None)
+    if se_i is None:
+        errors.append("missing SE segment")
+    else:
+        se = segs[se_i].split(sep)
+        try:
+            claimed = int(se[1])
+        except (IndexError, ValueError):
+            claimed = -1
+        actual = se_i - st_i + 1
+        if claimed != actual:
+            errors.append("SE segment count mismatch: claimed %s, actual %s"
+                          % (se[1] if len(se) > 1 else "?", actual))
+    ge_i = next((i for i, s in enumerate(segs) if is_seg(s, "GE")), None)
+    if ge_i is None:
+        errors.append("missing GE segment")
+    if not any(is_seg(s, "IEA") for s in segs):
+        errors.append("missing IEA segment")
+
+    beg = next((s for s in segs if is_seg(s, "BEG")), None)
+    if beg is None:
+        errors.append("missing BEG segment (purchase order header)")
+        po_number, po_date = "", ""
+    else:
+        be = beg.split(sep)
+        po_number = be[3] if len(be) > 3 else ""
+        po_date = be[5] if len(be) > 5 else ""
+        if not po_number:
+            errors.append("BEG03 purchase order number is missing")
+
+    def n1(code):
+        for s in segs:
+            e = s.split(sep)
+            if e[0] == "N1" and len(e) > 1 and e[1] == code:
+                return {"qualifier": e[3] if len(e) > 3 else "",
+                        "id": e[4] if len(e) > 4 else "",
+                        "name": e[2] if len(e) > 2 else ""}
+        return {"qualifier": "", "id": "", "name": ""}
+
+    lines = []
+    cur = None
+    for s in segs:
+        e = s.split(sep)
+        if e[0] == "PO1":
+            if cur:
+                lines.append(cur)
+            try:
+                qty = float(e[2]) if len(e) > 2 and e[2] else 0
+            except ValueError:
+                qty = -1
+            try:
+                price_cents = int(round(float(e[4]) * 100)) if len(e) > 4 and e[4] else 0
+            except ValueError:
+                price_cents = -1
+            cur = {"line": int(e[1]) if len(e) > 1 and e[1].isdigit() else len(lines) + 1,
+                   "qty": qty, "uom": e[3] if len(e) > 3 else "",
+                   "unit_price_cents": price_cents,
+                   "product_id": e[7] if len(e) > 7 else "",
+                   "description": ""}
+            if qty <= 0:
+                errors.append("PO1 line %s: quantity must be > 0" % cur["line"])
+            if price_cents < 0:
+                errors.append("PO1 line %s: unit price is not a number" % cur["line"])
+        elif e[0] == "PID" and cur is not None:
+            if len(e) > 5 and e[5]:
+                cur["description"] = e[5]
+    if cur:
+        lines.append(cur)
+    if not lines:
+        errors.append("no PO1 line items found")
+    ctt = next((s for s in segs if is_seg(s, "CTT")), None)
+    if ctt:
+        ce = ctt.split(sep)
+        try:
+            if int(ce[1]) != len(lines):
+                errors.append("CTT line count %s does not match %d PO1 segments"
+                              % (ce[1], len(lines)))
+        except (IndexError, ValueError):
+            errors.append("malformed CTT segment")
+    parsed = {"doc_type": "850", "po_number": po_number, "po_date": po_date,
+              "ship_to": n1("ST"), "bill_to": n1("BT"), "lines": lines,
+              "total_lines": len(lines),
+              "control": {"isa13": isa[13] if len(isa) > 13 else "",
+                         "sender": (isa[6] if len(isa) > 6 else "").strip(),
+                         "receiver": (isa[8] if len(isa) > 8 else "").strip()}}
+    return parsed, errors
+
+
+# ----- X12 generation -----
+
+def _edi_next_control(conn):
+    n = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 AS n"
+                     " FROM erp_edi_documents").fetchone()["n"]
+    return int(n)
+
+
+def _x12_pad(s, n):
+    s = (s or "")[:n]
+    return s + " " * (n - len(s))
+
+
+def _x12_envelope(doc_type, gs_code, body, sender, receiver, ctrl):
+    """Wrap ST..CTT body segments in ISA/GS/GE/IEA. Returns full X12 string."""
+    now = datetime.now(timezone.utc)
+    ymd = now.strftime("%Y%m%d")
+    hm = now.strftime("%H%M")
+    isa13 = "%09d" % (ctrl % 1000000000)
+    st02 = "%04d" % (ctrl % 10000)
+    segs = []
+    segs.append("ISA*00*%s*00*%s*ZZ*%s*ZZ*%s*%s*%s*U*00401*%s*0*P*>"
+                % (" " * 10, " " * 10, _x12_pad(sender, 15),
+                   _x12_pad(receiver, 15), now.strftime("%y%m%d"), hm, isa13))
+    segs.append("GS*%s*%s*%s*%s*%s*%d*X*004010"
+                % (gs_code, sender or "POPALICIOUS", receiver or "PARTNER",
+                   ymd, hm, ctrl))
+    body = [b if b.startswith("ST*") else b for b in body]
+    body[0] = "ST*%s*%s" % (doc_type, st02)
+    segs.extend(body)
+    segs.append("SE*%d*%s" % (len(body) + 1, st02))
+    segs.append("GE*1*%d" % ctrl)
+    segs.append("IEA*1*%s" % isa13)
+    return "~".join(segs) + "~"
+
+
+def _x12_build_856(order, lines, partner_cfg, ctrl):
+    """Ship notice for an order. lines: [{line, qty, product_id, description}]."""
+    sender = (partner_cfg.get("isa_sender") or "POPALICIOUS")
+    receiver = (partner_cfg.get("isa_receiver") or "PARTNER")
+    now = datetime.now(timezone.utc)
+    ymd = now.strftime("%Y%m%d")
+    ship_id = "SHP-%s-%d" % ((order.get("number") or "NA").replace("#", ""), ctrl)
+    ship_to = order.get("ship_to") or {}
+    body = [
+        "ST*856*0001",
+        "BSN*00*%s*%s*%s" % (ship_id, ymd, now.strftime("%H%M")),
+        "DTM*011*%s" % ymd,
+        "N1*ST*%s*%s*%s" % (ship_to.get("name") or "Customer",
+                            ship_to.get("qualifier") or "92",
+                            ship_to.get("id") or ""),
+        "HL*1**S",
+    ]
+    hl = 2
+    body.append("HL*%d**O*1" % hl)
+    hl += 1
+    body.append("PRF*%s*%s" % (order.get("po_number") or order.get("number") or "",
+                               order.get("po_date") or ymd))
+    for ln in lines:
+        body.append("HL*%d**I*2" % hl)
+        hl += 1
+        body.append("LIN**%s*%s" % (ln.get("id_qualifier") or "VP",
+                                    ln.get("product_id") or ""))
+        body.append("SN1**%s*EA" % _erp_fmt_qty(ln.get("qty") or 0))
+    body.append("CTT*%d" % len(lines))
+    return _x12_envelope("856", "SH", body, sender, receiver, ctrl)
+
+
+def _x12_build_810(order, lines, partner_cfg, ctrl):
+    """Invoice for a wholesale order."""
+    sender = (partner_cfg.get("isa_sender") or "POPALICIOUS")
+    receiver = (partner_cfg.get("isa_receiver") or "PARTNER")
+    now = datetime.now(timezone.utc)
+    ymd = now.strftime("%Y%m%d")
+    inv_num = "INV-%s" % (order.get("number") or ctrl)
+    ship_to = order.get("ship_to") or {}
+    total_cents = 0
+    body = [
+        "ST*810*0001",
+        "BIG*%s*%s*%s*%s" % (ymd, inv_num, order.get("po_date") or ymd,
+                             order.get("po_number") or order.get("number") or ""),
+        "N1*ST*%s*%s*%s" % (ship_to.get("name") or "Customer",
+                            ship_to.get("qualifier") or "92",
+                            ship_to.get("id") or ""),
+    ]
+    for i, ln in enumerate(lines, 1):
+        qty = float(ln.get("qty") or 0)
+        unit_cents = int(ln.get("unit_price_cents") or 0)
+        total_cents += int(round(qty * unit_cents))
+        body.append("IT1*%d*%s*EA*%.2f**%s*%s"
+                    % (i, _erp_fmt_qty(qty), unit_cents / 100.0,
+                       ln.get("id_qualifier") or "VP", ln.get("product_id") or ""))
+    body.append("TDS*%d" % total_cents)
+    body.append("CTT*%d" % len(lines))
+    return _x12_envelope("810", "IN", body, sender, receiver, ctrl), inv_num
+
+
+def _x12_build_997(inbound_ctrl, partner_cfg, ctrl):
+    """Functional acknowledgement for a received 850."""
+    sender = (partner_cfg.get("isa_sender") or "POPALICIOUS")
+    receiver = (partner_cfg.get("isa_receiver") or "PARTNER")
+    body = [
+        "ST*997*0001",
+        "AK1*PO*%s" % (inbound_ctrl.get("gs06") or "1"),
+        "AK2*850*%s" % (inbound_ctrl.get("st02") or "1"),
+        "AK5*A",
+        "AK9*A*1*1*1",
+    ]
+    return _x12_envelope("997", "FA", body, sender, receiver, ctrl)
+
+
+# ----- EDI document helpers -----
+
+def _edi_doc_dict(conn, d, include_content=False):
+    p = conn.execute("SELECT name FROM erp_edi_partners WHERE id = ?",
+                     (d["partner_id"],)).fetchone()
+    try:
+        parsed = json.loads(d["parsed_json"] or "{}")
+    except (TypeError, ValueError):
+        parsed = {}
+    order_number = ""
+    if d["order_source"] and d["order_id"]:
+        o = _erp_order_brief(conn, d["order_source"], d["order_id"])
+        order_number = o["number"] if o else ""
+    out = {"id": d["id"], "partner_id": d["partner_id"],
+           "partner_name": p["name"] if p else "",
+           "direction": d["direction"], "doc_type": d["doc_type"],
+           "status": d["status"], "order_source": d["order_source"],
+           "order_id": d["order_id"], "order_number": order_number,
+           "created_at": d["created_at"]}
+    if include_content:
+        out["raw_text"] = d["raw_text"]
+        out["x12"] = d["raw_text"]
+        out["parsed"] = parsed
+    return out
+
+
+def _edi_match_account(conn, partner, parsed):
+    """Match a parsed 850 to a wholesale account via partner config.
+    Returns (account_row, match_note, error). error is None on success."""
+    cfg = _edi_config(conn, partner)
+    ship_to_id = (parsed.get("ship_to") or {}).get("id") or ""
+    account_id = None
+    note = ""
+    ship_map = cfg.get("ship_to_map") or {}
+    if ship_to_id and str(ship_to_id) in {str(k) for k in ship_map}:
+        for k, v in ship_map.items():
+            if str(k) == str(ship_to_id):
+                account_id = v
+                note = "ship-to %s" % ship_to_id
+                break
+    elif cfg.get("account_id"):
+        account_id = cfg["account_id"]
+        note = "partner default account"
+    if not account_id:
+        return None, "", ("no wholesale account mapped for ship-to '%s'"
+                          % (ship_to_id or "?"))
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    if not acct:
+        return None, "", "mapped account id %s does not exist" % account_id
+    if not acct["active"]:
+        return None, "", "mapped account '%s' is inactive" % acct["name"]
+    return acct, note, None
+
+
+def _edi_create_997(conn, partner, parsed, actor):
+    cfg = _edi_config(conn, partner)
+    ctrl = _edi_next_control(conn)
+    x12 = _x12_build_997(parsed.get("control") or {}, cfg, ctrl)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
+        " raw_text, parsed_json, created_at)"
+        " VALUES (?, 'outbound', '997', 'sent', ?, ?, ?)",
+        (partner["id"], x12, json.dumps({"ack_for": "850"}), now))
+    return cur.lastrowid
+
+
+def _edi_map_850_to_order(conn, doc, parsed, partner, actor):
+    """Create a wholesale order from a parsed 850. Returns (order_brief, error)."""
+    acct, _note, match_err = _edi_match_account(conn, partner, parsed)
+    if match_err:
+        return None, match_err
+    lines = []
+    for i, ln in enumerate(parsed.get("lines") or [], 1):
+        flavor = (ln.get("description") or ln.get("product_id") or "").strip()
+        if not flavor:
+            return None, "PO1 line %d: no product id or description" % i
+        qty = float(ln.get("qty") or 0)
+        if qty <= 0:
+            return None, "PO1 line %d: quantity must be > 0" % i
+        unit = int(ln.get("unit_price_cents") or acct["price_per_bag_cents"] or 400)
+        if unit <= 0:
+            return None, "PO1 line %d: unit price must be > 0" % i
+        lines.append({"flavor_name": flavor, "qty_bags": qty,
+                      "unit_price_cents": unit,
+                      "line_total_cents": int(round(qty * unit))})
+    if not lines:
+        return None, "no order lines in 850"
+    now = datetime.now(timezone.utc).isoformat()
+    order_number = _erp_next_wholesale_number(conn)
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_orders (order_number, account_id, status, order_date,"
+        " due_date, notes, via_edi, edi_document_id, created_by, created_at)"
+        " VALUES (?, ?, 'new', ?, '', ?, 1, ?, ?, ?)",
+        (order_number, acct["id"], parsed.get("po_date") or "",
+         "EDI 850 %s" % (parsed.get("po_number") or ""), doc["id"], actor, now))
+    order_id = cur.lastrowid
+    for li in lines:
+        conn.execute(
+            "INSERT INTO erp_wholesale_order_lines (order_id, flavor_name, qty_bags,"
+            " unit_price_cents, line_total_cents) VALUES (?, ?, ?, ?, ?)",
+            (order_id, li["flavor_name"], li["qty_bags"],
+             li["unit_price_cents"], li["line_total_cents"]))
+    _erp_set_fulfillment(conn, "wholesale", order_id, "new", actor,
+                         "created from EDI 850 %s" % parsed.get("po_number"))
+    conn.execute("UPDATE erp_edi_documents SET status = 'mapped',"
+                 " order_source = 'wholesale', order_id = ? WHERE id = ?",
+                 (order_id, doc["id"]))
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    return _erp_wholesale_order_brief(conn, w), None
+
+
+def _edi_parse_and_store_inbound(conn, partner, content, actor):
+    """Shared by upload + webhook: detect type, parse, store, ack."""
+    segs = _x12_split_segments(content)
+    sep = segs[0][3:4] if segs and segs[0].startswith("ISA") else "*"
+    st = next((s for s in segs if s.split(sep)[0] == "ST"), None)
+    doc_type = ""
+    if st:
+        parts = st.split(sep)
+        doc_type = parts[1] if len(parts) > 1 else ""
+    if doc_type != "850":
+        return None, "unsupported inbound doc_type '%s' (only 850)" % (doc_type or "?")
+    parsed, errors = _x12_parse_850(content)
+    now = datetime.now(timezone.utc).isoformat()
+    status = "parsed" if not errors else "failed"
+    cur = conn.execute(
+        "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
+        " raw_text, parsed_json, created_at) VALUES (?, 'inbound', '850', ?, ?, ?, ?)",
+        (partner["id"] if partner else 0, status, content,
+         json.dumps(parsed or {"errors": errors}), now))
+    doc_id = cur.lastrowid
+    ack_id = None
+    if not errors and partner:
+        ack_id = _edi_create_997(conn, partner, parsed, actor)
+    doc = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                       (doc_id,)).fetchone()
+    preview = {"po_number": (parsed or {}).get("po_number", ""),
+               "partner_name": partner["name"] if partner else "",
+               "account_name": "", "account_match_note": "",
+               "lines": [{"flavor": (l.get("description") or l.get("product_id") or ""),
+                          "qty": l.get("qty"), "unit_price_cents": l.get("unit_price_cents")}
+                         for l in (parsed or {}).get("lines", [])],
+               "errors": errors, "ack_document_id": ack_id}
+    if not errors and partner:
+        acct, note, match_err = _edi_match_account(conn, partner, parsed)
+        if acct:
+            preview["account_name"] = acct["name"]
+            preview["account_match_note"] = note or ""
+        else:
+            preview["errors"] = errors + [match_err]
+    return doc, preview
+
+
+# ----- EDI endpoints -----
+
+@app.get("/api/erp/edi-partners")
+def erp_list_edi_partners():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute("SELECT * FROM erp_edi_partners ORDER BY name").fetchall()
+    out = [_edi_partner_public(conn, r) for r in rows]
+    conn.close()
+    return jsonify(partners=out)
+
+
+@app.post("/api/erp/edi-partners")
+def erp_create_edi_partner():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    transport = (data.get("transport") or "manual-file").strip()
+    if transport not in _EDI_TRANSPORTS:
+        return jsonify(error="unknown transport"), 400
+    cfg = _edi_sanitize_config(data.get("config") or {})
+    webhook_key = None
+    if transport == "webhook":
+        webhook_key = _edi_new_webhook_key()
+        cfg["webhook_key_hash"] = _edi_key_hash(webhook_key)
+    conn = db()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_edi_partners (name, provider, transport, config_json,"
+        " active, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (name, (data.get("provider") or "").strip(), transport,
+         json.dumps(cfg), 1 if data.get("active", True) else 0, actor, now))
+    p = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                     (cur.lastrowid,)).fetchone()
+    out = _edi_partner_detail(conn, p)
+    conn.commit()
+    conn.close()
+    resp = {"partner": out}
+    if webhook_key:
+        resp["webhook_key"] = webhook_key
+    return jsonify(resp), 201
+
+
+@app.get("/api/erp/edi-partners/<int:partner_id>")
+def erp_get_edi_partner(partner_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    p = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                     (partner_id,)).fetchone()
+    if not p:
+        conn.close()
+        return jsonify(error="partner not found"), 404
+    out = _edi_partner_detail(conn, p)
+    conn.close()
+    return jsonify(partner=out)
+
+
+@app.put("/api/erp/edi-partners/<int:partner_id>")
+def erp_update_edi_partner(partner_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    p = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                     (partner_id,)).fetchone()
+    if not p:
+        conn.close()
+        return jsonify(error="partner not found"), 404
+    fields = {}
+    if "name" in data:
+        if not (data.get("name") or "").strip():
+            conn.close()
+            return jsonify(error="name is required"), 400
+        fields["name"] = data["name"].strip()
+    if "provider" in data:
+        fields["provider"] = (data.get("provider") or "").strip()
+    if "transport" in data:
+        t = (data.get("transport") or "").strip()
+        if t not in _EDI_TRANSPORTS:
+            conn.close()
+            return jsonify(error="unknown transport"), 400
+        fields["transport"] = t
+    if "active" in data:
+        fields["active"] = 1 if data.get("active") else 0
+    cfg = _edi_config(conn, p)
+    webhook_key = None
+    if isinstance(data.get("config"), dict):
+        for k, v in _edi_sanitize_config(data["config"]).items():
+            cfg[k] = v
+    if data.get("rotate_webhook_key"):
+        webhook_key = _edi_new_webhook_key()
+        cfg["webhook_key_hash"] = _edi_key_hash(webhook_key)
+    fields["config_json"] = json.dumps(cfg)
+    sets = ", ".join("%s = ?" % k for k in fields)
+    conn.execute("UPDATE erp_edi_partners SET %s WHERE id = ?" % sets,
+                 tuple(fields.values()) + (partner_id,))
+    conn.commit()
+    p = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                     (partner_id,)).fetchone()
+    out = _edi_partner_detail(conn, p)
+    conn.close()
+    resp = {"partner": out}
+    if webhook_key:
+        resp["webhook_key"] = webhook_key
+    return jsonify(resp)
+
+
+@app.get("/api/erp/edi-documents")
+def erp_list_edi_documents():
+    actor, err = _require_erp()
+    if err:
+        return err
+    direction = (request.args.get("direction") or "").strip()
+    doc_type = (request.args.get("doc_type") or "").strip()
+    status = (request.args.get("status") or "").strip()
+    if direction and direction not in ("inbound", "outbound"):
+        return jsonify(error="unknown direction"), 400
+    if doc_type and doc_type not in _EDI_DOC_TYPES:
+        return jsonify(error="unknown doc_type"), 400
+    if status and status not in _EDI_DOC_STATUSES:
+        return jsonify(error="unknown status"), 400
+    conn = db()
+    q = "SELECT * FROM erp_edi_documents WHERE 1=1"
+    args = []
+    if direction:
+        q += " AND direction = ?"
+        args.append(direction)
+    if doc_type:
+        q += " AND doc_type = ?"
+        args.append(doc_type)
+    if status:
+        q += " AND status = ?"
+        args.append(status)
+    q += " ORDER BY id DESC"
+    out = [_edi_doc_dict(conn, d) for d in conn.execute(q, args).fetchall()]
+    conn.close()
+    return jsonify(documents=out)
+
+
+@app.get("/api/erp/edi-documents/<int:doc_id>")
+def erp_get_edi_document(doc_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (doc_id,)).fetchone()
+    if not d:
+        conn.close()
+        return jsonify(error="document not found"), 404
+    out = _edi_doc_dict(conn, d, include_content=True)
+    conn.close()
+    return jsonify(document=out)
+
+
+@app.post("/api/erp/edi-documents/upload")
+def erp_edi_upload():
+    """Manual X12 upload: parse -> preview. Confirm via POST .../id/map."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    content = ""
+    partner_id = 0
+    filename = ""
+    if request.files and "file" in request.files:
+        f = request.files["file"]
+        filename = f.filename or ""
+        content = f.read().decode("utf-8", "ignore")
+        partner_id = int(request.form.get("partner_id") or 0)
+    else:
+        data = request.get_json(force=True, silent=True) or {}
+        content = data.get("content") or ""
+        filename = data.get("filename") or ""
+        partner_id = int(data.get("partner_id") or 0)
+    if not content.strip():
+        return jsonify(error="X12 content is required"), 400
+    conn = db()
+    partner = None
+    if partner_id:
+        partner = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                               (partner_id,)).fetchone()
+        if not partner:
+            conn.close()
+            return jsonify(error="partner not found"), 404
+    else:
+        # auto-match by ISA sender id against partner config
+        segs = _x12_split_segments(content)
+        sender = ""
+        if segs and segs[0].startswith("ISA"):
+            sep = segs[0][3:4] or "*"
+            isa = segs[0].split(sep)
+            sender = (isa[6] if len(isa) > 6 else "").strip()
+        if sender:
+            for p in conn.execute(
+                    "SELECT * FROM erp_edi_partners WHERE active = 1").fetchall():
+                cfg = _edi_config(conn, p)
+                ids = cfg.get("isa_ids") or []
+                if sender in [str(x).strip() for x in ids]:
+                    partner = p
+                    break
+    doc, preview = _edi_parse_and_store_inbound(conn, partner, content, actor)
+    if doc is None:
+        conn.close()
+        return jsonify(error=preview), 400
+    conn.commit()
+    out = _edi_doc_dict(conn, doc)
+    conn.close()
+    return jsonify(document=out, preview=preview), 201
+
+
+@app.post("/api/erp/edi-documents/<int:doc_id>/map")
+def erp_edi_map_document(doc_id):
+    """Confirm: map a parsed inbound 850 to a wholesale order."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (doc_id,)).fetchone()
+    if not d:
+        conn.close()
+        return jsonify(error="document not found"), 404
+    if d["direction"] != "inbound" or d["doc_type"] != "850":
+        conn.close()
+        return jsonify(error="only inbound 850 documents can be mapped"), 400
+    if d["status"] == "mapped":
+        conn.close()
+        return jsonify(error="document is already mapped"), 400
+    if d["status"] != "parsed":
+        conn.close()
+        return jsonify(error="document must parse cleanly before mapping"), 400
+    partner = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                           (d["partner_id"],)).fetchone()
+    if not partner:
+        conn.close()
+        return jsonify(error="no trading partner on this document"), 400
+    try:
+        parsed = json.loads(d["parsed_json"] or "{}")
+    except (TypeError, ValueError):
+        parsed = {}
+    order, map_err = _edi_map_850_to_order(conn, d, parsed, partner, actor)
+    if map_err:
+        conn.close()
+        return jsonify(error=map_err), 400
+    conn.commit()
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (doc_id,)).fetchone()
+    conn.close()
+    return jsonify(ok=True, order=order, document=_edi_doc_dict_careful(d))
+
+
+def _edi_doc_dict_careful(d):
+    # _edi_doc_dict needs a conn for partner/order lookups; used only post-commit
+    # where a fresh conn is cheap. Kept separate to avoid signature churn.
+    conn = db()
+    try:
+        return _edi_doc_dict(conn, d)
+    finally:
+        conn.close()
+
+
+@app.post("/api/erp/edi-documents/<int:doc_id>/retry")
+def erp_edi_retry_document(doc_id):
+    """Re-run parse/map for inbound docs; re-queue or mark sent for outbound."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    conn = db()
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (doc_id,)).fetchone()
+    if not d:
+        conn.close()
+        return jsonify(error="document not found"), 404
+    if d["direction"] == "inbound":
+        if d["status"] == "mapped":
+            conn.close()
+            return jsonify(error="document is already mapped"), 400
+        parsed, errors = _x12_parse_850(d["raw_text"])
+        status = "parsed" if not errors else "failed"
+        conn.execute("UPDATE erp_edi_documents SET status = ?, parsed_json = ?"
+                     " WHERE id = ?",
+                     (status, json.dumps(parsed or {"errors": errors}), doc_id))
+        conn.commit()
+        d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                         (doc_id,)).fetchone()
+        conn.close()
+        return jsonify(document=_edi_doc_dict_careful(d))
+    # outbound
+    if data.get("mark_sent"):
+        conn.execute("UPDATE erp_edi_documents SET status = 'sent' WHERE id = ?",
+                     (doc_id,))
+        conn.commit()
+    elif d["status"] == "failed":
+        conn.execute("UPDATE erp_edi_documents SET status = 'queued' WHERE id = ?",
+                     (doc_id,))
+        conn.commit()
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (doc_id,)).fetchone()
+    conn.close()
+    return jsonify(document=_edi_doc_dict_careful(d))
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/edi-810")
+def erp_wholesale_order_edi810(order_id):
+    """Generate an 810 invoice X12 for a wholesale order (queued for transport)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    partner = None
+    if data.get("partner_id"):
+        partner = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                               (data["partner_id"],)).fetchone()
+    if not partner and w["edi_document_id"]:
+        src = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                           (w["edi_document_id"],)).fetchone()
+        if src:
+            partner = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                                   (src["partner_id"],)).fetchone()
+    if not partner:
+        partner = conn.execute("SELECT * FROM erp_edi_partners WHERE active = 1"
+                               " ORDER BY id LIMIT 1").fetchone()
+    if not partner:
+        conn.close()
+        return jsonify(error="no EDI partner configured"), 400
+    cfg = _edi_config(conn, partner)
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (w["account_id"],)).fetchone()
+    lines = [{"line": i + 1, "qty": float(l["qty_bags"]),
+              "unit_price_cents": int(l["unit_price_cents"]),
+              "product_id": (l["flavor_name"] or "")[:30].upper().replace(" ", "_"),
+              "description": l["flavor_name"]}
+             for i, l in enumerate(conn.execute(
+                 "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ?"
+                 " ORDER BY id", (order_id,)).fetchall())]
+    if not lines:
+        conn.close()
+        return jsonify(error="order has no lines"), 400
+    order = {"number": w["order_number"], "po_number": w["order_number"],
+             "po_date": w["order_date"],
+             "ship_to": {"name": (acct["name"] if acct else "")[:40],
+                         "qualifier": "92", "id": str(acct["id"]) if acct else ""}}
+    ctrl = _edi_next_control(conn)
+    x12, inv_num = _x12_build_810(order, lines, cfg, ctrl)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
+        " raw_text, parsed_json, order_source, order_id, created_at)"
+        " VALUES (?, 'outbound', '810', 'queued', ?, ?, 'wholesale', ?, ?)",
+        (partner["id"], x12,
+         json.dumps({"invoice_number": inv_num,
+                     "order_number": w["order_number"]}), order_id, now))
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (cur.lastrowid,)).fetchone()
+    out = _edi_doc_dict(conn, d, include_content=True)
+    conn.commit()
+    conn.close()
+    return jsonify(document=out), 201
+
+
+@app.post("/api/erp/orders/<source>/<int:order_id>/edi-856")
+def erp_order_edi856(source, order_id):
+    """Generate an 856 ship-notice X12 for an order (queued for transport)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    if source not in _ERP_ORDER_SOURCES:
+        return jsonify(error="unknown source"), 404
+    conn = db()
+    order = _erp_order_brief(conn, source, order_id)
+    if not order:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    partner = None
+    if data.get("partner_id"):
+        partner = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                               (data["partner_id"],)).fetchone()
+    if not partner:
+        partner = conn.execute("SELECT * FROM erp_edi_partners WHERE active = 1"
+                               " ORDER BY id LIMIT 1").fetchone()
+    if not partner:
+        conn.close()
+        return jsonify(error="no EDI partner configured"), 400
+    cfg = _edi_config(conn, partner)
+    if source == "wholesale":
+        wlines = conn.execute("SELECT * FROM erp_wholesale_order_lines"
+                              " WHERE order_id = ? ORDER BY id",
+                              (order_id,)).fetchall()
+        lines = [{"line": i + 1, "qty": float(l["qty_bags"]),
+                  "product_id": (l["flavor_name"] or "")[:30].upper().replace(" ", "_"),
+                  "description": l["flavor_name"]}
+                 for i, l in enumerate(wlines)]
+        ship_name = order.get("account_name") or order.get("customer_name")
+    else:
+        lines = [{"line": 1, "qty": float(order.get("total_qty") or 0),
+                  "product_id": (order.get("number") or "").replace("#", ""),
+                  "description": (order.get("items_summary") or "")[:60]}]
+        ship_name = order.get("customer_name") or order.get("email")
+    if not lines or sum(l["qty"] for l in lines) <= 0:
+        conn.close()
+        return jsonify(error="order has no shippable quantity"), 400
+    o = {"number": order["number"], "po_number": order["number"],
+         "ship_to": {"name": (ship_name or "Customer")[:40],
+                     "qualifier": "92", "id": str(order_id)}}
+    ctrl = _edi_next_control(conn)
+    x12 = _x12_build_856(o, lines, cfg, ctrl)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
+        " raw_text, parsed_json, order_source, order_id, created_at)"
+        " VALUES (?, 'outbound', '856', 'queued', ?, ?, ?, ?, ?)",
+        (partner["id"], x12,
+         json.dumps({"order_number": order["number"], "source": source}),
+         source, order_id, now))
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (cur.lastrowid,)).fetchone()
+    out = _edi_doc_dict(conn, d, include_content=True)
+    conn.commit()
+    conn.close()
+    return jsonify(document=out), 201
+
+
+@app.post("/api/erp/edi-webhook/<partner_key>")
+def erp_edi_webhook(partner_key):
+    """Provider push receiver. Key-authenticated ONLY (no login session).
+    Accepts JSON {"content": "<X12>"} or a raw X12 body."""
+    conn = db()
+    digest = _edi_key_hash(partner_key or "")
+    partner = None
+    for p in conn.execute("SELECT * FROM erp_edi_partners WHERE active = 1"
+                          " AND transport = 'webhook'").fetchall():
+        cfg = _edi_config(conn, p)
+        stored = cfg.get("webhook_key_hash") or ""
+        if stored and hmac.compare_digest(stored, digest):
+            partner = p
+            break
+    if not partner:
+        conn.close()
+        return jsonify(error="invalid partner key"), 401
+    data = request.get_json(force=True, silent=True) or {}
+    content = data.get("content") or ""
+    if not content and request.data:
+        try:
+            content = request.data.decode("utf-8", "ignore")
+        except Exception:
+            content = ""
+    if not content.strip():
+        conn.close()
+        return jsonify(error="X12 content is required"), 400
+    doc, preview = _edi_parse_and_store_inbound(conn, partner, content,
+                                               "edi-webhook")
+    if doc is None:
+        conn.close()
+        return jsonify(error=preview), 400
+    mapped_order = None
+    if preview and not preview.get("errors") and preview.get("account_name"):
+        try:
+            parsed = json.loads(doc["parsed_json"] or "{}")
+        except (TypeError, ValueError):
+            parsed = {}
+        mapped_order, map_err = _edi_map_850_to_order(conn, doc, parsed, partner,
+                                                     "edi-webhook")
+        if map_err:
+            preview["errors"] = (preview.get("errors") or []) + [map_err]
+    conn.commit()
+    doc = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                       (doc["id"],)).fetchone()
+    status = doc["status"]
+    doc_id = doc["id"]
+    conn.close()
+    resp = {"ok": True, "document_id": doc_id, "status": status}
+    if mapped_order:
+        resp["order"] = mapped_order
+    return jsonify(resp), 201
 
 
 if __name__ == "__main__":
