@@ -946,15 +946,28 @@ function wsRenderProfile() {
       rm.textContent = "Remove";
       rm.style.marginTop = "8px";
       rm.addEventListener("click", function () {
-        if (!window.confirm("Remove this delivery location?")) return;
-        rm.disabled = true;
-        erpDelete("/api/wholesale/addresses/" + a.id).then(function () {
-          wsState.me = null;
-          wsRenderProfile();
-        }).catch(function (e) {
-          rm.disabled = false;
-          wsSetStatus(e.message, true);
-        });
+        if (rm.getAttribute("data-confirm") === "1") {
+          rm.disabled = true;
+          rm.textContent = "Removing…";
+          erpDelete("/api/wholesale/addresses/" + a.id).then(function () {
+            wsState.me = null;
+            wsRenderProfile();
+          }).catch(function (e) {
+            rm.disabled = false;
+            rm.textContent = "Remove";
+            rm.setAttribute("data-confirm", "");
+            wsSetStatus(e.message, true);
+          });
+          return;
+        }
+        rm.setAttribute("data-confirm", "1");
+        rm.textContent = "Tap again to confirm remove";
+        setTimeout(function () {
+          if (rm.isConnected && rm.getAttribute("data-confirm") === "1") {
+            rm.setAttribute("data-confirm", "");
+            rm.textContent = "Remove";
+          }
+        }, 5000);
       });
       card.appendChild(rm);
       wrap.appendChild(card);
