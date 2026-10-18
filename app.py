@@ -824,12 +824,84 @@ def init_db():
             created_at TEXT NOT NULL
         );
         CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_sales_summaries ON erp_sales_summaries (period_start, period_end, channel);
+        -- ERP Phase 5: wholesale customer portal tables --
+        CREATE TABLE IF NOT EXISTS erp_wholesale_users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL DEFAULT '',
+            invite_token TEXT NOT NULL DEFAULT '',
+            invite_expires_at TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_wholesale_users_acct ON erp_wholesale_users (account_id);
+        CREATE TABLE IF NOT EXISTS erp_wholesale_addresses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            street TEXT NOT NULL DEFAULT '',
+            city TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT '',
+            zip TEXT NOT NULL DEFAULT '',
+            phone TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_wholesale_addrs ON erp_wholesale_addresses (account_id);
+        CREATE TABLE IF NOT EXISTS erp_flavor_categories (
+            flavor_name TEXT PRIMARY KEY,
+            category TEXT NOT NULL DEFAULT 'sweet'
+        );
+        CREATE TABLE IF NOT EXISTS erp_order_production_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            flavor_name TEXT NOT NULL,
+            qty_bags REAL NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            done_by TEXT NOT NULL DEFAULT '',
+            done_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_prod_lines ON erp_order_production_lines (order_id);
         INSERT OR IGNORE INTO erp_locations (code, name, type, active) VALUES
          ('HEND', 'Henderson Warehouse', 'warehouse', 1),
          ('EVT', 'Events / Mobile', 'mobile', 1),
          ('PFUL', 'Printful (virtual)', 'virtual', 1);
         """
     )
+    # ERP Phase 5 migrations: new columns on wholesale accounts/orders for the
+    # customer portal (guarded for databases created before these columns existed).
+    wacols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_accounts)").fetchall()]
+    for col, ddl in (("contact_person", "TEXT NOT NULL DEFAULT ''"),
+                     ("savory_price_cents", "INTEGER NOT NULL DEFAULT 400"),
+                     ("sweet_price_cents", "INTEGER NOT NULL DEFAULT 400"),
+                     ("default_po", "TEXT NOT NULL DEFAULT ''"),
+                     ("account_status", "TEXT NOT NULL DEFAULT 'active'")):
+        if col not in wacols:
+            conn.execute("ALTER TABLE erp_wholesale_accounts ADD COLUMN %s %s" % (col, ddl))
+    wocols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_orders)").fetchall()]
+    for col, ddl in (("po_number", "TEXT NOT NULL DEFAULT ''"),
+                     ("address_id", "INTEGER NOT NULL DEFAULT 0"),
+                     ("placed_by_user_id", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in wocols:
+            conn.execute("ALTER TABLE erp_wholesale_orders ADD COLUMN %s %s" % (col, ddl))
+    # Seed flavor categories (spec §4; the user may correct via the API).
+    for _flv, _cat in (
+            ("Bacon", "savory"), ("Buffalo Ranch", "savory"),
+            ("Cheddar", "savory"), ("Cheddar Jalapeño", "savory"),
+            ("Cheeseburger", "savory"), ("Dill Pickle", "savory"),
+            ("Garlic Butter", "savory"), ("Garlic Parmesan", "savory"),
+            ("Nashville Hot", "savory"), ("Pizza", "savory"),
+            ("Salt and Vinegar", "savory"), ("White Cheddar", "savory"),
+            ("Alien Mix", "sweet"), ("Banana Pudding", "sweet"),
+            ("Birthday Cake", "sweet"), ("Caramel", "sweet"),
+            ("Churro", "sweet"), ("Cinnamon Roll", "sweet"),
+            ("Cookie and Cream", "sweet"), ("Kettle Corn", "sweet"),
+            ("Lemonade", "sweet"), ("Muddy Buddy", "sweet"),
+            ("Snickerdoodle", "sweet"),
+            ("Strawberry Cheesecake", "sweet"), ("Sugar Cookie", "sweet")):
+        conn.execute("INSERT OR IGNORE INTO erp_flavor_categories (flavor_name, category)"
+                     " VALUES (?, ?)", (_flv, _cat))
     conn.commit()
     conn.close()
 
@@ -904,7 +976,17 @@ def send_gift_card_email(to_email, purchaser_name, recipient_name, code, message
     resp.raise_for_status()
     return resp.json()
 
+# Test hook: tests assign backend._MAIL_TEST_DOUBLE to a list; send_email()
+# appends to it instead of calling Resend.
+_MAIL_TEST_DOUBLE = None
+
+
 def send_email(to_email, subject, html):
+    # Test hook: tests assign backend._MAIL_TEST_DOUBLE to a list to capture
+    # outbound mail instead of calling Resend.
+    if _MAIL_TEST_DOUBLE is not None:
+        _MAIL_TEST_DOUBLE.append({"to": to_email, "subject": subject, "html": html})
+        return {"id": "test-mail-captured"}
     resp = requests.post(
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
@@ -3328,6 +3410,61 @@ def _require_staff():
     if not staff:
         return None, (jsonify(error="staff login required"), 401)
     return staff, None
+
+
+# ---------------- wholesale customer auth (ERP Phase 5) ----------------
+
+def _wholesale_serializer():
+    if not AUTH_SECRET:
+        return None
+    return URLSafeTimedSerializer(AUTH_SECRET, salt="popalicious-wholesale")
+
+
+def _issue_wholesale_token(user_id):
+    return _wholesale_serializer().dumps({"wid": user_id})
+
+
+def _wholesale_user_from_request():
+    """Wholesale customer from Bearer token. Returns (user_row, account_row)
+    or (None, None). Requires user active AND account active + not deactivated."""
+    s = _wholesale_serializer()
+    auth = request.headers.get("Authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return None, None
+    token = auth[7:].strip()
+    if not s or not token:
+        return None, None
+    try:
+        payload = s.loads(token, max_age=30 * 24 * 3600)  # 30-day sessions
+    except (BadSignature, SignatureExpired):
+        return None, None
+    conn = db()
+    user = conn.execute(
+        "SELECT wu.*, wa.name AS account_name, wa.account_status,"
+        " wa.active AS account_active, wa.savory_price_cents,"
+        " wa.sweet_price_cents, wa.default_po, wa.price_per_bag_cents"
+        " FROM erp_wholesale_users wu"
+        " JOIN erp_wholesale_accounts wa ON wa.id = wu.account_id"
+        " WHERE wu.id = ? AND wu.active = 1",
+        (payload.get("wid"),)).fetchone()
+    conn.close()
+    if not user:
+        return None, None
+    if not user["account_active"] or user["account_status"] == "deactivated":
+        return None, None
+    return user, user
+
+
+def _require_wholesale():
+    """Wholesale customer only. Returns ((user, account), None) or
+    (None, (resp, code)). 401 when no/invalid token, 403 for other logins."""
+    user, _acct = _wholesale_user_from_request()
+    if user:
+        return (user, user), None
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return None, (jsonify(error="wholesale customer login required"), 403)
+    return None, (jsonify(error="wholesale customer login required"), 401)
 
 def _set_staff_cookie(resp, token):
     resp.set_cookie(
@@ -7443,13 +7580,16 @@ _ERP_PERMS = {
 
 
 def _erp_role():
-    """'admin', 'staff', or None for the current request."""
+    """'admin', 'staff', 'wholesale', or None for the current request."""
     user = _current_member()
     if user and _is_admin(user):
         return "admin"
     staff, _ = _require_staff()
     if staff:
         return "staff"
+    wuser, _ = _wholesale_user_from_request()
+    if wuser:
+        return "wholesale"
     return None
 
 
@@ -7467,6 +7607,8 @@ def _erp_check_perm(perm):
         if perm in _ERP_PERMS["staff"]:
             return _erp_actor(), None
         return None, (jsonify(error="admin required"), 403)
+    if role == "wholesale":
+        return None, (jsonify(error="not permitted for wholesale accounts"), 403)
     user = _current_member()
     if user:
         msg = "admin or staff required" if perm == "erp.access" else "admin required"
@@ -8920,7 +9062,7 @@ def erp_batch_trace(batch_id):
 
 # ---------------- ERP Phase 3: Order hub + wholesale CRM ----------------
 
-_ERP_FULFILLMENT_STATUSES = ("new", "in_production", "ready", "shipped",
+_ERP_FULFILLMENT_STATUSES = ("new", "submitted", "accepted", "in_production", "ready", "shipped",
                              "picked_up", "cancelled")
 _ERP_ORDER_SOURCES = ("stripe", "paypal", "wholesale")
 
@@ -8956,6 +9098,31 @@ def _erp_set_fulfillment(conn, source, order_id, status, actor, note=""):
         conn.execute("UPDATE erp_wholesale_orders SET status = ? WHERE id = ?",
                      (status, order_id))
     return None
+
+
+def _erp_ensure_production_lines(conn, order_id):
+    """Generate per-flavor production checklist lines from the order's lines.
+    Idempotent: does nothing if lines already exist for the order."""
+    existing = conn.execute(
+        "SELECT COUNT(*) AS c FROM erp_order_production_lines WHERE order_id = ?",
+        (order_id,)).fetchone()["c"]
+    if existing:
+        return
+    for li in conn.execute(
+            "SELECT flavor_name, qty_bags FROM erp_wholesale_order_lines"
+            " WHERE order_id = ? ORDER BY id", (order_id,)).fetchall():
+        conn.execute(
+            "INSERT INTO erp_order_production_lines (order_id, flavor_name, qty_bags,"
+            " done, done_by, done_at) VALUES (?, ?, ?, 0, '', '')",
+            (order_id, li["flavor_name"], li["qty_bags"]))
+
+
+def _erp_production_progress(conn, order_id):
+    rows = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(done), 0) AS d"
+        " FROM erp_order_production_lines WHERE order_id = ?",
+        (order_id,)).fetchone()
+    return int(rows["d"] or 0), int(rows["n"] or 0)
 
 
 def _erp_fulfillment_dict(conn, source, order_id):
@@ -9177,10 +9344,21 @@ def erp_order_set_status(source, order_id):
     if not _erp_order_brief(conn, source, order_id):
         conn.close()
         return jsonify(error="order not found"), 404
+    if source == "wholesale" and status == "ready":
+        # Phase 5: an order with a production checklist can't be marked ready
+        # until every flavor is done.
+        done, total = _erp_production_progress(conn, order_id)
+        if total and done < total:
+            conn.close()
+            return jsonify(error="all %d flavors must be marked done first (%d of %d done)"
+                           % (total, done, total)), 400
     err_msg = _erp_set_fulfillment(conn, source, order_id, status, actor, note)
     if err_msg:
         conn.close()
         return jsonify(error=err_msg), 400
+    if source == "wholesale" and status == "in_production":
+        # Phase 5: entering production generates the per-flavor checklist.
+        _erp_ensure_production_lines(conn, order_id)
     conn.commit()
     conn.close()
     return jsonify(ok=True, status=status)
@@ -9216,17 +9394,27 @@ def erp_create_wholesale_account():
         return jsonify(error="price_per_bag_cents must be a number"), 400
     if price <= 0:
         return jsonify(error="price_per_bag_cents must be greater than zero"), 400
+    try:
+        savory = int(data.get("savory_price_cents", 400) or 400)
+        sweet = int(data.get("sweet_price_cents", 400) or 400)
+    except (TypeError, ValueError):
+        return jsonify(error="savory_price_cents and sweet_price_cents must be numbers"), 400
+    if savory <= 0 or sweet <= 0:
+        return jsonify(error="category prices must be greater than zero"), 400
     conn = db()
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
-        " price_per_bag_cents, payment_terms, notes, active, created_by, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        " price_per_bag_cents, payment_terms, notes, active, created_by, created_at,"
+        " contact_person, savory_price_cents, sweet_price_cents, default_po, account_status)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'active')",
         (name, (data.get("contact_name") or "").strip(),
          (data.get("email") or "").strip(), (data.get("phone") or "").strip(),
          (data.get("address") or "").strip(), price,
          (data.get("payment_terms") or "").strip(),
-         (data.get("notes") or "").strip(), actor, now))
+         (data.get("notes") or "").strip(), actor, now,
+         (data.get("contact_person") or "").strip(), savory, sweet,
+         (data.get("default_po") or "").strip()))
     acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
                         (cur.lastrowid,)).fetchone()
     out = _erp_wholesale_account_dict(conn, acct)
@@ -9268,7 +9456,7 @@ def erp_update_wholesale_account(account_id):
         return jsonify(error="account not found"), 404
     fields = {}
     for key in ("name", "contact_name", "email", "phone", "address",
-                "payment_terms", "notes"):
+                "payment_terms", "notes", "contact_person", "default_po"):
         if key in data:
             fields[key] = (data.get(key) or "").strip()
     if "price_per_bag_cents" in data:
@@ -9281,6 +9469,23 @@ def erp_update_wholesale_account(account_id):
             conn.close()
             return jsonify(error="price_per_bag_cents must be greater than zero"), 400
         fields["price_per_bag_cents"] = price
+    for key in ("savory_price_cents", "sweet_price_cents"):
+        if key in data:
+            try:
+                price = int(data.get(key) or 0)
+            except (TypeError, ValueError):
+                conn.close()
+                return jsonify(error="%s must be a number" % key), 400
+            if price <= 0:
+                conn.close()
+                return jsonify(error="%s must be greater than zero" % key), 400
+            fields[key] = price
+    if "account_status" in data:
+        st = (data.get("account_status") or "").strip()
+        if st not in ("invited", "active", "deactivated"):
+            conn.close()
+            return jsonify(error="account_status must be invited, active, or deactivated"), 400
+        fields["account_status"] = st
     if "active" in data:
         fields["active"] = 1 if data.get("active") else 0
     if "name" in fields and not fields["name"]:
@@ -9468,6 +9673,597 @@ def erp_get_wholesale_order(order_id):
     order["linked_batches"] = _erp_order_links(conn, "wholesale", order_id)
     conn.close()
     return jsonify(order=order)
+
+
+# ---------------- ERP Phase 5: wholesale customer portal ----------------
+
+_WHOLESALE_ADMIN_EMAILS = ("dj@fudgetopia.net", "matt@fudgetopia.net")
+
+
+def _wholesale_portal_url(data):
+    base = (data.get("portal_url") or "").strip() if isinstance(data, dict) else ""
+    if not base:
+        base = os.environ.get("WHOLESALE_PORTAL_URL", "").strip()
+    if not base:
+        base = "https://erp.pop-a-licious.com"
+    return base.rstrip("/")
+
+
+def _wholesale_account_prices(acct):
+    return {"savory": int(acct["savory_price_cents"] or 400),
+            "sweet": int(acct["sweet_price_cents"] or 400)}
+
+
+def _wholesale_flavor_price(conn, acct, flavor_name):
+    cat = conn.execute("SELECT category FROM erp_flavor_categories WHERE flavor_name = ?",
+                       (flavor_name,)).fetchone()
+    category = (cat["category"] if cat else "sweet")
+    prices = _wholesale_account_prices(acct)
+    return prices["savory"] if category == "savory" else prices["sweet"], category
+
+
+def _send_wholesale_invite_email(to_email, business_name, link):
+    return send_email(
+        to_email,
+        "You're invited to order Pop-A-Licious wholesale",
+        "<p>Hi%s,</p>"
+        "<p><strong>%s</strong> has set up a wholesale ordering account for you.</p>"
+        "<p><a href=\"%s\">Click here to set your password</a> and start ordering. "
+        "This link expires in 7 days.</p>"
+        "<p>— Pop-A-Licious</p>"
+        % (", " + business_name if business_name else "", business_name or "Pop-A-Licious",
+           link))
+
+
+def _send_new_wholesale_order_emails(order_number, acct, lines, total_cents, po_number,
+                                     address_label):
+    dollars = lambda c: "$%s" % "{:,.2f}".format(c / 100)
+    line_rows = "".join(
+        "<li>%s &times; %s — %s</li>"
+        % (l["qty_bags"], l["flavor_name"], dollars(l["line_total_cents"]))
+        for l in lines)
+    html = ("<p>New wholesale order <strong>%s</strong> from <strong>%s</strong>"
+            " is waiting for review.</p>"
+            "<ul>%s</ul>"
+            "<p>Total: <strong>%s</strong><br>PO: %s<br>Deliver to: %s</p>"
+            "<p>Log in to the ERP order hub to accept it.</p>"
+            % (order_number, acct["name"], line_rows, dollars(total_cents),
+               po_number or "—", address_label or "—"))
+    for to_email in _WHOLESALE_ADMIN_EMAILS:
+        send_email(to_email,
+                   "New wholesale order %s from %s — review to accept"
+                   % (order_number, acct["name"]), html)
+
+
+def _send_order_accepted_email(to_email, order_number, business_name):
+    send_email(
+        to_email,
+        "Your Pop-A-Licious order %s was accepted" % order_number,
+        "<p>Hi%s,</p>"
+        "<p>Good news — your wholesale order <strong>%s</strong> has been accepted"
+        " and is going into production.</p>"
+        "<p>We'll let you know when it ships.<br>— Pop-A-Licious</p>"
+        % (", " + business_name if business_name else "", order_number))
+
+
+def _send_order_declined_email(to_email, order_number, business_name, note):
+    send_email(
+        to_email,
+        "Update on your Pop-A-Licious order %s" % order_number,
+        "<p>Hi%s,</p>"
+        "<p>Your wholesale order <strong>%s</strong> couldn't be accepted%s.</p>"
+        "<p>Please contact us if you have questions.<br>— Pop-A-Licious</p>"
+        % (", " + business_name if business_name else "", order_number,
+           (" — " + note) if note else ""))
+
+
+@app.post("/api/wholesale/login")
+def wholesale_login():
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    conn = db()
+    user = conn.execute(
+        "SELECT wu.*, wa.account_status, wa.active AS account_active, wa.name AS account_name"
+        " FROM erp_wholesale_users wu"
+        " JOIN erp_wholesale_accounts wa ON wa.id = wu.account_id"
+        " WHERE LOWER(wu.email) = ?", (email,)).fetchone()
+    if not user or not user["password_hash"] or \
+            not check_password_hash(user["password_hash"], password):
+        conn.close()
+        return jsonify(error="invalid email or password"), 401
+    if not user["active"] or not user["account_active"] \
+            or user["account_status"] == "deactivated":
+        conn.close()
+        return jsonify(error="this account is deactivated"), 403
+    token = _issue_wholesale_token(user["id"])
+    out = {"token": token, "email": user["email"],
+           "account_id": user["account_id"], "account_name": user["account_name"]}
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/wholesale/set-password")
+def wholesale_set_password():
+    data = request.get_json(force=True) or {}
+    token = (data.get("token") or "").strip()
+    password = data.get("password") or ""
+    if not token:
+        conn = None
+        return jsonify(error="invite token is required"), 400
+    if len(password) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+    conn = db()
+    user = conn.execute("SELECT * FROM erp_wholesale_users WHERE invite_token = ?",
+                        (token,)).fetchone()
+    if not user:
+        conn.close()
+        return jsonify(error="invalid invite token"), 400
+    if not user["invite_expires_at"] or user["invite_expires_at"] < datetime.now(timezone.utc).isoformat():
+        conn.close()
+        return jsonify(error="invite token has expired — ask for a new invitation"), 410
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_wholesale_users SET password_hash = ?, invite_token = '',"
+                 " invite_expires_at = '', active = 1 WHERE id = ?",
+                 (generate_password_hash(password), user["id"]))
+    conn.execute("UPDATE erp_wholesale_accounts SET account_status = 'active'"
+                 " WHERE id = ? AND account_status = 'invited'", (user["account_id"],))
+    conn.commit()
+    out_token = _issue_wholesale_token(user["id"])
+    acct = conn.execute("SELECT name FROM erp_wholesale_accounts WHERE id = ?",
+                        (user["account_id"],)).fetchone()
+    conn.close()
+    return jsonify(token=out_token, email=user["email"],
+                   account_id=user["account_id"],
+                   account_name=acct["name"] if acct else "")
+
+
+def _wholesale_me_dict(conn, user):
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (user["account_id"],)).fetchone()
+    addrs = [dict(a) for a in conn.execute(
+        "SELECT * FROM erp_wholesale_addresses WHERE account_id = ? AND active = 1"
+        " ORDER BY id", (user["account_id"],)).fetchall()]
+    return {"email": user["email"], "account_id": user["account_id"],
+            "business_name": acct["name"] if acct else "",
+            "contact_person": acct["contact_person"] if acct else "",
+            "phone": acct["phone"] if acct else "",
+            "default_po": acct["default_po"] if acct else "",
+            "account_status": acct["account_status"] if acct else "",
+            "addresses": addrs}
+
+
+@app.get("/api/wholesale/me")
+def wholesale_me():
+    who, err = _require_wholesale()
+    if err:
+        return err
+    user, _acct = who
+    conn = db()
+    out = _wholesale_me_dict(conn, user)
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/wholesale/flavors")
+def wholesale_flavors():
+    who, err = _require_wholesale()
+    if err:
+        return err
+    user, _acct = who
+    conn = db()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (user["account_id"],)).fetchone()
+    prices = _wholesale_account_prices(acct)
+    flavors = []
+    for row in conn.execute("SELECT flavor_name, category FROM erp_flavor_categories"
+                            " ORDER BY category, flavor_name").fetchall():
+        flavors.append({"flavor_name": row["flavor_name"], "category": row["category"],
+                        "price_cents": prices["savory"] if row["category"] == "savory"
+                        else prices["sweet"]})
+    conn.close()
+    return jsonify(flavors=flavors)
+
+
+def _wholesale_order_detail(conn, user, order_id):
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ? AND account_id = ?",
+                     (order_id, user["account_id"])).fetchone()
+    if not w:
+        return None
+    order = _erp_wholesale_order_brief(conn, w)
+    order["lines"] = [dict(l) for l in conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
+        (order_id,)).fetchall()]
+    order["po_number"] = w["po_number"]
+    order["notes"] = w["notes"]
+    order["order_date"] = w["order_date"]
+    fulf = _erp_fulfillment_dict(conn, "wholesale", order_id)
+    order["status"] = fulf["status"]
+    order["fulfillment"] = fulf
+    addr = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                        (w["address_id"],)).fetchone() if w["address_id"] else None
+    order["address"] = dict(addr) if addr else None
+    done, total = _erp_production_progress(conn, order_id)
+    order["production"] = {"done": done, "total": total}
+    return order
+
+
+@app.get("/api/wholesale/orders")
+def wholesale_list_orders():
+    who, err = _require_wholesale()
+    if err:
+        return err
+    user, _acct = who
+    conn = db()
+    rows = conn.execute("SELECT * FROM erp_wholesale_orders WHERE account_id = ?"
+                        " ORDER BY id DESC", (user["account_id"],)).fetchall()
+    out = []
+    for w in rows:
+        b = _erp_wholesale_order_brief(conn, w)
+        b["po_number"] = w["po_number"]
+        fulf = _erp_fulfillment_dict(conn, "wholesale", w["id"])
+        b["status"] = fulf["status"]
+        out.append(b)
+    conn.close()
+    return jsonify(orders=out)
+
+
+@app.post("/api/wholesale/orders")
+def wholesale_create_order():
+    who, err = _require_wholesale()
+    if err:
+        return err
+    user, _acct = who
+    data = request.get_json(force=True) or {}
+    conn = db()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (user["account_id"],)).fetchone()
+    lines_in = data.get("lines") or []
+    if not lines_in:
+        conn.close()
+        return jsonify(error="at least one order line is required"), 400
+    lines = []
+    for i, li in enumerate(lines_in, 1):
+        flavor = ((li or {}).get("flavor_name") or "").strip()
+        if not flavor:
+            conn.close()
+            return jsonify(error="line %d: flavor_name is required" % i), 400
+        try:
+            qty = float((li or {}).get("qty_bags") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="line %d: qty_bags must be a number" % i), 400
+        if qty <= 0:
+            conn.close()
+            return jsonify(error="line %d: qty_bags must be greater than zero" % i), 400
+        unit, _cat = _wholesale_flavor_price(conn, acct, flavor)
+        if not conn.execute("SELECT 1 FROM erp_flavor_categories WHERE flavor_name = ?",
+                            (flavor,)).fetchone():
+            conn.close()
+            return jsonify(error="line %d: unknown flavor '%s'" % (i, flavor)), 400
+        lines.append({"flavor_name": flavor, "qty_bags": qty,
+                      "unit_price_cents": unit,
+                      "line_total_cents": int(round(qty * unit))})
+    # Delivery location: explicit pick, or the single address, or the account address.
+    address_id = int(data.get("address_id") or 0)
+    addrs = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE account_id = ?"
+                         " AND active = 1 ORDER BY id", (acct["id"],)).fetchall()
+    if address_id:
+        if not any(a["id"] == address_id for a in addrs):
+            conn.close()
+            return jsonify(error="unknown delivery address"), 400
+    elif len(addrs) == 1:
+        address_id = addrs[0]["id"]
+    elif len(addrs) > 1:
+        conn.close()
+        return jsonify(error="please choose a delivery location"), 400
+    po_number = (data.get("po_number") or "").strip() or (acct["default_po"] or "")
+    now = datetime.now(timezone.utc).isoformat()
+    order_number = _erp_next_wholesale_number(conn)
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_orders (order_number, account_id, status, order_date,"
+        " notes, created_by, created_at, po_number, address_id, placed_by_user_id)"
+        " VALUES (?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?)",
+        (order_number, acct["id"], now[:10], (data.get("notes") or "").strip(),
+         "customer:" + user["email"], now, po_number, address_id, user["id"]))
+    order_id = cur.lastrowid
+    for li in lines:
+        conn.execute(
+            "INSERT INTO erp_wholesale_order_lines (order_id, flavor_name, qty_bags,"
+            " unit_price_cents, line_total_cents) VALUES (?, ?, ?, ?, ?)",
+            (order_id, li["flavor_name"], li["qty_bags"],
+             li["unit_price_cents"], li["line_total_cents"]))
+    _erp_set_fulfillment(conn, "wholesale", order_id, "submitted",
+                         "customer:" + user["email"], "order placed via customer portal")
+    total_cents = sum(li["line_total_cents"] for li in lines)
+    addr_label = ""
+    if address_id:
+        a = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                         (address_id,)).fetchone()
+        if a:
+            addr_label = "%s — %s, %s %s %s" % (a["label"] or "Delivery",
+                                               a["street"], a["city"], a["state"], a["zip"])
+    conn.commit()
+    order = _wholesale_order_detail(conn, user, order_id)
+    conn.close()
+    _send_new_wholesale_order_emails(order_number, acct, lines, total_cents,
+                                     po_number, addr_label)
+    return jsonify(order=order), 201
+
+
+@app.get("/api/wholesale/orders/<int:order_id>")
+def wholesale_get_order(order_id):
+    who, err = _require_wholesale()
+    if err:
+        return err
+    user, _acct = who
+    conn = db()
+    order = _wholesale_order_detail(conn, user, order_id)
+    conn.close()
+    if not order:
+        return jsonify(error="order not found"), 404
+    return jsonify(order=order)
+
+
+@app.post("/api/erp/wholesale-accounts/<int:account_id>/invite")
+def erp_invite_wholesale_customer(account_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="account not found"), 404
+    if acct["account_status"] == "deactivated" or not acct["active"]:
+        conn.close()
+        return jsonify(error="account is deactivated"), 400
+    email = (acct["email"] or "").strip().lower()
+    if not email or not EMAIL_RE.match(email):
+        conn.close()
+        return jsonify(error="account needs a valid email before inviting"), 400
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    existing = conn.execute("SELECT * FROM erp_wholesale_users WHERE email = ?",
+                            (email,)).fetchone()
+    if existing:
+        if existing["account_id"] != account_id:
+            conn.close()
+            return jsonify(error="that email is already a portal login for another account"), 400
+        conn.execute("UPDATE erp_wholesale_users SET invite_token = ?,"
+                     " invite_expires_at = ?, active = 1 WHERE id = ?",
+                     (token, expires, existing["id"]))
+    else:
+        conn.execute("INSERT INTO erp_wholesale_users (account_id, email, password_hash,"
+                     " invite_token, invite_expires_at, active, created_at)"
+                     " VALUES (?, ?, '', ?, ?, 1, ?)",
+                     (account_id, email, token, expires, now))
+        # First invite for this account: mark it invited (re-invites of active
+        # customers leave the status alone).
+        conn.execute("UPDATE erp_wholesale_accounts SET account_status = 'invited'"
+                     " WHERE id = ? AND account_status = 'active'", (account_id,))
+    conn.commit()
+    link = _wholesale_portal_url(data) + "/#/wholesale-setup?token=" + token
+    conn.close()
+    _send_wholesale_invite_email(email, acct["name"], link)
+    out = {"ok": True, "email": email}
+    if str(request.args.get("reveal") or "") == "1":
+        out["invite_link"] = link
+    return jsonify(out)
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/accept")
+def erp_accept_wholesale_order(order_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    fulf = _erp_get_fulfillment(conn, "wholesale", order_id)
+    if not fulf or fulf["status"] != "submitted":
+        conn.close()
+        return jsonify(error="only submitted orders can be accepted"), 400
+    err_msg = _erp_set_fulfillment(conn, "wholesale", order_id, "accepted", actor,
+                                   (data.get("note") or "").strip())
+    if err_msg:
+        conn.close()
+        return jsonify(error=err_msg), 400
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (w["account_id"],)).fetchone()
+    conn.commit()
+    conn.close()
+    if acct and acct["email"]:
+        _send_order_accepted_email(acct["email"], w["order_number"], acct["name"])
+    return jsonify(ok=True, status="accepted")
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/decline")
+def erp_decline_wholesale_order(order_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    note = (data.get("note") or "").strip()
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    fulf = _erp_get_fulfillment(conn, "wholesale", order_id)
+    if not fulf or fulf["status"] != "submitted":
+        conn.close()
+        return jsonify(error="only submitted orders can be declined"), 400
+    err_msg = _erp_set_fulfillment(conn, "wholesale", order_id, "cancelled", actor,
+                                   note or "declined")
+    if err_msg:
+        conn.close()
+        return jsonify(error=err_msg), 400
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (w["account_id"],)).fetchone()
+    conn.commit()
+    conn.close()
+    if acct and acct["email"]:
+        _send_order_declined_email(acct["email"], w["order_number"], acct["name"], note)
+    return jsonify(ok=True, status="cancelled")
+
+
+@app.get("/api/erp/wholesale-orders/<int:order_id>/production")
+def erp_wholesale_production(order_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    lines = [dict(l) for l in conn.execute(
+        "SELECT * FROM erp_order_production_lines WHERE order_id = ? ORDER BY id",
+        (order_id,)).fetchall()]
+    done, total = _erp_production_progress(conn, order_id)
+    conn.close()
+    return jsonify(lines=lines, done=done, total=total)
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/production/<int:line_id>/done")
+def erp_wholesale_production_done(order_id, line_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    line = conn.execute("SELECT * FROM erp_order_production_lines WHERE id = ?"
+                        " AND order_id = ?", (line_id, order_id)).fetchone()
+    if not line:
+        conn.close()
+        return jsonify(error="production line not found"), 404
+    done = 1 if data.get("done", True) else 0
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_order_production_lines SET done = ?, done_by = ?,"
+                 " done_at = ? WHERE id = ?",
+                 (done, actor if done else "", now if done else "", line_id))
+    conn.commit()
+    d, t = _erp_production_progress(conn, order_id)
+    conn.close()
+    return jsonify(ok=True, done=d, total=t)
+
+
+@app.get("/api/erp/wholesale-accounts/<int:account_id>/addresses")
+def erp_list_wholesale_addresses(account_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    acct = conn.execute("SELECT id FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="account not found"), 404
+    rows = [dict(a) for a in conn.execute(
+        "SELECT * FROM erp_wholesale_addresses WHERE account_id = ? ORDER BY id",
+        (account_id,)).fetchall()]
+    conn.close()
+    return jsonify(addresses=rows)
+
+
+@app.post("/api/erp/wholesale-accounts/<int:account_id>/addresses")
+def erp_add_wholesale_address(account_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    acct = conn.execute("SELECT id FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="account not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_addresses (account_id, label, street, city, state,"
+        " zip, phone, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+        (account_id, (data.get("label") or "").strip(),
+         (data.get("street") or "").strip(), (data.get("city") or "").strip(),
+         (data.get("state") or "").strip(), (data.get("zip") or "").strip(),
+         (data.get("phone") or "").strip(), now))
+    addr = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(address=dict(addr)), 201
+
+
+@app.put("/api/erp/wholesale-accounts/addresses/<int:addr_id>")
+def erp_update_wholesale_address(addr_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    addr = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                        (addr_id,)).fetchone()
+    if not addr:
+        conn.close()
+        return jsonify(error="address not found"), 404
+    fields = {}
+    for key in ("label", "street", "city", "state", "zip", "phone"):
+        if key in data:
+            fields[key] = (data.get(key) or "").strip()
+    if "active" in data:
+        fields["active"] = 1 if data.get("active") else 0
+    if fields:
+        sets = ", ".join("%s = ?" % k for k in fields)
+        conn.execute("UPDATE erp_wholesale_addresses SET %s WHERE id = ?" % sets,
+                     tuple(fields.values()) + (addr_id,))
+        conn.commit()
+    addr = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                        (addr_id,)).fetchone()
+    conn.close()
+    return jsonify(address=dict(addr))
+
+
+@app.get("/api/erp/flavor-categories")
+def erp_list_flavor_categories():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT flavor_name, category FROM erp_flavor_categories"
+        " ORDER BY category, flavor_name").fetchall()]
+    conn.close()
+    return jsonify(categories=rows)
+
+
+@app.put("/api/erp/flavor-categories")
+def erp_update_flavor_categories():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    cats = data.get("categories") or {}
+    if not isinstance(cats, dict) or not cats:
+        return jsonify(error="categories object is required"), 400
+    conn = db()
+    for flavor, cat in cats.items():
+        if cat not in ("savory", "sweet"):
+            conn.close()
+            return jsonify(error="invalid category for '%s'" % flavor), 400
+        conn.execute("UPDATE erp_flavor_categories SET category = ? WHERE flavor_name = ?",
+                     (cat, flavor))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, updated=len(cats))
 
 
 # ---------------- batch <-> order links ----------------
