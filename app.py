@@ -876,15 +876,36 @@ def init_db():
                      ("savory_price_cents", "INTEGER NOT NULL DEFAULT 400"),
                      ("sweet_price_cents", "INTEGER NOT NULL DEFAULT 400"),
                      ("default_po", "TEXT NOT NULL DEFAULT ''"),
+                     ("pricing_mode", "TEXT NOT NULL DEFAULT 'bag'"),
                      ("account_status", "TEXT NOT NULL DEFAULT 'active'")):
         if col not in wacols:
             conn.execute("ALTER TABLE erp_wholesale_accounts ADD COLUMN %s %s" % (col, ddl))
     wocols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_orders)").fetchall()]
     for col, ddl in (("po_number", "TEXT NOT NULL DEFAULT ''"),
                      ("address_id", "INTEGER NOT NULL DEFAULT 0"),
+                     ("pricing_mode", "TEXT NOT NULL DEFAULT 'bag'"),
                      ("placed_by_user_id", "INTEGER NOT NULL DEFAULT 0")):
         if col not in wocols:
             conn.execute("ALTER TABLE erp_wholesale_orders ADD COLUMN %s %s" % (col, ddl))
+    wacols2 = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_addresses)").fetchall()]
+    for col, ddl in (("location_name", "TEXT NOT NULL DEFAULT ''"),
+                     ("contact_name", "TEXT NOT NULL DEFAULT ''"),
+                     ("contact_email", "TEXT NOT NULL DEFAULT ''"),
+                     ("contact_phone", "TEXT NOT NULL DEFAULT ''")):
+        if col not in wacols2:
+            conn.execute("ALTER TABLE erp_wholesale_addresses ADD COLUMN %s %s" % (col, ddl))
+    # Backfill one delivery location per account that still only has the legacy
+    # free-text address and no structured locations yet.
+    for _a in conn.execute("SELECT id, address FROM erp_wholesale_accounts").fetchall():
+        if (_a["address"] or "").strip():
+            _n = conn.execute("SELECT COUNT(*) AS c FROM erp_wholesale_addresses"
+                              " WHERE account_id = ?", (_a["id"],)).fetchone()["c"]
+            if not _n:
+                conn.execute("INSERT INTO erp_wholesale_addresses (account_id,"
+                             " location_name, street, active, created_at)"
+                             " VALUES (?, 'Main location', ?, 1, ?)",
+                             (_a["id"], _a["address"].strip(),
+                              datetime.now(timezone.utc).isoformat()))
     # Seed flavor categories (spec §4; the user may correct via the API).
     for _flv, _cat in (
             ("Bacon", "savory"), ("Buffalo Ranch", "savory"),
@@ -9193,6 +9214,7 @@ def _erp_wholesale_order_brief(conn, w):
             "customer_name": acct["name"] if acct else "",
             "account_name": acct["name"] if acct else "",
             "account_id": w["account_id"],
+            "pricing_mode": (w["pricing_mode"] if "pricing_mode" in w.keys() else "") or "bag",
             "email": "", "items_summary": "",
             "total_cents": total, "total_qty": qty,
             "status": w["status"], "created_at": w["created_at"],
@@ -9388,6 +9410,9 @@ def erp_create_wholesale_account():
     if not name:
         conn = None
         return jsonify(error="name is required"), 400
+    pricing_mode = (data.get("pricing_mode") or "bag").strip().lower()
+    if pricing_mode not in ("bag", "case"):
+        return jsonify(error="pricing_mode must be 'bag' or 'case'"), 400
     try:
         price = int(data.get("price_per_bag_cents", 400) or 400)
     except (TypeError, ValueError):
@@ -9406,17 +9431,32 @@ def erp_create_wholesale_account():
     cur = conn.execute(
         "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
         " price_per_bag_cents, payment_terms, notes, active, created_by, created_at,"
-        " contact_person, savory_price_cents, sweet_price_cents, default_po, account_status)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, 'active')",
+        " contact_person, savory_price_cents, sweet_price_cents, default_po,"
+        " pricing_mode, account_status)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'active')",
         (name, (data.get("contact_name") or "").strip(),
          (data.get("email") or "").strip(), (data.get("phone") or "").strip(),
          (data.get("address") or "").strip(), price,
          (data.get("payment_terms") or "").strip(),
          (data.get("notes") or "").strip(), actor, now,
          (data.get("contact_person") or "").strip(), savory, sweet,
-         (data.get("default_po") or "").strip()))
+         (data.get("default_po") or "").strip(), pricing_mode))
+    account_id = cur.lastrowid
+    # Main delivery location: the customer manages further addresses themselves
+    # in the portal; the admin sees the profile read-only.
+    loc = {k: (data.get(k) or "").strip() for k in
+           ("location_name", "street", "city", "state", "zip",
+            "location_contact", "location_email", "location_phone")}
+    if loc["street"] or loc["location_name"]:
+        conn.execute(
+            "INSERT INTO erp_wholesale_addresses (account_id, location_name, street,"
+            " city, state, zip, contact_name, contact_email, contact_phone,"
+            " active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+            (account_id, loc["location_name"] or "Main location", loc["street"],
+             loc["city"], loc["state"], loc["zip"], loc["location_contact"],
+             loc["location_email"], loc["location_phone"], now))
     acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
-                        (cur.lastrowid,)).fetchone()
+                        (account_id,)).fetchone()
     out = _erp_wholesale_account_dict(conn, acct)
     conn.commit()
     conn.close()
@@ -9486,6 +9526,12 @@ def erp_update_wholesale_account(account_id):
             conn.close()
             return jsonify(error="account_status must be invited, active, or deactivated"), 400
         fields["account_status"] = st
+    if "pricing_mode" in data:
+        pm = (data.get("pricing_mode") or "").strip().lower()
+        if pm not in ("bag", "case"):
+            conn.close()
+            return jsonify(error="pricing_mode must be 'bag' or 'case'"), 400
+        fields["pricing_mode"] = pm
     if "active" in data:
         fields["active"] = 1 if data.get("active") else 0
     if "name" in fields and not fields["name"]:
@@ -9716,19 +9762,34 @@ def _send_wholesale_invite_email(to_email, business_name, link):
 
 
 def _send_new_wholesale_order_emails(order_number, acct, lines, total_cents, po_number,
-                                     address_label):
+                                     address_label, portal_url=""):
     dollars = lambda c: "$%s" % "{:,.2f}".format(c / 100)
-    line_rows = "".join(
-        "<li>%s &times; %s — %s</li>"
-        % (l["qty_bags"], l["flavor_name"], dollars(l["line_total_cents"]))
-        for l in lines)
+    case_mode = (acct["pricing_mode"] or "bag") == "case"
+    def line_text(l):
+        if case_mode and l["qty_bags"] % 12 == 0:
+            cases = int(l["qty_bags"] // 12)
+            return "%d case%s (12 bags each) &times; %s — %s" % (
+                cases, "" if cases == 1 else "s", l["flavor_name"],
+                dollars(l["line_total_cents"]))
+        return "%s &times; %s — %s" % (l["qty_bags"], l["flavor_name"],
+                                       dollars(l["line_total_cents"]))
+    line_rows = "".join("<li>%s</li>" % line_text(l) for l in lines)
+    accept_url = "%s#/login?accept_order=%s" % (portal_url.rstrip("/"), order_number) \
+        if portal_url else ""
+    accept_btn = ("<p><a href=\"%s\" style=\"display:inline-block;background:#0d7d7d;color:#fff;"
+                  "font-weight:800;padding:12px 28px;border-radius:8px;text-decoration:none;\">"
+                  "Accept order</a></p>"
+                  "<p style=\"font-size:13px;color:#666;\">Tapping Accept order opens the ERP login — "
+                  "after you log in, the order is accepted automatically and the customer is notified.</p>"
+                  % accept_url) if accept_url else ""
     html = ("<p>New wholesale order <strong>%s</strong> from <strong>%s</strong>"
             " is waiting for review.</p>"
             "<ul>%s</ul>"
             "<p>Total: <strong>%s</strong><br>PO: %s<br>Deliver to: %s</p>"
-            "<p>Log in to the ERP order hub to accept it.</p>"
+            "%s"
+            "<p>Or log in to the ERP order hub to review it.</p>"
             % (order_number, acct["name"], line_rows, dollars(total_cents),
-               po_number or "—", address_label or "—"))
+               po_number or "—", address_label or "—", accept_btn))
     for to_email in _WHOLESALE_ADMIN_EMAILS:
         send_email(to_email,
                    "New wholesale order %s from %s — review to accept"
@@ -9867,6 +9928,7 @@ def _wholesale_me_dict(conn, user):
             "contact_person": acct["contact_person"] if acct else "",
             "phone": acct["phone"] if acct else "",
             "default_po": acct["default_po"] if acct else "",
+            "pricing_mode": (acct["pricing_mode"] if acct else "") or "bag",
             "account_status": acct["account_status"] if acct else "",
             "addresses": addrs}
 
@@ -10000,10 +10062,12 @@ def wholesale_create_order():
     order_number = _erp_next_wholesale_number(conn)
     cur = conn.execute(
         "INSERT INTO erp_wholesale_orders (order_number, account_id, status, order_date,"
-        " notes, created_by, created_at, po_number, address_id, placed_by_user_id)"
-        " VALUES (?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?)",
+        " notes, created_by, created_at, po_number, address_id, pricing_mode,"
+        " placed_by_user_id)"
+        " VALUES (?, ?, 'submitted', ?, ?, ?, ?, ?, ?, ?, ?)",
         (order_number, acct["id"], now[:10], (data.get("notes") or "").strip(),
-         "customer:" + user["email"], now, po_number, address_id, user["id"]))
+         "customer:" + user["email"], now, po_number, address_id,
+         (acct["pricing_mode"] or "bag"), user["id"]))
     order_id = cur.lastrowid
     for li in lines:
         conn.execute(
@@ -10025,7 +10089,8 @@ def wholesale_create_order():
     order = _wholesale_order_detail(conn, user, order_id)
     conn.close()
     _send_new_wholesale_order_emails(order_number, acct, lines, total_cents,
-                                     po_number, addr_label)
+                                     po_number, addr_label,
+                                     _wholesale_portal_url(data))
     return jsonify(order=order), 201
 
 
@@ -10041,6 +10106,75 @@ def wholesale_get_order(order_id):
     if not order:
         return jsonify(error="order not found"), 404
     return jsonify(order=order)
+
+
+@app.post("/api/wholesale/addresses")
+def wholesale_add_address():
+    # The customer manages their own delivery locations in their profile.
+    who, err = _require_wholesale()
+    if err:
+        return err
+    user, _acct = who
+    data = request.get_json(force=True) or {}
+    location_name = (data.get("location_name") or "").strip()
+    street = (data.get("street") or "").strip()
+    city = (data.get("city") or "").strip()
+    state = (data.get("state") or "").strip()
+    zipc = (data.get("zip") or "").strip()
+    missing = [f for f, v in (("location name", location_name), ("street", street),
+                              ("city", city), ("state", state), ("zip", zipc)) if not v]
+    if missing:
+        return jsonify(error="missing: " + ", ".join(missing)), 400
+    conn = db()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_addresses (account_id, location_name, street,"
+        " city, state, zip, contact_name, contact_email, contact_phone,"
+        " active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
+        (user["account_id"], location_name, street, city, state, zipc,
+         (data.get("contact_name") or "").strip(),
+         (data.get("contact_email") or "").strip(),
+         (data.get("contact_phone") or "").strip(), now))
+    addr = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(address=dict(addr)), 201
+
+
+@app.delete("/api/wholesale/addresses/<int:addr_id>")
+def wholesale_delete_address(addr_id):
+    who, err = _require_wholesale()
+    if err:
+        return err
+    user, _acct = who
+    conn = db()
+    addr = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?"
+                        " AND account_id = ?", (addr_id, user["account_id"])).fetchone()
+    if not addr:
+        conn.close()
+        return jsonify(error="address not found"), 404
+    conn.execute("UPDATE erp_wholesale_addresses SET active = 0 WHERE id = ?", (addr_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/wholesale-orders/by-number/<order_number>")
+def erp_wholesale_order_by_number(order_number):
+    # Powers the "Accept order" button in the new-order admin email: resolves
+    # an order number (e.g. W-1002) to its id after the admin logs in.
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    w = conn.execute("SELECT id, order_number, status FROM erp_wholesale_orders"
+                     " WHERE order_number = ?", (order_number.strip(),)).fetchone()
+    conn.close()
+    if not w:
+        return jsonify(error="order not found"), 404
+    return jsonify(order={"id": w["id"], "order_number": w["order_number"],
+                          "status": w["status"]})
 
 
 @app.post("/api/erp/wholesale-accounts/<int:account_id>/invite")
@@ -10228,12 +10362,17 @@ def erp_add_wholesale_address(account_id):
         return jsonify(error="account not found"), 404
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
-        "INSERT INTO erp_wholesale_addresses (account_id, label, street, city, state,"
-        " zip, phone, active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+        "INSERT INTO erp_wholesale_addresses (account_id, label, location_name, street,"
+        " city, state, zip, phone, contact_name, contact_email, contact_phone,"
+        " active, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)",
         (account_id, (data.get("label") or "").strip(),
+         (data.get("location_name") or "").strip(),
          (data.get("street") or "").strip(), (data.get("city") or "").strip(),
          (data.get("state") or "").strip(), (data.get("zip") or "").strip(),
-         (data.get("phone") or "").strip(), now))
+         (data.get("phone") or "").strip(),
+         (data.get("contact_name") or "").strip(),
+         (data.get("contact_email") or "").strip(),
+         (data.get("contact_phone") or "").strip(), now))
     addr = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
                         (cur.lastrowid,)).fetchone()
     conn.commit()
@@ -10254,7 +10393,8 @@ def erp_update_wholesale_address(addr_id):
         conn.close()
         return jsonify(error="address not found"), 404
     fields = {}
-    for key in ("label", "street", "city", "state", "zip", "phone"):
+    for key in ("label", "location_name", "street", "city", "state", "zip", "phone",
+                "contact_name", "contact_email", "contact_phone"):
         if key in data:
             fields[key] = (data.get(key) or "").strip()
     if "active" in data:
