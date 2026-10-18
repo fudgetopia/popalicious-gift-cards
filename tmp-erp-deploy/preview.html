@@ -187,7 +187,7 @@ button { font-family: inherit; }
       .pw-wrap input { width: 100%; padding-right: 44px; box-sizing: border-box; }
       .pw-eye { position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
         background: none; border: none; cursor: pointer; font-size: 19px; line-height: 1; padding: 8px; }
-      .forgot-wrap { margin: 2px 0 10px; text-align: right; }
+      .forgot-wrap { margin: 12px 0 2px; text-align: center; }
       .link-btn { background: none; border: none; color: var(--teal); font-weight: 700;
         cursor: pointer; padding: 4px 2px; font-size: 14px; text-decoration: underline; }
       .login-note { color: var(--teal); font-weight: 700; margin: 10px 0; }
@@ -207,10 +207,10 @@ button { font-family: inherit; }
     <form id="loginForm">
       <label>Email<input type="email" id="loginEmail" required autocomplete="username"></label>
       <label>Password<span class="pw-wrap"><input type="password" id="loginPass" required autocomplete="current-password"><button type="button" class="pw-eye" data-pw="loginPass" aria-label="Show password">👁</button></span></label>
-      <p class="forgot-wrap" id="forgotWrap" hidden><button type="button" id="forgotBtn" class="link-btn">Forgot password?</button></p>
       <p id="loginNote" class="login-note" hidden></p>
       <p id="loginError" class="login-error" hidden></p>
       <button type="submit" id="loginSubmit">Log in</button>
+      <p class="forgot-wrap" id="forgotWrap" hidden><button type="button" id="forgotBtn" class="link-btn">Forgot password?</button></p>
     </form>
   </div>
 </div>
@@ -398,6 +398,43 @@ function wholesaleSetupToken() {
   var m = h.match(/^#\/wholesale-setup\?token=([A-Za-z0-9\-_]+)/);
   return m ? m[1] : "";
 }
+/* Accept-order email button: #/login?accept_order=W-1002 — handled after login. */
+function hashQueryParam(name) {
+  var h = location.hash || "";
+  var q = h.indexOf("?");
+  if (q < 0) return "";
+  var parts = h.slice(q + 1).split("&");
+  for (var i = 0; i < parts.length; i++) {
+    var kv = parts[i].split("=");
+    if (decodeURIComponent(kv[0] || "") === name) return decodeURIComponent(kv.slice(1).join("=") || "");
+  }
+  return "";
+}
+function erpHandleAcceptOrderIntent(orderNumber) {
+  // The admin clicked "Accept order" in the new-order email. They are logged in
+  // (this only runs for admins); accept the order now and land on its page.
+  try { history.replaceState(null, "", "#/orders"); } catch (e) {}
+  setAdminDetailStatus("Accepting order " + orderNumber + "…");
+  erpGet("/api/erp/wholesale-orders/by-number/" + encodeURIComponent(orderNumber)).then(function (res) {
+    var id = res.order.id;
+    return erpPost("/api/erp/wholesale-orders/" + encodeURIComponent(String(id)) + "/accept", {}).then(function () {
+      return { id: id, ok: true };
+    }).catch(function (e) {
+      return { id: id, ok: false, note: e.message };
+    });
+  }).then(function (r) {
+    erpState.ordersPostMap = { source: "wholesale", id: r.id };
+    if ((location.hash || "") !== "#/orders") location.hash = "#/orders";
+    else renderRoute();
+    setAdminDetailStatus(r.ok
+      ? "Order " + orderNumber + " accepted — customer notified. Ready for production."
+      : "Order " + orderNumber + " opened (" + (r.note || "could not auto-accept") + ").");
+  }).catch(function (e) {
+    setAdminDetailStatus("Could not find order " + orderNumber + ": " + e.message, true);
+    if ((location.hash || "") !== "#/orders") location.hash = "#/orders";
+    else renderRoute();
+  });
+}
 function showWholesaleSetup() {
   document.getElementById("loginView").hidden = true;
   document.getElementById("appView").hidden = true;
@@ -485,9 +522,11 @@ function renderWholesaleRoute() {
   var m = h.match(/^#\/wholesale-orders\/(\d+)/);
   if (m) { wsState.view = "detail"; wsState.orderId = parseInt(m[1], 10); }
   else if (h.indexOf("#/wholesale-orders") === 0) { wsState.view = "history"; wsState.orderId = null; }
+  else if (h.indexOf("#/wholesale-profile") === 0) { wsState.view = "profile"; wsState.orderId = null; }
   else { wsState.view = "order"; wsState.orderId = null; }
   if (wsState.view === "detail") wsRenderOrderDetail();
   else if (wsState.view === "history") wsRenderHistory();
+  else if (wsState.view === "profile") wsRenderProfile();
   else wsRenderOrderPage();
 }
 function wsTopbar(title, showHistory) {
@@ -502,6 +541,11 @@ function wsTopbar(title, showHistory) {
   bar.appendChild(brand);
   var right = document.createElement("div");
   if (showHistory !== false) {
+    var pb = document.createElement("button");
+    pb.type = "button";
+    pb.textContent = "Profile";
+    pb.addEventListener("click", function () { location.hash = "#/wholesale-profile"; });
+    right.appendChild(pb);
     var hb = document.createElement("button");
     hb.type = "button";
     hb.textContent = wsState.view === "history" ? "New order" : "My orders";
@@ -534,12 +578,20 @@ function wsEnsureData() {
     throw error;
   });
 }
+function wsCaseMode() {
+  return wsState.me && (wsState.me.pricing_mode || "bag") === "case";
+}
 function wsCartLines() {
   var lines = [];
+  var caseMode = wsCaseMode();
   wsState.flavors.forEach(function (f) {
     var q = Number(wsState.cart[f.flavor_name] || 0);
-    if (q > 0) lines.push({ flavor_name: f.flavor_name, qty_bags: q,
-      unit_price_cents: f.price_cents, line_total_cents: Math.round(q * f.price_cents) });
+    if (q > 0) {
+      var bags = caseMode ? q * 12 : q;
+      lines.push({ flavor_name: f.flavor_name, qty_bags: bags,
+        cases: caseMode ? q : 0,
+        unit_price_cents: f.price_cents, line_total_cents: Math.round(bags * f.price_cents) });
+    }
   });
   return lines;
 }
@@ -564,12 +616,13 @@ function wsRenderOrderPage() {
       var f = document.createElement("div");
       f.className = "ws-field";
       var lab = document.createElement("label");
-      lab.textContent = "Deliver to";
+      lab.textContent = "Choose a delivery address";
       var sel = document.createElement("select");
       addrs.forEach(function (a) {
         var o = document.createElement("option");
         o.value = a.id;
-        o.textContent = (a.label ? a.label + " — " : "") + a.street + ", " + a.city + ", " + a.state + " " + a.zip;
+        o.textContent = (a.location_name || a.label ? (a.location_name || a.label) + " — " : "") +
+          a.street + ", " + a.city + ", " + a.state + " " + a.zip;
         sel.appendChild(o);
       });
       if (wsState.addressId) sel.value = String(wsState.addressId);
@@ -616,7 +669,8 @@ function wsRenderOrderPage() {
       nm.textContent = fl.flavor_name;
       var pr = document.createElement("div");
       pr.className = "ws-price";
-      pr.textContent = wsMoney(fl.price_cents) + " / bag";
+      pr.textContent = wsCaseMode() ? wsMoney(fl.price_cents * 12) + " / case (12 bags)"
+        : wsMoney(fl.price_cents) + " / bag";
       info.appendChild(nm);
       info.appendChild(pr);
       card.appendChild(info);
@@ -625,13 +679,13 @@ function wsRenderOrderPage() {
       var minus = document.createElement("button");
       minus.type = "button";
       minus.textContent = "−";
-      minus.setAttribute("aria-label", "Remove one " + fl.flavor_name);
+      minus.setAttribute("aria-label", wsCaseMode() ? "Remove one case of " + fl.flavor_name : "Remove one bag of " + fl.flavor_name);
       var qty = document.createElement("span");
       qty.className = "ws-qty";
       var plus = document.createElement("button");
       plus.type = "button";
       plus.textContent = "+";
-      plus.setAttribute("aria-label", "Add one " + fl.flavor_name);
+      plus.setAttribute("aria-label", wsCaseMode() ? "Add one case of " + fl.flavor_name : "Add one bag of " + fl.flavor_name);
       var paint = function () {
         var q = Number(wsState.cart[fl.flavor_name] || 0);
         qty.textContent = String(q);
@@ -667,8 +721,12 @@ function wsPaintBar() {
   bar.className = "ws-bar";
   var total = document.createElement("div");
   total.className = "ws-total";
+  var caseMode = wsCaseMode();
   var bags = wsCartLines().reduce(function (t, l) { return t + l.qty_bags; }, 0);
-  total.textContent = wsMoney(wsCartTotal()) + " · " + bags + " bag" + (bags === 1 ? "" : "s");
+  var cases = wsCartLines().reduce(function (t, l) { return t + (l.cases || 0); }, 0);
+  total.textContent = caseMode
+    ? wsMoney(wsCartTotal()) + " · " + cases + " case" + (cases === 1 ? "" : "s") + " (" + bags + " bags)"
+    : wsMoney(wsCartTotal()) + " · " + bags + " bag" + (bags === 1 ? "" : "s");
   bar.appendChild(total);
   var btn = document.createElement("button");
   btn.type = "button";
@@ -689,11 +747,14 @@ function wsShowReviewModal() {
   var h3 = document.createElement("h3");
   h3.textContent = "Review your order";
   modal.appendChild(h3);
+  var caseMode = wsCaseMode();
   lines.forEach(function (l) {
     var row = document.createElement("div");
     row.className = "ws-review-line";
     var left = document.createElement("span");
-    left.textContent = l.qty_bags + " × " + l.flavor_name + " @ " + wsMoney(l.unit_price_cents);
+    left.textContent = caseMode
+      ? l.cases + " case" + (l.cases === 1 ? "" : "s") + " × " + l.flavor_name + " @ " + wsMoney(l.unit_price_cents * 12) + "/case"
+      : l.qty_bags + " × " + l.flavor_name + " @ " + wsMoney(l.unit_price_cents) + "/bag";
     var right = document.createElement("span");
     right.textContent = wsMoney(l.line_total_cents);
     row.appendChild(left);
@@ -704,7 +765,7 @@ function wsShowReviewModal() {
   var meta = document.createElement("div");
   meta.className = "ws-review-line";
   var mleft = document.createElement("span");
-  mleft.textContent = "Deliver to: " + (addr ? ((addr.label ? addr.label + " — " : "") + addr.street + ", " + addr.city + ", " + addr.state + " " + addr.zip) : "—");
+  mleft.textContent = "Deliver to: " + (addr ? (((addr.location_name || addr.label) ? (addr.location_name || addr.label) + " — " : "") + addr.street + ", " + addr.city + ", " + addr.state + " " + addr.zip) : "—");
   meta.appendChild(mleft);
   modal.appendChild(meta);
   var poRow = document.createElement("div");
@@ -744,7 +805,8 @@ function wsShowReviewModal() {
     erpPost("/api/wholesale/orders", {
       lines: lines.map(function (l) { return { flavor_name: l.flavor_name, qty_bags: l.qty_bags }; }),
       address_id: wsState.addressId || 0,
-      po_number: wsState.po || ""
+      po_number: wsState.po || "",
+      portal_url: location.origin + location.pathname
     }).then(function (res) {
       overlay.parentNode.removeChild(overlay);
       wsState.cart = {};
@@ -812,6 +874,141 @@ function wsRenderHistory() {
     });
     els.body.replaceChildren(wrap);
   }).catch(function (error) { wsSetStatus(error.message, true); });
+}
+/* ---------- customer profile: business info (read-only) + own delivery locations ---------- */
+function wsRenderProfile() {
+  var els = wsEls();
+  document.title = "Profile \u00b7 Pop-A-Licious Wholesale";
+  var old = document.querySelector(".ws-bar");
+  if (old) old.parentNode.removeChild(old);
+  wsEnsureData().then(function () {
+    var me = wsState.me;
+    var wrap = document.createElement("div");
+    wrap.className = "ws-shell";
+    wrap.appendChild(wsTopbar("Profile"));
+    var h2 = document.createElement("h2");
+    h2.textContent = "My profile";
+    h2.style.margin = "6px 0 0";
+    wrap.appendChild(h2);
+    var info = document.createElement("div");
+    info.className = "ws-card";
+    info.style.display = "block";
+    [["Business", me.business_name], ["Contact person", me.contact_person],
+     ["Email", me.email], ["Phone", me.phone]].forEach(function (pair) {
+      var row = document.createElement("div");
+      row.style.padding = "6px 0";
+      row.style.borderBottom = "1px solid #eee";
+      var k = document.createElement("strong");
+      k.textContent = pair[0] + ": ";
+      var v = document.createElement("span");
+      v.textContent = pair[1] || "—";
+      row.appendChild(k); row.appendChild(v);
+      info.appendChild(row);
+    });
+    wrap.appendChild(info);
+    var h3 = document.createElement("h3");
+    h3.textContent = "Delivery locations";
+    h3.style.margin = "18px 0 6px";
+    wrap.appendChild(h3);
+    var addrs = me.addresses || [];
+    if (!addrs.length) {
+      var none = document.createElement("p");
+      none.style.color = "var(--muted)";
+      none.textContent = "No delivery locations yet — add your first one below.";
+      wrap.appendChild(none);
+    }
+    addrs.forEach(function (a) {
+      var card = document.createElement("div");
+      card.className = "ws-card";
+      card.style.display = "block";
+      var nm = document.createElement("div");
+      nm.style.fontWeight = "800";
+      nm.textContent = a.location_name || a.label || "Location";
+      card.appendChild(nm);
+      var ad = document.createElement("div");
+      ad.style.fontSize = "14px";
+      ad.style.color = "var(--muted)";
+      ad.textContent = [a.street, a.city, a.state, a.zip].filter(Boolean).join(", ");
+      card.appendChild(ad);
+      var bits = [];
+      if (a.contact_name) bits.push(a.contact_name);
+      if (a.contact_email) bits.push(a.contact_email);
+      if (a.contact_phone) bits.push(a.contact_phone);
+      if (bits.length) {
+        var ct = document.createElement("div");
+        ct.style.fontSize = "14px";
+        ct.style.color = "var(--muted)";
+        ct.textContent = bits.join(" · ");
+        card.appendChild(ct);
+      }
+      var rm = document.createElement("button");
+      rm.type = "button";
+      rm.textContent = "Remove";
+      rm.style.marginTop = "8px";
+      rm.addEventListener("click", function () {
+        if (!window.confirm("Remove this delivery location?")) return;
+        rm.disabled = true;
+        erpDelete("/api/wholesale/addresses/" + a.id).then(function () {
+          wsState.me = null;
+          wsRenderProfile();
+        }).catch(function (e) {
+          rm.disabled = false;
+          wsSetStatus(e.message, true);
+        });
+      });
+      card.appendChild(rm);
+      wrap.appendChild(card);
+    });
+    var fh = document.createElement("h3");
+    fh.textContent = "Add a delivery location";
+    fh.style.margin = "18px 0 6px";
+    wrap.appendChild(fh);
+    var form = document.createElement("form");
+    form.className = "erp-form";
+    var fLoc = document.createElement("input"); fLoc.name = "location_name"; fLoc.placeholder = "Location name"; fLoc.required = true;
+    var fStreet = document.createElement("input"); fStreet.name = "street"; fStreet.placeholder = "Street"; fStreet.required = true;
+    var fCity = document.createElement("input"); fCity.name = "city"; fCity.placeholder = "City"; fCity.required = true;
+    var fState = document.createElement("input"); fState.name = "state"; fState.placeholder = "State"; fState.required = true;
+    var fZip = document.createElement("input"); fZip.name = "zip"; fZip.placeholder = "ZIP"; fZip.required = true;
+    var fContact = document.createElement("input"); fContact.name = "contact_name"; fContact.placeholder = "Contact at location";
+    var fEmail = document.createElement("input"); fEmail.name = "contact_email"; fEmail.placeholder = "Contact email"; fEmail.type = "email";
+    var fPhone = document.createElement("input"); fPhone.name = "contact_phone"; fPhone.placeholder = "Contact phone"; fPhone.type = "tel";
+    [fLoc, fStreet, fCity, fState, fZip, fContact, fEmail, fPhone].forEach(function (inp) {
+      var lab = document.createElement("label");
+      lab.textContent = inp.placeholder + (inp.required ? " *" : "") + " ";
+      lab.appendChild(inp);
+      form.appendChild(lab);
+    });
+    var err = document.createElement("p");
+    err.className = "ws-error";
+    err.hidden = true;
+    form.appendChild(err);
+    var sub = document.createElement("button");
+    sub.type = "submit";
+    sub.textContent = "Add location";
+    form.appendChild(sub);
+    form.addEventListener("submit", function (ev) {
+      ev.preventDefault();
+      sub.disabled = true;
+      err.hidden = true;
+      erpPost("/api/wholesale/addresses", {
+        location_name: fLoc.value.trim(), street: fStreet.value.trim(),
+        city: fCity.value.trim(), state: fState.value.trim(), zip: fZip.value.trim(),
+        contact_name: fContact.value.trim(), contact_email: fEmail.value.trim(),
+        contact_phone: fPhone.value.trim()
+      }).then(function () {
+        wsState.me = null;
+        wsState.addressId = 0;
+        wsRenderProfile();
+      }).catch(function (e) {
+        sub.disabled = false;
+        err.textContent = e.message;
+        err.hidden = false;
+      });
+    });
+    wrap.appendChild(form);
+    els.body.replaceChildren(wrap);
+  }).catch(function () {});
 }
 function wsRenderOrderDetail() {
   var els = wsEls();
@@ -887,6 +1084,11 @@ function renderRoute() {
   // Invite links land here even with no session: #/wholesale-setup?token=…
   if (wholesaleSetupToken()) { showWholesaleSetup(); return; }
   if (!isLoggedIn()) { showLogin(); return; }
+  // "Accept order" button from the new-order admin email: #/login?accept_order=W-1002
+  if (erpSession().role === "admin") {
+    var acceptNum = hashQueryParam("accept_order");
+    if (acceptNum) { erpHandleAcceptOrderIntent(acceptNum); return; }
+  }
   // Wholesale customers never see ERP internals: dedicated customer shell.
   if (erpSession().role === "wholesale") { renderWholesaleRoute(); return; }
   var openModals = document.querySelectorAll(".erp-modal-overlay");
@@ -4124,6 +4326,14 @@ function erpNewWholesaleOrderForm() {
 }
 
 /* ---------- accounts sub-view ---------- */
+function erpAccountPriceLabel(a) {
+  var sv = Number(a.savory_price_cents) || 0, sw = Number(a.sweet_price_cents) || 0;
+  if (!sv || !sw) return "—";
+  var isCase = (a.pricing_mode || "bag") === "case";
+  var mult = isCase ? 12 : 1;
+  return "Savory " + erpMoney(sv * mult) + " · Sweet " + erpMoney(sw * mult) +
+    " / " + (isCase ? "case" : "bag");
+}
 function renderErpAccounts(body) {
   var toolbar = document.createElement("div");
   toolbar.className = "erp-toolbar";
@@ -4165,7 +4375,7 @@ function renderErpAccounts(body) {
   table.className = "admin-orders-table";
   var thead = document.createElement("thead");
   var hr = document.createElement("tr");
-  ["Account", "Contact", "Email", "Phone", "Price/bag", "Orders", "Status"].forEach(function (c) {
+  ["Account", "Contact", "Email", "Phone", "Pricing", "Orders", "Status", "Actions"].forEach(function (c) {
     var th = document.createElement("th");
     th.textContent = c;
     hr.appendChild(th);
@@ -4189,11 +4399,23 @@ function renderErpAccounts(body) {
     tr.appendChild(erpCell("Contact", a.contact_name));
     tr.appendChild(erpCell("Email", a.email));
     tr.appendChild(erpCell("Phone", a.phone));
-    tr.appendChild(erpCell("Price/bag", a.price_per_bag_cents ? erpMoney(a.price_per_bag_cents) : "—"));
+    tr.appendChild(erpCell("Pricing", erpAccountPriceLabel(a)));
     tr.appendChild(erpCell("Orders", a.order_count));
     var stTd = document.createElement("td");
     stTd.appendChild(erpChip(a.active ? "received" : "cancelled", a.active ? "Active" : "Inactive"));
     tr.appendChild(stTd);
+    var actTd = document.createElement("td");
+    var editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.textContent = "Edit";
+    editBtn.addEventListener("click", function (e) {
+      e.stopPropagation();
+      erpState.selectedAccountId = a.id;
+      erpState.showEditAccount = true;
+      renderErpOrdersDetail();
+    });
+    actTd.appendChild(editBtn);
+    tr.appendChild(actTd);
     tbody.appendChild(tr);
   });
   table.appendChild(tbody);
@@ -4213,10 +4435,51 @@ function erpNewAccountForm() {
   emailInput.type = "email";
   form.appendChild(erpField("Email", emailInput));
   form.appendChild(erpField("Phone", erpTextInput("phone", "")));
-  form.appendChild(erpField("Address", erpTextInput("address", "")));
   form.appendChild(erpField("Price/bag ($)", erpTextInput("price_per_bag", "4.00")));
-  form.appendChild(erpField("Savory price/bag ($)", erpTextInput("savory_price", "4.00")));
-  form.appendChild(erpField("Sweet price/bag ($)", erpTextInput("sweet_price", "4.00")));
+  var savoryPriceInput = erpTextInput("savory_price", "4.00");
+  var sweetPriceInput = erpTextInput("sweet_price", "4.00");
+  form.appendChild(erpField("Savory price/bag ($)", savoryPriceInput));
+  form.appendChild(erpField("Sweet price/bag ($)", sweetPriceInput));
+  // Pricing mode toggle: per bag, or per case (12 bags) with auto case-price math.
+  var modeField = document.createElement("label");
+  modeField.textContent = "Price by ";
+  var modeBag = document.createElement("input");
+  modeBag.type = "radio"; modeBag.name = "pricing_mode"; modeBag.value = "bag"; modeBag.checked = true;
+  var modeBagLab = document.createElement("span");
+  modeBagLab.textContent = " Per bag  ";
+  var modeCase = document.createElement("input");
+  modeCase.type = "radio"; modeCase.name = "pricing_mode"; modeCase.value = "case";
+  var modeCaseLab = document.createElement("span");
+  modeCaseLab.textContent = " Per case (12 bags) ";
+  modeField.appendChild(modeBag); modeField.appendChild(modeBagLab);
+  modeField.appendChild(modeCase); modeField.appendChild(modeCaseLab);
+  form.appendChild(modeField);
+  var caseHint = document.createElement("p");
+  caseHint.className = "erp-form-status";
+  form.appendChild(caseHint);
+  var paintCaseHint = function () {
+    var sv = erpDollarsToCents(savoryPriceInput.value.trim());
+    var sw = erpDollarsToCents(sweetPriceInput.value.trim());
+    if (sv === null || sw === null) { caseHint.textContent = ""; return; }
+    caseHint.textContent = "Case price (12 bags): savory " + erpMoney(sv * 12) +
+      " · sweet " + erpMoney(sw * 12);
+  };
+  savoryPriceInput.addEventListener("input", paintCaseHint);
+  sweetPriceInput.addEventListener("input", paintCaseHint);
+  paintCaseHint();
+  var locTitle = document.createElement("p");
+  locTitle.style.fontWeight = "800";
+  locTitle.style.margin = "14px 0 4px";
+  locTitle.textContent = "Main delivery location (customer adds more in their profile)";
+  form.appendChild(locTitle);
+  form.appendChild(erpField("Location name", erpTextInput("location_name", "e.g. Main store")));
+  form.appendChild(erpField("Street", erpTextInput("street", "")));
+  form.appendChild(erpField("City", erpTextInput("city", "")));
+  form.appendChild(erpField("State", erpTextInput("state", "")));
+  form.appendChild(erpField("ZIP", erpTextInput("zip", "")));
+  form.appendChild(erpField("Contact at location", erpTextInput("location_contact", "")));
+  form.appendChild(erpField("Location email", erpTextInput("location_email", "")));
+  form.appendChild(erpField("Location phone", erpTextInput("location_phone", "")));
   form.appendChild(erpField("Default PO", erpTextInput("default_po", "")));
   form.appendChild(erpField("Payment terms", erpTextInput("payment_terms", "Net 30")));
   form.appendChild(erpField("Notes", erpTextInput("notes", "")));
@@ -4242,11 +4505,19 @@ function erpNewAccountForm() {
       contact_person: form.contact_person.value.trim(),
       email: emailInput.value.trim(),
       phone: form.phone.value.trim(),
-      address: form.address.value.trim(),
       payment_terms: form.payment_terms.value.trim(),
       default_po: form.default_po.value.trim(),
       notes: form.notes.value.trim(),
-      active: activeInput.checked
+      active: activeInput.checked,
+      pricing_mode: (form.querySelector('input[name="pricing_mode"]:checked') || {}).value || "bag",
+      location_name: form.location_name.value.trim(),
+      street: form.street.value.trim(),
+      city: form.city.value.trim(),
+      state: form.state.value.trim(),
+      zip: form.zip.value.trim(),
+      location_contact: form.location_contact.value.trim(),
+      location_email: form.location_email.value.trim(),
+      location_phone: form.location_phone.value.trim()
     };
     var priceFields = [["price_per_bag", "price_per_bag_cents"],
       ["savory_price", "savory_price_cents"], ["sweet_price", "sweet_price_cents"]];
@@ -4339,8 +4610,11 @@ function renderErpAccountDetail(body) {
      "Phone: " + (a.phone || "—"),
      "Address: " + (a.address || "—"),
      "Price/bag: " + (a.price_per_bag_cents ? erpMoney(a.price_per_bag_cents) : "—"),
+     "Pricing: " + (((a.pricing_mode || "bag") === "case") ? "Per case (12 bags)" : "Per bag"),
      "Savory: " + (a.savory_price_cents ? erpMoney(a.savory_price_cents) : "—") +
-       " · Sweet: " + (a.sweet_price_cents ? erpMoney(a.sweet_price_cents) : "—"),
+       " · Sweet: " + (a.sweet_price_cents ? erpMoney(a.sweet_price_cents) : "—") +
+       (((a.pricing_mode || "bag") === "case" && a.savory_price_cents && a.sweet_price_cents)
+         ? "  (cases: " + erpMoney(a.savory_price_cents * 12) + " · " + erpMoney(a.sweet_price_cents * 12) + ")" : ""),
      "Default PO: " + (a.default_po || "—"),
      "Portal: " + (a.account_status || "active"),
      "Terms: " + (a.payment_terms || "—"),
@@ -4387,9 +4661,10 @@ function renderErpAccountDetail(body) {
       body.appendChild(etool);
       if (erpState.showEditAccount) body.appendChild(erpEditAccountForm(a));
     }
-    // Phase 5: delivery addresses.
+    // Phase 5: delivery addresses — customer profile, read-only for admins.
+    // Customers manage their own locations in the portal Profile.
     var ah = document.createElement("h3");
-    ah.textContent = "Delivery addresses";
+    ah.textContent = "Customer profile — delivery locations (read-only)";
     body.appendChild(ah);
     var abody = document.createElement("div");
     abody.id = "erpAccountAddresses";
@@ -4462,64 +4737,34 @@ function erpRenderAccountAddresses(container, accountId) {
         var info = document.createElement("div");
         var nm = document.createElement("div");
         nm.style.fontWeight = "800";
-        nm.textContent = (ad.label || "Address") + (ad.active ? "" : " (inactive)");
+        nm.textContent = (ad.location_name || ad.label || "Location") + (ad.active ? "" : " (inactive)");
         var sub = document.createElement("div");
         sub.style.fontSize = "13px";
         sub.style.color = "var(--muted)";
-        sub.textContent = [ad.street, ad.city, ad.state, ad.zip].filter(Boolean).join(", ") +
-          (ad.phone ? " · " + ad.phone : "");
+        sub.textContent = [ad.street, ad.city, ad.state, ad.zip].filter(Boolean).join(", ");
         info.appendChild(nm);
         info.appendChild(sub);
-        row.appendChild(info);
-        if (erpIsAdmin()) {
-          var tgl = document.createElement("button");
-          tgl.type = "button";
-          tgl.textContent = ad.active ? "Deactivate" : "Activate";
-          tgl.addEventListener("click", function () {
-            erpPut("/api/erp/wholesale-accounts/addresses/" + ad.id, {active: !ad.active}).then(function () {
-              erpRenderAccountAddresses(container, accountId);
-            }).catch(function (e) { setAdminDetailStatus(e.message, true); });
-          });
-          row.appendChild(tgl);
+        var contact = document.createElement("div");
+        contact.style.fontSize = "13px";
+        contact.style.color = "var(--muted)";
+        var bits = [];
+        if (ad.contact_name) bits.push(ad.contact_name);
+        if (ad.contact_email) bits.push(ad.contact_email);
+        if (ad.contact_phone) bits.push(ad.contact_phone);
+        else if (ad.phone) bits.push(ad.phone);
+        if (bits.length) {
+          contact.textContent = bits.join(" · ");
+          info.appendChild(contact);
         }
+        row.appendChild(info);
         list.appendChild(row);
       });
       container.appendChild(list);
     } else {
       var e = document.createElement("p");
       e.className = "admin-orders-empty";
-      e.textContent = "No delivery addresses yet — the account address is used.";
+      e.textContent = "No delivery locations yet — the customer adds them in their portal profile.";
       container.appendChild(e);
-    }
-    if (erpIsAdmin()) {
-      var form = document.createElement("form");
-      form.className = "erp-form erp-form-inline";
-      var li = erpTextInput("label", "Label (e.g. Store #2)");
-      var st = erpTextInput("street", "Street");
-      var ci = erpTextInput("city", "City");
-      var sa = erpTextInput("state", "ST");
-      sa.style.maxWidth = "70px";
-      var zi = erpTextInput("zip", "ZIP");
-      zi.style.maxWidth = "110px";
-      form.appendChild(li);
-      form.appendChild(st);
-      form.appendChild(ci);
-      form.appendChild(sa);
-      form.appendChild(zi);
-      var add = document.createElement("button");
-      add.type = "submit";
-      add.textContent = "Add address";
-      form.appendChild(add);
-      form.addEventListener("submit", function (ev) {
-        ev.preventDefault();
-        erpPost("/api/erp/wholesale-accounts/" + encodeURIComponent(String(accountId)) + "/addresses", {
-          label: li.value.trim(), street: st.value.trim(), city: ci.value.trim(),
-          state: sa.value.trim(), zip: zi.value.trim()
-        }).then(function () {
-          erpRenderAccountAddresses(container, accountId);
-        }).catch(function (err) { setAdminDetailStatus(err.message, true); });
-      });
-      container.appendChild(form);
     }
   }).catch(function (error) {
     container.textContent = error.message;
@@ -4544,21 +4789,43 @@ function erpEditAccountForm(a) {
   var phoneInput = erpTextInput("phone", "");
   phoneInput.value = a.phone || "";
   form.appendChild(erpField("Phone", phoneInput));
-  var addrInput = erpTextInput("address", "");
-  addrInput.value = a.address || "";
-  form.appendChild(erpField("Address", addrInput));
-  var priceInput = erpTextInput("price_per_bag", "4.00");
-  if (a.price_per_bag_cents) priceInput.value = (Number(a.price_per_bag_cents) / 100).toFixed(2);
-  form.appendChild(erpField("Price/bag ($)", priceInput));
-  var contactPersonInput = erpTextInput("contact_person", "");
-  contactPersonInput.value = a.contact_person || "";
-  form.appendChild(erpField("Contact person (portal)", contactPersonInput));
-  var savoryInput = erpTextInput("savory_price", "4.00");
-  if (a.savory_price_cents) savoryInput.value = (Number(a.savory_price_cents) / 100).toFixed(2);
-  form.appendChild(erpField("Savory price/bag ($)", savoryInput));
-  var sweetInput = erpTextInput("sweet_price", "4.00");
-  if (a.sweet_price_cents) sweetInput.value = (Number(a.sweet_price_cents) / 100).toFixed(2);
-  form.appendChild(erpField("Sweet price/bag ($)", sweetInput));
+  var contactPersonEditInput = erpTextInput("contact_person", "");
+  contactPersonEditInput.value = a.contact_person || "";
+  form.appendChild(erpField("Contact person (portal login name)", contactPersonEditInput));
+  var savoryEditInput = erpTextInput("savory_price", "4.00");
+  if (a.savory_price_cents) savoryEditInput.value = (Number(a.savory_price_cents) / 100).toFixed(2);
+  form.appendChild(erpField("Savory price/bag ($)", savoryEditInput));
+  var sweetEditInput = erpTextInput("sweet_price", "4.00");
+  if (a.sweet_price_cents) sweetEditInput.value = (Number(a.sweet_price_cents) / 100).toFixed(2);
+  form.appendChild(erpField("Sweet price/bag ($)", sweetEditInput));
+  var modeEditField = document.createElement("label");
+  modeEditField.textContent = "Price by ";
+  var modeEditBag = document.createElement("input");
+  modeEditBag.type = "radio"; modeEditBag.name = "pricing_mode"; modeEditBag.value = "bag";
+  modeEditBag.checked = (a.pricing_mode || "bag") !== "case";
+  var modeEditBagLab = document.createElement("span");
+  modeEditBagLab.textContent = " Per bag  ";
+  var modeEditCase = document.createElement("input");
+  modeEditCase.type = "radio"; modeEditCase.name = "pricing_mode"; modeEditCase.value = "case";
+  modeEditCase.checked = (a.pricing_mode || "bag") === "case";
+  var modeEditCaseLab = document.createElement("span");
+  modeEditCaseLab.textContent = " Per case (12 bags) ";
+  modeEditField.appendChild(modeEditBag); modeEditField.appendChild(modeEditBagLab);
+  modeEditField.appendChild(modeEditCase); modeEditField.appendChild(modeEditCaseLab);
+  form.appendChild(modeEditField);
+  var caseEditHint = document.createElement("p");
+  caseEditHint.className = "erp-form-status";
+  form.appendChild(caseEditHint);
+  var paintCaseEditHint = function () {
+    var sv = erpDollarsToCents(savoryEditInput.value.trim());
+    var sw = erpDollarsToCents(sweetEditInput.value.trim());
+    if (sv === null || sw === null) { caseEditHint.textContent = ""; return; }
+    caseEditHint.textContent = "Case price (12 bags): savory " + erpMoney(sv * 12) +
+      " · sweet " + erpMoney(sw * 12);
+  };
+  savoryEditInput.addEventListener("input", paintCaseEditHint);
+  sweetEditInput.addEventListener("input", paintCaseEditHint);
+  paintCaseEditHint();
   var poInput = erpTextInput("default_po", "");
   poInput.value = a.default_po || "";
   form.appendChild(erpField("Default PO", poInput));
@@ -4584,22 +4851,20 @@ function erpEditAccountForm(a) {
       status.textContent = "Account name is required.";
       return;
     }
-    var priceRaw = priceInput.value.trim();
     var payload = {
       name: name,
       contact_name: contactInput.value.trim(),
-      contact_person: contactPersonInput.value.trim(),
+      contact_person: contactPersonEditInput.value.trim(),
       email: emailInput.value.trim(),
       phone: phoneInput.value.trim(),
-      address: addrInput.value.trim(),
       payment_terms: termsInput.value.trim(),
       default_po: poInput.value.trim(),
       notes: notesInput.value.trim(),
-      active: activeInput.checked
+      active: activeInput.checked,
+      pricing_mode: (form.querySelector('input[name="pricing_mode"]:checked') || {}).value || "bag"
     };
-    var priceFields = [["price_per_bag", "price_per_bag_cents", priceRaw],
-      ["savory_price", "savory_price_cents", savoryInput.value.trim()],
-      ["sweet_price", "sweet_price_cents", sweetInput.value.trim()]];
+    var priceFields = [["savory_price", "savory_price_cents", savoryEditInput.value.trim()],
+      ["sweet_price", "sweet_price_cents", sweetEditInput.value.trim()]];
     for (var pi = 0; pi < priceFields.length; pi++) {
       if (priceFields[pi][2]) {
         var cents = erpDollarsToCents(priceFields[pi][2]);
