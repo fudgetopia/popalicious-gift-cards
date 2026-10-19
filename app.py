@@ -649,6 +649,25 @@ def init_db():
             preferred_vendor_id INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS erp_inventory_counts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            count_date TEXT NOT NULL,
+            location_id INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_inventory_count_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            count_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            on_hand_at_start REAL NOT NULL DEFAULT 0,
+            counted_qty REAL,
+            UNIQUE(count_id, item_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_count_lines ON erp_inventory_count_lines (count_id);
         CREATE TABLE IF NOT EXISTS erp_recipes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -8039,6 +8058,256 @@ def erp_adjust():
     conn.close()
     return jsonify(ok=True, item_id=item["id"], location_id=loc["id"],
                    on_hand=on_hand, reason=reason)
+
+
+def _erp_inventory_count_dict(conn, c):
+    d = dict(c)
+    loc = conn.execute("SELECT code, name FROM erp_locations WHERE id = ?",
+                       (c["location_id"],)).fetchone()
+    d["location_code"] = loc["code"] if loc else "?"
+    d["location_name"] = loc["name"] if loc else "?"
+    return d
+
+
+def _erp_inventory_email_html(count_date, location_name, zero_lines, base_url):
+    rows = "".join(
+        "<tr><td style='padding:6px 10px;border:1px solid #ded5c8'>%s</td>"
+        "<td style='padding:6px 10px;border:1px solid #ded5c8'>%s</td>"
+        "<td style='padding:6px 10px;border:1px solid #ded5c8'>%s</td></tr>" % (
+            l["sku"], l["name"], l["unit"])
+        for l in zero_lines)
+    return (
+        "<p>Inventory count for <b>%s</b> at <b>%s</b> is complete.</p>"
+        "<p>The following items counted <b>ZERO</b> — time to order more:</p>"
+        "<table style='border-collapse:collapse'>"
+        "<tr><th style='padding:6px 10px;border:1px solid #ded5c8'>SKU</th>"
+        "<th style='padding:6px 10px;border:1px solid #ded5c8'>Item</th>"
+        "<th style='padding:6px 10px;border:1px solid #ded5c8'>Unit</th></tr>"
+        "%s</table>"
+        "<p><a href='%s/#/inventory'>Open inventory in the ERP</a></p>"
+        % (count_date, location_name, rows, base_url))
+
+
+@app.post("/api/erp/inventory-counts")
+def erp_start_inventory_count():
+    actor, err = _require_erp()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    count_date = (data.get("count_date") or "").strip()
+    if not count_date:
+        count_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    conn = db()
+    loc = _erp_get_location(conn, data.get("location_id"))
+    if not loc or not loc["active"]:
+        conn.close()
+        return jsonify(error="valid location_id is required"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_inventory_counts (count_date, location_id, status,"
+        " notes, created_by, created_at) VALUES (?, ?, 'open', ?, ?, ?)",
+        (count_date, loc["id"], (data.get("notes") or "").strip(), actor, now))
+    count_id = cur.lastrowid
+    items = conn.execute(
+        "SELECT * FROM erp_items WHERE active = 1 ORDER BY type, name").fetchall()
+    for it in items:
+        conn.execute(
+            "INSERT OR IGNORE INTO erp_inventory_count_lines"
+            " (count_id, item_id, on_hand_at_start, counted_qty)"
+            " VALUES (?, ?, ?, NULL)",
+            (count_id, it["id"], _erp_on_hand(conn, it["id"], loc["id"])))
+    conn.commit()
+    c = conn.execute("SELECT * FROM erp_inventory_counts WHERE id = ?",
+                     (count_id,)).fetchone()
+    out = _erp_inventory_count_dict(conn, c)
+    out["line_count"] = len(items)
+    conn.close()
+    return jsonify(count=out), 201
+
+
+@app.get("/api/erp/inventory-counts")
+def erp_list_inventory_counts():
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_inventory_counts ORDER BY count_date DESC, id DESC"
+        " LIMIT 100").fetchall()
+    out = [_erp_inventory_count_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(counts=out)
+
+
+@app.get("/api/erp/inventory-counts/<int:count_id>")
+def erp_get_inventory_count(count_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    c = conn.execute("SELECT * FROM erp_inventory_counts WHERE id = ?",
+                     (count_id,)).fetchone()
+    if not c:
+        conn.close()
+        return jsonify(error="count not found"), 404
+    lines = conn.execute(
+        "SELECT l.*, i.sku, i.name, i.type, i.unit"
+        " FROM erp_inventory_count_lines l"
+        " JOIN erp_items i ON i.id = l.item_id"
+        " WHERE l.count_id = ? ORDER BY i.type, i.name",
+        (count_id,)).fetchall()
+    out = _erp_inventory_count_dict(conn, c)
+    out["lines"] = [dict(l) for l in lines]
+    conn.close()
+    return jsonify(count=out)
+
+
+@app.put("/api/erp/inventory-counts/<int:count_id>")
+def erp_save_inventory_count(count_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    c = conn.execute("SELECT * FROM erp_inventory_counts WHERE id = ?",
+                     (count_id,)).fetchone()
+    if not c:
+        conn.close()
+        return jsonify(error="count not found"), 404
+    if c["status"] != "open":
+        conn.close()
+        return jsonify(error="count is already completed"), 400
+    for li in data.get("lines") or []:
+        try:
+            item_id = int(li.get("item_id"))
+        except (TypeError, ValueError):
+            continue
+        raw = li.get("counted_qty")
+        if raw is None or raw == "":
+            qty = None
+        else:
+            try:
+                qty = float(raw)
+            except (TypeError, ValueError):
+                conn.close()
+                return jsonify(error="counted_qty must be a number"), 400
+            if qty < 0:
+                conn.close()
+                return jsonify(error="counted_qty can't be negative"), 400
+        conn.execute(
+            "UPDATE erp_inventory_count_lines SET counted_qty = ?"
+            " WHERE count_id = ? AND item_id = ?",
+            (qty, count_id, item_id))
+    if "notes" in data:
+        conn.execute("UPDATE erp_inventory_counts SET notes = ? WHERE id = ?",
+                     ((data.get("notes") or "").strip(), count_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/inventory-counts/<int:count_id>/complete")
+def erp_complete_inventory_count(count_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    c = conn.execute("SELECT * FROM erp_inventory_counts WHERE id = ?",
+                     (count_id,)).fetchone()
+    if not c:
+        conn.close()
+        return jsonify(error="count not found"), 404
+    if c["status"] != "open":
+        conn.close()
+        return jsonify(error="count is already completed"), 400
+    lines = conn.execute(
+        "SELECT l.*, i.sku, i.name, i.unit, i.avg_cost_cents"
+        " FROM erp_inventory_count_lines l"
+        " JOIN erp_items i ON i.id = l.item_id"
+        " WHERE l.count_id = ? ORDER BY i.type, i.name",
+        (count_id,)).fetchall()
+    adjusted = 0
+    zero_lines = []
+    for li in lines:
+        counted = li["counted_qty"]
+        if counted is None:
+            continue
+        diff = float(counted) - float(li["on_hand_at_start"] or 0)
+        if diff != 0:
+            _erp_post_movement(conn, li["item_id"], c["location_id"], diff,
+                               "adjustment", actor, ref_type="reason",
+                               ref_id="count_correction",
+                               unit_cost_cents=int(li["avg_cost_cents"] or 0),
+                               note="Inventory count %s" % c["count_date"])
+            adjusted += 1
+        if float(counted) == 0:
+            zero_lines.append({"sku": li["sku"], "name": li["name"],
+                               "unit": li["unit"]})
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_inventory_counts SET status = 'completed',"
+        " completed_at = ? WHERE id = ?", (now, count_id))
+    conn.commit()
+    loc = conn.execute("SELECT code, name FROM erp_locations WHERE id = ?",
+                       (c["location_id"],)).fetchone()
+    conn.close()
+    emailed = 0
+    if zero_lines:
+        base_url = (os.environ.get("ERP_FRONTEND_URL")
+                    or "https://erp.pop-a-licious.com")
+        html = _erp_inventory_email_html(c["count_date"],
+                                         loc["name"] if loc else "?",
+                                         zero_lines, base_url)
+        for email in _WHOLESALE_ADMIN_EMAILS:
+            try:
+                send_email(email,
+                           "Reorder needed: %d item(s) at zero (%s)" % (
+                               len(zero_lines), c["count_date"]),
+                           html)
+                emailed += 1
+            except Exception:
+                pass
+    return jsonify(ok=True, adjusted_lines=adjusted,
+                   zero_count=len(zero_lines), emailed=emailed)
+
+
+def _erp_send_inventory_reminder():
+    base_url = (os.environ.get("ERP_FRONTEND_URL")
+                or "https://erp.pop-a-licious.com")
+    html = (
+        "<p>It's time to do inventory in the ERP.</p>"
+        "<p>Open the count sheet, walk the warehouse, and enter your counts —"
+        " the system saves everything by date and flags anything at zero"
+        " for reorder.</p>"
+        "<p><a href='%s/#/inventory'>Log in and open inventory</a></p>"
+        % base_url)
+    sent = 0
+    for email in _WHOLESALE_ADMIN_EMAILS:
+        try:
+            send_email(email, "Time to do inventory — Pop-A-Licious ERP", html)
+            sent += 1
+        except Exception:
+            pass
+    return sent
+
+
+@app.post("/api/erp/inventory-reminder")
+def erp_inventory_reminder():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    return jsonify(sent=_erp_send_inventory_reminder())
+
+
+@app.post("/api/erp/cron/inventory-reminder")
+def erp_cron_inventory_reminder():
+    """Scheduled (e.g. biweekly) inventory reminder. Header X-Cron-Secret must
+    equal the CRON_SECRET env var (503 when not configured)."""
+    if not CRON_SECRET:
+        return jsonify(error="cron is not configured"), 503
+    if request.headers.get("X-Cron-Secret", "") != CRON_SECRET:
+        return jsonify(error="forbidden"), 403
+    return jsonify(sent=_erp_send_inventory_reminder())
 
 
 @app.post("/api/erp/transfer")
