@@ -1941,7 +1941,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
                   td3.textContent = l.unit;
                   tr.appendChild(td3);
                   var td4 = document.createElement("td");
-                  td4.textContent = erpQty(l.on_hand_at_start);
+                  td4.textContent = erpQty(l.on_hand_at_start) + " " + (l.unit || "");
                   tr.appendChild(td4);
                   var td5 = document.createElement("td");
                   var inp = document.createElement("input");
@@ -1949,11 +1949,16 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
                   inp.min = "0";
                   inp.step = "any";
                   inp.style.width = "90px";
+                  inp.placeholder = l.unit || "";
                   if (l.counted_qty !== null && l.counted_qty !== undefined) {
                     inp.value = l.counted_qty;
                   }
                   if (done) inp.disabled = true;
                   td5.appendChild(inp);
+                  var uSpan = document.createElement("span");
+                  uSpan.textContent = " " + (l.unit || "");
+                  uSpan.style.color = "var(--muted)";
+                  td5.appendChild(uSpan);
                   tr.appendChild(td5);
                   tbody.appendChild(tr);
                   inputs[l.item_id] = inp;
