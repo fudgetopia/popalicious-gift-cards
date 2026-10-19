@@ -10227,6 +10227,46 @@ def erp_invite_wholesale_customer(account_id):
     return jsonify(out)
 
 
+@app.post("/api/erp/wholesale-accounts/<int:account_id>/deactivate")
+def erp_deactivate_wholesale_account(account_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="account not found"), 404
+    conn.execute("UPDATE erp_wholesale_accounts SET account_status = 'deactivated'"
+                 " WHERE id = ?", (account_id,))
+    conn.execute("UPDATE erp_wholesale_users SET active = 0 WHERE account_id = ?",
+                 (account_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, account_status="deactivated")
+
+
+@app.post("/api/erp/wholesale-accounts/<int:account_id>/reactivate")
+def erp_reactivate_wholesale_account(account_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="account not found"), 404
+    conn.execute("UPDATE erp_wholesale_accounts SET account_status = 'active'"
+                 " WHERE id = ?", (account_id,))
+    conn.execute("UPDATE erp_wholesale_users SET active = 1 WHERE account_id = ?",
+                 (account_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, account_status="active")
+
+
 @app.post("/api/erp/wholesale-orders/<int:order_id>/accept")
 def erp_accept_wholesale_order(order_id):
     actor, err = _require_erp_admin()
