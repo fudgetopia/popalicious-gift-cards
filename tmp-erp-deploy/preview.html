@@ -4712,6 +4712,29 @@ function renderErpAccountDetail(body) {
         }).finally(function () { inviteBtn.disabled = false; });
       });
       etool.appendChild(inviteBtn);
+      // Deactivate / reactivate the customer. Deactivating blocks their
+      // portal login immediately; the button flips to Reactivate as the undo.
+      var deactBtn = document.createElement("button");
+      deactBtn.type = "button";
+      var isDeactivated = (a.account_status === "deactivated");
+      deactBtn.textContent = isDeactivated ? "Reactivate" : "Deactivate";
+      deactBtn.addEventListener("click", function () {
+        if (!isDeactivated) {
+          var ok = window.confirm("Deactivate " + a.name +
+            "? They will no longer be able to log in to the ordering portal.");
+          if (!ok) return;
+        }
+        deactBtn.disabled = true;
+        setAdminDetailStatus(isDeactivated ? "Reactivating…" : "Deactivating…");
+        erpPost("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id)) +
+                (isDeactivated ? "/reactivate" : "/deactivate"), {}).then(function () {
+          setAdminDetailStatus(isDeactivated ? "Account reactivated." : "Account deactivated.");
+          renderErpAccountDetail(body);
+        }).catch(function (error) {
+          setAdminDetailStatus(error.message, true);
+        }).finally(function () { deactBtn.disabled = false; });
+      });
+      etool.appendChild(deactBtn);
       body.appendChild(etool);
       if (erpState.showEditAccount) body.appendChild(erpEditAccountForm(a));
     }
