@@ -192,6 +192,29 @@ button { font-family: inherit; }
         cursor: pointer; padding: 4px 2px; font-size: 14px; text-decoration: underline; }
       .login-note { color: var(--teal); font-weight: 700; margin: 10px 0; }
 
+      /* ============ Readability: slightly larger text ============ */
+      .login-card label, .login-error { font-size: 15px; }
+      .app-nav a { font-size: 15px; }
+      .app-user { font-size: 15px; }
+      .app-user button { font-size: 14px; }
+      .role-badge { font-size: 13px; }
+      .erp-form label { font-size: 15px; }
+      .erp-form input, .erp-form select { font-size: 15px; }
+      .erp-form-status { font-size: 15px; }
+      .erp-chip { font-size: 14px; }
+      .erp-detail-meta { font-size: 15px; }
+      .erp-po-line select, .erp-po-line input { font-size: 15px; }
+      .admin-stat-label { font-size: 14px; }
+      .admin-orders-table th { font-size: 14px; }
+      .admin-orders-table td { font-size: 15px; }
+      .erp-pre { font-size: 14px; }
+      .ws-brand small { font-size: 13px; }
+      .ws-topbar button { font-size: 15px; }
+      .ws-field label { font-size: 15px; }
+      .ws-cat { font-size: 14px; }
+      .ws-card .ws-price { font-size: 14px; }
+      .link-btn { font-size: 15px; }
+
       /* ============ Responsive: phones & tablets ============ */
       /* All data tables live in .admin-orders-wrap: swipe horizontally instead of squeezing. */
       .admin-orders-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
@@ -863,6 +886,13 @@ function wsRenderHistory() {
     var wrap = document.createElement("div");
     wrap.className = "ws-shell";
     wrap.appendChild(wsTopbar("My orders", true));
+    var backBtn = document.createElement("button");
+    backBtn.type = "button";
+    backBtn.className = "erp-back";
+    backBtn.textContent = "← New order";
+    backBtn.style.marginTop = "8px";
+    backBtn.addEventListener("click", function () { location.hash = "#/"; });
+    wrap.appendChild(backBtn);
     var h2 = document.createElement("h2");
     h2.textContent = "My orders";
     h2.style.margin = "6px 0 0";
@@ -1533,30 +1563,94 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           lotLabel.appendChild(lotCheck);
           lotLabel.appendChild(document.createTextNode(" Track lots"));
           form.appendChild(lotLabel);
+          var locLabel2 = document.createElement("label");
+          locLabel2.textContent = "Location ";
+          var locSel2 = document.createElement("select");
+          var activeLocs = (erpState.locations || []).filter(function (l) { return l.active; });
+          activeLocs.forEach(function (l) {
+            var o = document.createElement("option");
+            o.value = l.id;
+            o.textContent = l.code + " — " + l.name;
+            locSel2.appendChild(o);
+          });
+          locLabel2.appendChild(locSel2);
+          form.appendChild(locLabel2);
+          var openQtyLabel = document.createElement("label");
+          openQtyLabel.textContent = "Opening qty ";
+          var openQtyInput = document.createElement("input");
+          openQtyInput.type = "number";
+          openQtyInput.min = "0";
+          openQtyInput.step = "any";
+          openQtyInput.value = "0";
+          openQtyLabel.appendChild(openQtyInput);
+          form.appendChild(openQtyLabel);
           var submit = document.createElement("button");
           submit.type = "submit";
           submit.textContent = "Save item";
           form.appendChild(submit);
+          var allLocBtn = document.createElement("button");
+          allLocBtn.type = "button";
+          allLocBtn.textContent = "Add to all locations";
+          allLocBtn.title = "Save the item and record the opening quantity at every location";
+          form.appendChild(allLocBtn);
           var status = document.createElement("p");
           status.className = "erp-form-status";
           form.appendChild(status);
-          form.addEventListener("submit", function (event) {
-            event.preventDefault();
+          if (!activeLocs.length) {
+            var noLoc = document.createElement("p");
+            noLoc.className = "erp-form-status";
+            noLoc.textContent = "Add a location first (Inventory → Locations) before adding items.";
+            form.appendChild(noLoc);
             submit.disabled = true;
+            allLocBtn.disabled = true;
+          }
+          function erpSaveNewItem(locationIds, doneBtn) {
+            var qty = parseFloat(openQtyInput.value) || 0;
+            if (qty < 0) {
+              status.textContent = "Opening qty can't be negative.";
+              return;
+            }
+            submit.disabled = true;
+            allLocBtn.disabled = true;
             status.textContent = "Saving…";
+            var newItemId = null;
             erpPost("/api/erp/items", {
               sku: inputs.sku.value.trim(),
               name: inputs.name.value.trim(),
               type: typeSel.value,
               unit: unitSel.value,
               track_lots: lotCheck.checked
+            }).then(function (res) {
+              newItemId = res.item.id;
+              if (!qty || !locationIds.length) return null;
+              var chain = Promise.resolve();
+              locationIds.forEach(function (lid) {
+                chain = chain.then(function () {
+                  return erpPost("/api/erp/adjust", {
+                    item_id: newItemId,
+                    location_id: lid,
+                    qty_change: qty,
+                    reason: "count_correction",
+                    note: "Opening stock"
+                  });
+                });
+              });
+              return chain;
             }).then(function () {
               erpState.showAddItem = false;
               return loadErpInventoryDetail();
             }).catch(function (error) {
-              submit.disabled = false;
+              submit.disabled = activeLocs.length === 0;
+              allLocBtn.disabled = activeLocs.length === 0;
               status.textContent = error.message;
             });
+          }
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            erpSaveNewItem(activeLocs.length ? [Number(locSel2.value)] : [], submit);
+          });
+          allLocBtn.addEventListener("click", function () {
+            erpSaveNewItem(activeLocs.map(function (l) { return Number(l.id); }), allLocBtn);
           });
           return form;
         }
@@ -1572,6 +1666,15 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           var panel = document.createElement("div");
           panel.className = "erp-form";
           panel.style.display = "block";
+          var backBtn = document.createElement("button");
+          backBtn.type = "button";
+          backBtn.className = "erp-back";
+          backBtn.textContent = "← Back to inventory";
+          backBtn.addEventListener("click", function () {
+            erpState.showLocations = false;
+            renderErpInventoryDetail();
+          });
+          panel.appendChild(backBtn);
           var h = document.createElement("h3");
           h.textContent = "Locations";
           h.style.marginTop = "0";
@@ -1609,37 +1712,35 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
                   listWrap.appendChild(erpLocationEditForm(l, refresh));
                 });
                 actTd.appendChild(editBtn);
-                if (l.active) {
-                  var locDelBtn = document.createElement("button");
-                  locDelBtn.type = "button";
-                  locDelBtn.textContent = "Delete";
-                  locDelBtn.style.marginLeft = "6px";
-                  var locDelArmed = false;
-                  var locDelReset = null;
-                  locDelBtn.addEventListener("click", function () {
-                    if (!locDelArmed) {
-                      locDelArmed = true;
-                      locDelBtn.textContent = "Tap again to confirm";
-                      locDelReset = setTimeout(function () {
-                        locDelArmed = false;
-                        locDelBtn.textContent = "Delete";
-                      }, 6000);
-                      return;
-                    }
-                    if (locDelReset) clearTimeout(locDelReset);
-                    locDelBtn.disabled = true;
-                    erpDelete("/api/erp/locations/" + encodeURIComponent(String(l.id))).then(function () {
-                      refresh();
-                      return loadErpInventoryDetail();
-                    }).catch(function (error) {
-                      status.textContent = error.message;
-                      locDelBtn.disabled = false;
+                var locDelBtn = document.createElement("button");
+                locDelBtn.type = "button";
+                locDelBtn.textContent = "Delete";
+                locDelBtn.style.marginLeft = "6px";
+                var locDelArmed = false;
+                var locDelReset = null;
+                locDelBtn.addEventListener("click", function () {
+                  if (!locDelArmed) {
+                    locDelArmed = true;
+                    locDelBtn.textContent = "Tap again to confirm";
+                    locDelReset = setTimeout(function () {
                       locDelArmed = false;
                       locDelBtn.textContent = "Delete";
-                    });
+                    }, 6000);
+                    return;
+                  }
+                  if (locDelReset) clearTimeout(locDelReset);
+                  locDelBtn.disabled = true;
+                  erpDelete("/api/erp/locations/" + encodeURIComponent(String(l.id))).then(function () {
+                    refresh();
+                    return loadErpInventoryDetail();
+                  }).catch(function (error) {
+                    status.textContent = error.message;
+                    locDelBtn.disabled = false;
+                    locDelArmed = false;
+                    locDelBtn.textContent = "Delete";
                   });
-                  actTd.appendChild(locDelBtn);
-                }
+                });
+                actTd.appendChild(locDelBtn);
                 tr.appendChild(actTd);
                 tbody.appendChild(tr);
               });
@@ -3926,6 +4027,77 @@ function renderErpOrderDetail(body) {
       var summ = document.createElement("p");
       summ.textContent = o.items_summary || "No line detail.";
       body.appendChild(summ);
+    }
+
+    // admin: add an off-catalog product to a wholesale order
+    if (erpIsAdmin() && o.source === "wholesale" &&
+        ["shipped", "picked_up", "cancelled"].indexOf(o.status) === -1) {
+      var addProdForm = document.createElement("form");
+      addProdForm.className = "erp-form";
+      var apTitle = document.createElement("strong");
+      apTitle.textContent = "Add product";
+      apTitle.style.width = "100%";
+      addProdForm.appendChild(apTitle);
+      var apNote = document.createElement("span");
+      apNote.style.width = "100%";
+      apNote.style.fontSize = "14px";
+      apNote.style.color = "var(--muted)";
+      apNote.textContent = "For products not on the site — enter any product name.";
+      addProdForm.appendChild(apNote);
+      var apNameLabel = document.createElement("label");
+      apNameLabel.textContent = "Product ";
+      var apNameInput = document.createElement("input");
+      apNameInput.required = true;
+      apNameInput.placeholder = "Custom variety pack";
+      apNameLabel.appendChild(apNameInput);
+      addProdForm.appendChild(apNameLabel);
+      var apQtyLabel = document.createElement("label");
+      apQtyLabel.textContent = "Qty (bags) ";
+      var apQtyInput = document.createElement("input");
+      apQtyInput.type = "number";
+      apQtyInput.min = "1";
+      apQtyInput.step = "any";
+      apQtyInput.required = true;
+      apQtyInput.placeholder = "12";
+      apQtyLabel.appendChild(apQtyInput);
+      addProdForm.appendChild(apQtyLabel);
+      var apPriceLabel = document.createElement("label");
+      apPriceLabel.textContent = "Unit price $ ";
+      var apPriceInput = document.createElement("input");
+      apPriceInput.type = "number";
+      apPriceInput.min = "0.01";
+      apPriceInput.step = "0.01";
+      apPriceInput.placeholder = o.account && o.account.price_per_bag_cents ?
+        (o.account.price_per_bag_cents / 100).toFixed(2) + " (account default)" : "4.00";
+      apPriceLabel.appendChild(apPriceInput);
+      addProdForm.appendChild(apPriceLabel);
+      var apSubmit = document.createElement("button");
+      apSubmit.type = "submit";
+      apSubmit.textContent = "Add to order";
+      addProdForm.appendChild(apSubmit);
+      var apStatus = document.createElement("p");
+      apStatus.className = "erp-form-status";
+      addProdForm.appendChild(apStatus);
+      addProdForm.addEventListener("submit", function (event) {
+        event.preventDefault();
+        apSubmit.disabled = true;
+        apStatus.textContent = "Adding…";
+        var payload = {
+          product_name: apNameInput.value.trim(),
+          qty_bags: Number(apQtyInput.value)
+        };
+        if (apPriceInput.value.trim()) {
+          payload.unit_price_cents = Math.round(Number(apPriceInput.value) * 100);
+        }
+        erpPost("/api/erp/wholesale-orders/" + encodeURIComponent(String(id)) + "/lines",
+          payload).then(function () {
+            renderErpOrderDetail(body);
+          }).catch(function (error) {
+            apSubmit.disabled = false;
+            apStatus.textContent = error.message;
+          });
+      });
+      body.appendChild(addProdForm);
     }
 
     // fulfillment
