@@ -1505,9 +1505,19 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             });
             toolbar.appendChild(locBtn);
           }
+          var countBtn = document.createElement("button");
+          countBtn.type = "button";
+          countBtn.textContent = erpState.showCounts ? "Hide counts" : "Inventory count";
+          countBtn.addEventListener("click", function () {
+            erpState.showCounts = !erpState.showCounts;
+            erpState.openCountId = null;
+            renderErpInventoryDetail();
+          });
+          toolbar.appendChild(countBtn);
           els.body.appendChild(toolbar);
           if (erpState.showAddItem) els.body.appendChild(erpAddItemForm());
           if (erpState.showLocations) els.body.appendChild(erpLocationsPanel());
+          if (erpState.showCounts) els.body.appendChild(erpCountPanel());
           var tableWrap = document.createElement("div");
           tableWrap.className = "admin-orders-wrap";
           els.body.appendChild(tableWrap);
@@ -1754,6 +1764,302 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
               status.textContent = error.message;
             });
           }
+          refresh();
+          return panel;
+        }
+        /* ---------- physical inventory counts ---------- */
+        function erpCountPanel() {
+          var panel = document.createElement("div");
+          panel.className = "erp-form";
+          panel.style.display = "block";
+          var backBtn = document.createElement("button");
+          backBtn.type = "button";
+          backBtn.className = "erp-back";
+          backBtn.textContent = "← Back to inventory";
+          backBtn.addEventListener("click", function () {
+            erpState.showCounts = false;
+            erpState.openCountId = null;
+            renderErpInventoryDetail();
+          });
+          panel.appendChild(backBtn);
+          var h = document.createElement("h3");
+          h.textContent = "Inventory counts";
+          panel.appendChild(h);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          function refresh() {
+            erpGet("/api/erp/inventory-counts").then(function (res) {
+              renderList(res.counts || []);
+            }).catch(function (error) {
+              status.textContent = error.message;
+            });
+          }
+          function renderList(counts) {
+            listWrap.innerHTML = "";
+            if (erpState.openCountId) {
+              renderSheet(listWrap, erpState.openCountId);
+              return;
+            }
+            // start-a-count form
+            var sf = document.createElement("form");
+            sf.className = "erp-form";
+            var st = document.createElement("strong");
+            st.textContent = "Start a new count";
+            st.style.width = "100%";
+            sf.appendChild(st);
+            var dLabel = document.createElement("label");
+            dLabel.textContent = "Date ";
+            var dInput = document.createElement("input");
+            dInput.type = "date";
+            dInput.value = new Date().toISOString().slice(0, 10);
+            dLabel.appendChild(dInput);
+            sf.appendChild(dLabel);
+            var lLabel = document.createElement("label");
+            lLabel.textContent = "Location ";
+            var lSel = document.createElement("select");
+            erpLocationOptions(null).forEach(function (o) { lSel.appendChild(o); });
+            lLabel.appendChild(lSel);
+            sf.appendChild(lLabel);
+            var sBtn = document.createElement("button");
+            sBtn.type = "submit";
+            sBtn.textContent = "Start count";
+            sf.appendChild(sBtn);
+            sf.addEventListener("submit", function (event) {
+              event.preventDefault();
+              if (!lSel.value) { status.textContent = "Pick a location."; return; }
+              sBtn.disabled = true;
+              status.textContent = "Starting…";
+              erpPost("/api/erp/inventory-counts", {
+                count_date: dInput.value, location_id: Number(lSel.value)
+              }).then(function (res) {
+                erpState.openCountId = res.count.id;
+                refresh();
+              }).catch(function (error) {
+                sBtn.disabled = false;
+                status.textContent = error.message;
+              });
+            });
+            listWrap.appendChild(sf);
+            // history
+            var hh = document.createElement("h3");
+            hh.textContent = "Past counts";
+            listWrap.appendChild(hh);
+            if (!counts.length) {
+              var p = document.createElement("p");
+              p.textContent = "No counts yet.";
+              listWrap.appendChild(p);
+            }
+            counts.forEach(function (c) {
+              var row = document.createElement("div");
+              row.className = "erp-detail-meta";
+              row.style.margin = "6px 0";
+              row.textContent = c.count_date + " · " + c.location_code +
+                " — " + c.location_name + " · " + c.status;
+              if (c.status === "open") {
+                var openBtn = document.createElement("button");
+                openBtn.type = "button";
+                openBtn.textContent = "Continue";
+                openBtn.style.marginLeft = "8px";
+                openBtn.addEventListener("click", function () {
+                  erpState.openCountId = c.id;
+                  refresh();
+                });
+                row.appendChild(openBtn);
+              } else {
+                var viewBtn = document.createElement("button");
+                viewBtn.type = "button";
+                viewBtn.textContent = "Review";
+                viewBtn.style.marginLeft = "8px";
+                viewBtn.addEventListener("click", function () {
+                  erpState.openCountId = c.id;
+                  refresh();
+                });
+                row.appendChild(viewBtn);
+              }
+              listWrap.appendChild(row);
+            });
+            // reminder button (admin only)
+            if (erpIsAdmin()) {
+              var rBtn = document.createElement("button");
+              rBtn.type = "button";
+              rBtn.textContent = "Email inventory reminder";
+              rBtn.title = "Email all admins a reminder to do inventory";
+              rBtn.style.marginTop = "8px";
+              rBtn.addEventListener("click", function () {
+                rBtn.disabled = true;
+                status.textContent = "Sending…";
+                erpPost("/api/erp/inventory-reminder", {}).then(function (res) {
+                  status.textContent = "Reminder sent to " + res.sent + " admin(s).";
+                  rBtn.disabled = false;
+                }).catch(function (error) {
+                  status.textContent = error.message;
+                  rBtn.disabled = false;
+                });
+              });
+              listWrap.appendChild(rBtn);
+            }
+          }
+          function renderSheet(wrap, countId) {
+            erpGet("/api/erp/inventory-counts/" + encodeURIComponent(String(countId)))
+              .then(function (res) {
+                var c = res.count;
+                var done = c.status !== "open";
+                var title = document.createElement("h3");
+                title.textContent = "Count " + c.count_date + " · " +
+                  c.location_code + " — " + c.location_name +
+                  (done ? " (completed)" : "");
+                wrap.appendChild(title);
+                var note = document.createElement("p");
+                note.className = "erp-detail-meta";
+                note.textContent = "On-hand is filled in for you — just change the numbers to what you count.";
+                wrap.appendChild(note);
+                var tw = document.createElement("div");
+                tw.className = "admin-orders-wrap";
+                var table = document.createElement("table");
+                table.className = "admin-orders-table";
+                var thead = document.createElement("thead");
+                var hr = document.createElement("tr");
+                ["SKU", "Item", "Unit", "On hand", "Counted"].forEach(function (t) {
+                  var th = document.createElement("th");
+                  th.textContent = t;
+                  hr.appendChild(th);
+                });
+                thead.appendChild(hr);
+                table.appendChild(thead);
+                var tbody = document.createElement("tbody");
+                var inputs = {};
+                (c.lines || []).forEach(function (l) {
+                  var tr = document.createElement("tr");
+                  var td1 = document.createElement("td");
+                  td1.textContent = l.sku;
+                  tr.appendChild(td1);
+                  var td2 = document.createElement("td");
+                  td2.textContent = l.name;
+                  tr.appendChild(td2);
+                  var td3 = document.createElement("td");
+                  td3.textContent = l.unit;
+                  tr.appendChild(td3);
+                  var td4 = document.createElement("td");
+                  td4.textContent = erpQty(l.on_hand_at_start);
+                  tr.appendChild(td4);
+                  var td5 = document.createElement("td");
+                  var inp = document.createElement("input");
+                  inp.type = "number";
+                  inp.min = "0";
+                  inp.step = "any";
+                  inp.style.width = "90px";
+                  if (l.counted_qty !== null && l.counted_qty !== undefined) {
+                    inp.value = l.counted_qty;
+                  }
+                  if (done) inp.disabled = true;
+                  td5.appendChild(inp);
+                  tr.appendChild(td5);
+                  tbody.appendChild(tr);
+                  inputs[l.item_id] = inp;
+                });
+                table.appendChild(tbody);
+                tw.appendChild(table);
+                wrap.appendChild(tw);
+                var sheetStatus = document.createElement("p");
+                sheetStatus.className = "erp-form-status";
+                wrap.appendChild(sheetStatus);
+                if (!done) {
+                  var saveBtn = document.createElement("button");
+                  saveBtn.type = "button";
+                  saveBtn.textContent = "Save progress";
+                  saveBtn.addEventListener("click", function () {
+                    saveBtn.disabled = true;
+                    sheetStatus.textContent = "Saving…";
+                    erpPut("/api/erp/inventory-counts/" +
+                      encodeURIComponent(String(countId)), {
+                        lines: collectLines()
+                      }).then(function () {
+                        sheetStatus.textContent = "Saved.";
+                        saveBtn.disabled = false;
+                      }).catch(function (error) {
+                        sheetStatus.textContent = error.message;
+                        saveBtn.disabled = false;
+                      });
+                  });
+                  wrap.appendChild(saveBtn);
+                  var doneBtn = document.createElement("button");
+                  doneBtn.type = "button";
+                  doneBtn.textContent = "Complete count";
+                  doneBtn.style.marginLeft = "8px";
+                  var doneArmed = false;
+                  var doneReset = null;
+                  doneBtn.addEventListener("click", function () {
+                    if (!doneArmed) {
+                      doneArmed = true;
+                      doneBtn.textContent = "Tap again to complete (posts adjustments)";
+                      doneReset = setTimeout(function () {
+                        doneArmed = false;
+                        doneBtn.textContent = "Complete count";
+                      }, 6000);
+                      return;
+                    }
+                    if (doneReset) clearTimeout(doneReset);
+                    doneBtn.disabled = true;
+                    sheetStatus.textContent = "Completing…";
+                    erpPut("/api/erp/inventory-counts/" +
+                      encodeURIComponent(String(countId)), {
+                        lines: collectLines()
+                      }).then(function () {
+                        return erpPost("/api/erp/inventory-counts/" +
+                          encodeURIComponent(String(countId)) + "/complete", {});
+                      }).then(function (res) {
+                        var msg = "Count complete. " + res.adjusted_lines +
+                          " item(s) adjusted.";
+                        if (res.zero_count) {
+                          msg += " " + res.zero_count +
+                            " item(s) at ZERO — reorder email sent to admins.";
+                        }
+                        sheetStatus.textContent = msg;
+                        erpState.openCountId = null;
+                        setTimeout(refresh, 1500);
+                      }).catch(function (error) {
+                        sheetStatus.textContent = error.message;
+                        doneBtn.disabled = false;
+                      });
+                  });
+                  wrap.appendChild(doneBtn);
+                  var closeBtn = document.createElement("button");
+                  closeBtn.type = "button";
+                  closeBtn.textContent = "Back to counts";
+                  closeBtn.className = "link-btn";
+                  closeBtn.style.marginLeft = "8px";
+                  closeBtn.addEventListener("click", function () {
+                    erpState.openCountId = null;
+                    refresh();
+                  });
+                  wrap.appendChild(closeBtn);
+                } else {
+                  var backLink = document.createElement("button");
+                  backLink.type = "button";
+                  backLink.textContent = "Back to counts";
+                  backLink.className = "link-btn";
+                  backLink.addEventListener("click", function () {
+                    erpState.openCountId = null;
+                    refresh();
+                  });
+                  wrap.appendChild(backLink);
+                }
+                function collectLines() {
+                  return Object.keys(inputs).map(function (itemId) {
+                    var v = inputs[itemId].value;
+                    return {
+                      item_id: Number(itemId),
+                      counted_qty: (v === "" || v === null) ? null : Number(v)
+                    };
+                  });
+                }
+              }).catch(function (error) {
+                status.textContent = error.message;
+              });
+          }
+          var listWrap = document.createElement("div");
+          panel.appendChild(listWrap);
+          panel.appendChild(status);
           refresh();
           return panel;
         }
