@@ -7827,7 +7827,9 @@ def erp_delete_location(location_id):
         return jsonify(error="location not found"), 404
     on_hand = conn.execute(
         "SELECT COALESCE(SUM(qty_change), 0) FROM erp_stock_ledger"
-        " WHERE location_id = ?", (location_id,)).fetchone()[0]
+        " WHERE location_id = ?"
+        " AND item_id IN (SELECT id FROM erp_items WHERE active = 1)",
+        (location_id,)).fetchone()[0]
     if float(on_hand or 0) != 0:
         conn.close()
         return jsonify(
