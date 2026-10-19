@@ -7810,6 +7810,26 @@ def erp_update_location(location_id):
     return jsonify(location=dict(loc))
 
 
+@app.delete("/api/erp/locations/<int:location_id>")
+def erp_delete_location(location_id):
+    # Soft delete (deactivate): the location leaves the active lists (and can't
+    # receive new stock), but its ledger history stays intact for reports.
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    loc = conn.execute("SELECT * FROM erp_locations WHERE id = ?",
+                       (location_id,)).fetchone()
+    if not loc:
+        conn.close()
+        return jsonify(error="location not found"), 404
+    conn.execute("UPDATE erp_locations SET active = 0 WHERE id = ?",
+                 (location_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
 @app.get("/api/erp/items")
 def erp_list_items():
     actor, err = _require_erp()
