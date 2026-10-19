@@ -210,7 +210,7 @@ button { font-family: inherit; }
       <p id="loginNote" class="login-note" hidden></p>
       <p id="loginError" class="login-error" hidden></p>
       <button type="submit" id="loginSubmit">Log in</button>
-      <p class="forgot-wrap" id="forgotWrap" hidden><button type="button" id="forgotBtn" class="link-btn">Forgot password?</button></p>
+      <p class="forgot-wrap" id="forgotWrap"><button type="button" id="forgotBtn" class="link-btn">Forgot password?</button></p>
     </form>
   </div>
 </div>
@@ -305,7 +305,7 @@ function setLoginMode(mode) {
   document.getElementById("tabAdmin").classList.toggle("active", mode === "admin");
   document.getElementById("tabStaff").classList.toggle("active", mode === "staff");
   document.getElementById("tabWholesale").classList.toggle("active", mode === "wholesale");
-  document.getElementById("forgotWrap").hidden = mode !== "wholesale";
+  document.getElementById("forgotWrap").hidden = false;
   document.getElementById("loginError").hidden = true;
   loginNote("");
 }
@@ -1258,10 +1258,22 @@ document.getElementById("forgotBtn").addEventListener("click", async function ()
   var btn = document.getElementById("forgotBtn");
   btn.disabled = true;
   try {
-    await fetch(API_BASE + "/api/wholesale/forgot-password", {
+    // Each login tab has its own password store, so each gets its own reset flow.
+    var fUrl, fBody;
+    if (loginMode === "admin") {
+      fUrl = API_BASE + "/api/auth/forgot-password";
+      fBody = { email: email };
+    } else if (loginMode === "staff") {
+      fUrl = API_BASE + "/api/loyalty/staff/forgot-password";
+      fBody = { email: email };
+    } else {
+      fUrl = API_BASE + "/api/wholesale/forgot-password";
+      fBody = { email: email, portal_url: location.origin + location.pathname };
+    }
+    await fetch(fUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: email, portal_url: location.origin + location.pathname })
+      body: JSON.stringify(fBody)
     });
     loginNote("If that email is registered, a reset link is on its way.");
   } catch (e) {
@@ -4735,6 +4747,28 @@ function renderErpAccountDetail(body) {
         }).finally(function () { deactBtn.disabled = false; });
       });
       etool.appendChild(deactBtn);
+      // Full delete: removes the account, its portal users, addresses, and
+      // all of its orders. Destructive — confirm popup first.
+      var delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", function () {
+        var ok = window.confirm("Delete " + a.name +
+          " and ALL of its orders, users, and addresses? This cannot be undone.");
+        if (!ok) return;
+        delBtn.disabled = true;
+        setAdminDetailStatus("Deleting…");
+        erpDelete("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id))).then(function () {
+          setAdminDetailStatus("Account deleted.");
+          erpState.selectedAccountId = null;
+          erpState.showEditAccount = false;
+          erpState.ordersView = "accounts";
+          renderErpOrdersDetail();
+        }).catch(function (error) {
+          setAdminDetailStatus(error.message, true);
+        }).finally(function () { delBtn.disabled = false; });
+      });
+      etool.appendChild(delBtn);
       body.appendChild(etool);
       if (erpState.showEditAccount) body.appendChild(erpEditAccountForm(a));
     }
