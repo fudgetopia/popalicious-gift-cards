@@ -1465,8 +1465,19 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             renderErpInventoryDetail();
           });
           toolbar.appendChild(addBtn);
+          if (erpIsAdmin()) {
+            var locBtn = document.createElement("button");
+            locBtn.type = "button";
+            locBtn.textContent = erpState.showLocations ? "Hide locations" : "Locations";
+            locBtn.addEventListener("click", function () {
+              erpState.showLocations = !erpState.showLocations;
+              renderErpInventoryDetail();
+            });
+            toolbar.appendChild(locBtn);
+          }
           els.body.appendChild(toolbar);
           if (erpState.showAddItem) els.body.appendChild(erpAddItemForm());
+          if (erpState.showLocations) els.body.appendChild(erpLocationsPanel());
           var tableWrap = document.createElement("div");
           tableWrap.className = "admin-orders-wrap";
           els.body.appendChild(tableWrap);
@@ -1544,6 +1555,193 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
               return loadErpInventoryDetail();
             }).catch(function (error) {
               submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        /* ---------- locations: admin add/edit/deactivate. Each location
+           keeps its own inventory (stock ledger is per location). ---------- */
+        var LOCATION_TYPES = ["warehouse", "storefront", "mobile", "virtual"];
+        function erpLocationTypeLabel(t) {
+          var labels = {warehouse: "Warehouse", storefront: "Storefront",
+            mobile: "Mobile / Events", virtual: "Virtual"};
+          return labels[t] || t || "—";
+        }
+        function erpLocationsPanel() {
+          var panel = document.createElement("div");
+          panel.className = "erp-form";
+          panel.style.display = "block";
+          var h = document.createElement("h3");
+          h.textContent = "Locations";
+          h.style.marginTop = "0";
+          panel.appendChild(h);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          panel.appendChild(status);
+          var listWrap = document.createElement("div");
+          panel.appendChild(listWrap);
+          function refresh() {
+            status.textContent = "Loading locations…";
+            erpGet("/api/erp/locations?all=1").then(function (res) {
+              status.textContent = "";
+              listWrap.replaceChildren();
+              var table = document.createElement("table");
+              table.className = "admin-orders-table";
+              table.innerHTML = "<thead><tr><th>Code</th><th>Name</th><th>Type</th>" +
+                "<th>Status</th><th></th></tr></thead>";
+              var tbody = document.createElement("tbody");
+              (res.locations || []).forEach(function (l) {
+                var tr = document.createElement("tr");
+                tr.appendChild(erpCell("Code", l.code));
+                tr.appendChild(erpCell("Name", l.name));
+                tr.appendChild(erpCell("Type", erpLocationTypeLabel(l.type)));
+                var stTd = document.createElement("td");
+                stTd.appendChild(erpChip(l.active ? "received" : "cancelled",
+                  l.active ? "Active" : "Inactive"));
+                tr.appendChild(stTd);
+                var actTd = document.createElement("td");
+                var editBtn = document.createElement("button");
+                editBtn.type = "button";
+                editBtn.textContent = "Edit";
+                editBtn.addEventListener("click", function () {
+                  listWrap.replaceChildren();
+                  listWrap.appendChild(erpLocationEditForm(l, refresh));
+                });
+                actTd.appendChild(editBtn);
+                tr.appendChild(actTd);
+                tbody.appendChild(tr);
+              });
+              table.appendChild(tbody);
+              var tw = document.createElement("div");
+              tw.className = "admin-orders-wrap";
+              tw.appendChild(table);
+              listWrap.appendChild(tw);
+              listWrap.appendChild(erpLocationAddForm(refresh));
+            }).catch(function (error) {
+              status.textContent = error.message;
+            });
+          }
+          refresh();
+          return panel;
+        }
+        function erpLocationTypeSelect(selected) {
+          var sel = document.createElement("select");
+          LOCATION_TYPES.forEach(function (t) {
+            var o = document.createElement("option");
+            o.value = t;
+            o.textContent = erpLocationTypeLabel(t);
+            if (t === selected) o.selected = true;
+            sel.appendChild(o);
+          });
+          return sel;
+        }
+        function erpLocationAddForm(onDone) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          form.style.marginTop = "12px";
+          var title = document.createElement("strong");
+          title.textContent = "Add location";
+          title.style.width = "100%";
+          form.appendChild(title);
+          var codeLabel = document.createElement("label");
+          codeLabel.textContent = "Code ";
+          var codeInput = document.createElement("input");
+          codeInput.required = true;
+          codeInput.placeholder = "DTLV";
+          codeInput.style.textTransform = "uppercase";
+          codeLabel.appendChild(codeInput);
+          form.appendChild(codeLabel);
+          var nameLabel = document.createElement("label");
+          nameLabel.textContent = "Name ";
+          var nameInput = document.createElement("input");
+          nameInput.required = true;
+          nameInput.placeholder = "Downtown Las Vegas";
+          nameLabel.appendChild(nameInput);
+          form.appendChild(nameLabel);
+          var typeLabel = document.createElement("label");
+          typeLabel.textContent = "Type ";
+          var typeSel = erpLocationTypeSelect("warehouse");
+          typeLabel.appendChild(typeSel);
+          form.appendChild(typeLabel);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Add location";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            submit.disabled = true;
+            status.textContent = "Adding…";
+            erpPost("/api/erp/locations", {
+              code: codeInput.value,
+              name: nameInput.value,
+              type: typeSel.value
+            }).then(function () {
+              status.textContent = "";
+              onDone();
+              return loadErpInventoryDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpLocationEditForm(l, onDone) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var title = document.createElement("strong");
+          title.textContent = "Edit " + l.code;
+          title.style.width = "100%";
+          form.appendChild(title);
+          var nameLabel = document.createElement("label");
+          nameLabel.textContent = "Name ";
+          var nameInput = document.createElement("input");
+          nameInput.required = true;
+          nameInput.value = l.name || "";
+          nameLabel.appendChild(nameInput);
+          form.appendChild(nameLabel);
+          var typeLabel = document.createElement("label");
+          typeLabel.textContent = "Type ";
+          var typeSel = erpLocationTypeSelect(l.type);
+          typeLabel.appendChild(typeSel);
+          form.appendChild(typeLabel);
+          var activeLabel = document.createElement("label");
+          var activeCheck = document.createElement("input");
+          activeCheck.type = "checkbox";
+          activeCheck.checked = !!l.active;
+          activeLabel.appendChild(activeCheck);
+          activeLabel.appendChild(document.createTextNode(" Active"));
+          form.appendChild(activeLabel);
+          var save = document.createElement("button");
+          save.type = "submit";
+          save.textContent = "Save";
+          form.appendChild(save);
+          var cancel = document.createElement("button");
+          cancel.type = "button";
+          cancel.textContent = "Cancel";
+          cancel.addEventListener("click", onDone);
+          form.appendChild(cancel);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            save.disabled = true;
+            status.textContent = "Saving…";
+            erpPut("/api/erp/locations/" + encodeURIComponent(String(l.id)), {
+              name: nameInput.value,
+              type: typeSel.value,
+              active: activeCheck.checked
+            }).then(function () {
+              status.textContent = "";
+              onDone();
+              return loadErpInventoryDetail();
+            }).catch(function (error) {
+              save.disabled = false;
               status.textContent = error.message;
             });
           });
@@ -1630,6 +1828,38 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             renderErpInventoryDetail();
           });
           body.appendChild(back);
+          if (erpIsAdmin()) {
+            var delBtn = document.createElement("button");
+            delBtn.type = "button";
+            delBtn.textContent = "Delete";
+            delBtn.style.margin = "8px 0";
+            var delArmed = false;
+            var delReset = null;
+            delBtn.addEventListener("click", function () {
+              if (!delArmed) {
+                delArmed = true;
+                delBtn.textContent = "Tap again to confirm delete";
+                delReset = setTimeout(function () {
+                  delArmed = false;
+                  delBtn.textContent = "Delete";
+                }, 6000);
+                return;
+              }
+              if (delReset) clearTimeout(delReset);
+              delBtn.disabled = true;
+              erpDelete("/api/erp/items/" + encodeURIComponent(String(item.id))).then(function () {
+                erpState.selectedItemId = null;
+                erpState.selectedItem = null;
+                loadErpInventoryDetail();
+              }).catch(function (error) {
+                setAdminDetailStatus(error.message, true);
+                delBtn.disabled = false;
+                delArmed = false;
+                delBtn.textContent = "Delete";
+              });
+            });
+            body.appendChild(delBtn);
+          }
           var head = document.createElement("div");
           head.className = "erp-item-head";
           var title = document.createElement("h3");
