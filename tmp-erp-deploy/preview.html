@@ -987,14 +987,16 @@ function wsRenderProfile() {
     var fLoc = document.createElement("input"); fLoc.name = "location_name"; fLoc.placeholder = "Location name"; fLoc.required = true;
     var fStreet = document.createElement("input"); fStreet.name = "street"; fStreet.placeholder = "Street"; fStreet.required = true;
     var fCity = document.createElement("input"); fCity.name = "city"; fCity.placeholder = "City"; fCity.required = true;
-    var fState = document.createElement("input"); fState.name = "state"; fState.placeholder = "State"; fState.required = true;
+    var fState = erpStateSelect("state", true);
+    fState.setAttribute("data-label", "State");
     var fZip = document.createElement("input"); fZip.name = "zip"; fZip.placeholder = "ZIP"; fZip.required = true;
     var fContact = document.createElement("input"); fContact.name = "contact_name"; fContact.placeholder = "Contact at location";
     var fEmail = document.createElement("input"); fEmail.name = "contact_email"; fEmail.placeholder = "Contact email"; fEmail.type = "email";
     var fPhone = document.createElement("input"); fPhone.name = "contact_phone"; fPhone.placeholder = "Contact phone"; fPhone.type = "tel";
     [fLoc, fStreet, fCity, fState, fZip, fContact, fEmail, fPhone].forEach(function (inp) {
       var lab = document.createElement("label");
-      lab.textContent = inp.placeholder + (inp.required ? " *" : "") + " ";
+      var labelText = inp.getAttribute("data-label") || inp.placeholder || "";
+      lab.textContent = labelText + (inp.required ? " *" : "") + " ";
       lab.appendChild(inp);
       form.appendChild(lab);
     });
@@ -2646,6 +2648,39 @@ function erpTextInput(name, placeholder, required) {
   if (placeholder) input.placeholder = placeholder;
   if (required) input.required = true;
   return input;
+}
+
+/* US state dropdown, used anywhere an address asks for a state. */
+var US_STATES = [
+  ["AL", "Alabama"], ["AK", "Alaska"], ["AZ", "Arizona"], ["AR", "Arkansas"],
+  ["CA", "California"], ["CO", "Colorado"], ["CT", "Connecticut"], ["DE", "Delaware"],
+  ["FL", "Florida"], ["GA", "Georgia"], ["HI", "Hawaii"], ["ID", "Idaho"],
+  ["IL", "Illinois"], ["IN", "Indiana"], ["IA", "Iowa"], ["KS", "Kansas"],
+  ["KY", "Kentucky"], ["LA", "Louisiana"], ["ME", "Maine"], ["MD", "Maryland"],
+  ["MA", "Massachusetts"], ["MI", "Michigan"], ["MN", "Minnesota"], ["MS", "Mississippi"],
+  ["MO", "Missouri"], ["MT", "Montana"], ["NE", "Nebraska"], ["NV", "Nevada"],
+  ["NH", "New Hampshire"], ["NJ", "New Jersey"], ["NM", "New Mexico"], ["NY", "New York"],
+  ["NC", "North Carolina"], ["ND", "North Dakota"], ["OH", "Ohio"], ["OK", "Oklahoma"],
+  ["OR", "Oregon"], ["PA", "Pennsylvania"], ["RI", "Rhode Island"], ["SC", "South Carolina"],
+  ["SD", "South Dakota"], ["TN", "Tennessee"], ["TX", "Texas"], ["UT", "Utah"],
+  ["VT", "Vermont"], ["VA", "Virginia"], ["WA", "Washington"], ["WV", "West Virginia"],
+  ["WI", "Wisconsin"], ["WY", "Wyoming"]
+];
+function erpStateSelect(name, required) {
+  var sel = document.createElement("select");
+  sel.name = name;
+  if (required) sel.required = true;
+  var ph = document.createElement("option");
+  ph.value = "";
+  ph.textContent = "Select state";
+  sel.appendChild(ph);
+  US_STATES.forEach(function (s) {
+    var o = document.createElement("option");
+    o.value = s[0];
+    o.textContent = s[1];
+    sel.appendChild(o);
+  });
+  return sel;
 }
 
 /* ---------- new batch form ---------- */
@@ -4494,7 +4529,7 @@ function erpNewAccountForm() {
   form.appendChild(erpField("Location name", erpTextInput("location_name", "e.g. Main store")));
   form.appendChild(erpField("Street", erpTextInput("street", "")));
   form.appendChild(erpField("City", erpTextInput("city", "")));
-  form.appendChild(erpField("State", erpTextInput("state", "")));
+  form.appendChild(erpField("State", erpStateSelect("state")));
   form.appendChild(erpField("ZIP", erpTextInput("zip", "")));
   form.appendChild(erpField("Contact at location", erpTextInput("location_contact", "")));
   form.appendChild(erpField("Location email", erpTextInput("location_email", "")));
