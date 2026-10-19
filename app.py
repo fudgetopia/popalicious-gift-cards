@@ -7812,8 +7812,10 @@ def erp_update_location(location_id):
 
 @app.delete("/api/erp/locations/<int:location_id>")
 def erp_delete_location(location_id):
-    # Soft delete (deactivate): the location leaves the active lists (and can't
-    # receive new stock), but its ledger history stays intact for reports.
+    # Hard delete: the location row is removed entirely (its code becomes
+    # reusable). Ledger history rows keep their location_id; location-joined
+    # reads use LEFT JOIN so they degrade gracefully. Blocked while the
+    # location still holds inventory.
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -7823,8 +7825,17 @@ def erp_delete_location(location_id):
     if not loc:
         conn.close()
         return jsonify(error="location not found"), 404
-    conn.execute("UPDATE erp_locations SET active = 0 WHERE id = ?",
+    on_hand = conn.execute(
+        "SELECT COALESCE(SUM(qty_change), 0) FROM erp_stock_ledger"
+        " WHERE location_id = ?", (location_id,)).fetchone()[0]
+    if float(on_hand or 0) != 0:
+        conn.close()
+        return jsonify(
+            error="location still has inventory on hand; adjust it to zero first"
+        ), 400
+    conn.execute("DELETE FROM erp_reorder_rules WHERE location_id = ?",
                  (location_id,))
+    conn.execute("DELETE FROM erp_locations WHERE id = ?", (location_id,))
     conn.commit()
     conn.close()
     return jsonify(ok=True)
@@ -10471,6 +10482,70 @@ def erp_decline_wholesale_order(order_id):
     if acct and acct["email"]:
         _send_order_declined_email(acct["email"], w["order_number"], acct["name"], note)
     return jsonify(ok=True, status="cancelled")
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/lines")
+def erp_add_wholesale_order_line(order_id):
+    # Admin adds a product to an existing wholesale order — the product name is
+    # free text, so this covers off-catalog / not-on-the-site products.
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    fulf = _erp_get_fulfillment(conn, "wholesale", order_id)
+    status = fulf["status"] if fulf else "new"
+    if status in ("shipped", "picked_up", "cancelled"):
+        conn.close()
+        return jsonify(error="lines cannot be added to a %s order" % status), 400
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (w["account_id"],)).fetchone()
+    name = (data.get("flavor_name") or data.get("product_name") or "").strip()
+    if not name:
+        conn.close()
+        return jsonify(error="product name is required"), 400
+    try:
+        qty = float(data.get("qty_bags") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="qty_bags must be a number"), 400
+    if qty <= 0:
+        conn.close()
+        return jsonify(error="qty_bags must be greater than zero"), 400
+    default_unit = int(acct["price_per_bag_cents"]) if acct and acct["price_per_bag_cents"] else 0
+    try:
+        unit = int(data.get("unit_price_cents") or default_unit)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="unit_price_cents must be a number"), 400
+    if unit <= 0:
+        conn.close()
+        return jsonify(error="unit_price_cents must be greater than zero"), 400
+    line_total = int(round(qty * unit))
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_order_lines (order_id, flavor_name, qty_bags,"
+        " unit_price_cents, line_total_cents) VALUES (?, ?, ?, ?, ?)",
+        (order_id, name, qty, unit, line_total))
+    line_id = cur.lastrowid
+    # Keep the production checklist in sync if it was already generated.
+    prod_exists = conn.execute(
+        "SELECT COUNT(*) AS c FROM erp_order_production_lines WHERE order_id = ?",
+        (order_id,)).fetchone()["c"]
+    if prod_exists:
+        conn.execute(
+            "INSERT INTO erp_order_production_lines (order_id, flavor_name, qty_bags,"
+            " done, done_by, done_at) VALUES (?, ?, ?, 0, '', '')",
+            (order_id, name, qty))
+    line = conn.execute("SELECT * FROM erp_wholesale_order_lines WHERE id = ?",
+                        (line_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(line=dict(line)), 201
 
 
 @app.get("/api/erp/wholesale-orders/<int:order_id>/production")
