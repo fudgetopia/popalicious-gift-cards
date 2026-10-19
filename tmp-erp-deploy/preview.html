@@ -4748,14 +4748,25 @@ function renderErpAccountDetail(body) {
       });
       etool.appendChild(deactBtn);
       // Full delete: removes the account, its portal users, addresses, and
-      // all of its orders. Destructive — confirm popup first.
+      // all of its orders. Destructive — two-tap inline confirm.
       var delBtn = document.createElement("button");
       delBtn.type = "button";
       delBtn.textContent = "Delete";
+      var delArmed = false;
+      var delReset = null;
       delBtn.addEventListener("click", function () {
-        var ok = window.confirm("Delete " + a.name +
-          " and ALL of its orders, users, and addresses? This cannot be undone.");
-        if (!ok) return;
+        if (!delArmed) {
+          delArmed = true;
+          delBtn.textContent = "Tap again to confirm delete";
+          delReset = setTimeout(function () {
+            delArmed = false;
+            delBtn.textContent = "Delete";
+          }, 6000);
+          return;
+        }
+        if (delReset) clearTimeout(delReset);
+        delArmed = false;
+        delBtn.textContent = "Delete";
         delBtn.disabled = true;
         setAdminDetailStatus("Deleting…");
         erpDelete("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id))).then(function () {
