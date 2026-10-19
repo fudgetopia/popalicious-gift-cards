@@ -1609,6 +1609,37 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
                   listWrap.appendChild(erpLocationEditForm(l, refresh));
                 });
                 actTd.appendChild(editBtn);
+                if (l.active) {
+                  var locDelBtn = document.createElement("button");
+                  locDelBtn.type = "button";
+                  locDelBtn.textContent = "Delete";
+                  locDelBtn.style.marginLeft = "6px";
+                  var locDelArmed = false;
+                  var locDelReset = null;
+                  locDelBtn.addEventListener("click", function () {
+                    if (!locDelArmed) {
+                      locDelArmed = true;
+                      locDelBtn.textContent = "Tap again to confirm";
+                      locDelReset = setTimeout(function () {
+                        locDelArmed = false;
+                        locDelBtn.textContent = "Delete";
+                      }, 6000);
+                      return;
+                    }
+                    if (locDelReset) clearTimeout(locDelReset);
+                    locDelBtn.disabled = true;
+                    erpDelete("/api/erp/locations/" + encodeURIComponent(String(l.id))).then(function () {
+                      refresh();
+                      return loadErpInventoryDetail();
+                    }).catch(function (error) {
+                      status.textContent = error.message;
+                      locDelBtn.disabled = false;
+                      locDelArmed = false;
+                      locDelBtn.textContent = "Delete";
+                    });
+                  });
+                  actTd.appendChild(locDelBtn);
+                }
                 tr.appendChild(actTd);
                 tbody.appendChild(tr);
               });
