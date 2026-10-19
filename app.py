@@ -10267,6 +10267,43 @@ def erp_reactivate_wholesale_account(account_id):
     return jsonify(ok=True, account_status="active")
 
 
+@app.delete("/api/erp/wholesale-accounts/<int:account_id>")
+def erp_delete_wholesale_account(account_id):
+    # Admin-only full removal: the account, its portal users, addresses,
+    # orders and everything attached to those orders (lines, fulfillment
+    # history, production checklists, batch links).
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="account not found"), 404
+    order_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM erp_wholesale_orders WHERE account_id = ?", (account_id,))]
+    if order_ids:
+        ph = ",".join("?" * len(order_ids))
+        conn.execute("DELETE FROM erp_batch_orders WHERE order_source = 'wholesale'"
+                     " AND order_id IN (%s)" % ph, order_ids)
+        conn.execute("DELETE FROM erp_order_production_lines WHERE order_id IN (%s)" % ph,
+                     order_ids)
+        conn.execute("DELETE FROM erp_order_fulfillment WHERE order_source = 'wholesale'"
+                     " AND order_id IN (%s)" % ph, order_ids)
+        conn.execute("DELETE FROM erp_fulfillment_history WHERE order_source = 'wholesale'"
+                     " AND order_id IN (%s)" % ph, order_ids)
+        conn.execute("DELETE FROM erp_wholesale_order_lines WHERE order_id IN (%s)" % ph,
+                     order_ids)
+        conn.execute("DELETE FROM erp_wholesale_orders WHERE account_id = ?", (account_id,))
+    conn.execute("DELETE FROM erp_wholesale_users WHERE account_id = ?", (account_id,))
+    conn.execute("DELETE FROM erp_wholesale_addresses WHERE account_id = ?", (account_id,))
+    conn.execute("DELETE FROM erp_wholesale_accounts WHERE id = ?", (account_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, deleted_orders=len(order_ids))
+
+
 @app.post("/api/erp/wholesale-orders/<int:order_id>/accept")
 def erp_accept_wholesale_order(order_id):
     actor, err = _require_erp_admin()
