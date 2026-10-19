@@ -886,6 +886,12 @@ function wsRenderProfile() {
     var wrap = document.createElement("div");
     wrap.className = "ws-shell";
     wrap.appendChild(wsTopbar("Profile"));
+    var back = document.createElement("button");
+    back.type = "button";
+    back.textContent = "← New order";
+    back.style.margin = "8px 0";
+    back.addEventListener("click", function () { location.hash = "#/"; });
+    wrap.appendChild(back);
     var h2 = document.createElement("h2");
     h2.textContent = "My profile";
     h2.style.margin = "6px 0 0";
