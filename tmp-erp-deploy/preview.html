@@ -1629,7 +1629,8 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
               name: inputs.name.value.trim(),
               type: typeSel.value,
               unit: unitSel.value,
-              track_lots: lotCheck.checked
+              track_lots: lotCheck.checked,
+              location_ids: locationIds
             }).then(function (res) {
               newItemId = res.item.id;
               if (!qty || !locationIds.length) return null;
@@ -2267,6 +2268,15 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           });
           body.appendChild(back);
           if (erpIsAdmin()) {
+            var editBtn = document.createElement("button");
+            editBtn.type = "button";
+            editBtn.textContent = "Edit";
+            editBtn.style.margin = "8px 8px 8px 0";
+            editBtn.addEventListener("click", function () {
+              erpState.editingItem = !erpState.editingItem;
+              renderErpItemDetail(body);
+            });
+            body.appendChild(editBtn);
             var delBtn = document.createElement("button");
             delBtn.type = "button";
             delBtn.textContent = "Delete";
@@ -2310,6 +2320,98 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             " · total on hand " + erpQty(item.on_hand_total) + " " + (item.unit || "");
           head.appendChild(meta);
           body.appendChild(head);
+          if (erpIsAdmin() && erpState.editingItem) {
+            var eform = document.createElement("form");
+            eform.className = "erp-form";
+            var et = document.createElement("strong");
+            et.textContent = "Edit item";
+            et.style.width = "100%";
+            eform.appendChild(et);
+            var eSkuL = document.createElement("label");
+            eSkuL.textContent = "SKU ";
+            var eSku = document.createElement("input");
+            eSku.required = true;
+            eSku.value = item.sku || "";
+            eSkuL.appendChild(eSku);
+            eform.appendChild(eSkuL);
+            var eNameL = document.createElement("label");
+            eNameL.textContent = "Name ";
+            var eName = document.createElement("input");
+            eName.required = true;
+            eName.value = item.name || "";
+            eNameL.appendChild(eName);
+            eform.appendChild(eNameL);
+            var eTypeL = document.createElement("label");
+            eTypeL.textContent = "Type ";
+            var eType = document.createElement("select");
+            ["ingredient", "bag", "front_label", "back_label"].forEach(function (t) {
+              var o = document.createElement("option");
+              o.value = t;
+              o.textContent = erpTypeLabel(t);
+              if (t === item.type) o.selected = true;
+              eType.appendChild(o);
+            });
+            eTypeL.appendChild(eType);
+            eform.appendChild(eTypeL);
+            var eUnitL = document.createElement("label");
+            eUnitL.textContent = "Unit ";
+            var eUnit = document.createElement("select");
+            ["lb", "oz", "bag", "each", "roll"].forEach(function (u) {
+              var o = document.createElement("option");
+              o.value = u;
+              o.textContent = u;
+              if (u === item.unit) o.selected = true;
+              eUnit.appendChild(o);
+            });
+            eUnitL.appendChild(eUnit);
+            eform.appendChild(eUnitL);
+            var eLotL = document.createElement("label");
+            var eLot = document.createElement("input");
+            eLot.type = "checkbox";
+            eLot.checked = !!item.track_lots;
+            eLotL.appendChild(eLot);
+            eLotL.appendChild(document.createTextNode(" Track lots"));
+            eform.appendChild(eLotL);
+            var eSave = document.createElement("button");
+            eSave.type = "submit";
+            eSave.textContent = "Save changes";
+            eform.appendChild(eSave);
+            var eCancel = document.createElement("button");
+            eCancel.type = "button";
+            eCancel.textContent = "Cancel";
+            eCancel.className = "link-btn";
+            eCancel.style.marginLeft = "8px";
+            eCancel.addEventListener("click", function () {
+              erpState.editingItem = false;
+              renderErpItemDetail(body);
+            });
+            eform.appendChild(eCancel);
+            var eStatus = document.createElement("p");
+            eStatus.className = "erp-form-status";
+            eform.appendChild(eStatus);
+            eform.addEventListener("submit", function (event) {
+              event.preventDefault();
+              eSave.disabled = true;
+              eStatus.textContent = "Saving…";
+              erpPut("/api/erp/items/" + encodeURIComponent(String(item.id)), {
+                sku: eSku.value.trim(),
+                name: eName.value.trim(),
+                type: eType.value,
+                unit: eUnit.value,
+                track_lots: eLot.checked
+              }).then(function () {
+                erpState.editingItem = false;
+                return erpGet("/api/erp/items/" + encodeURIComponent(String(item.id)));
+              }).then(function (res) {
+                erpState.selectedItem = res.item;
+                renderErpItemDetail(body);
+              }).catch(function (error) {
+                eSave.disabled = false;
+                eStatus.textContent = error.message;
+              });
+            });
+            body.appendChild(eform);
+          }
           body.appendChild(erpSectionTitle("Stock by location"));
           var locWrap = document.createElement("div");
           locWrap.className = "admin-orders-wrap";
