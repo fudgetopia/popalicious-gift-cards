@@ -668,6 +668,13 @@ def init_db():
             UNIQUE(count_id, item_id)
         );
         CREATE INDEX IF NOT EXISTS idx_erp_count_lines ON erp_inventory_count_lines (count_id);
+        CREATE TABLE IF NOT EXISTS erp_item_locations (
+            item_id INTEGER NOT NULL,
+            location_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(item_id, location_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_item_locations ON erp_item_locations (location_id);
         CREATE TABLE IF NOT EXISTS erp_recipes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -888,6 +895,24 @@ def init_db():
          ('PFUL', 'Printful (virtual)', 'virtual', 1);
         """
     )
+    # Location-specific inventory: backfill item<->location assignments.
+    # Items go where they have ledger history; items with no history anywhere
+    # stay visible at every active location so nothing vanishes.
+    _now_il = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_item_locations (item_id, location_id, created_at)"
+        " SELECT DISTINCT l.item_id, l.location_id, ? FROM erp_stock_ledger l"
+        " JOIN erp_items i ON i.id = l.item_id AND i.active = 1"
+        " JOIN erp_locations loc ON loc.id = l.location_id AND loc.active = 1",
+        (_now_il,))
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_item_locations (item_id, location_id, created_at)"
+        " SELECT i.id, loc.id, ? FROM erp_items i CROSS JOIN erp_locations loc"
+        " WHERE i.active = 1 AND loc.active = 1"
+        " AND NOT EXISTS (SELECT 1 FROM erp_item_locations il"
+        "               WHERE il.item_id = i.id)",
+        (_now_il,))
+    conn.commit()
     # ERP Phase 5 migrations: new columns on wholesale accounts/orders for the
     # customer portal (guarded for databases created before these columns existed).
     wacols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_accounts)").fetchall()]
@@ -7715,6 +7740,11 @@ def _erp_post_movement(conn, item_id, location_id, qty_change, movement_type, ac
          lot_code, int(unit_cost_cents), actor,
          datetime.now(timezone.utc).isoformat(), note),
     )
+    # Location-specific inventory: any movement registers the item at that location.
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_item_locations (item_id, location_id, created_at)"
+        " VALUES (?, ?, ?)",
+        (item_id, location_id, datetime.now(timezone.utc).isoformat()))
 
 
 def _erp_new_avg_cost(conn, item_id, received_qty, landed_unit_cost_cents):
@@ -7832,9 +7862,9 @@ def erp_update_location(location_id):
 @app.delete("/api/erp/locations/<int:location_id>")
 def erp_delete_location(location_id):
     # Hard delete: the location row is removed entirely (its code becomes
-    # reusable). Ledger history rows keep their location_id; location-joined
-    # reads use LEFT JOIN so they degrade gracefully. Blocked while the
-    # location still holds inventory.
+    # reusable), and its inventory goes away with it — the location's ledger
+    # rows, item assignments, and reorder rules are all removed. Blocked while
+    # the location still holds inventory.
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -7855,6 +7885,10 @@ def erp_delete_location(location_id):
             error="location still has inventory on hand; adjust it to zero first"
         ), 400
     conn.execute("DELETE FROM erp_reorder_rules WHERE location_id = ?",
+                 (location_id,))
+    conn.execute("DELETE FROM erp_stock_ledger WHERE location_id = ?",
+                 (location_id,))
+    conn.execute("DELETE FROM erp_item_locations WHERE location_id = ?",
                  (location_id,))
     conn.execute("DELETE FROM erp_locations WHERE id = ?", (location_id,))
     conn.commit()
@@ -7904,10 +7938,61 @@ def erp_create_item():
         (sku, name, itype, unit, track_lots, datetime.now(timezone.utc).isoformat()),
     )
     item_id = cur.lastrowid
+    # Location-specific inventory: register the item at the given locations
+    # (even with zero opening qty) so each location's inventory is explicit.
+    now_il = datetime.now(timezone.utc).isoformat()
+    for lid in data.get("location_ids") or []:
+        try:
+            lid = int(lid)
+        except (TypeError, ValueError):
+            continue
+        if conn.execute("SELECT 1 FROM erp_locations WHERE id = ? AND active = 1",
+                        (lid,)).fetchone():
+            conn.execute(
+                "INSERT OR IGNORE INTO erp_item_locations (item_id, location_id,"
+                " created_at) VALUES (?, ?, ?)", (item_id, lid, now_il))
     conn.commit()
     row = conn.execute("SELECT * FROM erp_items WHERE id = ?", (item_id,)).fetchone()
     conn.close()
     return jsonify(item=dict(row)), 201
+
+
+@app.put("/api/erp/items/<int:item_id>")
+def erp_update_item(item_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    item = _erp_get_item(conn, item_id)
+    if not item:
+        conn.close()
+        return jsonify(error="item not found"), 404
+    sku = (data.get("sku") or "").strip()
+    name = (data.get("name") or "").strip()
+    itype = (data.get("type") or "").strip()
+    unit = (data.get("unit") or "").strip()
+    if not sku or not name:
+        conn.close()
+        return jsonify(error="sku and name are required"), 400
+    if itype not in ERP_ITEM_TYPES:
+        conn.close()
+        return jsonify(error="type must be one of: " + ", ".join(ERP_ITEM_TYPES)), 400
+    if unit not in ERP_ITEM_UNITS:
+        conn.close()
+        return jsonify(error="unit must be one of: " + ", ".join(ERP_ITEM_UNITS)), 400
+    if conn.execute("SELECT 1 FROM erp_items WHERE sku = ? AND id != ?",
+                    (sku, item_id)).fetchone():
+        conn.close()
+        return jsonify(error="sku already exists"), 400
+    conn.execute(
+        "UPDATE erp_items SET sku = ?, name = ?, type = ?, unit = ?,"
+        " track_lots = ? WHERE id = ?",
+        (sku, name, itype, unit, 1 if data.get("track_lots") else 0, item_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_items WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+    return jsonify(item=dict(row))
 
 
 @app.get("/api/erp/items/<int:item_id>")
@@ -7921,7 +8006,9 @@ def erp_get_item(item_id):
         conn.close()
         return jsonify(error="item not found"), 404
     locs = conn.execute(
-        "SELECT * FROM erp_locations WHERE active = 1 ORDER BY id").fetchall()
+        "SELECT l.* FROM erp_item_locations il"
+        " JOIN erp_locations l ON l.id = il.location_id AND l.active = 1"
+        " WHERE il.item_id = ? ORDER BY l.id", (item["id"],)).fetchall()
     stock = [
         {"location_id": loc["id"], "location_code": loc["code"],
          "location_name": loc["name"],
@@ -7969,14 +8056,21 @@ def erp_stock():
     loc_filter = (request.args.get("location_id") or "").strip()
     items = conn.execute(
         "SELECT * FROM erp_items WHERE active = 1 ORDER BY type, name").fetchall()
-    locs = conn.execute(
-        "SELECT * FROM erp_locations WHERE active = 1 ORDER BY id").fetchall()
+    # Location-specific inventory: only item<->location pairs the admin has
+    # set up (via add-item, adjustments, transfers, or receiving).
+    pairs = conn.execute(
+        "SELECT il.item_id, l.* FROM erp_item_locations il"
+        " JOIN erp_locations l ON l.id = il.location_id AND l.active = 1"
+        " ORDER BY l.id").fetchall()
+    locs_by_item = {}
+    for p in pairs:
+        locs_by_item.setdefault(p["item_id"], []).append(p)
     rows = []
     for it in items:
         if type_filter and it["type"] != type_filter:
             continue
         avg = int(it["avg_cost_cents"] or 0)
-        for loc in locs:
+        for loc in locs_by_item.get(it["id"], []):
             if loc_filter and str(loc["id"]) != loc_filter:
                 continue
             q = _erp_on_hand(conn, it["id"], loc["id"])
@@ -8109,7 +8203,10 @@ def erp_start_inventory_count():
         (count_date, loc["id"], (data.get("notes") or "").strip(), actor, now))
     count_id = cur.lastrowid
     items = conn.execute(
-        "SELECT * FROM erp_items WHERE active = 1 ORDER BY type, name").fetchall()
+        "SELECT i.* FROM erp_item_locations il"
+        " JOIN erp_items i ON i.id = il.item_id AND i.active = 1"
+        " WHERE il.location_id = ? ORDER BY i.type, i.name",
+        (loc["id"],)).fetchall()
     for it in items:
         conn.execute(
             "INSERT OR IGNORE INTO erp_inventory_count_lines"
