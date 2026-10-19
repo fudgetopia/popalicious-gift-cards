@@ -7957,6 +7957,32 @@ def erp_create_item():
     return jsonify(item=dict(row)), 201
 
 
+@app.post("/api/erp/items/<int:item_id>/locations")
+def erp_assign_item_location(item_id):
+    # Register an existing item at a location (no stock moved) so the admin
+    # can build each location's inventory explicitly.
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    item = _erp_get_item(conn, item_id)
+    if not item or not item["active"]:
+        conn.close()
+        return jsonify(error="valid item_id is required"), 400
+    loc = _erp_get_location(conn, data.get("location_id"))
+    if not loc or not loc["active"]:
+        conn.close()
+        return jsonify(error="valid location_id is required"), 400
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_item_locations (item_id, location_id,"
+        " created_at) VALUES (?, ?, ?)",
+        (item_id, loc["id"], datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, item_id=item_id, location_id=loc["id"])
+
+
 @app.put("/api/erp/items/<int:item_id>")
 def erp_update_item(item_id):
     actor, err = _require_erp_admin()
