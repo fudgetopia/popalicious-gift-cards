@@ -7734,10 +7734,80 @@ def erp_list_locations():
     if err:
         return err
     conn = db()
-    rows = conn.execute(
-        "SELECT * FROM erp_locations WHERE active = 1 ORDER BY id").fetchall()
+    if str(request.args.get("all") or "") == "1":
+        _actor, err = _require_erp_admin()
+        if err:
+            conn.close()
+            return err
+        rows = conn.execute(
+            "SELECT * FROM erp_locations ORDER BY id").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_locations WHERE active = 1 ORDER BY id").fetchall()
     conn.close()
     return jsonify(locations=[dict(r) for r in rows])
+
+
+@app.post("/api/erp/locations")
+def erp_create_location():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    code = (data.get("code") or "").strip().upper()
+    name = (data.get("name") or "").strip()
+    ltype = (data.get("type") or "").strip().lower() or "warehouse"
+    if not code:
+        return jsonify(error="code is required"), 400
+    if not name:
+        return jsonify(error="name is required"), 400
+    conn = db()
+    if conn.execute("SELECT id FROM erp_locations WHERE code = ?",
+                    (code,)).fetchone():
+        conn.close()
+        return jsonify(error="a location with that code already exists"), 400
+    cur = conn.execute(
+        "INSERT INTO erp_locations (code, name, type, active) VALUES (?, ?, ?, 1)",
+        (code, name, ltype))
+    loc = conn.execute("SELECT * FROM erp_locations WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(location=dict(loc)), 201
+
+
+@app.put("/api/erp/locations/<int:location_id>")
+def erp_update_location(location_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    loc = conn.execute("SELECT * FROM erp_locations WHERE id = ?",
+                       (location_id,)).fetchone()
+    if not loc:
+        conn.close()
+        return jsonify(error="location not found"), 404
+    fields = {}
+    if "name" in data:
+        name = (data.get("name") or "").strip()
+        if not name:
+            conn.close()
+            return jsonify(error="name is required"), 400
+        fields["name"] = name
+    if "type" in data:
+        fields["type"] = (data.get("type") or "").strip().lower() or "warehouse"
+    if "active" in data:
+        fields["active"] = 1 if data.get("active") else 0
+    if fields:
+        sets = ", ".join("%s = ?" % k for k in fields)
+        conn.execute("UPDATE erp_locations SET %s WHERE id = %s" % (sets, "?"),
+                     list(fields.values()) + [location_id])
+        conn.commit()
+    loc = conn.execute("SELECT * FROM erp_locations WHERE id = ?",
+                       (location_id,)).fetchone()
+    conn.close()
+    return jsonify(location=dict(loc))
 
 
 @app.get("/api/erp/items")
@@ -7817,6 +7887,24 @@ def erp_get_item(item_id):
     d["on_hand_total"] = sum(s["on_hand"] for s in stock)
     d["ledger"] = [dict(r) for r in ledger]
     return jsonify(item=d)
+
+
+@app.delete("/api/erp/items/<int:item_id>")
+def erp_delete_item(item_id):
+    # Soft delete: the item leaves the active list (and can't be used in new
+    # POs/recipes), but its ledger history stays intact for reports.
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    item = _erp_get_item(conn, item_id)
+    if not item:
+        conn.close()
+        return jsonify(error="item not found"), 404
+    conn.execute("UPDATE erp_items SET active = 0 WHERE id = ?", (item_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
 
 
 @app.get("/api/erp/stock")
