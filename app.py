@@ -26,6 +26,7 @@ import hashlib
 import base64
 import html
 from datetime import datetime, timedelta, timezone
+from contextlib import contextmanager
 from urllib.parse import urlencode
 
 import requests
@@ -2030,6 +2031,29 @@ def merch_catalog():
 # Merch loyalty rewards — specific items only, each with its own kernel cost.
 # Customer gets a MCH- code for free merch (pays Printful shipping only).
 # Employee redemptions notify admins with a Printful link.
+@contextmanager
+def _db():
+    """Connection context manager used by the merch reward endpoints:
+    commits on success, always closes."""
+    conn = db()
+    try:
+        yield conn
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _add_kernels(conn, user_id, kernels, reason):
+    """Signed kernel adjustment (merch redemptions debit through here)."""
+    if kernels >= 0:
+        return _credit_kernels(conn, user_id, kernels, reason)
+    return -kernels if _debit_kernels(conn, user_id, -kernels, reason) else 0
+
+
 MERCH_REWARDS = [
     {"sku": "MERCH-STICKERS", "kernels": 300},
     {"sku": "MERCH-MUG", "kernels": 400},
@@ -2052,11 +2076,11 @@ STAFF_MERCH_REWARDS = [
 
 def merch_rewards_for_balance(kernel_balance):
     """Return list of {kernels, sku, name, price_cents, sizes}
-    for merch rewards the balance unlocks, ordered by kernel cost."""
+    for ALL merch rewards, ordered by kernel cost. The frontend shows
+    locked rewards with a 'kernels needed' note and a disabled button;
+    affordability is enforced at redemption time by merch_reward_for_sku."""
     eligible = []
     for reward in MERCH_REWARDS:
-        if kernel_balance < reward["kernels"]:
-            continue
         prod = PRINTFUL_MERCH.get(reward["sku"])
         if not prod:
             continue
@@ -2137,7 +2161,7 @@ def loyalty_redeem_merch():
         return jsonify(error="invalid merch selection"), 400
     with _db() as conn:
         balance = _kernel_balance(conn, user["id"])
-    reward = staff_merch_reward_for_sku(sku, balance)
+    reward = merch_reward_for_sku(sku, balance)
     if not reward:
         return jsonify(error="not enough kernels for this item"), 400
     code = _new_merch_code()
@@ -2419,10 +2443,26 @@ def _compute_order(data):
     elif code:
         conn = db()
         reward = conn.execute(
-            "SELECT reward_type FROM loyalty_rewards WHERE code = ? AND used = 0",
+            "SELECT reward_type, user_id FROM loyalty_rewards WHERE code = ? AND used = 0",
             (code,),
         ).fetchone()
         if reward:
+            if reward["reward_type"] == "birthday_bag":
+                # Birthday bag codes only work during the owner's birthday
+                # month (user rule, Oct 20 2026).
+                owner = conn.execute(
+                    "SELECT birthday FROM users WHERE id = ?",
+                    (reward["user_id"],),
+                ).fetchone()
+                bmonth = None
+                if owner and owner["birthday"]:
+                    try:
+                        bmonth = int(owner["birthday"].split("-")[1])
+                    except (IndexError, ValueError):
+                        bmonth = None
+                if bmonth != datetime.now(timezone.utc).month:
+                    conn.close()
+                    return None, (jsonify(error="Birthday bag codes can only be used during your birthday month"), 400)
             # Loyalty reward code (single use, issued from Kernels redemption).
             order["discount_kind"] = "reward"
             order["reward_code"] = code
@@ -2439,6 +2479,12 @@ def _compute_order(data):
             else:
                 order["reward_discount_cents"] = REWARD_DISCOUNT_CENTS.get(
                     reward["reward_type"], 0)
+            # A reward covers product only — never shipping. Cap the
+            # discount at the merchandise total so the excess can't eat
+            # the shipping charge (user rule, Oct 20 2026: free-bag
+            # redemptions still pay shipping).
+            order["reward_discount_cents"] = min(
+                order["reward_discount_cents"], total)
             conn.close()
         else:
             row = conn.execute(
@@ -3427,6 +3473,13 @@ def _maybe_grant_birthday_reward(conn, user_id):
     ).fetchone()
     if exists:
         return None
+    # Retire any older unused birthday codes so exactly one live
+    # birthday code exists at a time.
+    conn.execute(
+        "UPDATE loyalty_rewards SET used = 1, used_at = ?"
+        " WHERE user_id = ? AND reward_type = 'birthday_bag' AND used = 0",
+        (datetime.now(timezone.utc).isoformat(), user_id),
+    )
     code = _new_reward_code()
     conn.execute(
         "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent, created_at)"
@@ -3571,6 +3624,16 @@ def loyalty_status():
         (user["id"],),
     ).fetchall()
     conn.close()
+    # The birthday bag code is only visible during the member's birthday
+    # month (user rule, Oct 20 2026) — hide it the rest of the year even
+    # if it was never spent.
+    _bday_month = None
+    if brow and brow["birthday"]:
+        try:
+            _bday_month = int(brow["birthday"].split("-")[1])
+        except (IndexError, ValueError):
+            _bday_month = None
+    _this_month = datetime.now(timezone.utc).month
     return jsonify(
         kernels=balance,
         lifetime_kernels=lifetime,
@@ -3584,6 +3647,7 @@ def loyalty_status():
              "label": REWARD_TIERS.get(r["reward_type"], {}).get("label", "Birthday reward"),
              "created_at": r["created_at"]}
             for r in rewards
+            if r["reward_type"] != "birthday_bag" or _bday_month == _this_month
         ],
     )
 
@@ -3870,6 +3934,10 @@ def staff_redeem_for_member():
     tier = REWARD_TIERS.get(reward_type)
     if user_id <= 0 or not tier:
         return jsonify(error="invalid input"), 400
+    if reward_type == "free_shipping":
+        # Free shipping only exists on online orders — it can never be
+        # redeemed or applied in person (user rule, Oct 20 2026).
+        return jsonify(error="Free shipping rewards are online only and can't be redeemed in person"), 400
     conn = db()
     mrow = conn.execute("SELECT active FROM users WHERE id = ?", (user_id,)).fetchone()
     if not mrow:
