@@ -8976,10 +8976,66 @@ def _erp_get_recipe(conn, recipe_id):
 def _erp_recipe_lines(conn, recipe_id, version):
     return conn.execute(
         "SELECT rl.*, i.sku, i.name AS item_name, i.type AS item_type,"
-        " i.unit AS item_unit FROM erp_recipe_lines rl"
+        " i.unit AS item_unit, i.avg_cost_cents FROM erp_recipe_lines rl"
         " JOIN erp_items i ON i.id = rl.item_id"
         " WHERE rl.recipe_id = ? AND rl.recipe_version = ? ORDER BY rl.id",
         (recipe_id, version)).fetchall()
+
+
+_ERP_WEIGHT_TO_G = {"g": 1.0, "gram": 1.0, "grams": 1.0,
+                    "oz": 28.349523125, "ounce": 28.349523125, "ounces": 28.349523125,
+                    "lb": 453.59237, "pound": 453.59237, "pounds": 453.59237,
+                    "kg": 1000.0, "kilo": 1000.0, "kilogram": 1000.0}
+_ERP_VOL_TO_ML = {"ml": 1.0, "milliliter": 1.0,
+                  "l": 1000.0, "liter": 1000.0, "litre": 1000.0,
+                  "teaspoon": 4.92892159375, "teaspoons": 4.92892159375, "tsp": 4.92892159375,
+                  "tablespoon": 14.78676478125, "tablespoons": 14.78676478125, "tbsp": 14.78676478125,
+                  "cup": 236.5882365, "cups": 236.5882365}
+
+
+def _erp_convert_qty(qty, from_unit, to_unit):
+    """Convert a quantity between units of the same dimension (weight or
+    volume). Returns the converted float, or None when the units are
+    incompatible (e.g. cups of an item stocked by the pound)."""
+    f = (from_unit or "").strip().lower()
+    t = (to_unit or "").strip().lower()
+    if f == t:
+        return float(qty)
+    if f in _ERP_WEIGHT_TO_G and t in _ERP_WEIGHT_TO_G:
+        return float(qty) * _ERP_WEIGHT_TO_G[f] / _ERP_WEIGHT_TO_G[t]
+    if f in _ERP_VOL_TO_ML and t in _ERP_VOL_TO_ML:
+        return float(qty) * _ERP_VOL_TO_ML[f] / _ERP_VOL_TO_ML[t]
+    return None
+
+
+def _erp_recipe_cost(lines, batch_size_bags):
+    """Cost a recipe from live average item costs.
+
+    line cost = (item avg cost per stocked unit) x (qty used, converted to
+    the stocked unit). Lines whose unit cannot convert to the stocked unit
+    get line_cost_cents = None.
+    Returns (lines_with_cost, batch_cost_cents, cost_per_bag_cents, unknown_count).
+    batch_cost_cents sums only the known lines.
+    """
+    out = []
+    unknown = 0
+    total = 0
+    for ln in lines:
+        ln = dict(ln)
+        qty_item_units = _erp_convert_qty(ln.get("qty_per_batch") or 0,
+                                          ln.get("unit"), ln.get("item_unit"))
+        avg = ln.get("avg_cost_cents") or 0
+        if qty_item_units is None:
+            ln["line_cost_cents"] = None
+            unknown += 1
+        else:
+            ln["line_cost_cents"] = int(round(avg * qty_item_units))
+            total += ln["line_cost_cents"]
+        out.append(ln)
+    per_bag = None
+    if batch_size_bags and batch_size_bags > 0:
+        per_bag = int(round(total / batch_size_bags))
+    return out, total, per_bag, unknown
 
 
 def _erp_get_batch(conn, batch_id):
@@ -9017,6 +9073,48 @@ def _erp_expiry_plus_months(date_str, months):
     return "%04d-%02d-%02d" % (y, m, d)
 
 
+def _erp_parse_qty(value):
+    """Parse a quantity that may be a number, a decimal string, a fraction
+    ("1/2", "3/4") or a mixed number ("1 1/2"). Returns a float, or None
+    when the value cannot be parsed."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        pass
+    # mixed number like "1 1/2"
+    parts = s.split()
+    whole = 0.0
+    frac_part = None
+    if len(parts) == 2:
+        try:
+            whole = float(parts[0])
+        except (TypeError, ValueError):
+            return None
+        frac_part = parts[1]
+    elif len(parts) == 1:
+        frac_part = parts[0]
+    else:
+        return None
+    if "/" not in (frac_part or ""):
+        return None
+    num_s, _, den_s = frac_part.partition("/")
+    try:
+        num = float(num_s.strip())
+        den = float(den_s.strip())
+    except (TypeError, ValueError):
+        return None
+    if den == 0:
+        return None
+    return whole + num / den
+
+
 def _erp_validate_recipe_lines(conn, lines):
     """Validate recipe lines. Returns (clean_lines, error)."""
     clean = []
@@ -9029,10 +9127,9 @@ def _erp_validate_recipe_lines(conn, lines):
         if item["id"] in seen:
             return None, "line %d: duplicate item '%s'" % (n, item["sku"])
         seen.add(item["id"])
-        try:
-            qty = float(ln.get("qty_per_batch") or 0)
-        except (TypeError, ValueError):
-            return None, "line %d: qty_per_batch must be a number" % n
+        qty = _erp_parse_qty(ln.get("qty_per_batch"))
+        if qty is None:
+            return None, "line %d: qty_per_batch must be a number or fraction (e.g. 1/2)" % n
         if qty <= 0:
             return None, "line %d: qty_per_batch must be greater than zero" % n
         unit = (ln.get("unit") or item["unit"] or "each").strip()
@@ -9139,8 +9236,13 @@ def erp_get_recipe(recipe_id):
         "SELECT DISTINCT recipe_version FROM erp_recipe_lines"
         " WHERE recipe_id = ? ORDER BY recipe_version", (recipe_id,)).fetchall()]
     conn.close()
+    cost_lines, batch_cost, per_bag, unknown = _erp_recipe_cost(
+        lines, recipe["batch_size_bags"])
     return jsonify(recipe=dict(recipe), version=version,
-                   lines=[dict(l) for l in lines], versions=versions)
+                   lines=cost_lines, versions=versions,
+                   batch_cost_cents=batch_cost,
+                   cost_per_bag_cents=per_bag,
+                   cost_unknown_lines=unknown)
 
 
 @app.put("/api/erp/recipes/<int:recipe_id>")
@@ -9231,11 +9333,10 @@ def erp_import_recipes():
         if not item or not item["active"]:
             conn.close()
             return jsonify(error="row %d: unknown sku '%s'" % (n, row.get("sku"))), 400
-        try:
-            qty = float(row.get("qty_per_batch") or 0)
-        except (TypeError, ValueError):
+        qty = _erp_parse_qty(row.get("qty_per_batch"))
+        if qty is None:
             conn.close()
-            return jsonify(error="row %d: qty_per_batch must be a number" % n), 400
+            return jsonify(error="row %d: qty_per_batch must be a number or fraction (e.g. 1/2)" % n), 400
         if qty <= 0:
             conn.close()
             return jsonify(error="row %d: qty_per_batch must be > 0" % n), 400
