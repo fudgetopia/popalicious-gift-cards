@@ -2269,7 +2269,8 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           back.addEventListener("click", function () {
             erpState.selectedItemId = null;
             erpState.selectedItem = null;
-            renderErpInventoryDetail();
+            erpState.editingItem = false;
+            loadErpInventoryDetail();
           });
           body.appendChild(back);
           if (erpIsAdmin()) {
