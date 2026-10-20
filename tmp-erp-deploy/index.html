@@ -1352,6 +1352,49 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           var s = n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
           return s === "" ? "0" : s;
         }
+        // Parse "2", "0.5", "1/2", "1 1/2" -> number, or NaN.
+        function erpParseQty(str) {
+          if (str === null || str === undefined) return NaN;
+          if (typeof str === "number") return str;
+          var s = String(str).trim();
+          if (!s) return NaN;
+          var plain = Number(s);
+          if (isFinite(plain)) return plain;
+          var parts = s.split(/\s+/);
+          var whole = 0, frac = null;
+          if (parts.length === 2) {
+            whole = Number(parts[0]);
+            if (!isFinite(whole)) return NaN;
+            frac = parts[1];
+          } else if (parts.length === 1) {
+            frac = parts[0];
+          } else return NaN;
+          var bits = String(frac).split("/");
+          if (bits.length !== 2) return NaN;
+          var num = Number(bits[0]), den = Number(bits[1]);
+          if (!isFinite(num) || !isFinite(den) || den === 0) return NaN;
+          return whole + num / den;
+        }
+        // Display a quantity as a fraction when it is a clean one (1/2, 1 1/4...).
+        function erpQtyFrac(q) {
+          var n = Number(q);
+          if (!isFinite(n)) return "0";
+          var dens = [2, 3, 4, 6, 8];
+          for (var i = 0; i < dens.length; i++) {
+            var d = dens[i];
+            var scaled = n * d;
+            if (Math.abs(scaled - Math.round(scaled)) < 1e-6) {
+              var total = Math.round(scaled);
+              var whole = Math.trunc(total / d);
+              var rem = Math.abs(total % d);
+              if (rem === 0) return String(whole);
+              if (whole === 0) return rem + "/" + d;
+              return whole + " " + rem + "/" + d;
+            }
+          }
+          return erpQty(n);
+        }
+        var ERP_RECIPE_UNITS = ["cup", "tablespoon", "teaspoon", "oz", "lb", "g", "each", "bag"];
         function erpMoney(cents) { return money((Number(cents) || 0) / 100); }
         function erpTypeLabel(t) {
           var labels = {ingredient: "Ingredient", bag: "Bag", front_label: "Front label", back_label: "Back label"};
@@ -3363,8 +3406,8 @@ function renderErpProductionDetail() {
     var wul = document.createElement("ul");
     erpState.lastShortfalls.forEach(function (s) {
       var li = document.createElement("li");
-      li.textContent = s.sku + " (" + s.item_name + "): need " + erpQty(s.required) +
-        " " + (s.unit || "") + ", have " + erpQty(s.on_hand);
+      li.textContent = s.sku + " (" + s.item_name + "): need " + erpQtyFrac(s.required) +
+        " " + (s.unit || "") + ", have " + erpQtyFrac(s.on_hand);
       wul.appendChild(li);
     });
     warn.appendChild(wul);
@@ -3715,7 +3758,7 @@ function renderErpBatchDetail(body) {
         var tr = document.createElement("tr");
         tr.appendChild(erpCell("SKU", l.sku));
         tr.appendChild(erpCell("Item", l.item_name));
-        tr.appendChild(erpCell("Per batch", erpQty(l.qty_per_batch) + " " + (l.unit || "")));
+        tr.appendChild(erpCell("Per batch", erpQtyFrac(l.qty_per_batch) + " " + (l.unit || "")));
         tr.appendChild(erpCell("For this batch", erpQty(l.qty_for_batch) + " " + (l.unit || "")));
         tr.appendChild(erpCell("On hand", erpQty(l.on_hand) + " " + (l.unit || "")));
         tbody.appendChild(tr);
@@ -3890,7 +3933,7 @@ function renderErpRecipeDetail(body) {
     table.className = "admin-orders-table";
     var thead = document.createElement("thead");
     var hr = document.createElement("tr");
-    ["SKU", "Item", "Qty per batch", "Unit"].forEach(function (c) {
+    ["SKU", "Item", "Qty per batch", "Unit", "Line cost"].forEach(function (c) {
       var th = document.createElement("th");
       th.textContent = c;
       hr.appendChild(th);
@@ -3902,13 +3945,32 @@ function renderErpRecipeDetail(body) {
       var tr = document.createElement("tr");
       tr.appendChild(erpCell("SKU", l.sku));
       tr.appendChild(erpCell("Item", l.item_name));
-      tr.appendChild(erpCell("Qty per batch", erpQty(l.qty_per_batch)));
+      tr.appendChild(erpCell("Qty per batch", erpQtyFrac(l.qty_per_batch)));
       tr.appendChild(erpCell("Unit", l.unit));
+      tr.appendChild(erpCell("Line cost",
+        l.line_cost_cents === null || l.line_cost_cents === undefined
+          ? "—" : erpMoney(l.line_cost_cents)));
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
     wrap.appendChild(table);
     body.appendChild(wrap);
+
+    var costBox = document.createElement("p");
+    costBox.style.marginTop = "10px";
+    var costText = "Batch cost: " + erpMoney(res.batch_cost_cents || 0) +
+      " · Cost per bag: " + erpMoney(res.cost_per_bag_cents || 0);
+    if (res.cost_unknown_lines > 0) {
+      costText += " (" + res.cost_unknown_lines + " line" +
+        (res.cost_unknown_lines === 1 ? "" : "s") +
+        " not costed — the recipe unit can't convert to the item's stocked unit)";
+    }
+    costBox.textContent = costText;
+    body.appendChild(costBox);
+    var costNote = document.createElement("p");
+    costNote.style.color = "var(--muted)";
+    costNote.textContent = "Costs use each item's current average cost from purchasing/receiving.";
+    body.appendChild(costNote);
     setAdminDetailStatus(r.name + " v" + res.version + " — " + (res.lines || []).length + " lines.");
   }).catch(function (error) {
     setAdminDetailStatus(error.message, true);
@@ -3967,18 +4029,37 @@ function erpNewRecipeForm(existing) {
     itemOptions(itemId).forEach(function (o) { sel.appendChild(o); });
     row.appendChild(sel);
     var q = document.createElement("input");
-    q.type = "number";
-    q.min = "0.0001";
-    q.step = "any";
+    q.type = "text";
+    q.inputMode = "decimal";
     q.required = true;
-    q.placeholder = "Qty";
+    q.placeholder = "Qty (e.g. 1/2)";
     q.style.width = "90px";
-    if (qty !== undefined) q.value = qty;
+    if (qty !== undefined) q.value = erpQtyFrac(qty);
     row.appendChild(q);
-    var u = document.createElement("input");
-    u.placeholder = "Unit";
-    u.style.width = "70px";
-    if (unit) u.value = unit;
+    var u = document.createElement("select");
+    u.style.width = "110px";
+    function unitOptions(selectedUnit) {
+      u.innerHTML = "";
+      var labels = {cup: "cups", tablespoon: "tablespoons", teaspoon: "teaspoons",
+                    oz: "oz", lb: "lb", g: "g", each: "each", bag: "bags"};
+      var list = ERP_RECIPE_UNITS.slice();
+      if (selectedUnit && list.indexOf(selectedUnit) === -1) {
+        list.push(selectedUnit);
+      }
+      list.forEach(function (un) {
+        var o = document.createElement("option");
+        o.value = un;
+        o.textContent = labels[un] || un;
+        if (String(un) === String(selectedUnit)) o.selected = true;
+        u.appendChild(o);
+      });
+    }
+    var selItem = erpState.items.filter(function (i) { return String(i.id) === String(sel.value); })[0];
+    unitOptions(unit || (selItem && selItem.unit) || "cup");
+    sel.addEventListener("change", function () {
+      var it = erpState.items.filter(function (i) { return String(i.id) === String(sel.value); })[0];
+      if (it && it.unit && ERP_RECIPE_UNITS.indexOf(it.unit) !== -1) unitOptions(it.unit);
+    });
     row.appendChild(u);
     var rm = document.createElement("button");
     rm.type = "button";
@@ -4020,15 +4101,16 @@ function erpNewRecipeForm(existing) {
     }
     var lines = [];
     for (var i = 0; i < rows.length; i++) {
-      var sel = rows[i].querySelector("select");
-      var inputs = rows[i].querySelectorAll("input");
-      var qv = Number(inputs[0].value);
+      var selects = rows[i].querySelectorAll("select");
+      var qtyInput = rows[i].querySelector("input");
+      var qv = erpParseQty(qtyInput.value);
       if (!isFinite(qv) || qv <= 0) {
-        status.textContent = "Every line needs a quantity greater than zero.";
+        status.textContent = "Every line needs a quantity greater than zero — whole numbers, " +
+          "decimals, or fractions like 1/2 or 1 1/2 all work.";
         return;
       }
-      lines.push({item_id: Number(sel.value), qty_per_batch: qv,
-                  unit: inputs[1].value.trim()});
+      lines.push({item_id: Number(selects[0].value), qty_per_batch: qv,
+                  unit: selects[1].value});
     }
     var size = Number(sizeInput.value);
     if (!isFinite(size) || size <= 0) {
@@ -4070,7 +4152,8 @@ function erpImportRecipesForm() {
   form.className = "erp-form";
   var help = document.createElement("p");
   help.textContent = "CSV columns: recipe_name, batch_size_bags, sku, qty_per_batch, unit, notes. " +
-    "One row per ingredient; rows with the same recipe_name become one recipe.";
+    "One row per ingredient; rows with the same recipe_name become one recipe. " +
+    "Quantities can be fractions, like 1/2 or 1 1/2.";
   form.appendChild(help);
   var area = document.createElement("textarea");
   area.rows = 8;
