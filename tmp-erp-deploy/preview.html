@@ -3968,12 +3968,45 @@ function renderErpRecipeDetail(body) {
       toolbar.className = "erp-toolbar";
       var nvBtn = document.createElement("button");
       nvBtn.type = "button";
-      nvBtn.textContent = erpState.showNewRecipeVersion ? "Cancel" : "New version";
+      nvBtn.textContent = erpState.showNewRecipeVersion ? "Cancel edit" : "Edit recipe";
       nvBtn.addEventListener("click", function () {
         erpState.showNewRecipeVersion = !erpState.showNewRecipeVersion;
         renderErpRecipeDetail(body);
       });
       toolbar.appendChild(nvBtn);
+      var delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.textContent = "Delete recipe";
+      delBtn.style.marginLeft = "8px";
+      var delArmed = false, delTimer = null;
+      delBtn.addEventListener("click", function () {
+        if (!delArmed) {
+          delArmed = true;
+          delBtn.textContent = "Tap again to confirm delete";
+          delBtn.classList.add("erp-danger-armed");
+          delTimer = setTimeout(function () {
+            delArmed = false;
+            delBtn.textContent = "Delete recipe";
+            delBtn.classList.remove("erp-danger-armed");
+          }, 3000);
+          return;
+        }
+        clearTimeout(delTimer);
+        delBtn.disabled = true;
+        erpDelete("/api/erp/recipes/" + encodeURIComponent(String(r.id))).then(function () {
+          erpState.selectedRecipeId = null;
+          erpState.selectedRecipeVersion = null;
+          erpState.showNewRecipeVersion = false;
+          renderErpProductionDetail();
+        }).catch(function (error) {
+          setAdminDetailStatus(error.message, true);
+          delBtn.disabled = false;
+          delArmed = false;
+          delBtn.textContent = "Delete recipe";
+          delBtn.classList.remove("erp-danger-armed");
+        });
+      });
+      toolbar.appendChild(delBtn);
       body.appendChild(toolbar);
       if (erpState.showNewRecipeVersion) {
         body.appendChild(erpNewRecipeForm(r));
@@ -4047,8 +4080,8 @@ function erpNewRecipeForm(existing) {
     form.appendChild(erpField("Recipe name", nameInput));
   } else {
     var nh = document.createElement("p");
-    nh.innerHTML = "<strong>New version of " + existing.name + "</strong> — old batches keep v" +
-      existing.version + ".";
+    nh.innerHTML = "<strong>Editing " + existing.name + "</strong> — saving creates a new " +
+      "version; batches already made keep v" + existing.version + ".";
     form.appendChild(nh);
   }
   sizeInput = erpTextInput("batch_size_bags", "e.g. 50", true);
@@ -4144,7 +4177,7 @@ function erpNewRecipeForm(existing) {
 
   var submit = document.createElement("button");
   submit.type = "submit";
-  submit.textContent = isVersion ? "Save as new version" : "Create recipe";
+  submit.textContent = isVersion ? "Save changes" : "Create recipe";
   form.appendChild(submit);
   form.appendChild(status);
 
