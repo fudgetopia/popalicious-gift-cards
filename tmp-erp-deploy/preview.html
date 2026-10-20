@@ -1599,11 +1599,19 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           var unitL = document.createElement("label");
           unitL.textContent = "Package size unit ";
           var unit = document.createElement("select");
-          ERP_RECIPE_UNITS.forEach(function (u) {
+          var pkgUnitLabels = {cup: "cups", tablespoon: "tablespoons",
+            teaspoon: "teaspoons", oz: "oz", lb: "lb", g: "g", each: "each", bag: "bags"};
+          var curPkgUnit = (existing.pkg_unit && existing.pkg_unit !== "undefined")
+            ? existing.pkg_unit : "lb";
+          var pkgUnitList = ERP_RECIPE_UNITS.slice();
+          if (pkgUnitList.indexOf(curPkgUnit) === -1) {
+            pkgUnitList.push(curPkgUnit);
+          }
+          pkgUnitList.forEach(function (u) {
             var o = document.createElement("option");
-            o.value = u.value;
-            o.textContent = u.label;
-            if ((existing.pkg_unit || "lb") === u.value) o.selected = true;
+            o.value = u;
+            o.textContent = pkgUnitLabels[u] || u;
+            if (curPkgUnit === u) o.selected = true;
             unit.appendChild(o);
           });
           unitL.appendChild(unit);
