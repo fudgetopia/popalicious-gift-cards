@@ -9409,6 +9409,25 @@ def erp_update_recipe(recipe_id):
     return jsonify(recipe=dict(row), lines=[dict(l) for l in lines])
 
 
+@app.delete("/api/erp/recipes/<int:recipe_id>")
+def erp_delete_recipe(recipe_id):
+    """Delete a recipe (admin). Soft delete: it leaves the recipes list and
+    can no longer be used for new batches, but batches already made keep
+    their recipe lines and history."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    conn.execute("UPDATE erp_recipes SET active = 0 WHERE id = ?", (recipe_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(deleted=True)
+
+
 @app.post("/api/erp/recipes/import")
 def erp_import_recipes():
     """CSV import of recipes. Columns: recipe_name, batch_size_bags, sku,
