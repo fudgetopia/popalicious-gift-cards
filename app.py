@@ -1,5 +1,7 @@
 """
 Pop-A-Licious Gift Card backend.
+Build: 2026-10-20 (recipe delete endpoint; no location re-seeding;
+automatic cup weights for recipe costing).
 
 Endpoints:
   POST /api/gift-cards/checkout   Create a Stripe Checkout Session for a gift card
