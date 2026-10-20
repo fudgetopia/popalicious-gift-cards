@@ -573,6 +573,8 @@ def init_db():
             unit TEXT NOT NULL DEFAULT 'each',
             track_lots INTEGER NOT NULL DEFAULT 0,
             avg_cost_cents INTEGER NOT NULL DEFAULT 0,
+            cost_cents INTEGER,
+            oz_per_cup REAL,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         );
@@ -895,6 +897,14 @@ def init_db():
          ('PFUL', 'Printful (virtual)', 'virtual', 1);
         """
     )
+    # Item cost fields (manual cost per unit + cup weight for recipe costing);
+    # guarded for databases created before these columns existed.
+    icols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_items)").fetchall()]
+    if "cost_cents" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN cost_cents INTEGER")
+    if "oz_per_cup" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN oz_per_cup REAL")
+    conn.commit()
     # Location-specific inventory: backfill item<->location assignments.
     # Items go where they have ledger history; items with no history anywhere
     # stay visible at every active location so nothing vanishes.
@@ -7911,6 +7921,42 @@ def erp_list_items():
     return jsonify(items=[dict(r) for r in rows])
 
 
+def _erp_item_cost_fields(data, partial=False):
+    """Parse the manual cost fields on an item payload.
+
+    Returns (fields, error) where fields maps column -> value for the keys
+    present (or all keys when partial=False). cost_cents is the admin-entered
+    cost per 1 item unit; oz_per_cup is the weight of one cup of the item,
+    used to cost recipe lines measured in cups/spoons. None clears a field.
+    """
+    fields = {}
+    if not partial or "cost_cents" in data:
+        raw = data.get("cost_cents")
+        if raw is None or raw == "":
+            fields["cost_cents"] = None
+        else:
+            try:
+                c = int(raw)
+            except (TypeError, ValueError):
+                return None, "cost must be a whole number of cents"
+            if c < 0:
+                return None, "cost must be zero or more"
+            fields["cost_cents"] = c
+    if not partial or "oz_per_cup" in data:
+        raw = data.get("oz_per_cup")
+        if raw is None or raw == "":
+            fields["oz_per_cup"] = None
+        else:
+            try:
+                o = float(raw)
+            except (TypeError, ValueError):
+                return None, "cup weight must be a number of ounces"
+            if o <= 0:
+                return None, "cup weight must be greater than zero"
+            fields["oz_per_cup"] = o
+    return fields, None
+
+
 @app.post("/api/erp/items")
 def erp_create_item():
     actor, err = _require_erp_admin()
@@ -7928,14 +7974,18 @@ def erp_create_item():
         return jsonify(error="type must be one of: " + ", ".join(ERP_ITEM_TYPES)), 400
     if unit not in ERP_ITEM_UNITS:
         return jsonify(error="unit must be one of: " + ", ".join(ERP_ITEM_UNITS)), 400
+    cost_fields, cferr = _erp_item_cost_fields(data)
+    if cferr:
+        return jsonify(error=cferr), 400
     conn = db()
     if conn.execute("SELECT 1 FROM erp_items WHERE sku = ?", (sku,)).fetchone():
         conn.close()
         return jsonify(error="sku already exists"), 400
     cur = conn.execute(
         "INSERT INTO erp_items (sku, name, type, unit, track_lots, avg_cost_cents,"
-        " active, created_at) VALUES (?, ?, ?, ?, ?, 0, 1, ?)",
-        (sku, name, itype, unit, track_lots, datetime.now(timezone.utc).isoformat()),
+        " cost_cents, oz_per_cup, active, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, ?)",
+        (sku, name, itype, unit, track_lots, cost_fields["cost_cents"],
+         cost_fields["oz_per_cup"], datetime.now(timezone.utc).isoformat()),
     )
     item_id = cur.lastrowid
     # Location-specific inventory: register the item at the given locations
@@ -8011,10 +8061,17 @@ def erp_update_item(item_id):
                     (sku, item_id)).fetchone():
         conn.close()
         return jsonify(error="sku already exists"), 400
+    cost_fields, cferr = _erp_item_cost_fields(data, partial=True)
+    if cferr:
+        conn.close()
+        return jsonify(error=cferr), 400
     conn.execute(
         "UPDATE erp_items SET sku = ?, name = ?, type = ?, unit = ?,"
         " track_lots = ? WHERE id = ?",
         (sku, name, itype, unit, 1 if data.get("track_lots") else 0, item_id))
+    for col, val in cost_fields.items():
+        conn.execute("UPDATE erp_items SET %s = ? WHERE id = ?" % col,
+                     (val, item_id))
     conn.commit()
     row = conn.execute("SELECT * FROM erp_items WHERE id = ?", (item_id,)).fetchone()
     conn.close()
@@ -8103,6 +8160,7 @@ def erp_stock():
             rows.append({
                 "item_id": it["id"], "sku": it["sku"], "name": it["name"],
                 "type": it["type"], "unit": it["unit"], "avg_cost_cents": avg,
+                "cost_cents": it["cost_cents"],
                 "location_id": loc["id"], "location_code": loc["code"],
                 "location_name": loc["name"], "on_hand": q,
                 "value_cents": int(round(q * avg)),
@@ -8976,7 +9034,8 @@ def _erp_get_recipe(conn, recipe_id):
 def _erp_recipe_lines(conn, recipe_id, version):
     return conn.execute(
         "SELECT rl.*, i.sku, i.name AS item_name, i.type AS item_type,"
-        " i.unit AS item_unit, i.avg_cost_cents FROM erp_recipe_lines rl"
+        " i.unit AS item_unit, i.avg_cost_cents, i.cost_cents, i.oz_per_cup"
+        " FROM erp_recipe_lines rl"
         " JOIN erp_items i ON i.id = rl.item_id"
         " WHERE rl.recipe_id = ? AND rl.recipe_version = ? ORDER BY rl.id",
         (recipe_id, version)).fetchall()
@@ -8993,10 +9052,11 @@ _ERP_VOL_TO_ML = {"ml": 1.0, "milliliter": 1.0,
                   "cup": 236.5882365, "cups": 236.5882365}
 
 
-def _erp_convert_qty(qty, from_unit, to_unit):
+def _erp_convert_qty(qty, from_unit, to_unit, oz_per_cup=None):
     """Convert a quantity between units of the same dimension (weight or
-    volume). Returns the converted float, or None when the units are
-    incompatible (e.g. cups of an item stocked by the pound)."""
+    volume). Volume <-> weight works when oz_per_cup is given (the weight
+    of one cup of the item). Returns the converted float, or None when the
+    units cannot be converted."""
     f = (from_unit or "").strip().lower()
     t = (to_unit or "").strip().lower()
     if f == t:
@@ -9005,15 +9065,31 @@ def _erp_convert_qty(qty, from_unit, to_unit):
         return float(qty) * _ERP_WEIGHT_TO_G[f] / _ERP_WEIGHT_TO_G[t]
     if f in _ERP_VOL_TO_ML and t in _ERP_VOL_TO_ML:
         return float(qty) * _ERP_VOL_TO_ML[f] / _ERP_VOL_TO_ML[t]
+    if oz_per_cup:
+        oz_g = _ERP_WEIGHT_TO_G["oz"]
+        cup_ml = _ERP_VOL_TO_ML["cup"]
+        try:
+            op = float(oz_per_cup)
+        except (TypeError, ValueError):
+            op = 0
+        if op > 0:
+            if f in _ERP_VOL_TO_ML and t in _ERP_WEIGHT_TO_G:
+                cups = float(qty) * _ERP_VOL_TO_ML[f] / cup_ml
+                return cups * op * oz_g / _ERP_WEIGHT_TO_G[t]
+            if f in _ERP_WEIGHT_TO_G and t in _ERP_VOL_TO_ML:
+                cups = float(qty) * _ERP_WEIGHT_TO_G[f] / oz_g / op
+                return cups * cup_ml / _ERP_VOL_TO_ML[t]
     return None
 
 
 def _erp_recipe_cost(lines, batch_size_bags):
-    """Cost a recipe from live average item costs.
+    """Cost a recipe.
 
-    line cost = (item avg cost per stocked unit) x (qty used, converted to
-    the stocked unit). Lines whose unit cannot convert to the stocked unit
-    get line_cost_cents = None.
+    Unit price = the item's entered cost (cost_cents) when set, otherwise
+    its live average cost from purchasing/receiving. Line cost = unit price
+    x (qty used, converted to the stocked unit — cups/spoons included when
+    the item has a cup weight). Lines that cannot be converted get
+    line_cost_cents = None.
     Returns (lines_with_cost, batch_cost_cents, cost_per_bag_cents, unknown_count).
     batch_cost_cents sums only the known lines.
     """
@@ -9023,13 +9099,19 @@ def _erp_recipe_cost(lines, batch_size_bags):
     for ln in lines:
         ln = dict(ln)
         qty_item_units = _erp_convert_qty(ln.get("qty_per_batch") or 0,
-                                          ln.get("unit"), ln.get("item_unit"))
-        avg = ln.get("avg_cost_cents") or 0
+                                          ln.get("unit"), ln.get("item_unit"),
+                                          ln.get("oz_per_cup"))
+        if ln.get("cost_cents") is not None:
+            unit_price = ln["cost_cents"]
+            ln["cost_source"] = "entered"
+        else:
+            unit_price = ln.get("avg_cost_cents") or 0
+            ln["cost_source"] = "average"
         if qty_item_units is None:
             ln["line_cost_cents"] = None
             unknown += 1
         else:
-            ln["line_cost_cents"] = int(round(avg * qty_item_units))
+            ln["line_cost_cents"] = int(round(unit_price * qty_item_units))
             total += ln["line_cost_cents"]
         out.append(ln)
     per_bag = None
