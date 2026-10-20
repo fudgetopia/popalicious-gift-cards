@@ -891,10 +891,6 @@ def init_db():
             done_at TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_erp_prod_lines ON erp_order_production_lines (order_id);
-        INSERT OR IGNORE INTO erp_locations (code, name, type, active) VALUES
-         ('HEND', 'Henderson Warehouse', 'warehouse', 1),
-         ('EVT', 'Events / Mobile', 'mobile', 1),
-         ('PFUL', 'Printful (virtual)', 'virtual', 1);
         """
     )
     # Item cost fields (manual cost per unit + cup weight for recipe costing);
@@ -9051,6 +9047,38 @@ _ERP_VOL_TO_ML = {"ml": 1.0, "milliliter": 1.0,
                   "tablespoon": 14.78676478125, "tablespoons": 14.78676478125, "tbsp": 14.78676478125,
                   "cup": 236.5882365, "cups": 236.5882365}
 
+# Standard kitchen cup weights (oz per cup) for common ingredients, matched
+# by keyword against the item name/SKU. Lets the system cost recipe lines
+# measured in cups/spoons for items stocked by weight, automatically.
+_ERP_CUP_WEIGHT_KEYWORDS = (
+    ("kernel", 7.1), ("popcorn", 7.1), ("seed", 7.1),
+    ("brown sugar", 7.75), ("powdered sugar", 4.0), ("confectioners", 4.0),
+    ("sugar", 7.1),
+    ("oil", 7.6), ("butter", 8.0),
+    ("flour", 4.5), ("cornmeal", 4.9), ("cocoa", 3.5),
+    ("salt", 10.2), ("honey", 12.0), ("syrup", 11.5),
+    ("cheddar", 4.4), ("cheese", 4.4),
+)
+_ERP_CUP_WEIGHT_DEFAULT_OZ = 5.0  # generic dry powder / seasoning
+
+
+def _erp_cup_weight_oz(item):
+    """Ounces in one cup of an item, plus where the value came from:
+    ("entered") the item's own cup weight when set, otherwise a standard
+    kitchen value matched by ingredient keyword ("standard")."""
+    own = item.get("oz_per_cup")
+    if own:
+        try:
+            return float(own), "entered"
+        except (TypeError, ValueError):
+            pass
+    text = ((item.get("item_name") or item.get("name") or "") + " " +
+            (item.get("sku") or "")).lower()
+    for kw, oz in _ERP_CUP_WEIGHT_KEYWORDS:
+        if kw in text:
+            return oz, "standard"
+    return _ERP_CUP_WEIGHT_DEFAULT_OZ, "standard"
+
 
 def _erp_convert_qty(qty, from_unit, to_unit, oz_per_cup=None):
     """Convert a quantity between units of the same dimension (weight or
@@ -9098,9 +9126,12 @@ def _erp_recipe_cost(lines, batch_size_bags):
     total = 0
     for ln in lines:
         ln = dict(ln)
+        cup_oz, cup_src = _erp_cup_weight_oz(ln)
         qty_item_units = _erp_convert_qty(ln.get("qty_per_batch") or 0,
                                           ln.get("unit"), ln.get("item_unit"),
-                                          ln.get("oz_per_cup"))
+                                          cup_oz)
+        ln["cup_weight_oz"] = cup_oz
+        ln["cup_weight_source"] = cup_src
         if ln.get("cost_cents") is not None:
             unit_price = ln["cost_cents"]
             ln["cost_source"] = "entered"
