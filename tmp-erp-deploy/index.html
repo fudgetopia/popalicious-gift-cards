@@ -1637,6 +1637,24 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           openQtyInput.value = "0";
           openQtyLabel.appendChild(openQtyInput);
           form.appendChild(openQtyLabel);
+          var costLabel3 = document.createElement("label");
+          costLabel3.textContent = "Cost per unit ($) — for recipe costs ";
+          var costInput3 = document.createElement("input");
+          costInput3.type = "number";
+          costInput3.min = "0";
+          costInput3.step = "0.01";
+          costInput3.placeholder = "optional";
+          costLabel3.appendChild(costInput3);
+          form.appendChild(costLabel3);
+          var cupLabel3 = document.createElement("label");
+          cupLabel3.textContent = "1 cup weighs (oz) — for recipes in cups/spoons ";
+          var cupInput3 = document.createElement("input");
+          cupInput3.type = "number";
+          cupInput3.min = "0";
+          cupInput3.step = "any";
+          cupInput3.placeholder = "optional";
+          cupLabel3.appendChild(cupInput3);
+          form.appendChild(cupLabel3);
           var submit = document.createElement("button");
           submit.type = "submit";
           submit.textContent = "Save item";
@@ -1673,7 +1691,10 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
               type: typeSel.value,
               unit: unitSel.value,
               track_lots: lotCheck.checked,
-              location_ids: locationIds
+              location_ids: locationIds,
+              cost_cents: costInput3.value.trim() === "" ? null :
+                Math.round(Number(costInput3.value) * 100),
+              oz_per_cup: cupInput3.value.trim() === "" ? null : Number(cupInput3.value)
             }).then(function (res) {
               newItemId = res.item.id;
               if (!qty || !locationIds.length) return null;
@@ -2250,7 +2271,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           }
           var table = document.createElement("table");
           table.className = "admin-orders-table";
-          table.innerHTML = "<thead><tr><th>Item</th><th>Type</th><th>Location</th><th>On hand</th><th>Avg cost</th><th>Value</th></tr></thead>";
+          table.innerHTML = "<thead><tr><th>Item</th><th>Type</th><th>Location</th><th>On hand</th><th>Unit cost</th><th>Value</th></tr></thead>";
           var body = document.createElement("tbody");
           rows.forEach(function (r) {
             var tr = document.createElement("tr");
@@ -2267,7 +2288,9 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             tr.appendChild(erpCell("Location", r.location_code));
             var onHand = erpCell("On hand", erpQty(r.on_hand) + " " + (r.unit || ""));
             tr.appendChild(onHand);
-            tr.appendChild(erpCell("Avg cost", erpMoney(r.avg_cost_cents)));
+            var effCost = (r.cost_cents !== null && r.cost_cents !== undefined)
+              ? r.cost_cents : r.avg_cost_cents;
+            tr.appendChild(erpCell("Unit cost", erpMoney(effCost)));
             tr.appendChild(erpCell("Value", erpMoney(r.value_cents)));
             tr.setAttribute("tabindex", "0");
             tr.setAttribute("title", "View item details");
@@ -2365,7 +2388,10 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           var meta = document.createElement("p");
           meta.className = "admin-orders-empty";
           meta.textContent = erpTypeLabel(item.type) + " · per " + (item.unit || "each") +
-            " · avg cost " + erpMoney(item.avg_cost_cents) +
+            (item.cost_cents !== null && item.cost_cents !== undefined
+              ? " · cost " + erpMoney(item.cost_cents) + " (entered)"
+              : " · avg cost " + erpMoney(item.avg_cost_cents)) +
+            (item.oz_per_cup ? " · 1 cup = " + erpQty(item.oz_per_cup) + " oz" : "") +
             " · total on hand " + erpQty(item.on_hand_total) + " " + (item.unit || "");
           head.appendChild(meta);
           body.appendChild(head);
@@ -2414,6 +2440,30 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             });
             eUnitL.appendChild(eUnit);
             eform.appendChild(eUnitL);
+            var eCostL = document.createElement("label");
+            eCostL.textContent = "Cost per " + (item.unit || "unit") + " ($) — used for recipe costs ";
+            var eCost = document.createElement("input");
+            eCost.type = "number";
+            eCost.min = "0";
+            eCost.step = "0.01";
+            eCost.placeholder = "e.g. 1.60 — blank uses average purchase cost";
+            if (item.cost_cents !== null && item.cost_cents !== undefined) {
+              eCost.value = (Number(item.cost_cents) / 100).toFixed(2);
+            }
+            eCostL.appendChild(eCost);
+            eform.appendChild(eCostL);
+            var eCupL = document.createElement("label");
+            eCupL.textContent = "1 cup weighs (oz) — so recipes in cups/spoons can be costed ";
+            var eCup = document.createElement("input");
+            eCup.type = "number";
+            eCup.min = "0";
+            eCup.step = "any";
+            eCup.placeholder = "optional, e.g. 5";
+            if (item.oz_per_cup !== null && item.oz_per_cup !== undefined) {
+              eCup.value = item.oz_per_cup;
+            }
+            eCupL.appendChild(eCup);
+            eform.appendChild(eCupL);
             var eLotL = document.createElement("label");
             var eLot = document.createElement("input");
             eLot.type = "checkbox";
@@ -2447,7 +2497,10 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
                 name: eName.value.trim(),
                 type: eType.value,
                 unit: eUnit.value,
-                track_lots: eLot.checked
+                track_lots: eLot.checked,
+                cost_cents: eCost.value.trim() === "" ? null :
+                  Math.round(Number(eCost.value) * 100),
+                oz_per_cup: eCup.value.trim() === "" ? null : Number(eCup.value)
               }).then(function () {
                 erpState.editingItem = false;
                 return erpGet("/api/erp/items/" + encodeURIComponent(String(item.id)));
@@ -3963,13 +4016,14 @@ function renderErpRecipeDetail(body) {
     if (res.cost_unknown_lines > 0) {
       costText += " (" + res.cost_unknown_lines + " line" +
         (res.cost_unknown_lines === 1 ? "" : "s") +
-        " not costed — the recipe unit can't convert to the item's stocked unit)";
+        " not costed — set the item's cost and, for cup/spoon amounts, its '1 cup weighs' in Inventory)";
     }
     costBox.textContent = costText;
     body.appendChild(costBox);
     var costNote = document.createElement("p");
     costNote.style.color = "var(--muted)";
-    costNote.textContent = "Costs use each item's current average cost from purchasing/receiving.";
+    costNote.textContent = "Costs use the cost you entered on the item in Inventory — " +
+      "or its average purchase cost when no cost is entered.";
     body.appendChild(costNote);
     setAdminDetailStatus(r.name + " v" + res.version + " — " + (res.lines || []).length + " lines.");
   }).catch(function (error) {
