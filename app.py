@@ -578,6 +578,9 @@ def init_db():
             avg_cost_cents INTEGER NOT NULL DEFAULT 0,
             cost_cents INTEGER,
             oz_per_cup REAL,
+            pkg_price_cents INTEGER,
+            pkg_size REAL,
+            pkg_unit TEXT,
             active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL
         );
@@ -903,6 +906,14 @@ def init_db():
         conn.execute("ALTER TABLE erp_items ADD COLUMN cost_cents INTEGER")
     if "oz_per_cup" not in icols:
         conn.execute("ALTER TABLE erp_items ADD COLUMN oz_per_cup REAL")
+    # Package pricing (Budget Bytes method): what the whole package cost
+    # and how much it contains; recipe costing divides price by size.
+    if "pkg_price_cents" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN pkg_price_cents INTEGER")
+    if "pkg_size" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN pkg_size REAL")
+    if "pkg_unit" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN pkg_unit TEXT")
     conn.commit()
     # Location-specific inventory: backfill item<->location assignments.
     # Items go where they have ledger history; items with no history anywhere
@@ -8020,6 +8031,37 @@ def _erp_item_cost_fields(data, partial=False):
             if o <= 0:
                 return None, "cup weight must be greater than zero"
             fields["oz_per_cup"] = o
+    # Package pricing (Budget Bytes method): the price paid for the whole
+    # package and the amount it contains. Recipe costing = price / size.
+    if not partial or "pkg_price_cents" in data:
+        raw = data.get("pkg_price_cents")
+        if raw is None or raw == "":
+            fields["pkg_price_cents"] = None
+        else:
+            try:
+                c = int(raw)
+            except (TypeError, ValueError):
+                return None, "package price must be a whole number of cents"
+            if c < 0:
+                return None, "package price must be zero or more"
+            fields["pkg_price_cents"] = c
+    if not partial or "pkg_size" in data:
+        raw = data.get("pkg_size")
+        if raw is None or raw == "":
+            fields["pkg_size"] = None
+        else:
+            s = _erp_parse_qty(raw)
+            if s is None:
+                return None, "package size must be a number"
+            if s <= 0:
+                return None, "package size must be greater than zero"
+            fields["pkg_size"] = s
+    if not partial or "pkg_unit" in data:
+        raw = data.get("pkg_unit")
+        if raw is None or str(raw).strip() == "":
+            fields["pkg_unit"] = None
+        else:
+            fields["pkg_unit"] = str(raw).strip()
     return fields, None
 
 
@@ -8049,9 +8091,12 @@ def erp_create_item():
         return jsonify(error="sku already exists"), 400
     cur = conn.execute(
         "INSERT INTO erp_items (sku, name, type, unit, track_lots, avg_cost_cents,"
-        " cost_cents, oz_per_cup, active, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, 1, ?)",
+        " cost_cents, oz_per_cup, pkg_price_cents, pkg_size, pkg_unit,"
+        " active, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?)",
         (sku, name, itype, unit, track_lots, cost_fields["cost_cents"],
-         cost_fields["oz_per_cup"], datetime.now(timezone.utc).isoformat()),
+         cost_fields["oz_per_cup"], cost_fields["pkg_price_cents"],
+         cost_fields["pkg_size"], cost_fields["pkg_unit"],
+         datetime.now(timezone.utc).isoformat()),
     )
     item_id = cur.lastrowid
     # Location-specific inventory: register the item at the given locations
@@ -8223,10 +8268,14 @@ def erp_stock():
             if loc_filter and str(loc["id"]) != loc_filter:
                 continue
             q = _erp_on_hand(conn, it["id"], loc["id"])
+            eff = _erp_unit_cost_from_package(dict(it))
             rows.append({
                 "item_id": it["id"], "sku": it["sku"], "name": it["name"],
                 "type": it["type"], "unit": it["unit"], "avg_cost_cents": avg,
                 "cost_cents": it["cost_cents"],
+                "pkg_price_cents": it["pkg_price_cents"],
+                "pkg_size": it["pkg_size"], "pkg_unit": it["pkg_unit"],
+                "effective_cost_cents": (int(round(eff)) if eff is not None else None),
                 "location_id": loc["id"], "location_code": loc["code"],
                 "location_name": loc["name"], "on_hand": q,
                 "value_cents": int(round(q * avg)),
@@ -9100,7 +9149,8 @@ def _erp_get_recipe(conn, recipe_id):
 def _erp_recipe_lines(conn, recipe_id, version):
     return conn.execute(
         "SELECT rl.*, i.sku, i.name AS item_name, i.type AS item_type,"
-        " i.unit AS item_unit, i.avg_cost_cents, i.cost_cents, i.oz_per_cup"
+        " i.unit AS item_unit, i.avg_cost_cents, i.cost_cents, i.oz_per_cup,"
+        " i.pkg_price_cents, i.pkg_size, i.pkg_unit"
         " FROM erp_recipe_lines rl"
         " JOIN erp_items i ON i.id = rl.item_id"
         " WHERE rl.recipe_id = ? AND rl.recipe_version = ? ORDER BY rl.id",
@@ -9180,14 +9230,33 @@ def _erp_convert_qty(qty, from_unit, to_unit, oz_per_cup=None):
     return None
 
 
-def _erp_recipe_cost(lines, batch_size_bags):
-    """Cost a recipe.
+def _erp_unit_cost_from_package(item):
+    """Cents per 1 stocked unit derived from the item's package pricing
+    (package price / package size, converted into the stocked unit).
+    Items stocked per each/bag ARE packages, so 1 unit = the package
+    price. Returns None when no usable package pricing exists."""
+    price = item.get("pkg_price_cents")
+    size = item.get("pkg_size")
+    pu = (item.get("pkg_unit") or "").strip()
+    if price is None or not size or float(size) <= 0 or not pu:
+        return None
+    per_pkg_unit = float(price) / float(size)
+    cup_oz, _src = _erp_cup_weight_oz(item)
+    conv = _erp_convert_qty(1, item.get("unit"), pu, cup_oz)
+    if conv is not None:
+        return per_pkg_unit * conv
+    if (item.get("unit") or "").strip().lower() in ("each", "bag", "bags"):
+        return float(price)
+    return None
 
-    Unit price = the item's entered cost (cost_cents) when set, otherwise
-    its live average cost from purchasing/receiving. Line cost = unit price
-    x (qty used, converted to the stocked unit — cups/spoons included when
-    the item has a cup weight). Lines that cannot be converted get
-    line_cost_cents = None.
+
+def _erp_recipe_cost(lines, batch_size_bags):
+    """Cost a recipe, Budget Bytes style: for each ingredient, the cost of
+    the amount USED = (package price / package size) x amount used, with
+    amounts converted between units (cups/spoons weighed via the item's
+    cup weight). Items without package pricing fall back to the entered
+    per-unit cost, then the purchasing average. Lines that cannot be
+    costed get line_cost_cents = None. No labor or overhead.
     Returns (lines_with_cost, batch_cost_cents, cost_per_bag_cents, unknown_count).
     batch_cost_cents sums only the known lines.
     """
@@ -9197,23 +9266,34 @@ def _erp_recipe_cost(lines, batch_size_bags):
     for ln in lines:
         ln = dict(ln)
         cup_oz, cup_src = _erp_cup_weight_oz(ln)
-        qty_item_units = _erp_convert_qty(ln.get("qty_per_batch") or 0,
-                                          ln.get("unit"), ln.get("item_unit"),
-                                          cup_oz)
         ln["cup_weight_oz"] = cup_oz
         ln["cup_weight_source"] = cup_src
-        if ln.get("cost_cents") is not None:
-            unit_price = ln["cost_cents"]
-            ln["cost_source"] = "entered"
-        else:
-            unit_price = ln.get("avg_cost_cents") or 0
-            ln["cost_source"] = "average"
-        if qty_item_units is None:
-            ln["line_cost_cents"] = None
+        qty = ln.get("qty_per_batch") or 0
+        line_cost = None
+        pkg_price = ln.get("pkg_price_cents")
+        pkg_size = ln.get("pkg_size")
+        pkg_unit = (ln.get("pkg_unit") or "").strip()
+        if pkg_price is not None and pkg_size and float(pkg_size) > 0 and pkg_unit:
+            qty_pkg = _erp_convert_qty(qty, ln.get("unit"), pkg_unit, cup_oz)
+            if qty_pkg is not None:
+                line_cost = int(round(float(pkg_price) * qty_pkg / float(pkg_size)))
+                ln["cost_source"] = "package"
+        if line_cost is None:
+            qty_item_units = _erp_convert_qty(qty, ln.get("unit"),
+                                              ln.get("item_unit"), cup_oz)
+            if ln.get("cost_cents") is not None:
+                unit_price = ln["cost_cents"]
+                ln["cost_source"] = "entered"
+            else:
+                unit_price = ln.get("avg_cost_cents") or 0
+                ln["cost_source"] = "average"
+            if qty_item_units is not None:
+                line_cost = int(round(unit_price * qty_item_units))
+        ln["line_cost_cents"] = line_cost
+        if line_cost is None:
             unknown += 1
         else:
-            ln["line_cost_cents"] = int(round(unit_price * qty_item_units))
-            total += ln["line_cost_cents"]
+            total += line_cost
         out.append(ln)
     per_bag = None
     if batch_size_bags and batch_size_bags > 0:
