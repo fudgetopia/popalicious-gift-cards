@@ -2453,7 +2453,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             eCostL.appendChild(eCost);
             eform.appendChild(eCostL);
             var eCupL = document.createElement("label");
-            eCupL.textContent = "1 cup weighs (oz) — so recipes in cups/spoons can be costed ";
+            eCupL.textContent = "1 cup weighs (oz) — optional; standard weights are used otherwise ";
             var eCup = document.createElement("input");
             eCup.type = "number";
             eCup.min = "0";
@@ -4016,14 +4016,16 @@ function renderErpRecipeDetail(body) {
     if (res.cost_unknown_lines > 0) {
       costText += " (" + res.cost_unknown_lines + " line" +
         (res.cost_unknown_lines === 1 ? "" : "s") +
-        " not costed — set the item's cost and, for cup/spoon amounts, its '1 cup weighs' in Inventory)";
+        " not costed — the recipe unit doesn't match how the item is stocked)";
     }
     costBox.textContent = costText;
     body.appendChild(costBox);
     var costNote = document.createElement("p");
     costNote.style.color = "var(--muted)";
     costNote.textContent = "Costs use the cost you entered on the item in Inventory — " +
-      "or its average purchase cost when no cost is entered.";
+      "or its average purchase cost when no cost is entered. Cup and spoon amounts are " +
+      "weighed automatically using standard kitchen cup weights (or the item's own " +
+      "'1 cup weighs' if you set one).";
     body.appendChild(costNote);
     setAdminDetailStatus(r.name + " v" + res.version + " — " + (res.lines || []).length + " lines.");
   }).catch(function (error) {
