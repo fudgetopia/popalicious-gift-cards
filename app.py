@@ -2034,7 +2034,10 @@ def merch_catalog():
             "sku": sku,
             "name": prod["name"],
             "price_cents": prod["price_cents"],
-            "sizes": sorted(prod["variants"].keys()),
+            "sizes": sorted(prod["variants"].keys(),
+                            key=lambda s: ({"XS": 0, "S": 1, "M": 2, "L": 3, "XL": 4,
+                                            "2XL": 5, "3XL": 6, "4XL": 7, "5XL": 8,
+                                            "OS": 9, "11OZ": 10, "3X3": 11}.get(s, 99), s)),
         })
     return jsonify(items=items)
 
@@ -2100,7 +2103,10 @@ def merch_rewards_for_balance(kernel_balance):
             "sku": reward["sku"],
             "name": prod["name"],
             "price_cents": prod["price_cents"],
-            "sizes": sorted(prod["variants"].keys()),
+            "sizes": sorted(prod["variants"].keys(),
+                            key=lambda s: ({"XS": 0, "S": 1, "M": 2, "L": 3, "XL": 4,
+                                            "2XL": 5, "3XL": 6, "4XL": 7, "5XL": 8,
+                                            "OS": 9, "11OZ": 10, "3X3": 11}.get(s, 99), s)),
         })
     eligible.sort(key=lambda x: x["kernels"])
     return eligible
