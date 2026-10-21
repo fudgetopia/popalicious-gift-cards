@@ -1566,6 +1566,70 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           els.body.appendChild(tableWrap);
           renderErpStockTable(tableWrap);
         }
+        function erpPkgInputs(item) {
+          // Package pricing (Budget Bytes method): what the whole package
+          // cost + how much it contains. Recipe cost = price / size x used.
+          var existing = item || {};
+          var wrap = document.createElement("div");
+          wrap.style.width = "100%";
+          var priceL = document.createElement("label");
+          priceL.textContent = "Package price ($) — what you paid for the whole package ";
+          var price = document.createElement("input");
+          price.type = "number";
+          price.min = "0";
+          price.step = "0.01";
+          price.placeholder = "e.g. 38.00 for a 50 lb bag";
+          var prefill = (existing.pkg_price_cents !== null && existing.pkg_price_cents !== undefined)
+            ? existing.pkg_price_cents : existing.cost_cents;
+          if (prefill !== null && prefill !== undefined) {
+            price.value = (Number(prefill) / 100).toFixed(2);
+          }
+          priceL.appendChild(price);
+          wrap.appendChild(priceL);
+          var sizeL = document.createElement("label");
+          sizeL.textContent = "Package size — how much the package holds ";
+          var size = document.createElement("input");
+          size.type = "text";
+          size.placeholder = "e.g. 50";
+          if (existing.pkg_size !== null && existing.pkg_size !== undefined) {
+            size.value = existing.pkg_size;
+          }
+          sizeL.appendChild(size);
+          wrap.appendChild(sizeL);
+          var unitL = document.createElement("label");
+          unitL.textContent = "Package size unit ";
+          var unit = document.createElement("select");
+          var pkgUnitLabels = {cup: "cups", tablespoon: "tablespoons",
+            teaspoon: "teaspoons", oz: "oz", lb: "lb", g: "g", each: "each", bag: "bags"};
+          var curPkgUnit = (existing.pkg_unit && existing.pkg_unit !== "undefined")
+            ? existing.pkg_unit : "lb";
+          var pkgUnitList = ERP_RECIPE_UNITS.slice();
+          if (pkgUnitList.indexOf(curPkgUnit) === -1) {
+            pkgUnitList.push(curPkgUnit);
+          }
+          pkgUnitList.forEach(function (u) {
+            var o = document.createElement("option");
+            o.value = u;
+            o.textContent = pkgUnitLabels[u] || u;
+            if (curPkgUnit === u) o.selected = true;
+            unit.appendChild(o);
+          });
+          unitL.appendChild(unit);
+          wrap.appendChild(unitL);
+          var note = document.createElement("p");
+          note.className = "erp-form-status";
+          note.textContent = "Recipe cost = package price ÷ package size × amount used.";
+          wrap.appendChild(note);
+          return {wrap: wrap, price: price, size: size, unit: unit};
+        }
+        function erpPkgPayload(refs) {
+          return {
+            pkg_price_cents: refs.price.value.trim() === "" ? null :
+              Math.round(Number(refs.price.value) * 100),
+            pkg_size: refs.size.value.trim() === "" ? null : erpParseQty(refs.size.value),
+            pkg_unit: refs.unit.value
+          };
+        }
         function erpAddItemForm() {
           var form = document.createElement("form");
           form.className = "erp-form";
@@ -1638,7 +1702,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           openQtyLabel.appendChild(openQtyInput);
           form.appendChild(openQtyLabel);
           var costLabel3 = document.createElement("label");
-          costLabel3.textContent = "Cost per unit ($) — for recipe costs ";
+          costLabel3.textContent = "Cost per unit ($) — only when no package price ";
           var costInput3 = document.createElement("input");
           costInput3.type = "number";
           costInput3.min = "0";
@@ -1655,6 +1719,8 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           cupInput3.placeholder = "optional";
           cupLabel3.appendChild(cupInput3);
           form.appendChild(cupLabel3);
+          var pkg3 = erpPkgInputs(null);
+          form.appendChild(pkg3.wrap);
           var submit = document.createElement("button");
           submit.type = "submit";
           submit.textContent = "Save item";
@@ -1694,7 +1760,10 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
               location_ids: locationIds,
               cost_cents: costInput3.value.trim() === "" ? null :
                 Math.round(Number(costInput3.value) * 100),
-              oz_per_cup: cupInput3.value.trim() === "" ? null : Number(cupInput3.value)
+              oz_per_cup: cupInput3.value.trim() === "" ? null : Number(cupInput3.value),
+              pkg_price_cents: erpPkgPayload(pkg3).pkg_price_cents,
+              pkg_size: erpPkgPayload(pkg3).pkg_size,
+              pkg_unit: erpPkgPayload(pkg3).pkg_unit
             }).then(function (res) {
               newItemId = res.item.id;
               if (!qty || !locationIds.length) return null;
@@ -2288,8 +2357,10 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             tr.appendChild(erpCell("Location", r.location_code));
             var onHand = erpCell("On hand", erpQty(r.on_hand) + " " + (r.unit || ""));
             tr.appendChild(onHand);
-            var effCost = (r.cost_cents !== null && r.cost_cents !== undefined)
-              ? r.cost_cents : r.avg_cost_cents;
+            var effCost = (r.effective_cost_cents !== null && r.effective_cost_cents !== undefined)
+              ? r.effective_cost_cents
+              : ((r.cost_cents !== null && r.cost_cents !== undefined)
+                ? r.cost_cents : r.avg_cost_cents);
             tr.appendChild(erpCell("Unit cost", erpMoney(effCost)));
             tr.appendChild(erpCell("Value", erpMoney(r.value_cents)));
             tr.setAttribute("tabindex", "0");
@@ -2388,9 +2459,14 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           var meta = document.createElement("p");
           meta.className = "admin-orders-empty";
           meta.textContent = erpTypeLabel(item.type) + " · per " + (item.unit || "each") +
-            (item.cost_cents !== null && item.cost_cents !== undefined
-              ? " · cost " + erpMoney(item.cost_cents) + " (entered)"
-              : " · avg cost " + erpMoney(item.avg_cost_cents)) +
+            (item.pkg_price_cents !== null && item.pkg_price_cents !== undefined && item.pkg_size
+              ? " · package " + erpMoney(item.pkg_price_cents) + " / " + erpQty(item.pkg_size) +
+                " " + (item.pkg_unit || "") + " = " +
+                erpMoney(Math.round(item.pkg_price_cents / item.pkg_size)) + " per " +
+                (item.pkg_unit || "unit")
+              : (item.cost_cents !== null && item.cost_cents !== undefined
+                ? " · cost " + erpMoney(item.cost_cents) + " (entered)"
+                : " · avg cost " + erpMoney(item.avg_cost_cents))) +
             (item.oz_per_cup ? " · 1 cup = " + erpQty(item.oz_per_cup) + " oz" : "") +
             " · total on hand " + erpQty(item.on_hand_total) + " " + (item.unit || "");
           head.appendChild(meta);
@@ -2441,7 +2517,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             eUnitL.appendChild(eUnit);
             eform.appendChild(eUnitL);
             var eCostL = document.createElement("label");
-            eCostL.textContent = "Cost per " + (item.unit || "unit") + " ($) — used for recipe costs ";
+            eCostL.textContent = "Cost per " + (item.unit || "unit") + " ($) — only when no package price ";
             var eCost = document.createElement("input");
             eCost.type = "number";
             eCost.min = "0";
@@ -2464,6 +2540,8 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             }
             eCupL.appendChild(eCup);
             eform.appendChild(eCupL);
+            var ePkg = erpPkgInputs(item);
+            eform.appendChild(ePkg.wrap);
             var eLotL = document.createElement("label");
             var eLot = document.createElement("input");
             eLot.type = "checkbox";
@@ -2500,7 +2578,10 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
                 track_lots: eLot.checked,
                 cost_cents: eCost.value.trim() === "" ? null :
                   Math.round(Number(eCost.value) * 100),
-                oz_per_cup: eCup.value.trim() === "" ? null : Number(eCup.value)
+                oz_per_cup: eCup.value.trim() === "" ? null : Number(eCup.value),
+                pkg_price_cents: erpPkgPayload(ePkg).pkg_price_cents,
+                pkg_size: erpPkgPayload(ePkg).pkg_size,
+                pkg_unit: erpPkgPayload(ePkg).pkg_unit
               }).then(function () {
                 erpState.editingItem = false;
                 return erpGet("/api/erp/items/" + encodeURIComponent(String(item.id)));
@@ -4055,10 +4136,12 @@ function renderErpRecipeDetail(body) {
     body.appendChild(costBox);
     var costNote = document.createElement("p");
     costNote.style.color = "var(--muted)";
-    costNote.textContent = "Costs use the cost you entered on the item in Inventory — " +
-      "or its average purchase cost when no cost is entered. Cup and spoon amounts are " +
-      "weighed automatically using standard kitchen cup weights (or the item's own " +
-      "'1 cup weighs' if you set one).";
+    costNote.textContent = "Costed the Budget Bytes way: for each ingredient, " +
+      "(package price ÷ package size) × the amount used — set the package price and " +
+      "size on the item in Inventory. Items without package pricing use their per-unit " +
+      "or average purchase cost. Cup and spoon amounts are weighed automatically using " +
+      "standard kitchen cup weights (or the item's own '1 cup weighs' if you set one). " +
+      "Ingredients only — no labor.";
     body.appendChild(costNote);
     setAdminDetailStatus(r.name + " v" + res.version + " — " + (res.lines || []).length + " lines.");
   }).catch(function (error) {
