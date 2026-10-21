@@ -7963,10 +7963,10 @@ def erp_update_location(location_id):
 
 @app.delete("/api/erp/locations/<int:location_id>")
 def erp_delete_location(location_id):
-    # Hard delete: the location row is removed entirely (its code becomes
-    # reusable), and its inventory goes away with it — the location's ledger
-    # rows, item assignments, and reorder rules are all removed. Blocked while
-    # the location still holds inventory.
+    # Hard delete (user directive): the location is removed entirely (its
+    # code becomes reusable) AND its inventory goes away with it — the
+    # location's ledger rows, item assignments, reorder rules, and
+    # inventory counts are all removed, even if it still holds stock.
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -7976,16 +7976,12 @@ def erp_delete_location(location_id):
     if not loc:
         conn.close()
         return jsonify(error="location not found"), 404
-    on_hand = conn.execute(
-        "SELECT COALESCE(SUM(qty_change), 0) FROM erp_stock_ledger"
-        " WHERE location_id = ?"
-        " AND item_id IN (SELECT id FROM erp_items WHERE active = 1)",
-        (location_id,)).fetchone()[0]
-    if float(on_hand or 0) != 0:
-        conn.close()
-        return jsonify(
-            error="location still has inventory on hand; adjust it to zero first"
-        ), 400
+    conn.execute(
+        "DELETE FROM erp_inventory_count_lines WHERE count_id IN"
+        " (SELECT id FROM erp_inventory_counts WHERE location_id = ?)",
+        (location_id,))
+    conn.execute("DELETE FROM erp_inventory_counts WHERE location_id = ?",
+                 (location_id,))
     conn.execute("DELETE FROM erp_reorder_rules WHERE location_id = ?",
                  (location_id,))
     conn.execute("DELETE FROM erp_stock_ledger WHERE location_id = ?",
