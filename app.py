@@ -2510,6 +2510,15 @@ def _compute_order(data):
             order["gift_card_code"] = code
             order["gift_card_discount_cents"] = min(row["balance_cents"], total)
 
+    # Never check out with uncalculated shipping: if neither the popcorn
+    # rate nor the merch rate produced a charge and no free-shipping
+    # promo/reward zeroed it (label "FREE (...)"), the client never got a
+    # rate. A reward code could then zero the whole order total, leaving a
+    # $0 checkout the payment buttons can't process (user report, Oct 20).
+    if (order["shipping_cents"] == 0 and order["merch_shipping_cents"] == 0
+            and not order["shipping_label"].startswith("FREE")):
+        return None, (jsonify(error="Shipping hasn't been calculated yet — enter your ZIP code so we can calculate shipping before you pay."), 400)
+
     summary = ", ".join(f"{it['quantity']}x {it['name']}" for it in items)
     if order["shipping_cents"] > 0:
         summary += f", Shipping{f' ({order['shipping_label']})' if order['shipping_label'] else ''}"
