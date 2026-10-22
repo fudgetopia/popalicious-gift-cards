@@ -318,6 +318,12 @@ def init_db():
         );
         """
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS push_tokens ("
+        " token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,"
+        " platform TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,"
+        " updated_at TEXT NOT NULL)"
+    )
     # Migration for databases created before the approved column existed.
     cols = [r["name"] for r in conn.execute("PRAGMA table_info(reviews)").fetchall()]
     if "approved" not in cols:
@@ -3738,6 +3744,61 @@ def loyalty_birthday():
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+@app.post("/api/auth/delete-account")
+def auth_delete_account():
+    """Self-service account deletion (Apple/Google require it in-app for
+    apps that offer signup). Follows the site's deactivation rule: the
+    account is deactivated and hidden from admin lists, its signed tokens
+    stop working immediately (token lookup requires active=1), any push
+    tokens are removed, and the email is free to re-register fresh."""
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True, silent=True) or {}
+    pwd = str(data.get('password') or '')
+    conn = db()
+    row = conn.execute(
+        "SELECT password_hash FROM users WHERE id = ?", (user["id"],)
+    ).fetchone()
+    if not row or not row["password_hash"] or not check_password_hash(
+        row["password_hash"], pwd
+    ):
+        conn.close()
+        return jsonify(error="password is incorrect"), 401
+    conn.execute("UPDATE users SET active = 0 WHERE id = ?", (user["id"],))
+    conn.execute("DELETE FROM push_tokens WHERE user_id = ?", (user["id"],))
+    conn.commit()
+    conn.close()
+    return _clear_session_cookie(jsonify(ok=True))
+
+
+@app.post("/api/loyalty/push-token")
+def loyalty_push_token():
+    """Register a device push token for the loyalty app (APNs/FCM).
+    Sending is wired once Firebase/APNs credentials exist; collecting
+    tokens now means the audience is ready when it does."""
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True, silent=True) or {}
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "").strip().lower()[:20]
+    if not token or len(token) > 512:
+        return jsonify(error="invalid token"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        "INSERT INTO push_tokens (token, user_id, platform, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(token) DO UPDATE SET user_id = excluded.user_id,"
+        " platform = excluded.platform, updated_at = excluded.updated_at",
+        (token, user["id"], platform, now, now),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
 
 # ---------------- staff loyalty endpoints ----------------
 
