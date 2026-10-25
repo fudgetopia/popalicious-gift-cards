@@ -1790,7 +1790,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-TOTE": {  # Pop It Like It's Hot Eco Tote (Econscious EC8000, Oyster)
         "name": "Pop It Like It's Hot Eco Tote", "price_cents": 2800,
-        "file_id": "1094588739", "file_type": "default",
+        "file_id": "1094795993", "file_type": "default",
         "variants": {"OS": 10458},
     },
     "MERCH-BACKPACK": {  # Kernel Chaos All-Over Backpack
