@@ -1843,7 +1843,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-SAMSUNG-CASE": {  # But First, Popcorn Tough Samsung Case
         "name": "But First, Popcorn Tough Samsung Case", "price_cents": 2800,
-        "file_id": "1094694075", "file_type": "default",
+        "file_id": "1094789753", "file_type": "default",
         "variants": {
             "S20": 16981, "S20FE": 16975, "S20PLUS": 16977,
             "S20ULTRA": 16979, "S21": 16989, "S21FE": 16983,
