@@ -1785,7 +1785,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-MUG": {  # But First, Popcorn Mug (White Glossy 11oz)
         "name": "But First, Popcorn Mug", "price_cents": 1800,
-        "file_id": "1086605611", "file_type": "default",
+        "file_id": "1094608367", "file_type": "default",
         "variants": {"11OZ": 1320},
     },
     "MERCH-TOTE": {  # Pop It Like It's Hot Eco Tote (Econscious EC8000, Oyster)
@@ -1795,12 +1795,12 @@ PRINTFUL_MERCH = {
     },
     "MERCH-BACKPACK": {  # Kernel Chaos All-Over Backpack
         "name": "Kernel Chaos All-Over Backpack", "price_cents": 6500,
-        "file_id": "1086619935", "file_type": "default",
+        "file_id": "1094620028", "file_type": "default",
         "variants": {"OS": 9063},
     },
     "MERCH-UTIL-BACKPACK": {  # Midnight Pop Utility Backpack (Black)
         "name": "Midnight Pop Utility Backpack", "price_cents": 7200,
-        "file_id": "1086621108", "file_type": "default",
+        "file_id": "1094622311", "file_type": "default",
         "variants": {"OS": 24563},
     },
     "MERCH-SOCKS": {  # Popcorn Party Crew Socks
@@ -1827,7 +1827,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-IPHONE-CASE": {  # Big Flavor Tough iPhone Case
         "name": "Big Flavor Tough iPhone Case", "price_cents": 2800,
-        "file_id": "1086637891", "file_type": "default",
+        "file_id": "1094609483", "file_type": "default",
         "variants": {
             "IP11": 15381, "IP11PRO": 15382, "IP11PROMAX": 15383,
             "IP12": 15384, "IP12MINI": 15385, "IP12PRO": 15386,
@@ -1843,7 +1843,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-SAMSUNG-CASE": {  # But First, Popcorn Tough Samsung Case
         "name": "But First, Popcorn Tough Samsung Case", "price_cents": 2800,
-        "file_id": "1086638309", "file_type": "default",
+        "file_id": "1094608963", "file_type": "default",
         "variants": {
             "S20": 16981, "S20FE": 16975, "S20PLUS": 16977,
             "S20ULTRA": 16979, "S21": 16989, "S21FE": 16983,
@@ -1879,7 +1879,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-SLIPON-M": {  # Popcorn Party Men's Slip-On Canvas Shoes
         "name": "Popcorn Party Men's Slip-On Canvas Shoes", "price_cents": 6800,
-        "file_id": "1086613804", "file_type": "default",
+        "file_id": "1094630882", "file_type": "default",
         "variants": {
             "5": 14736, "6": 14738, "7": 14740, "8": 14742,
             "9": 14744, "10": 14746, "11": 14748, "12": 14750,
@@ -1890,7 +1890,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-SLIPON-W": {  # Popcorn Party Women's Slip-On Canvas Shoes
         "name": "Popcorn Party Women's Slip-On Canvas Shoes", "price_cents": 6800,
-        "file_id": "1086613804", "file_type": "default",
+        "file_id": "1094630882", "file_type": "default",
         "variants": {
             "5": 14721, "6": 14723, "7": 14725, "8": 14727,
             "9": 14729, "10": 14731, "11": 14733, "12": 14735,
