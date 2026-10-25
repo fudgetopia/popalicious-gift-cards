@@ -26,6 +26,7 @@ import hashlib
 import base64
 import html
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 from urllib.parse import urlencode
 
@@ -91,7 +92,41 @@ PROMOS = {
         "label": "Free Shipping $50+",
         "description": "Free shipping on orders of $50 or more",
     },
+    # Holiday 2026 seasonal codes (user-approved schedule, Oct 14; sitewide
+    # scope confirmed Oct 20). Optional "windows" = inclusive YYYY-MM-DD
+    # pairs in America/Los_Angeles; codes with no "windows" stay always-on.
+    # MERRYPOP15's Nov 27–Dec 1 pause is modeled as TWO windows so the
+    # promo_redemptions one-use-per-email rule still holds across the season.
+    "MERRYPOP15": {
+        "type": "percent", "percent_off": 15,
+        "label": "Holiday Season",
+        "description": "15% off your order",
+        "windows": [["2026-11-10", "2026-11-26"], ["2026-12-02", "2026-12-26"]],
+    },
+    "BLACKPOP25": {
+        "type": "percent", "percent_off": 25,
+        "label": "Black Friday",
+        "description": "25% off your order",
+        "windows": [["2026-11-27", "2026-11-29"]],
+    },
+    "CYBERPOP25": {
+        "type": "percent", "percent_off": 25,
+        "label": "Cyber Monday",
+        "description": "25% off your order",
+        "windows": [["2026-11-30", "2026-12-01"]],
+    },
 }
+
+_LA_TZ = ZoneInfo("America/Los_Angeles")
+
+
+def _promo_is_active(promo, now=None):
+    """True when the promo has no date windows, or today (PT) falls in one."""
+    windows = promo.get("windows")
+    if not windows:
+        return True
+    today = (now or datetime.now(timezone.utc)).astimezone(_LA_TZ).date().isoformat()
+    return any(start <= today <= end for start, end in windows)
 
 MIN_AMOUNT_CENTS = 500      # $5
 MAX_AMOUNT_CENTS = 50000    # $500
@@ -1689,7 +1724,7 @@ def validate_discount():
     code = (request.args.get("code") or "").strip().upper()
     if not code:
         return jsonify(error="code is required"), 400
-    if code in PROMOS:
+    if code in PROMOS and _promo_is_active(PROMOS[code]):
         p = PROMOS[code]
         return jsonify(type="promo", code=code, label=p["label"], description=p["description"])
     conn = db()
@@ -1727,7 +1762,7 @@ def validate_discount():
 PRINTFUL_MERCH = {
     "MERCH-TEE": {  # Big Flavor Staple Tee (Bella+Canvas 3001, Black)
         "name": "Big Flavor Staple Tee", "price_cents": 2800,
-        "file_id": "1086595717", "file_type": "default",
+        "file_id": "1094592953", "file_type": "default",
         "variants": {"XS": 9527, "S": 4016, "M": 4017, "L": 4018, "XL": 4019,
                      "2XL": 4020, "3XL": 5295, "4XL": 5310, "5XL": 12871},
     },
@@ -1755,7 +1790,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-TOTE": {  # Pop It Like It's Hot Eco Tote (Econscious EC8000, Oyster)
         "name": "Pop It Like It's Hot Eco Tote", "price_cents": 2800,
-        "file_id": "1086609725", "file_type": "default",
+        "file_id": "1094588739", "file_type": "default",
         "variants": {"OS": 10458},
     },
     "MERCH-BACKPACK": {  # Kernel Chaos All-Over Backpack
@@ -1892,7 +1927,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-STEEL-TUMBLER": {  # Tapered Stainless Steel Tumbler (20 oz)
         "name": "Big Flavor Steel Tumbler", "price_cents": 3500,
-        "file_id": "1086692382", "file_type": "default",
+        "file_id": "1094592953", "file_type": "default",
         "variants": {"WHITE": 23470},
     },
     "MERCH-XMAS-TUMBLER": {  # Merry Popmas Tumbler (Christmas 2026)
@@ -2441,7 +2476,7 @@ def _compute_order(data):
         "reward_type": "",
         "reward_discount_cents": 0,
     }
-    if code and code in PROMOS:
+    if code and code in PROMOS and _promo_is_active(PROMOS[code]):
         # Offers-page promo code: one use per email address, one per order.
         if not email:
             return None, (jsonify(error="an email address is required to use a promo code"), 400)
