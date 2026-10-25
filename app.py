@@ -3254,7 +3254,7 @@ def auth_login():
     try:
         joined = datetime.fromisoformat(row["created_at"])
         now = datetime.now(timezone.utc)
-        if (joined.month, joined.day) == (now.month, now.day):
+        if (joined.month, joined.day) == (now.month, now.day) and now.year > joined.year:
             if (row["anniversary_credited_year"] or 0) < now.year:
                 _credit_kernels(conn, row["id"], 10, "anniversary",
                                 order_ref=f"{now.year} anniversary")
@@ -7265,7 +7265,7 @@ def subscription_renewals_run():
             joined = datetime.fromisoformat(m["created_at"])
         except Exception:
             continue
-        if (joined.month, joined.day) == (today.month, today.day):
+        if (joined.month, joined.day) == (today.month, today.day) and today.year > joined.year:
             if (m["anniversary_credited_year"] or 0) < today.year:
                 _credit_kernels(conn, m["id"], 10, "anniversary",
                                 order_ref=f"{today.year} anniversary")
