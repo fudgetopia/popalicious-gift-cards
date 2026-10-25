@@ -1827,7 +1827,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-IPHONE-CASE": {  # Big Flavor Tough iPhone Case
         "name": "Big Flavor Tough iPhone Case", "price_cents": 2800,
-        "file_id": "1094609483", "file_type": "default",
+        "file_id": "1094693912", "file_type": "default",
         "variants": {
             "IP11": 15381, "IP11PRO": 15382, "IP11PROMAX": 15383,
             "IP12": 15384, "IP12MINI": 15385, "IP12PRO": 15386,
@@ -1843,7 +1843,7 @@ PRINTFUL_MERCH = {
     },
     "MERCH-SAMSUNG-CASE": {  # But First, Popcorn Tough Samsung Case
         "name": "But First, Popcorn Tough Samsung Case", "price_cents": 2800,
-        "file_id": "1094608963", "file_type": "default",
+        "file_id": "1094694075", "file_type": "default",
         "variants": {
             "S20": 16981, "S20FE": 16975, "S20PLUS": 16977,
             "S20ULTRA": 16979, "S21": 16989, "S21FE": 16983,
