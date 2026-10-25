@@ -585,6 +585,11 @@ def init_db():
             email TEXT PRIMARY KEY,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS newsletter_subscribers (
+            email TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
         CREATE TABLE IF NOT EXISTS marketing_campaigns (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL DEFAULT '',
@@ -5195,6 +5200,9 @@ def _marketing_audience(conn):
     for row in conn.execute(
             "SELECT DISTINCT email FROM paypal_orders WHERE email IS NOT NULL AND email != ''"):
         emails.setdefault(row["email"].lower(), {"email": row["email"], "name": ""})
+    for row in conn.execute(
+            "SELECT email FROM newsletter_subscribers WHERE active = 1 AND email != ''"):
+        emails.setdefault(row["email"].lower(), {"email": row["email"], "name": ""})
     unsub = {r["email"] for r in conn.execute("SELECT email FROM marketing_unsubscribes")}
     return [v for k, v in emails.items() if k not in unsub]
 
@@ -5296,6 +5304,26 @@ def admin_marketing_campaigns():
         " ORDER BY id DESC LIMIT 50").fetchall()
     conn.close()
     return jsonify(campaigns=[dict(r) for r in rows])
+
+@app.post("/api/newsletter/subscribe")
+def newsletter_subscribe():
+    """Public newsletter signup (Offers page form). Stores the address for
+    marketing campaigns; unsubscribes via /api/marketing/unsubscribe still
+    apply, since _marketing_audience filters on marketing_unsubscribes."""
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email or not EMAIL_RE.match(email):
+        return jsonify(error="Enter a valid email address."), 400
+    conn = db()
+    conn.execute(
+        "INSERT INTO newsletter_subscribers (email, created_at, active)"
+        " VALUES (?, ?, 1)"
+        " ON CONFLICT(email) DO UPDATE SET active = 1",
+        (email, datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(subscribed=True)
 
 @app.get("/api/marketing/unsubscribe")
 def marketing_unsubscribe():
