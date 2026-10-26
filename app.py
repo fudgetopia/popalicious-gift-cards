@@ -584,6 +584,14 @@ def init_db():
             conn.execute(_ddl)
         except sqlite3.OperationalError:
             pass
+    # Migration: automatic free shipping for qualifying subscriptions
+    # (Oct 26 2026). free_shipping = 1 when the signup cart's per-delivery
+    # bag total was $50+; renewals honor it, so a subscription qualifies
+    # the same way every time — even when its own line sits under $50.
+    try:
+        conn.execute("ALTER TABLE subscriptions ADD COLUMN free_shipping INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         """CREATE TABLE IF NOT EXISTS paypal_meta (
             key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT ''
@@ -3052,18 +3060,26 @@ def _paypal_sub_plan_price_cents(plan, shipping_zip):
     terms _attempt_subscription_charge bills per subscription record.
     shipping_zip is the ZIP entered at checkout. When Shippo cannot rate
     the ZIP at creation time, fall back to the checkout's calculated
-    shipping rate rather than pricing the plan without shipping.
+    shipping rate rather than pricing the plan without shipping. A cart
+    whose per-delivery bag total is $50+ ships free automatically
+    (Oct 26 2026): every line's ship term is 0.
     """
+    cart_per = sum(_per_delivery_cents(s["items"], SUB_FREQUENCIES[s["frequency"]]["discount"])
+                   for s in plan["subscriptions"])
+    free_ship = cart_per >= FREE_SHIP_SUB_MIN_CENTS
     total = 0
     for s in plan["subscriptions"]:
         items = s["items"]
         disc = SUB_FREQUENCIES[s["frequency"]]["discount"]
         per = _per_delivery_cents(items, disc)
         bags = sum(it["quantity"] for it in items if isinstance(it, dict))
-        ship = _cheapest_shipping_cents(shipping_zip, bags) if (shipping_zip and bags) else 0
-        ship = ship or 0
-        if not ship and plan["shipping_cents"]:
-            ship = plan["shipping_cents"]
+        if free_ship:
+            ship = 0
+        else:
+            ship = _cheapest_shipping_cents(shipping_zip, bags) if (shipping_zip and bags) else 0
+            ship = ship or 0
+            if not ship and plan["shipping_cents"]:
+                ship = plan["shipping_cents"]
         total += per + ship
     return total
 
@@ -3333,7 +3349,8 @@ def _paypal_webhook_sale_completed(resource):
             disc = SUB_FREQUENCIES.get(sub["frequency"], {}).get("discount", sub["discount_percent"] or 0)
             per = _per_delivery_cents(items, disc)
             bags = sum(it["quantity"] for it in items if isinstance(it, dict))
-            ship = _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0
+            ship = 0 if (_sub_has_free_shipping(sub) or per >= FREE_SHIP_SUB_MIN_CENTS) else (
+                _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0)
             amount = per + (ship or 0)
         if amount < 50:
             return
@@ -7193,6 +7210,26 @@ def _validate_subscription_items(raw):
         return None, (jsonify(error="subscriptions are 1 to 12 bags per delivery"), 400)
     return items, None
 
+# Automatic free shipping for qualifying subscriptions (user decision
+# Oct 26 2026): a subscription delivery whose bag subtotal is $50+
+# ships free, no code needed — FREESHIP50's threshold, reused. At
+# checkout the cart total qualifies the whole cart's shipping, and each
+# created record stores that qualification in free_shipping, so renewals
+# qualify the same way every time — even when a single line sits under
+# $50. A record also ships free when its own per-delivery total is $50+
+# (covers pre-flag records and edits that push a line over $50).
+FREE_SHIP_SUB_MIN_CENTS = 5000
+
+
+def _sub_has_free_shipping(sub):
+    """True when the subscription record carries the signup cart's free-
+    shipping qualification. Missing key (pre-migration row) reads as 0."""
+    try:
+        return bool(sub["free_shipping"])
+    except (KeyError, IndexError, TypeError):
+        return False
+
+
 def _per_delivery_cents(items, discount_percent):
     bags = sum(it["quantity"] for it in items if isinstance(it, dict))
     return int(round(BAG_PRICE_CENTS * bags * (1 - discount_percent / 100)))
@@ -7349,7 +7386,8 @@ def _attempt_subscription_charge(conn, sub, renewal, items):
         "discount", sub["discount_percent"] or 0)
     per = _per_delivery_cents(items, disc)
     bags = sum(it["quantity"] for it in items if isinstance(it, dict))
-    ship = _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0
+    ship = 0 if (_sub_has_free_shipping(sub) or per >= FREE_SHIP_SUB_MIN_CENTS) else (
+        _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0)
     ship = ship or 0
     amount = per + ship
     if amount < 50:
@@ -7407,7 +7445,8 @@ def subscription_setup_intent():
     return jsonify(client_secret=si.client_secret, customer_id=customer_id)
 
 def _create_subscription_record(conn, user, full, payment_method_id, frequency, items, ship,
-                                payment_provider="stripe", paypal_subscription_id=""):
+                                payment_provider="stripe", paypal_subscription_id="",
+                                free_shipping=0):
     """Attach a card and insert a subscription + its pending renewal row.
 
     Shared by POST /api/subscriptions and the subscription-checkout path, so
@@ -7421,6 +7460,10 @@ def _create_subscription_record(conn, user, full, payment_method_id, frequency, 
     PayPal rows (payment_provider="paypal") skip the Stripe customer /
     payment-method attach entirely — PayPal bills itself — and store the
     PayPal subscription id instead.
+
+    free_shipping (Oct 26 2026): 1 when the signup cart's per-delivery bag
+    total was $50+; renewals honor it so the subscription qualifies the
+    same way every time.
     """
     if payment_provider == "paypal":
         customer_id = ""
@@ -7439,13 +7482,13 @@ def _create_subscription_record(conn, user, full, payment_method_id, frequency, 
            (user_id, stripe_customer_id, stripe_payment_method_id, items, frequency,
             discount_percent, status, next_billing_date,
             ship_name, ship_street, ship_city, ship_state, ship_zip, ship_email,
-            payment_provider, paypal_subscription_id,
+            payment_provider, paypal_subscription_id, free_shipping,
             created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (user["id"], customer_id, payment_method_id or "", json.dumps(items), frequency,
          freq["discount"], next_billing,
          ship["name"], ship["street"], ship["city"], ship["state"], ship["zip"], full["email"],
-         payment_provider, paypal_subscription_id or "",
+         payment_provider, paypal_subscription_id or "", 1 if free_shipping else 0,
          now))
     sub_id = cur.lastrowid
     conn.execute(
@@ -7489,7 +7532,9 @@ def create_subscription():
         sub_id, next_billing, discount = _create_subscription_record(
             conn, user, full, payment_method_id, frequency, items,
             {"name": ship_name, "street": ship_street, "city": ship_city,
-             "state": ship_state, "zip": ship_zip})
+             "state": ship_state, "zip": ship_zip},
+            free_shipping=1 if _per_delivery_cents(
+                items, SUB_FREQUENCIES[frequency]["discount"]) >= FREE_SHIP_SUB_MIN_CENTS else 0)
     except stripe.error.StripeError:
         conn.close()
         return jsonify(error="could not save your payment method"), 502
@@ -7529,8 +7574,9 @@ def _validate_subscription_checkout(data, user, full, require_payment_method=Tru
     Rules: discount codes apply to the one-time portion only (via
     _compute_order, exactly as today). A subscription-only cart carrying a
     discount code is rejected with a plain message rather than silently
-    ignoring the code — whether FREESHIP50 should zero sub-only shipping is
-    still an open product question. Subscription-only carts earn no Kernels
+    ignoring the code. Qualifying subscription-only carts (per-delivery
+    bag total $50+) ship free automatically, no code (user decision
+    Oct 26 2026). Subscription-only carts earn no Kernels
     (consistent with today: signup alone never credited Kernels); mixed-cart
     orders credit Kernels on the full PaymentIntent amount via fulfill_order,
     including first-delivery amounts.
@@ -7600,7 +7646,13 @@ def _validate_subscription_checkout(data, user, full, require_payment_method=Tru
             return None, (jsonify(error="invalid shipping"), 400)
         if merch_shipping_cents < 0 or merch_shipping_cents > 100000:
             return None, (jsonify(error="invalid merch shipping"), 400)
-        shipping_label = (data.get("shipping_label") or "").strip()[:120]
+        # Automatic free shipping (Oct 26 2026): a subscription-only cart
+        # whose per-delivery bag total is $50+ ships free, no code needed.
+        if first_delivery >= FREE_SHIP_SUB_MIN_CENTS:
+            shipping_cents = 0
+            shipping_label = "FREE shipping $50+"
+        else:
+            shipping_label = (data.get("shipping_label") or "").strip()[:120]
         # Same guard as _compute_order: never check out with uncalculated
         # shipping unless a free-shipping label zeroed it.
         if (shipping_cents == 0 and merch_shipping_cents == 0
@@ -7666,6 +7718,9 @@ def _finalize_subscription_checkout(user, full, plan, payment_intent_id, amount_
     sub_ids = []
     next_billings = []
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    # The signup cart's free-shipping qualification carries onto every
+    # line's record, so renewals qualify the same way every time.
+    cart_free_ship = 1 if plan["first_delivery_cents"] >= FREE_SHIP_SUB_MIN_CENTS else 0
     for sub in plan["subscriptions"]:
         items_json = json.dumps(sub["items"])
         existing = conn.execute(
@@ -7682,7 +7737,8 @@ def _finalize_subscription_checkout(user, full, plan, payment_intent_id, amount_
                 conn, user, full, plan["payment_method_id"], sub["frequency"],
                 sub["items"], plan["ship"],
                 payment_provider=payment_provider,
-                paypal_subscription_id=paypal_subscription_id)
+                paypal_subscription_id=paypal_subscription_id,
+                free_shipping=cart_free_ship)
         except stripe.error.StripeError:
             conn.close()
             raise
@@ -8255,7 +8311,8 @@ def subscription_confirm_page(token):
     disc = freq.get("discount", sub["discount_percent"] or 0)
     per = _per_delivery_cents(items, disc)
     bags = sum(it["quantity"] for it in items if isinstance(it, dict))
-    ship_est = _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0
+    ship_est = 0 if (_sub_has_free_shipping(sub) or per >= FREE_SHIP_SUB_MIN_CENTS) else (
+        _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0)
     ship_est = ship_est or 0
     conn.close()
     name = ""
@@ -8374,7 +8431,8 @@ def subscription_renewals_run():
         bags = sum(it["quantity"] for it in items if isinstance(it, dict))
         disc = SUB_FREQUENCIES.get(sub["frequency"], {}).get("discount", 0)
         per = _per_delivery_cents(items, disc)
-        ship_est = _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0
+        ship_est = 0 if (_sub_has_free_shipping(sub) or per >= FREE_SHIP_SUB_MIN_CENTS) else (
+            _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0)
         ship_est = ship_est or 0
         user = conn.execute(
             "SELECT name FROM users WHERE id = ?", (sub["user_id"],)).fetchone()
