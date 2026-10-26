@@ -573,6 +573,30 @@ def init_db():
             conn.execute(f"ALTER TABLE {_t} ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+    # Migration: PayPal subscriptions (v1, Oct 26 2026). Stripe rows keep
+    # payment_provider 'stripe'; PayPal rows store the PayPal subscription id
+    # and are never charged through Stripe (see subscription_renewals_run).
+    for _ddl in (
+        "ALTER TABLE subscriptions ADD COLUMN payment_provider TEXT NOT NULL DEFAULT 'stripe'",
+        "ALTER TABLE subscriptions ADD COLUMN paypal_subscription_id TEXT NOT NULL DEFAULT ''",
+    ):
+        try:
+            conn.execute(_ddl)
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS paypal_meta (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT ''
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS paypal_pending_subscriptions (
+            paypal_subscription_id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            payload TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        )"""
+    )
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS subscription_email_templates (
@@ -2411,6 +2435,9 @@ def paypal_api(method, path, json_body=None):
         timeout=30,
     )
     resp.raise_for_status()
+    # PayPal subscription suspend/activate/cancel answer 204 No Content.
+    if resp.status_code == 204 or not resp.content:
+        return {}
     return resp.json()
 
 def _dollars(cents):
@@ -2959,6 +2986,477 @@ def paypal_capture_order():
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- paypal subscriptions (v1)
+#
+# PayPal Subscriptions for subscription-only carts. Stripe remains the card
+# path; PayPal bills each delivery itself, so PayPal rows are never charged
+# by the Stripe renewal cron (see subscription_renewals_run).
+# v1 boundaries, stated plainly:
+# - Subscription-only carts only: mixed carts (one-time items present) stay
+#   card-only, because they would need two separate PayPal flows.
+# - One subscription line per PayPal checkout: a multi-line cart is
+#   rejected, because each line becomes its own subscription record and
+#   one PayPal subscription cannot carry two different billing cycles.
+# - Plan price is fixed at creation (per-delivery + cheapest shipping for
+#   the ZIP entered at checkout, exactly the renewal computation). A later
+#   PayPal-address ZIP change does not reprice the plan.
+# - Plan-changing edits (items, frequency) for PayPal rows are rejected;
+#   cancel + resubscribe is the v1 path to a different plan.
+# - The first PayPal billing-cycle payment is the first delivery. Confirm
+#   records it the same way the Stripe sub-only checkout does (record +
+#   welcome email; no orders row, no signup Kernels). Later cycle payments
+#   arrive via webhook and are fulfilled as renewals (orders row, label,
+#   Kernels, merchant email).
+
+def _paypal_meta_get(key):
+    conn = db()
+    try:
+        row = conn.execute("SELECT value FROM paypal_meta WHERE key = ?", (key,)).fetchone()
+        return (row["value"] if row else "") or ""
+    finally:
+        conn.close()
+
+def _paypal_meta_set(key, value):
+    conn = db()
+    try:
+        conn.execute("INSERT OR REPLACE INTO paypal_meta (key, value) VALUES (?, ?)", (key, value))
+        conn.commit()
+    finally:
+        conn.close()
+
+def _get_or_create_paypal_subscription_product():
+    """Return the stored PayPal subscription product id, creating it once."""
+    pid = _paypal_meta_get("subscription_product_id")
+    if pid:
+        return pid
+    try:
+        prod = paypal_api("POST", "/v1/catalogs/products", {
+            "name": "Pop-A-Licious Subscription",
+            "description": "Recurring Pop-A-Licious popcorn subscription",
+            "type": "SERVICE",
+        })
+    except Exception:
+        return ""
+    pid = (prod or {}).get("id") or ""
+    if pid:
+        _paypal_meta_set("subscription_product_id", pid)
+    return pid
+
+def _paypal_sub_plan_price_cents(plan, shipping_zip):
+    """Renewal price for a PayPal plan: EXACTLY the renewal computation.
+
+    Sum over subscription lines of (discounted per-delivery + cheapest
+    Shippo rate for the ZIP and that line's bag count) — the same two
+    terms _attempt_subscription_charge bills per subscription record.
+    shipping_zip is the ZIP entered at checkout. When Shippo cannot rate
+    the ZIP at creation time, fall back to the checkout's calculated
+    shipping rate rather than pricing the plan without shipping.
+    """
+    total = 0
+    for s in plan["subscriptions"]:
+        items = s["items"]
+        disc = SUB_FREQUENCIES[s["frequency"]]["discount"]
+        per = _per_delivery_cents(items, disc)
+        bags = sum(it["quantity"] for it in items if isinstance(it, dict))
+        ship = _cheapest_shipping_cents(shipping_zip, bags) if (shipping_zip and bags) else 0
+        ship = ship or 0
+        if not ship and plan["shipping_cents"]:
+            ship = plan["shipping_cents"]
+        total += per + ship
+    return total
+
+def _paypal_subscriber_ship(subscriber):
+    """Shipping address from a PayPal subscription's subscriber object.
+
+    Prefers the PayPal shipping address; falls back to the subscriber's
+    account name. Fields are blank when incomplete (the caller 400s).
+    """
+    subscriber = subscriber or {}
+    addr = subscriber.get("shipping_address") or {}
+    name = ((addr.get("name") or {}).get("full_name") or "").strip()
+    if not name:
+        nm = subscriber.get("name") or {}
+        name = " ".join(x for x in [(nm.get("given_name") or "").strip(),
+                                    (nm.get("surname") or "").strip()] if x)
+    a = addr.get("address") or {}
+    return {
+        "name": name[:120],
+        "street": (a.get("address_line_1") or "").strip()[:200],
+        "city": (a.get("admin_area_2") or "").strip()[:120],
+        "state": (a.get("admin_area_1") or "").strip().upper()[:2],
+        "zip": (a.get("postal_code") or "").strip()[:10],
+    }
+
+def _paypal_subscription_action(pp_sub_id, action, reason):
+    """Suspend, activate, or cancel a PayPal subscription. Returns True/False."""
+    try:
+        paypal_api("POST", f"/v1/billing/subscriptions/{pp_sub_id}/{action}",
+                   {"reason": (reason or "Customer request")[:200]})
+        return True
+    except Exception:
+        return False
+
+def _paypal_webhook_id():
+    """Id of the registered PayPal webhook for this site, stored or discovered."""
+    wid = _paypal_meta_get("webhook_id")
+    if wid:
+        return wid
+    try:
+        data = paypal_api("GET", "/v1/notifications/webhooks")
+    except Exception:
+        return ""
+    target = f"{SITE_URL}/api/paypal/webhook"
+    for wh in (data or {}).get("webhooks", []):
+        if (wh.get("url") or "") == target:
+            wid = wh.get("id") or ""
+            if wid:
+                _paypal_meta_set("webhook_id", wid)
+            return wid
+    return ""
+
+@app.post("/api/paypal/subscriptions/create")
+def paypal_subscription_create():
+    """Create a PayPal subscription for a subscription-only cart (auth).
+
+    Validates with the same checkout validator as the card path, then
+    creates one PayPal plan (price = renewal computation) and one PayPal
+    subscription for the account email, and returns the approval URL +
+    subscription id. The SDK button approves that id; the confirm endpoint
+    finalizes. The cart payload is stored server-side (pending row) so
+    confirm re-validates trusted data, never the request body.
+    """
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    conn = db()
+    full = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    conn.close()
+    plan, err = _validate_subscription_checkout(
+        data, user, full, require_payment_method=False, require_address=False)
+    if err:
+        return err[0], err[1]
+    if data.get("items"):
+        return jsonify(error="PayPal subscriptions cover subscription-only carts — check out one-time items with a card, or check them out separately."), 400
+    if len(plan["subscriptions"]) != 1:
+        return jsonify(error="PayPal checkout supports one subscription at a time — check out additional subscriptions separately."), 400
+    sub = plan["subscriptions"][0]
+    shipping_zip = (data.get("shipping_zip") or "").strip()[:10]
+    price = _paypal_sub_plan_price_cents(plan, shipping_zip)
+    if price < 50:
+        return jsonify(error="order total is too small"), 400
+    product_id = _get_or_create_paypal_subscription_product()
+    if not product_id:
+        return jsonify(error="the payment service could not start checkout"), 502
+    days = SUB_FREQUENCIES[sub["frequency"]]["days"]
+    label = SUB_FREQUENCIES[sub["frequency"]]["label"]
+    summary = _items_summary_str(sub["items"])
+    subscriber = {"email_address": full["email"]}
+    full_name = (full["name"] or "").strip()
+    if full_name:
+        parts = full_name.split()
+        subscriber["name"] = {"given_name": parts[0],
+                              "surname": " ".join(parts[1:]) or parts[0]}
+    try:
+        plan_resp = paypal_api("POST", "/v1/billing/plans", {
+            "product_id": product_id,
+            "name": f"Pop-A-Licious subscription ({label})",
+            "description": summary[:120],
+            "status": "ACTIVE",
+            "billing_cycles": [{
+                "frequency": {"interval_unit": "DAY", "interval_count": days},
+                "tenure_type": "REGULAR",
+                "sequence": 1,
+                "total_cycles": 0,
+                "pricing_scheme": {"fixed_price": {"value": _dollars(price), "currency_code": "USD"}},
+            }],
+            "payment_preferences": {"auto_bill_outstanding": True},
+        })
+        plan_id = (plan_resp or {}).get("id") or ""
+        if not plan_id:
+            return jsonify(error="the payment service could not start checkout"), 502
+        sub_resp = paypal_api("POST", "/v1/billing/subscriptions", {
+            "plan_id": plan_id,
+            "subscriber": subscriber,
+            "application_context": {
+                "brand_name": "Pop-A-Licious",
+                "locale": "en-US",
+                "shipping_preference": "GET_FROM_FILE",
+                "user_action": "SUBSCRIBE_NOW",
+                "return_url": f"{SITE_URL}/?paypal_sub_return=1",
+                "cancel_url": f"{SITE_URL}/#checkout",
+            },
+        })
+    except Exception:
+        return jsonify(error="the payment service could not start checkout"), 502
+    pp_id = (sub_resp or {}).get("id") or ""
+    approve_url = ""
+    for link in (sub_resp or {}).get("links", []):
+        if link.get("rel") == "approve":
+            approve_url = link.get("href") or ""
+    if not pp_id or not approve_url:
+        return jsonify(error="the payment service could not start checkout"), 502
+    stored = {
+        "subscriptions": [{"frequency": s["frequency"], "items": s["items"]}
+                          for s in plan["subscriptions"]],
+        "items": [],
+        "email": plan["email"],
+        "discount_code": (data.get("discount_code") or "").strip().upper() or None,
+        "shipping_cents": plan["shipping_cents"],
+        "shipping_label": plan["shipping_label"],
+        "merch_shipping_cents": plan["merch_shipping_cents"],
+        "shipping_zip": shipping_zip,
+    }
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO paypal_pending_subscriptions"
+        " (paypal_subscription_id, user_id, payload, created_at) VALUES (?, ?, ?, ?)",
+        (pp_id, user["id"], json.dumps(stored), datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    conn.close()
+    return jsonify(plan_id=plan_id, paypal_subscription_id=pp_id,
+                   approval_url=approve_url, amount_cents=price)
+
+@app.post("/api/paypal/subscriptions/confirm")
+def paypal_subscription_confirm():
+    """Finalize an approved PayPal subscription (auth).
+
+    Body: {paypal_subscription_id}. The subscription must have been
+    created by /api/paypal/subscriptions/create for this user (pending
+    row), must belong to the account email, and must be ACTIVE or
+    APPROVED. The shipping address comes from the PayPal subscription
+    object; totals are re-validated from the server-stored cart payload.
+    Idempotent: a subscription id already on a record returns
+    already_processed instead of creating a second record.
+    """
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    pp_id = (data.get("paypal_subscription_id") or "").strip()
+    if not pp_id:
+        return jsonify(error="paypal_subscription_id is required"), 400
+    conn = db()
+    full = conn.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    pend = conn.execute(
+        "SELECT * FROM paypal_pending_subscriptions"
+        " WHERE paypal_subscription_id = ? AND user_id = ?",
+        (pp_id, user["id"])).fetchone()
+    conn.close()
+    if not full or not pend:
+        return jsonify(error="the PayPal subscription could not be verified"), 403
+    try:
+        stored = json.loads(pend["payload"] or "{}")
+    except (TypeError, ValueError):
+        stored = {}
+    if not isinstance(stored, dict) or not stored.get("subscriptions"):
+        return jsonify(error="the PayPal subscription could not be verified"), 403
+    try:
+        pp = paypal_api("GET", f"/v1/billing/subscriptions/{pp_id}")
+    except Exception:
+        return jsonify(error="the payment could not be verified"), 502
+    if (pp.get("status") or "") not in ("ACTIVE", "APPROVED"):
+        return jsonify(error="the PayPal subscription is not active yet"), 402
+    subscriber = pp.get("subscriber") or {}
+    if (subscriber.get("email_address") or "").strip().lower() != (full["email"] or "").strip().lower():
+        return jsonify(error="the PayPal subscription could not be verified"), 403
+    ship = _paypal_subscriber_ship(subscriber)
+    if not (ship["name"] and ship["street"] and ship["city"] and ship["state"] and ship["zip"]):
+        return jsonify(error="a complete shipping address is required"), 400
+    conn = db()
+    existing = conn.execute(
+        "SELECT id, next_billing_date FROM subscriptions WHERE paypal_subscription_id = ?",
+        (pp_id,)).fetchone()
+    conn.close()
+    if existing:
+        return jsonify(success=True, already_processed=True,
+                       subscription_ids=[existing["id"]],
+                       next_billing_dates=[existing["next_billing_date"]])
+    plan, err = _validate_subscription_checkout(
+        stored, user, full, require_payment_method=False, require_address=False)
+    if err:
+        return err[0], err[1]
+    plan["ship"] = ship
+    price = _paypal_sub_plan_price_cents(plan, ship["zip"])
+    try:
+        result = _finalize_subscription_checkout(
+            user, full, plan, "", price,
+            payment_provider="paypal", paypal_subscription_id=pp_id)
+    except Exception:
+        return jsonify(error="Your payment succeeded but we couldn't finish your subscription. Please try again or contact us — you will not be charged twice for the same order."), 502
+    conn = db()
+    conn.execute("DELETE FROM paypal_pending_subscriptions WHERE paypal_subscription_id = ?", (pp_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(result)
+
+def _paypal_webhook_sale_completed(resource):
+    """Fulfill one PayPal subscription renewal payment (idempotent).
+
+    Renewals only: the earliest due pending renewal is fulfilled. A sale
+    with no due renewal is the first payment, which the confirm endpoint
+    already handled — it is ignored, never double-fulfilled. A redelivered
+    webhook hits the orders-row check first and stops.
+    """
+    pp_sub_id = (resource.get("billing_agreement_id") or "").strip()
+    sale_id = (resource.get("id") or "").strip()
+    if not pp_sub_id or not sale_id:
+        return
+    order_ref = f"sub_paypal_{sale_id}"
+    conn = db()
+    try:
+        if conn.execute("SELECT 1 FROM orders WHERE stripe_session_id = ?", (order_ref,)).fetchone():
+            return
+        sub = conn.execute("SELECT * FROM subscriptions WHERE paypal_subscription_id = ?", (pp_sub_id,)).fetchone()
+        if not sub:
+            return
+        ren = conn.execute(
+            "SELECT * FROM subscription_renewals"
+            " WHERE subscription_id = ? AND status = 'pending' AND billing_date <= ?"
+            " ORDER BY billing_date ASC, id ASC LIMIT 1",
+            (sub["id"], datetime.now(timezone.utc).date().isoformat())).fetchone()
+        if not ren:
+            return
+        try:
+            items = json.loads(sub["items"] or "[]")
+        except (TypeError, ValueError):
+            items = []
+        amount = None
+        amt = resource.get("amount") or {}
+        try:
+            amount = int(round(float(amt.get("total", 0)) * 100))
+        except (TypeError, ValueError):
+            amount = None
+        if not amount or (amt.get("currency_code") or "USD") != "USD":
+            disc = SUB_FREQUENCIES.get(sub["frequency"], {}).get("discount", sub["discount_percent"] or 0)
+            per = _per_delivery_cents(items, disc)
+            bags = sum(it["quantity"] for it in items if isinstance(it, dict))
+            ship = _cheapest_shipping_cents(sub["ship_zip"], bags) if bags else 0
+            amount = per + (ship or 0)
+        if amount < 50:
+            return
+        payload = _record_subscription_renewal_payment(conn, sub, ren, items, amount, order_ref)
+        conn.commit()
+        notify_merchant_of_order(order_ref, sub["ship_name"], sub["ship_email"],
+                                 payload["summary"], payload["amount"], "", 0, "",
+                                 payload["ship_addr"], payload.get("label_url", ""),
+                                 payload.get("tracking_number", ""))
+    finally:
+        conn.close()
+
+def _paypal_webhook_subscription_status(resource, target):
+    """Mirror a PayPal subscription state change locally (guarded).
+
+    CANCELLED always lands; SUSPENDED only pauses an active row and
+    ACTIVATED only resumes a paused row, so a stale event can never
+    resurrect a cancelled subscription.
+    """
+    pp_sub_id = (resource.get("id") or "").strip()
+    if not pp_sub_id:
+        return
+    conn = db()
+    try:
+        sub = conn.execute("SELECT * FROM subscriptions WHERE paypal_subscription_id = ?", (pp_sub_id,)).fetchone()
+        if not sub:
+            return
+        cur = sub["status"]
+        if target == "cancelled":
+            new = "cancelled"
+        elif target == "paused" and cur == "active":
+            new = "paused"
+        elif target == "active" and cur == "paused":
+            new = "active"
+        else:
+            return
+        if new != cur:
+            conn.execute("UPDATE subscriptions SET status = ? WHERE id = ?", (new, sub["id"]))
+            conn.commit()
+    finally:
+        conn.close()
+
+@app.post("/api/paypal/webhook")
+def paypal_webhook():
+    """PayPal webhook receiver (public; signature-verified, never crashes).
+
+    Bad signatures are rejected; malformed bodies are 400s; unknown event
+    types are logged and ignored. Verification needs the registered
+    webhook id (stored by the admin register endpoint, or discovered by
+    listing webhooks); without one, events are rejected fail-closed.
+    """
+    try:
+        event = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify(error="invalid webhook body"), 400
+    if not isinstance(event, dict) or not event.get("event_type"):
+        return jsonify(error="invalid webhook body"), 400
+    webhook_id = _paypal_webhook_id()
+    if not webhook_id:
+        app.logger.warning("paypal webhook: no webhook id on file; event ignored")
+        return jsonify(error="webhook not verified"), 403
+    try:
+        ver = paypal_api("POST", "/v1/notifications/verify-webhook-signature", {
+            "auth_algo": request.headers.get("PAYPAL-AUTH-ALGO", ""),
+            "cert_url": request.headers.get("PAYPAL-CERT-URL", ""),
+            "transmission_id": request.headers.get("PAYPAL-TRANSMISSION-ID", ""),
+            "transmission_sig": request.headers.get("PAYPAL-TRANSMISSION-SIG", ""),
+            "transmission_time": request.headers.get("PAYPAL-TRANSMISSION-TIME", ""),
+            "webhook_id": webhook_id,
+            "webhook_event": event,
+        })
+    except Exception:
+        return jsonify(error="webhook not verified"), 403
+    if (ver or {}).get("verification_status") != "SUCCESS":
+        return jsonify(error="webhook not verified"), 403
+    etype = event.get("event_type")
+    resource = event.get("resource") or {}
+    if etype == "PAYMENT.SALE.COMPLETED":
+        _paypal_webhook_sale_completed(resource)
+    elif etype == "BILLING.SUBSCRIPTION.CANCELLED":
+        _paypal_webhook_subscription_status(resource, "cancelled")
+    elif etype == "BILLING.SUBSCRIPTION.SUSPENDED":
+        _paypal_webhook_subscription_status(resource, "paused")
+    elif etype == "BILLING.SUBSCRIPTION.ACTIVATED":
+        _paypal_webhook_subscription_status(resource, "active")
+    return jsonify(ok=True)
+
+@app.post("/api/admin/paypal/register-webhook")
+def admin_paypal_register_webhook():
+    """Register this site's PayPal webhook once (admin only).
+
+    Lists existing webhooks first and skips registration when the URL is
+    already registered. The webhook id is stored for signature checks.
+    Run once after backend deploy, before the first PayPal subscription.
+    """
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    target = f"{SITE_URL}/api/paypal/webhook"
+    try:
+        data = paypal_api("GET", "/v1/notifications/webhooks")
+    except Exception:
+        return jsonify(error="could not list PayPal webhooks"), 502
+    for wh in (data or {}).get("webhooks", []):
+        if (wh.get("url") or "") == target:
+            wid = wh.get("id") or ""
+            if wid:
+                _paypal_meta_set("webhook_id", wid)
+            return jsonify(already_registered=True, webhook_id=wid, url=target)
+    try:
+        created = paypal_api("POST", "/v1/notifications/webhooks", {
+            "url": target,
+            "event_types": [{"name": "PAYMENT.SALE.COMPLETED"},
+                            {"name": "BILLING.SUBSCRIPTION.CANCELLED"},
+                            {"name": "BILLING.SUBSCRIPTION.SUSPENDED"},
+                            {"name": "BILLING.SUBSCRIPTION.ACTIVATED"}],
+        })
+    except Exception:
+        return jsonify(error="could not register PayPal webhook"), 502
+    wid = (created or {}).get("id") or ""
+    if wid:
+        _paypal_meta_set("webhook_id", wid)
+    return jsonify(registered=True, webhook_id=wid, url=target)
 
 
 # ---------------------------------------------------------------- customer auth
@@ -6764,6 +7262,82 @@ def _notify_renewal_failure(conn, sub, renewal, reason):
     except Exception:
         pass
 
+def _record_subscription_renewal_payment(conn, sub, renewal, items, amount, order_ref):
+    """Record an already-paid subscription renewal: Shippo label, orders
+    row, billing-cycle advance, next pending renewal row, Kernels.
+
+    Shared by the Stripe renewal charge and the PayPal webhook path, so a
+    renewal is fulfilled exactly once per payment no matter which provider
+    billed it. Does NOT commit (the caller commits, so cron can batch).
+    Returns the payload dict the cron's merchant notification uses.
+    """
+    bags = sum(it["quantity"] for it in items if isinstance(it, dict))
+    now = datetime.now(timezone.utc).isoformat()
+    summary = _items_summary_str(items)
+    ship_addr = ", ".join(
+        x for x in [sub["ship_name"], sub["ship_street"], sub["ship_city"],
+                    sub["ship_state"], sub["ship_zip"]] if x)
+    # Shippo label (never blocks the charge — blank fields = admin retry).
+    label_url, tracking_number = _create_shippo_label(
+        _shippo_address_to(
+            name=sub["ship_name"] or "",
+            street1=sub["ship_street"] or "",
+            city=sub["ship_city"] or "",
+            state=sub["ship_state"] or "",
+            zip_code=sub["ship_zip"] or "",
+        ),
+        bags,
+        order_ref=order_ref,
+    )
+    label_created_at = now if label_url else ""
+    cur = conn.execute(
+        """INSERT INTO orders
+           (stripe_session_id, email, customer_name, shipping_address, items_summary,
+            amount_total_cents, gift_card_code, gift_card_discount_cents,
+            promo_code, reward_code, total_qty,
+            shippo_label_url, shippo_tracking_number, shippo_label_created_at,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, '', 0, '', '', ?, ?, ?, ?, ?)""",
+        (order_ref, sub["ship_email"] or "", sub["ship_name"] or "",
+         ship_addr, summary, amount, bags,
+         label_url or "", tracking_number or "", label_created_at, now))
+    order_id = cur.lastrowid
+    # Advance the billing cycle from the later of the old billing date / today.
+    days = SUB_FREQUENCIES.get(sub["frequency"], {}).get("days", 30)
+    try:
+        base = datetime.strptime(
+            sub["next_billing_date"], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        base = datetime.now(timezone.utc).date()
+    new_next = max(base, datetime.now(timezone.utc).date()) + timedelta(days=days)
+    conn.execute(
+        "UPDATE subscription_renewals SET status = 'charged', charged_at = ?,"
+        " order_id = ?, amount_cents = ? WHERE id = ?",
+        (now, order_id, amount, renewal["id"]))
+    conn.execute(
+        "UPDATE subscriptions SET next_billing_date = ?, last_billed_at = ? WHERE id = ?",
+        (new_next.isoformat(), now, sub["id"]))
+    conn.execute(
+        "INSERT INTO subscription_renewals (subscription_id, billing_date, status, confirm_token)"
+        " VALUES (?, ?, 'pending', ?)",
+        (sub["id"], new_next.isoformat(), _new_confirm_token()))
+    # Loyalty: 1 Kernel per $1 on the subscription total.
+    if sub["user_id"]:
+        urow = conn.execute(
+            "SELECT id FROM users WHERE id = ?", (sub["user_id"],)).fetchone()
+        if urow:
+            _credit_kernels(conn, urow["id"],
+                            amount // 100 * KERNELS_PER_DOLLAR,
+                            "subscription", order_ref=order_ref)
+    return {
+        "order_number": 1000 + order_id,
+        "summary": summary,
+        "amount": amount,
+        "ship_addr": ship_addr,
+        "label_url": label_url or "",
+        "tracking_number": tracking_number or "",
+    }
+
 def _attempt_subscription_charge(conn, sub, renewal, items):
     """Charge one subscription renewal off-session.
 
@@ -6807,72 +7381,10 @@ def _attempt_subscription_charge(conn, sub, renewal, items):
         _notify_renewal_failure(conn, sub, renewal, "the payment could not be completed")
         return False, (jsonify(error="the payment could not be completed"), 402)
 
-    now = datetime.now(timezone.utc).isoformat()
-    summary = _items_summary_str(items)
-    ship_addr = ", ".join(
-        x for x in [sub["ship_name"], sub["ship_street"], sub["ship_city"],
-                    sub["ship_state"], sub["ship_zip"]] if x)
-    # Shippo label (never blocks the charge — blank fields = admin retry).
-    label_url, tracking_number = _create_shippo_label(
-        _shippo_address_to(
-            name=sub["ship_name"] or "",
-            street1=sub["ship_street"] or "",
-            city=sub["ship_city"] or "",
-            state=sub["ship_state"] or "",
-            zip_code=sub["ship_zip"] or "",
-        ),
-        bags,
-        order_ref=f"sub_{pi.id}",
-    )
-    label_created_at = now if label_url else ""
-    cur = conn.execute(
-        """INSERT INTO orders
-           (stripe_session_id, email, customer_name, shipping_address, items_summary,
-            amount_total_cents, gift_card_code, gift_card_discount_cents,
-            promo_code, reward_code, total_qty,
-            shippo_label_url, shippo_tracking_number, shippo_label_created_at,
-            created_at)
-           VALUES (?, ?, ?, ?, ?, ?, '', 0, '', '', ?, ?, ?, ?, ?)""",
-        (f"sub_{pi.id}", sub["ship_email"] or "", sub["ship_name"] or "",
-         ship_addr, summary, amount, bags,
-         label_url or "", tracking_number or "", label_created_at, now))
-    order_id = cur.lastrowid
-    # Advance the billing cycle from the later of the old billing date / today.
-    days = SUB_FREQUENCIES.get(sub["frequency"], {}).get("days", 30)
-    try:
-        base = datetime.strptime(
-            sub["next_billing_date"], "%Y-%m-%d").date()
-    except (TypeError, ValueError):
-        base = datetime.now(timezone.utc).date()
-    new_next = max(base, datetime.now(timezone.utc).date()) + timedelta(days=days)
-    conn.execute(
-        "UPDATE subscription_renewals SET status = 'charged', charged_at = ?,"
-        " order_id = ?, amount_cents = ? WHERE id = ?",
-        (now, order_id, amount, renewal["id"]))
-    conn.execute(
-        "UPDATE subscriptions SET next_billing_date = ?, last_billed_at = ? WHERE id = ?",
-        (new_next.isoformat(), now, sub["id"]))
-    conn.execute(
-        "INSERT INTO subscription_renewals (subscription_id, billing_date, status, confirm_token)"
-        " VALUES (?, ?, 'pending', ?)",
-        (sub["id"], new_next.isoformat(), _new_confirm_token()))
-    # Loyalty: 1 Kernel per $1 on the subscription total.
-    if sub["user_id"]:
-        urow = conn.execute(
-            "SELECT id FROM users WHERE id = ?", (sub["user_id"],)).fetchone()
-        if urow:
-            _credit_kernels(conn, urow["id"],
-                            amount // 100 * KERNELS_PER_DOLLAR,
-                            "subscription", order_ref=f"sub_{pi.id}")
-    return True, {
-        "order_number": 1000 + order_id,
-        "payment_intent_id": pi.id,
-        "summary": summary,
-        "amount": amount,
-        "ship_addr": ship_addr,
-        "label_url": label_url or "",
-        "tracking_number": tracking_number or "",
-    }
+    payload = _record_subscription_renewal_payment(
+        conn, sub, renewal, items, amount, f"sub_{pi.id}")
+    payload["payment_intent_id"] = pi.id
+    return True, payload
 
 # ---------------- subscription endpoints ----------------
 
@@ -6893,6 +7405,54 @@ def subscription_setup_intent():
         return jsonify(error="the payment service could not start setup"), 502
     conn.close()
     return jsonify(client_secret=si.client_secret, customer_id=customer_id)
+
+def _create_subscription_record(conn, user, full, payment_method_id, frequency, items, ship,
+                                payment_provider="stripe", paypal_subscription_id=""):
+    """Attach a card and insert a subscription + its pending renewal row.
+
+    Shared by POST /api/subscriptions and the subscription-checkout path, so
+    both create exactly the same records (same table, same next_billing_date
+    = now + frequency days, same pending renewal row). Returns
+    (sub_id, next_billing, discount_percent). Raises stripe.error.StripeError
+    on payment-service failure; the caller owns commit/close and the welcome
+    email. Does NOT commit: the caller commits after all inserts so a
+    multi-subscription checkout is atomic with its order row.
+
+    PayPal rows (payment_provider="paypal") skip the Stripe customer /
+    payment-method attach entirely — PayPal bills itself — and store the
+    PayPal subscription id instead.
+    """
+    if payment_provider == "paypal":
+        customer_id = ""
+    else:
+        customer_id = _get_or_create_stripe_customer(conn, full)
+        stripe.PaymentMethod.attach(payment_method_id, customer=customer_id)
+        stripe.Customer.modify(
+            customer_id,
+            invoice_settings={"default_payment_method": payment_method_id})
+    freq = SUB_FREQUENCIES[frequency]
+    next_billing = (datetime.now(timezone.utc).date()
+                    + timedelta(days=freq["days"])).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        """INSERT INTO subscriptions
+           (user_id, stripe_customer_id, stripe_payment_method_id, items, frequency,
+            discount_percent, status, next_billing_date,
+            ship_name, ship_street, ship_city, ship_state, ship_zip, ship_email,
+            payment_provider, paypal_subscription_id,
+            created_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user["id"], customer_id, payment_method_id or "", json.dumps(items), frequency,
+         freq["discount"], next_billing,
+         ship["name"], ship["street"], ship["city"], ship["state"], ship["zip"], full["email"],
+         payment_provider, paypal_subscription_id or "",
+         now))
+    sub_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO subscription_renewals (subscription_id, billing_date, status, confirm_token)"
+        " VALUES (?, ?, 'pending', ?)",
+        (sub_id, next_billing, _new_confirm_token()))
+    return sub_id, next_billing, freq["discount"]
 
 @app.post("/api/subscriptions")
 def create_subscription():
@@ -6926,43 +7486,619 @@ def create_subscription():
     full = conn.execute(
         "SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
     try:
-        customer_id = _get_or_create_stripe_customer(conn, full)
-        stripe.PaymentMethod.attach(payment_method_id, customer=customer_id)
-        stripe.Customer.modify(
-            customer_id,
-            invoice_settings={"default_payment_method": payment_method_id})
+        sub_id, next_billing, discount = _create_subscription_record(
+            conn, user, full, payment_method_id, frequency, items,
+            {"name": ship_name, "street": ship_street, "city": ship_city,
+             "state": ship_state, "zip": ship_zip})
     except stripe.error.StripeError:
         conn.close()
         return jsonify(error="could not save your payment method"), 502
-
-    freq = SUB_FREQUENCIES[frequency]
-    next_billing = (datetime.now(timezone.utc).date()
-                    + timedelta(days=freq["days"])).isoformat()
-    now = datetime.now(timezone.utc).isoformat()
-    cur = conn.execute(
-        """INSERT INTO subscriptions
-           (user_id, stripe_customer_id, stripe_payment_method_id, items, frequency,
-            discount_percent, status, next_billing_date,
-            ship_name, ship_street, ship_city, ship_state, ship_zip, ship_email,
-            created_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (user["id"], customer_id, payment_method_id, json.dumps(items), frequency,
-         freq["discount"], next_billing,
-         ship_name, ship_street, ship_city, ship_state, ship_zip, full["email"],
-         now))
-    sub_id = cur.lastrowid
-    conn.execute(
-        "INSERT INTO subscription_renewals (subscription_id, billing_date, status, confirm_token)"
-        " VALUES (?, ?, 'pending', ?)",
-        (sub_id, next_billing, _new_confirm_token()))
     conn.commit()
     conn.close()
     # Welcome email (never blocks the response if sending fails).
     _send_subscription_welcome_email(
         full["name"] or ship_name, full["email"], items, frequency, next_billing)
     return jsonify(id=sub_id, next_billing_date=next_billing,
-                   per_delivery_cents=_per_delivery_cents(items, freq["discount"]),
-                   discount_percent=freq["discount"])
+                   per_delivery_cents=_per_delivery_cents(items, discount),
+                   discount_percent=discount)
+
+def _validate_subscription_checkout(data, user, full, require_payment_method=True,
+                                     require_address=True):
+    """Validate a subscription-checkout payload (shared by the create and
+    confirm endpoints, so both compute the same total).
+
+    Body: { payment_method_id, subscriptions: [{frequency, items}],
+            items (one-time, may be []), email, discount_code,
+            shipping_cents, shipping_label, merch_shipping_cents,
+            shipping_address: {name, street, city, state, zip} }.
+
+    The embedded-checkout session path validates before payment, when the
+    card and the shipping address are not known yet (both are collected
+    inside the embedded Checkout Session): it calls with
+    require_payment_method=False, require_address=False, and the confirm
+    endpoint fills plan["payment_method_id"] and plan["ship"] from the
+    completed session. Legacy callers keep the defaults, so their
+    behavior is unchanged.
+
+    Returns (plan, None) or (None, (response, status)). plan keys: one_time
+    (the _compute_order dict or None), one_time_net_cents, subscriptions
+    [{frequency, items, per_delivery_cents, discount_percent}],
+    first_delivery_cents, shipping_cents, merch_shipping_cents,
+    shipping_label, email, ship {name, street, city, state, zip}.
+
+    Rules: discount codes apply to the one-time portion only (via
+    _compute_order, exactly as today). A subscription-only cart carrying a
+    discount code is rejected with a plain message rather than silently
+    ignoring the code — whether FREESHIP50 should zero sub-only shipping is
+    still an open product question. Subscription-only carts earn no Kernels
+    (consistent with today: signup alone never credited Kernels); mixed-cart
+    orders credit Kernels on the full PaymentIntent amount via fulfill_order,
+    including first-delivery amounts.
+    """
+    payment_method_id = (data.get("payment_method_id") or "").strip()
+    if require_payment_method and not payment_method_id:
+        return None, (jsonify(error="payment_method_id is required"), 400)
+    raw_subs = data.get("subscriptions")
+    if not isinstance(raw_subs, list) or not raw_subs:
+        return None, (jsonify(error="at least one subscription is required"), 400)
+    subs = []
+    first_delivery = 0
+    for raw in raw_subs:
+        if not isinstance(raw, dict):
+            return None, (jsonify(error="invalid subscriptions"), 400)
+        frequency = (raw.get("frequency") or "").strip()
+        if frequency not in SUB_FREQUENCIES:
+            return None, (jsonify(error="frequency must be biweekly, monthly, or bimonthly"), 400)
+        items, err = _validate_subscription_items(raw.get("items"))
+        if err:
+            return None, err
+        per = _per_delivery_cents(items, SUB_FREQUENCIES[frequency]["discount"])
+        subs.append({"frequency": frequency, "items": items,
+                     "per_delivery_cents": per,
+                     "discount_percent": SUB_FREQUENCIES[frequency]["discount"]})
+        first_delivery += per
+    ship = data.get("shipping_address") or {}
+    if not isinstance(ship, dict):
+        return None, (jsonify(error="a complete shipping address is required"), 400)
+    ship_name = (ship.get("name") or "").strip()[:120]
+    ship_street = (ship.get("street") or "").strip()[:200]
+    ship_city = (ship.get("city") or "").strip()[:120]
+    ship_state = (ship.get("state") or "").strip().upper()[:2]
+    ship_zip = (ship.get("zip") or "").strip()[:10]
+    if require_address and (not ship_name or not ship_street or not ship_city or not ship_state or not ship_zip):
+        return None, (jsonify(error="a complete shipping address is required"), 400)
+    email = (data.get("email") or full["email"] or "").strip()
+    if not email or not EMAIL_RE.match(email):
+        return None, (jsonify(error="a valid email address is required"), 400)
+    raw_items = data.get("items") or []
+    one_time = None
+    one_time_net = 0
+    if raw_items:
+        one_time, err = _compute_order(data)
+        if err:
+            return None, err
+        discount_cents = 0
+        if one_time["discount_kind"] == "promo":
+            discount_cents = one_time["merchandise_total"] * one_time["promo_percent_off"] // 100
+        elif one_time["discount_kind"] == "gift_card":
+            discount_cents = one_time["gift_card_discount_cents"]
+        elif one_time["discount_kind"] == "reward":
+            discount_cents = one_time["reward_discount_cents"]
+        one_time_net = max(0, one_time["merchandise_total"] - discount_cents)
+        shipping_cents = one_time["shipping_cents"]
+        merch_shipping_cents = one_time["merch_shipping_cents"]
+        shipping_label = one_time["shipping_label"]
+    else:
+        if (data.get("discount_code") or "").strip():
+            return None, (jsonify(error="Discount codes apply to one-time items only — remove the code to check out with subscriptions alone."), 400)
+        try:
+            shipping_cents = int(data.get("shipping_cents") or 0)
+            merch_shipping_cents = int(data.get("merch_shipping_cents") or 0)
+        except (TypeError, ValueError):
+            return None, (jsonify(error="invalid shipping"), 400)
+        if shipping_cents < 0 or shipping_cents > 100000:
+            return None, (jsonify(error="invalid shipping"), 400)
+        if merch_shipping_cents < 0 or merch_shipping_cents > 100000:
+            return None, (jsonify(error="invalid merch shipping"), 400)
+        shipping_label = (data.get("shipping_label") or "").strip()[:120]
+        # Same guard as _compute_order: never check out with uncalculated
+        # shipping unless a free-shipping label zeroed it.
+        if (shipping_cents == 0 and merch_shipping_cents == 0
+                and not shipping_label.startswith("FREE")):
+            return None, (jsonify(error="Shipping hasn't been calculated yet — enter your ZIP code so we can calculate shipping before you pay."), 400)
+    return {
+        "one_time": one_time,
+        "one_time_net_cents": one_time_net,
+        "subscriptions": subs,
+        "first_delivery_cents": first_delivery,
+        "shipping_cents": shipping_cents,
+        "merch_shipping_cents": merch_shipping_cents,
+        "shipping_label": shipping_label,
+        "email": email,
+        "payment_method_id": payment_method_id,
+        "ship": {"name": ship_name, "street": ship_street, "city": ship_city,
+                 "state": ship_state, "zip": ship_zip},
+    }, None
+
+def _finalize_subscription_checkout(user, full, plan, payment_intent_id, amount_cents,
+                                    payment_provider="stripe", paypal_subscription_id=""):
+    """Create the subscription records, then (only when one-time items exist)
+    the normal order via fulfill_order with a synthetic session.
+
+    Idempotency: if an order row with stripe_session_id "pi_<intent>" already
+    exists, the subscriptions were created by the earlier finalize that wrote
+    that row, so nothing is inserted again. For subscription-only carts there
+    is no order row, so each subscription is additionally guarded by a
+    recent-identical check (same user, items JSON, frequency, created within
+    15 minutes → reuse, don't insert a duplicate). Trade-off, stated plainly:
+    a deliberate second identical subscription within 15 minutes would be
+    folded into the first record instead of creating a second — recoverable
+    by support, and far safer than duplicating subscriptions when the
+    confirm response is lost and the frontend retries.
+
+    PayPal variant (payment_provider="paypal"): the already-processed check
+    is keyed on the PayPal subscription id instead of an order row, and the
+    records are created without any Stripe customer or payment method.
+    """
+    if payment_provider == "paypal":
+        session_ref = "paypal_sub_" + (paypal_subscription_id or "")
+    else:
+        session_ref = "pi_" + payment_intent_id
+    conn = db()
+    if payment_provider == "paypal" and paypal_subscription_id:
+        existing = conn.execute(
+            "SELECT id, next_billing_date FROM subscriptions"
+            " WHERE paypal_subscription_id = ?",
+            (paypal_subscription_id,)).fetchone()
+        if existing:
+            conn.close()
+            return {"success": True, "already_processed": True,
+                    "subscription_ids": [existing["id"]],
+                    "next_billing_dates": [existing["next_billing_date"]],
+                    "order_ref": session_ref, "amount_cents": amount_cents}
+    if plan["one_time"] and conn.execute(
+        "SELECT 1 FROM orders WHERE stripe_session_id = ?", (session_ref,)
+    ).fetchone():
+        conn.close()
+        return {"success": True, "already_processed": True, "subscription_ids": [],
+                "order_ref": session_ref, "amount_cents": amount_cents}
+    mark_abandoned_converted(plan["email"])
+    sub_ids = []
+    next_billings = []
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=15)).isoformat()
+    for sub in plan["subscriptions"]:
+        items_json = json.dumps(sub["items"])
+        existing = conn.execute(
+            "SELECT id, next_billing_date FROM subscriptions"
+            " WHERE user_id = ? AND frequency = ? AND items = ? AND created_at >= ?"
+            " ORDER BY id DESC LIMIT 1",
+            (user["id"], sub["frequency"], items_json, cutoff)).fetchone()
+        if existing:
+            sub_ids.append(existing["id"])
+            next_billings.append(existing["next_billing_date"])
+            continue
+        try:
+            sub_id, next_billing, _disc = _create_subscription_record(
+                conn, user, full, plan["payment_method_id"], sub["frequency"],
+                sub["items"], plan["ship"],
+                payment_provider=payment_provider,
+                paypal_subscription_id=paypal_subscription_id)
+        except stripe.error.StripeError:
+            conn.close()
+            raise
+        sub_ids.append(sub_id)
+        next_billings.append(next_billing)
+    conn.commit()
+    conn.close()
+    # Welcome emails (never block the response if sending fails). Sent for
+    # every subscription in the plan: a reused record's first run already
+    # sent one, and _send_subscription_welcome_email is idempotent in
+    # content — a duplicate welcome on a retried confirm is the lesser evil
+    # versus a new subscription with no welcome at all.
+    for sub, next_billing in zip(plan["subscriptions"], next_billings):
+        _send_subscription_welcome_email(
+            full["name"] or plan["ship"]["name"], plan["email"],
+            sub["items"], sub["frequency"], next_billing)
+    result = {"success": True, "subscription_ids": sub_ids,
+              "next_billing_dates": next_billings, "amount_cents": amount_cents,
+              "order_ref": session_ref if plan["one_time"] else None}
+    if not plan["one_time"]:
+        return result
+    # One-time portion: exactly the normal order path, via fulfill_order.
+    one_time = plan["one_time"]
+    sub_text = "; ".join(
+        "Subscription (%s): %s - first delivery" % (
+            SUB_FREQUENCIES[s["frequency"]]["label"],
+            ", ".join("%sx %s" % (it["quantity"], it["flavor"]) for it in s["items"]))
+        for s in plan["subscriptions"])
+    summary = one_time["summary"] + "; " + sub_text
+    # Appended subscription text contains no MERCH- pattern, so
+    # _parse_merch_items ignores it; the one-time summary (already <=400
+    # chars from _compute_order) is kept intact in front, so no merch token
+    # can be cut by truncation.
+    total_qty = (sum(it["quantity"] for it in one_time["items"])
+                 + sum(it["quantity"] for s in plan["subscriptions"] for it in s["items"]))
+    session = {
+        "id": session_ref,
+        "amount_total": amount_cents,
+        "customer_details": {
+            "email": plan["email"],
+            "name": plan["ship"]["name"],
+            "address": {"line1": plan["ship"]["street"], "line2": "",
+                        "city": plan["ship"]["city"], "state": plan["ship"]["state"],
+                        "postal_code": plan["ship"]["zip"], "country": "US"},
+        },
+        "shipping_details": {
+            "name": plan["ship"]["name"],
+            "address": {"line1": plan["ship"]["street"], "line2": "",
+                        "city": plan["ship"]["city"], "state": plan["ship"]["state"],
+                        "postal_code": plan["ship"]["zip"], "country": "US"},
+        },
+    }
+    meta = {
+        "items_summary": summary,
+        "total_qty": str(total_qty),
+        "gift_card_code": one_time["gift_card_code"],
+        "gift_card_discount_cents": str(one_time["gift_card_discount_cents"]),
+        "promo_code": one_time["promo_code"],
+        "reward_code": one_time["reward_code"],
+    }
+    try:
+        fulfill_order(session, meta)
+    except Exception as exc:  # noqa: BLE001 - a paid order must not 502
+        # The payment already succeeded and the subscriptions are created.
+        # fulfill_order raises before committing (its email step runs first),
+        # so nothing is half-written; the order row is simply missing and
+        # admin can reconcile it from the PaymentIntent + this flag.
+        app.logger.warning("subscription-checkout order fulfill failed for %s: %s",
+                           session_ref, exc)
+        result["order_email_failed"] = True
+    return result
+
+@app.post("/api/orders/subscription-checkout")
+def subscription_checkout():
+    """Charge one-time lines + first-delivery subscription amount(s) in one
+    card payment, save that card for renewals, and create the subscription(s)
+    via the existing subscription logic. Auth required; subscriptions stay
+    account-bound. If the card needs SCA, returns requires_action and the
+    frontend completes it, then calls /api/orders/subscription-checkout/confirm.
+    """
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    conn = db()
+    full = conn.execute(
+        "SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    conn.close()
+    plan, err = _validate_subscription_checkout(data, user, full)
+    if err:
+        return err[0], err[1]
+    payment_method_id = (data.get("payment_method_id") or "").strip()
+    plan["payment_method_id"] = payment_method_id
+    amount = (plan["one_time_net_cents"] + plan["first_delivery_cents"]
+              + plan["shipping_cents"] + plan["merch_shipping_cents"])
+    if amount < 50:
+        return jsonify(error="order total is too small"), 400
+    conn = db()
+    try:
+        customer_id = _get_or_create_stripe_customer(conn, full)
+    except stripe.error.StripeError:
+        conn.close()
+        return jsonify(error="the payment service could not start checkout"), 502
+    conn.close()
+    # Server-derived idempotency key: an identical retry (same user + plan)
+    # returns the original PaymentIntent instead of charging twice.
+    canonical = json.dumps({
+        "user_id": user["id"], "email": plan["email"], "ship": plan["ship"],
+        "subscriptions": [{"frequency": s["frequency"], "items": s["items"]}
+                          for s in plan["subscriptions"]],
+        "one_time": plan["one_time"]["items"] if plan["one_time"] else [],
+        "discount_code": (data.get("discount_code") or "").strip().upper(),
+        "shipping_cents": plan["shipping_cents"],
+        "merch_shipping_cents": plan["merch_shipping_cents"],
+    }, sort_keys=True)
+    idem_key = "subchk_" + hashlib.sha256(canonical.encode()).hexdigest()[:32]
+    try:
+        pi = stripe.PaymentIntent.create(
+            amount=amount,
+            currency="usd",
+            customer=customer_id,
+            payment_method=payment_method_id,
+            setup_future_usage="off_session",
+            confirm=True,
+            description="Pop-A-Licious order + first subscription delivery",
+            receipt_email=plan["email"] or None,
+            metadata={"type": "subscription_checkout"},
+            idempotency_key=idem_key,
+        )
+    except stripe.error.StripeError as e:
+        return jsonify(error=_stripe_error_message(e)), 502
+    if pi.status == "requires_action":
+        return jsonify(requires_action=True, client_secret=pi.client_secret,
+                       payment_intent_id=pi.id)
+    if pi.status != "succeeded":
+        return jsonify(error="the payment could not be completed"), 402
+    try:
+        result = _finalize_subscription_checkout(user, full, plan, pi.id, amount)
+    except stripe.error.StripeError:
+        return jsonify(error="Your payment succeeded but we couldn't create your subscription. Please try again or contact us — you will not be charged twice for the same order."), 502
+    return jsonify(result)
+
+def _sub_checkout_session_line_items(plan):
+    """Build embedded-session line items summing EXACTLY to the checkout
+    total (one-time net + first delivery + shipping + merch shipping).
+
+    Discounts are distributed across the one-time items with integer math,
+    never a Stripe coupon: coupon rounding can differ from the
+    floor-division discount in _compute_order by a cent, which would fail
+    the confirm endpoint's exact amount check. Zero-amount lines are
+    dropped — Stripe rejects them — which only happens when a discount
+    zeroes an item outright.
+    """
+    items = []
+    one_time = plan["one_time"]
+    if one_time:
+        raw = [(it["name"], it["amount_cents"] * it["quantity"])
+               for it in one_time["items"]]
+        if one_time["discount_kind"] == "promo":
+            percent = one_time["promo_percent_off"]
+            raws = [r - r * percent // 100 for _, r in raw]
+            # Floor per item can leave a small shortfall vs the
+            # floor-division net; take it off the largest line (which
+            # always has room: every line is at least a bag price).
+            residual = plan["one_time_net_cents"] - sum(raws)
+            if residual:
+                j = max(range(len(raws)), key=lambda i: raw[i][1])
+                raws[j] += residual
+        elif one_time["discount_kind"] in ("gift_card", "reward"):
+            if one_time["discount_kind"] == "gift_card":
+                remaining = one_time["gift_card_discount_cents"]
+            else:
+                remaining = one_time["reward_discount_cents"]
+            raws = []
+            for _, r in raw:
+                take = min(r, remaining)
+                raws.append(r - take)
+                remaining -= take
+        else:
+            raws = [r for _, r in raw]
+        for (name, _), amt in zip(raw, raws):
+            if amt > 0:
+                items.append({"price_data": {"currency": "usd",
+                                             "unit_amount": amt,
+                                             "product_data": {"name": name}},
+                              "quantity": 1})
+    for sub in plan["subscriptions"]:
+        items.append({"price_data": {"currency": "usd",
+                                     "unit_amount": sub["per_delivery_cents"],
+                                     "product_data": {"name": "Subscription (%s) - first delivery" % SUB_FREQUENCIES[sub["frequency"]]["label"]}},
+                      "quantity": 1})
+    if plan["shipping_cents"] > 0:
+        items.append({"price_data": {"currency": "usd",
+                                     "unit_amount": plan["shipping_cents"],
+                                     "product_data": {"name": f"Shipping{f' ({plan['shipping_label']})' if plan['shipping_label'] else ''}"}},
+                      "quantity": 1})
+    if plan["merch_shipping_cents"] > 0:
+        items.append({"price_data": {"currency": "usd",
+                                     "unit_amount": plan["merch_shipping_cents"],
+                                     "product_data": {"name": "Merch shipping (Printful)"}},
+                      "quantity": 1})
+    return items
+
+
+@app.post("/api/orders/subscription-checkout/session")
+def subscription_checkout_session():
+    """Create an embedded Checkout Session for a subscription checkout.
+
+    Auth required. Validates the same cart + totals as the legacy
+    subscription-checkout path (combined one-time + first-delivery
+    amounts, promo/gift-card/reward math preserved) but does NOT charge
+    and does NOT create subscriptions: the card and the shipping address
+    are collected inside the embedded Checkout Session, and the frontend
+    finalizes through /api/orders/subscription-checkout/confirm with the
+    session id once payment completes.
+
+    The session is card-only (payment_method_types=["card"]) with
+    payment_intent_data.setup_future_usage="off_session" so the card is
+    saved for renewals — wallets and PayPal cannot auto-charge renewals.
+    Returns {client_secret, session_id} for the embedded mount.
+    """
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    conn = db()
+    full = conn.execute(
+        "SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    conn.close()
+    plan, err = _validate_subscription_checkout(
+        data, user, full, require_payment_method=False, require_address=False)
+    if err:
+        return err[0], err[1]
+    amount = (plan["one_time_net_cents"] + plan["first_delivery_cents"]
+              + plan["shipping_cents"] + plan["merch_shipping_cents"])
+    if amount < 50:
+        return jsonify(error="order total is too small"), 400
+    conn = db()
+    try:
+        customer_id = _get_or_create_stripe_customer(conn, full)
+    except stripe.error.StripeError:
+        conn.close()
+        return jsonify(error="the payment service could not start checkout"), 502
+    conn.close()
+    line_items = _sub_checkout_session_line_items(plan)
+    if sum(li["price_data"]["unit_amount"] * li["quantity"] for li in line_items) != amount:
+        return jsonify(error="the payment service could not start checkout"), 502
+    # Server-derived idempotency key: an identical retry (same user + plan)
+    # returns the original session instead of creating a second one. The
+    # ship address is unknown before payment, so it is not part of the key.
+    canonical = json.dumps({
+        "user_id": user["id"], "email": plan["email"],
+        "subscriptions": [{"frequency": s["frequency"], "items": s["items"]}
+                          for s in plan["subscriptions"]],
+        "one_time": plan["one_time"]["items"] if plan["one_time"] else [],
+        "discount_code": (data.get("discount_code") or "").strip().upper(),
+        "shipping_cents": plan["shipping_cents"],
+        "merch_shipping_cents": plan["merch_shipping_cents"],
+    }, sort_keys=True)
+    idem_key = "subchk_sess_" + hashlib.sha256(canonical.encode()).hexdigest()[:32]
+    try:
+        session = stripe.checkout.Session.create(
+            mode="payment",
+            ui_mode="embedded",
+            customer=customer_id,
+            customer_email=plan["email"] or None,
+            payment_method_types=["card"],
+            payment_intent_data={
+                "setup_future_usage": "off_session",
+                "description": "Pop-A-Licious order + first subscription delivery",
+                "receipt_email": plan["email"] or None,
+                "metadata": {"type": "subscription_checkout"},
+            },
+            line_items=line_items,
+            shipping_address_collection={"allowed_countries": ["US"]},
+            phone_number_collection={"enabled": True},
+            metadata={"type": "subscription_checkout",
+                      "user_id": str(user["id"])},
+            return_url=f"{SITE_URL}/#my-subscriptions?session_id={{CHECKOUT_SESSION_ID}}",
+            idempotency_key=idem_key,
+        )
+    except stripe.error.StripeError:
+        return jsonify(error="the payment service could not start checkout"), 502
+    return jsonify(client_secret=session.client_secret, session_id=session.id)
+
+
+@app.post("/api/orders/subscription-checkout/confirm")
+def subscription_checkout_confirm():
+    """Complete a subscription checkout whose PaymentIntent needed SCA.
+    Re-validates the payload, verifies the PaymentIntent succeeded and its
+    amount matches the recomputed total, then finalizes (idempotent — see
+    _finalize_subscription_checkout).
+
+    Also accepts the embedded-checkout flow: {session_id, ...cart payload}.
+    The card and shipping address are derived server-side from the
+    completed Checkout Session instead of the request body, so the
+    session path never trusts client-supplied payment or address data.
+    """
+    user = _current_member()
+    if not user:
+        return jsonify(error="login required"), 401
+    data = request.get_json(force=True) or {}
+    session_id = (data.get("session_id") or "").strip()
+    if session_id:
+        # Embedded-checkout path: the card and shipping address were
+        # collected inside the Checkout Session. Derive both server-side.
+        try:
+            session = stripe.checkout.Session.retrieve(session_id)
+        except stripe.error.StripeError:
+            return jsonify(error="the payment could not be verified"), 502
+        meta = session.metadata or {}
+        if meta.get("type") != "subscription_checkout" or str(meta.get("user_id")) != str(user["id"]):
+            return jsonify(error="the payment could not be verified"), 403
+        if session.payment_status != "paid":
+            return jsonify(error="the payment has not completed yet"), 402
+        pi_id = session.payment_intent
+        if isinstance(pi_id, dict):
+            pi_id = pi_id.get("id") or ""
+        if not pi_id:
+            return jsonify(error="the payment could not be verified"), 502
+        try:
+            pi = stripe.PaymentIntent.retrieve(pi_id)
+        except stripe.error.StripeError:
+            return jsonify(error="the payment could not be verified"), 502
+        pm_id = pi.payment_method
+        if isinstance(pm_id, dict):
+            pm_id = pm_id.get("id") or ""
+        if not pm_id:
+            return jsonify(error="the payment could not be verified"), 502
+        ship_src = None
+        collected = getattr(session, "collected_information", None)
+        if collected:
+            ship_src = getattr(collected, "shipping_details", None)
+        if not ship_src:
+            ship_src = getattr(session, "shipping_details", None)
+        ship = {}
+        if ship_src:
+            addr = getattr(ship_src, "address", None) or {}
+            def _addr_get(key):
+                if isinstance(addr, dict):
+                    return addr.get(key) or ""
+                return getattr(addr, key, None) or ""
+            ship = {"name": str(getattr(ship_src, "name", None) or "").strip()[:120],
+                    "street": str(_addr_get("line1")).strip()[:200],
+                    "city": str(_addr_get("city")).strip()[:120],
+                    "state": str(_addr_get("state")).strip().upper()[:2],
+                    "zip": str(_addr_get("postal_code")).strip()[:10]}
+        if not (ship.get("name") and ship.get("street") and ship.get("city") and ship.get("state") and ship.get("zip")):
+            return jsonify(error="a complete shipping address is required"), 400
+        if data.get("items"):
+            conn = db()
+            done = conn.execute(
+                "SELECT 1 FROM orders WHERE stripe_session_id = ?",
+                ("pi_" + pi_id,)).fetchone()
+            conn.close()
+            if done:
+                return jsonify(success=True, already_processed=True, subscription_ids=[],
+                               order_ref="pi_" + pi_id)
+        conn = db()
+        full = conn.execute(
+            "SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+        conn.close()
+        plan, err = _validate_subscription_checkout(
+            data, user, full, require_payment_method=False, require_address=False)
+        if err:
+            return err[0], err[1]
+        plan["payment_method_id"] = pm_id
+        plan["ship"] = ship
+        if pi.status != "succeeded":
+            return jsonify(error="the payment has not completed yet"), 402
+        expected = (plan["one_time_net_cents"] + plan["first_delivery_cents"]
+                    + plan["shipping_cents"] + plan["merch_shipping_cents"])
+        if int(pi.amount or 0) != expected:
+            return jsonify(error="the payment amount does not match this order"), 400
+        try:
+            result = _finalize_subscription_checkout(user, full, plan, pi.id, expected)
+        except stripe.error.StripeError:
+            return jsonify(error="Your payment succeeded but we couldn't finish your subscription. Please try again or contact us — you will not be charged twice for the same order."), 502
+        return jsonify(result)
+    payment_intent_id = (data.get("payment_intent_id") or "").strip()
+    if not payment_intent_id:
+        return jsonify(error="payment_intent_id is required"), 400
+    # Already finalized (mixed cart with a promo/reward/gift card would fail
+    # re-validation as "already used", so check the order row first).
+    if data.get("items"):
+        conn = db()
+        done = conn.execute(
+            "SELECT 1 FROM orders WHERE stripe_session_id = ?",
+            ("pi_" + payment_intent_id,)).fetchone()
+        conn.close()
+        if done:
+            return jsonify(success=True, already_processed=True, subscription_ids=[],
+                           order_ref="pi_" + payment_intent_id)
+    conn = db()
+    full = conn.execute(
+        "SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    conn.close()
+    plan, err = _validate_subscription_checkout(data, user, full)
+    if err:
+        return err[0], err[1]
+    plan["payment_method_id"] = (data.get("payment_method_id") or "").strip()
+    try:
+        pi = stripe.PaymentIntent.retrieve(payment_intent_id)
+    except stripe.error.StripeError:
+        return jsonify(error="the payment could not be verified"), 502
+    if pi.status != "succeeded":
+        return jsonify(error="the payment has not completed yet"), 402
+    expected = (plan["one_time_net_cents"] + plan["first_delivery_cents"]
+                + plan["shipping_cents"] + plan["merch_shipping_cents"])
+    if int(pi.amount or 0) != expected:
+        return jsonify(error="the payment amount does not match this order"), 400
+    try:
+        result = _finalize_subscription_checkout(user, full, plan, pi.id, expected)
+    except stripe.error.StripeError:
+        return jsonify(error="Your payment succeeded but we couldn't finish your subscription. Please try again or contact us — you will not be charged twice for the same order."), 502
+    return jsonify(result)
 
 @app.get("/api/subscriptions/mine")
 def my_subscriptions():
@@ -6996,6 +8132,7 @@ def my_subscriptions():
             "next_billing_date": r["next_billing_date"],
             "per_delivery_cents": _per_delivery_cents(items, disc),
             "ship_state": r["ship_state"] or "", "ship_zip": r["ship_zip"] or "",
+            "payment_provider": r["payment_provider"] if "payment_provider" in r.keys() else "stripe",
             "days_until_billing": days_until,
         })
     return jsonify(subscriptions=out)
@@ -7014,6 +8151,13 @@ def update_subscription(sub_id):
     if not sub:
         conn.close()
         return jsonify(error="subscription not found"), 404
+    provider = sub["payment_provider"] if "payment_provider" in sub.keys() else "stripe"
+    if provider == "paypal" and ("items" in data or "frequency" in data):
+        # v1: a PayPal plan's price and cycle are fixed at creation. Changing
+        # flavors or frequency would desync the plan, so reject outright
+        # instead of half-applying the edit.
+        conn.close()
+        return jsonify(error="PayPal subscriptions can't change flavors or frequency here yet — cancel and start a new subscription to change your plan."), 400
     sets = {}
     if "items" in data:
         items, err = _validate_subscription_items(data.get("items"))
@@ -7062,6 +8206,13 @@ def update_subscription(sub_id):
                 if key == "state":
                     val = val.upper()[:2]
                 sets[col] = val[:200]
+    if provider == "paypal" and "status" in sets:
+        # Pause/resume/cancel on PayPal's side first; the local row only
+        # changes when PayPal accepts, so the two never disagree.
+        action = {"paused": "suspend", "active": "activate", "cancelled": "cancel"}.get(sets["status"])
+        if action and not _paypal_subscription_action(sub["paypal_subscription_id"] or "", action, "Customer request"):
+            conn.close()
+            return jsonify(error="PayPal could not update the subscription"), 502
     if not sets:
         conn.close()
         return jsonify(error="nothing to update"), 400
@@ -7139,6 +8290,10 @@ def subscription_confirm_charge(token):
     if not sub or sub["status"] != "active":
         conn.close()
         return jsonify(error="subscription is not active"), 400
+    if (sub["payment_provider"] if "payment_provider" in sub.keys() else "stripe") == "paypal":
+        # The confirm-charge link is Stripe-only; PayPal bills itself.
+        conn.close()
+        return jsonify(error="PayPal subscriptions are billed by PayPal — no card charge is needed."), 400
     if "items" in data and data.get("items") is not None:
         items, err = _validate_subscription_items(data.get("items"))
         if err:
@@ -7188,6 +8343,11 @@ def subscription_renewals_run():
         "SELECT * FROM subscriptions WHERE status = 'active' AND next_billing_date = ?",
         (target,)).fetchall()
     for sub in subs:
+        # PayPal bills itself and sends its own payment notices; the
+        # reminder's confirm-charge link is Stripe-only, so PayPal rows
+        # skip reminders entirely in v1.
+        if (sub["payment_provider"] if "payment_provider" in sub.keys() else "stripe") == "paypal":
+            continue
         ren = conn.execute(
             "SELECT * FROM subscription_renewals"
             " WHERE subscription_id = ? AND billing_date = ?"
@@ -7266,6 +8426,9 @@ def subscription_renewals_run():
             "SELECT * FROM subscriptions WHERE id = ?",
             (ren["subscription_id"],)).fetchone()
         if not sub or sub["status"] != "active":
+            continue
+        # Never attempt a Stripe off_session charge for PayPal rows.
+        if (sub["payment_provider"] if "payment_provider" in sub.keys() else "stripe") == "paypal":
             continue
         try:
             items = json.loads(sub["items"] or "[]")
