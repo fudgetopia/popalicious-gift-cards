@@ -4023,17 +4023,19 @@ def _credit_kernels(conn, user_id, kernels, reason, order_ref="", staff_id=None)
     return kernels
 
 def _debit_kernels(conn, user_id, kernels, reason, order_ref="", staff_id=None):
+    # Atomic conditional insert: the balance check and the debit happen in
+    # one statement under SQLite's write lock, so two simultaneous redeems
+    # for the same account cannot both pass on the same balance (Oct 26 2026).
     if kernels <= 0:
         return False
-    if _kernel_balance(conn, user_id) < kernels:
-        return False
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO kernel_transactions (user_id, kernels, reason, order_ref, staff_id, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?)",
-        (user_id, -kernels, reason, order_ref, staff_id,
-         datetime.now(timezone.utc).isoformat()),
+        " SELECT ?, -?, ?, ?, ?, ?"
+        " WHERE (SELECT COALESCE(SUM(kernels), 0) FROM kernel_transactions WHERE user_id = ?) >= ?",
+        (user_id, kernels, reason, order_ref, staff_id,
+         datetime.now(timezone.utc).isoformat(), user_id, kernels),
     )
-    return True
+    return cur.rowcount == 1
 
 def _new_reward_code():
     return "KERN-" + secrets.token_hex(4).upper()
