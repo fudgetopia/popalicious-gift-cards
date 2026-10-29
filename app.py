@@ -992,6 +992,26 @@ def init_db():
         conn.execute("ALTER TABLE erp_items ADD COLUMN pkg_size REAL")
     if "pkg_unit" not in icols:
         conn.execute("ALTER TABLE erp_items ADD COLUMN pkg_unit TEXT")
+    # Product URL + nutrition facts (per nutrition serving) so items can be
+    # imported from a supplier listing and recipes can print a nutrition
+    # label. Guarded for databases created before these columns existed.
+    if "product_url" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN product_url TEXT")
+    if "nut_serving_size" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN nut_serving_size TEXT")
+    if "nut_serving_grams" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN nut_serving_grams REAL")
+    for _ncol in ("nut_calories", "nut_fat_g", "nut_sat_fat_g",
+                  "nut_trans_fat_g", "nut_chol_mg", "nut_sodium_mg",
+                  "nut_carb_g", "nut_fiber_g", "nut_sugars_g",
+                  "nut_added_sugars_g", "nut_protein_g", "nut_vit_d_mcg",
+                  "nut_calcium_mg", "nut_iron_mg", "nut_potassium_mg"):
+        if _ncol not in icols:
+            conn.execute("ALTER TABLE erp_items ADD COLUMN %s REAL" % _ncol)
+    if "ingredients_text" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN ingredients_text TEXT")
+    if "allergens_text" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN allergens_text TEXT")
     conn.commit()
     # Location-specific inventory: backfill item<->location assignments.
     # Items go where they have ledger history; items with no history anywhere
@@ -9423,6 +9443,301 @@ def _erp_item_cost_fields(data, partial=False):
     return fields, None
 
 
+# Nutrition facts per serving, stored on the item. The label math in
+# _erp_recipe_nutrition converts each recipe line into servings of its
+# item (weight/volume lines via grams, each/bag lines count as servings).
+_ERP_NUTRITION_TEXT_FIELDS = ("product_url", "nut_serving_size",
+                              "ingredients_text", "allergens_text")
+_ERP_NUTRITION_NUM_FIELDS = ("nut_serving_grams", "nut_calories",
+                             "nut_fat_g", "nut_sat_fat_g", "nut_trans_fat_g",
+                             "nut_chol_mg", "nut_sodium_mg", "nut_carb_g",
+                             "nut_fiber_g", "nut_sugars_g",
+                             "nut_added_sugars_g", "nut_protein_g",
+                             "nut_vit_d_mcg", "nut_calcium_mg",
+                             "nut_iron_mg", "nut_potassium_mg")
+_ERP_NUTRIENT_KEYS = ("nut_calories", "nut_fat_g", "nut_sat_fat_g",
+                      "nut_trans_fat_g", "nut_chol_mg", "nut_sodium_mg",
+                      "nut_carb_g", "nut_fiber_g", "nut_sugars_g",
+                      "nut_added_sugars_g", "nut_protein_g",
+                      "nut_vit_d_mcg", "nut_calcium_mg", "nut_iron_mg",
+                      "nut_potassium_mg")
+# FDA daily values, for %DV on the printed label.
+_ERP_DAILY_VALUES = {"nut_fat_g": 78, "nut_sat_fat_g": 20,
+                     "nut_chol_mg": 300, "nut_sodium_mg": 2300,
+                     "nut_carb_g": 275, "nut_fiber_g": 28,
+                     "nut_protein_g": 50, "nut_vit_d_mcg": 20,
+                     "nut_calcium_mg": 1300, "nut_iron_mg": 18,
+                     "nut_potassium_mg": 4700,
+                     "nut_added_sugars_g": 50}
+
+
+def _erp_item_nutrition_fields(data, partial=False):
+    """Parse the product-URL + nutrition fields on an item payload.
+
+    Returns (fields, error) like _erp_item_cost_fields. Numbers must be
+    zero or more; None clears a field. Text fields are stripped.
+    """
+    fields = {}
+    for col in _ERP_NUTRITION_TEXT_FIELDS:
+        if not partial or col in data:
+            raw = data.get(col)
+            fields[col] = None if raw is None else str(raw).strip() or None
+    for col in _ERP_NUTRITION_NUM_FIELDS:
+        if not partial or col in data:
+            raw = data.get(col)
+            if raw is None or raw == "":
+                fields[col] = None
+            else:
+                try:
+                    v = float(raw)
+                except (TypeError, ValueError):
+                    return None, "%s must be a number" % col
+                if v < 0:
+                    return None, "%s must be zero or more" % col
+                fields[col] = v
+    return fields, None
+
+
+def _erp_suggest_sku(conn, name):
+    """Unique SKU from a product name: uppercased slug, -2/-3 on clash.
+
+    Checks every row, including soft-deleted items, because a deleted
+    item's SKU stays reserved.
+    """
+    base = re.sub(r"[^A-Z0-9]+", "-", (name or "").upper()).strip("-")
+    base = (base[:40].strip("-") or "ITEM")
+    cand, n = base, 2
+    while conn.execute("SELECT 1 FROM erp_items WHERE sku = ?",
+                       (cand,)).fetchone():
+        cand = "%s-%d" % (base, n)
+        n += 1
+    return cand
+
+
+def _erp_parse_amount(text):
+    """Parse '6g', '115 mg', '80' -> (number, unit) or (None, None)."""
+    if text is None:
+        return None, None
+    m = re.search(r"([\d]+(?:\.[\d]+)?)\s*(g|mg|mcg|kg|oz|lb|cal|kcal)?",
+                  str(text), re.I)
+    if not m:
+        return None, None
+    return float(m.group(1)), (m.group(2) or "").lower()
+
+
+def _erp_amount_in(amount, unit, target):
+    """Convert a parsed amount to the target unit (g, mg, or mcg)."""
+    if amount is None:
+        return None
+    if target == "g":
+        factor = {"g": 1, "mg": 0.001, "mcg": 0.000001, "kg": 1000,
+                  "oz": 28.3495, "lb": 453.592}.get(unit, 1)
+    elif target == "mg":
+        factor = {"mg": 1, "g": 1000, "mcg": 0.001, "kg": 1000000,
+                  "oz": 28349.5, "lb": 453592}.get(unit, 1)
+    else:  # mcg
+        factor = {"mcg": 1, "mg": 1000, "g": 1000000, "kg": 1000000000}.get(
+            unit, 1)
+    return amount * factor
+
+
+def _erp_nutrition_from_schema(obj, out):
+    """Pull NutritionInformation fields out of a schema.org object."""
+    if not isinstance(obj, dict):
+        return
+    nut = obj.get("nutrition")
+    if isinstance(nut, dict):
+        mapping = (("calories", "nut_calories", None),
+                   ("fatContent", "nut_fat_g", "g"),
+                   ("saturatedFatContent", "nut_sat_fat_g", "g"),
+                   ("transFatContent", "nut_trans_fat_g", "g"),
+                   ("cholesterolContent", "nut_chol_mg", "mg"),
+                   ("sodiumContent", "nut_sodium_mg", "mg"),
+                   ("carbohydrateContent", "nut_carb_g", "g"),
+                   ("fiberContent", "nut_fiber_g", "g"),
+                   ("sugarContent", "nut_sugars_g", "g"),
+                   ("proteinContent", "nut_protein_g", "g"))
+        for key, col, target in mapping:
+            if key in nut and out.get(col) is None:
+                amount, unit = _erp_parse_amount(nut.get(key))
+                if amount is not None:
+                    out[col] = amount if target is None else \
+                        _erp_amount_in(amount, unit, target)
+        serving = nut.get("servingSize")
+        if serving and not out.get("nut_serving_size"):
+            out["nut_serving_size"] = str(serving).strip()
+            m = re.search(r"\(([\d.]+)\s*g\)", str(serving))
+            if m:
+                out["nut_serving_grams"] = float(m.group(1))
+    for child in obj.get("@graph", []) if isinstance(obj.get("@graph"), list) \
+            else []:
+        _erp_nutrition_from_schema(child, out)
+
+
+def _erp_parse_product_page(html):
+    """Best-effort product import from a listing page's HTML.
+
+    Pure function (no network) so tests can feed it sample pages. Tries
+    schema.org JSON-LD first, then a nutrition-facts table, then
+    og:title / <title> / <h1> for the name. Staff always reviews the
+    filled form before saving — a listing that blocks bots or lays its
+    facts out unusually just yields fewer fields, never a silent guess.
+    Returns {name, nutrition{...}, ingredients_text}.
+    """
+    import html as _html
+    text = _html.unescape(html or "")
+    out = {"name": None, "nutrition": {}, "ingredients_text": None}
+    nut = out["nutrition"]
+    # JSON-LD blocks.
+    for m in re.finditer(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)'
+            r"</script>", text, re.S | re.I):
+        try:
+            data = json.loads(m.group(1).strip())
+        except (ValueError, TypeError):
+            continue
+        objs = data if isinstance(data, list) else [data]
+        for obj in objs:
+            if not isinstance(obj, dict):
+                continue
+            types = obj.get("@type")
+            if isinstance(types, str):
+                types = [types]
+            if types and "Product" in types and not out["name"]:
+                name = obj.get("name")
+                if name:
+                    out["name"] = str(name).strip()
+            _erp_nutrition_from_schema(obj, nut)
+    # Plain-text helpers: strip tags, collapse whitespace.
+    def _clean(s):
+        s = re.sub(r"<[^>]+>", " ", s or "")
+        return re.sub(r"\s+", " ", _html.unescape(s)).strip()
+    if not out["name"]:
+        m = re.search(r'<meta[^>]+property=["\']og:title["\'][^>]+'
+                      r'content=["\']([^"\']+)["\']', text, re.I)
+        if not m:
+            m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+'
+                          r'property=["\']og:title["\']', text, re.I)
+        if m:
+            out["name"] = _clean(m.group(1))
+    if not out["name"]:
+        m = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
+        if m and _clean(m.group(1)):
+            out["name"] = _clean(m.group(1))
+    if not out["name"]:
+        m = re.search(r"<h1[^>]*>(.*?)</h1>", text, re.S | re.I)
+        if m and _clean(m.group(1)):
+            out["name"] = _clean(m.group(1))
+    # Nutrition table rows: label cell followed by a value cell.
+    label_map = (("calories", "nut_calories", None),
+                 ("total fat", "nut_fat_g", "g"),
+                 ("saturated fat", "nut_sat_fat_g", "g"),
+                 ("trans fat", "nut_trans_fat_g", "g"),
+                 ("cholesterol", "nut_chol_mg", "mg"),
+                 ("sodium", "nut_sodium_mg", "mg"),
+                 ("total carbohydrate", "nut_carb_g", "g"),
+                 ("dietary fiber", "nut_fiber_g", "g"),
+                 ("total sugars", "nut_sugars_g", "g"),
+                 ("added sugars", "nut_added_sugars_g", "g"),
+                 ("protein", "nut_protein_g", "g"),
+                 ("vitamin d", "nut_vit_d_mcg", "mcg"),
+                 ("calcium", "nut_calcium_mg", "mg"),
+                 ("iron", "nut_iron_mg", "mg"),
+                 ("potassium", "nut_potassium_mg", "mg"))
+    cells = [_clean(c) for c in re.findall(
+        r"<t[hd][^>]*>(.*?)</t[hd]>", text, re.S | re.I)]
+    for i, cell in enumerate(cells):
+        low = cell.lower()
+        if low.startswith("serving size") and not nut.get("nut_serving_size"):
+            val = cells[i + 1] if i + 1 < len(cells) else cell
+            val = re.sub(r"^serving size\s*", "", val, flags=re.I).strip()
+            if val:
+                nut["nut_serving_size"] = val
+                m = re.search(r"\(([\d.]+)\s*g\)", val)
+                if m:
+                    nut["nut_serving_grams"] = float(m.group(1))
+            continue
+        for label, col, target in label_map:
+            if low == label or low.startswith(label + " ") \
+                    or low.startswith(label + ","):
+                if nut.get(col) is not None or i + 1 >= len(cells):
+                    break
+                amount, unit = _erp_parse_amount(cells[i + 1])
+                if amount is not None:
+                    nut[col] = amount if target is None else \
+                        _erp_amount_in(amount, unit, target)
+                break
+    # Ingredients paragraph.
+    if not out["ingredients_text"]:
+        m = re.search(r"Ingredients\s*:\s*(.{20,2000}?)(?:</p>|</div>|<br)",
+                      text, re.S | re.I)
+        if m:
+            ing = _clean(m.group(1))
+            if ing:
+                out["ingredients_text"] = ing
+    return out
+
+
+@app.get("/api/erp/items/suggest-sku")
+def erp_suggest_sku():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    sku = _erp_suggest_sku(conn, request.args.get("name") or "")
+    conn.close()
+    return jsonify(sku=sku)
+
+
+@app.post("/api/erp/items/fetch-url")
+def erp_fetch_url():
+    """Fetch a supplier listing and return what could be pulled from it.
+
+    Admin-only. Returns name, nutrition facts, and ingredients for the
+    staff to review in the item form — nothing is saved by this call.
+    Rejects non-http(s) URLs and localhost/private-IP hosts.
+    """
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    url = (data.get("url") or "").strip()
+    try:
+        from urllib.parse import urlparse
+        import ipaddress
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in ("http", "https") or not host:
+            raise ValueError("bad url")
+        if host == "localhost" or host.endswith(".local"):
+            raise ValueError("local host")
+        try:
+            ip = ipaddress.ip_address(host)
+            if ip.is_private or ip.is_loopback or ip.is_link_local \
+                    or ip.is_reserved:
+                raise ValueError("private ip")
+        except ValueError as e:
+            if str(e) in ("local host", "private ip"):
+                raise
+    except ValueError:
+        return jsonify(error="a public http(s) product URL is required"), 400
+    try:
+        resp = requests.get(url, timeout=15,
+                            headers={"User-Agent":
+                                     "Pop-A-Licious ERP item importer"})
+    except Exception:
+        return jsonify(error="could not fetch that URL"), 502
+    if resp.status_code != 200:
+        return jsonify(error="listing returned HTTP %d" % resp.status_code), \
+            502
+    found = _erp_parse_product_page(resp.text)
+    if not found["name"] and not found["nutrition"]:
+        return jsonify(error="no product name or nutrition facts found on"
+                              " that page — fill the item in by hand"), 422
+    found["product_url"] = url
+    return jsonify(found)
+
+
 @app.post("/api/erp/items")
 def erp_create_item():
     actor, err = _require_erp_admin()
@@ -9434,8 +9749,8 @@ def erp_create_item():
     itype = (data.get("type") or "").strip()
     unit = (data.get("unit") or "each").strip()
     track_lots = 1 if data.get("track_lots") else 0
-    if not sku or not name:
-        return jsonify(error="sku and name are required"), 400
+    if not name:
+        return jsonify(error="name is required"), 400
     if itype not in ERP_ITEM_TYPES:
         return jsonify(error="type must be one of: " + ", ".join(ERP_ITEM_TYPES)), 400
     if unit not in ERP_ITEM_UNITS:
@@ -9443,18 +9758,27 @@ def erp_create_item():
     cost_fields, cferr = _erp_item_cost_fields(data)
     if cferr:
         return jsonify(error=cferr), 400
+    nut_fields, nferr = _erp_item_nutrition_fields(data)
+    if nferr:
+        return jsonify(error=nferr), 400
     conn = db()
+    if not sku:
+        sku = _erp_suggest_sku(conn, name)
     if conn.execute("SELECT 1 FROM erp_items WHERE sku = ?", (sku,)).fetchone():
         conn.close()
         return jsonify(error="sku already exists"), 400
+    nut_cols = list(_ERP_NUTRITION_TEXT_FIELDS) + list(_ERP_NUTRITION_NUM_FIELDS)
     cur = conn.execute(
         "INSERT INTO erp_items (sku, name, type, unit, track_lots, avg_cost_cents,"
         " cost_cents, oz_per_cup, pkg_price_cents, pkg_size, pkg_unit,"
-        " active, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?)",
+        " active, created_at, " + ", ".join(nut_cols) + ")"
+        " VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?"
+        + ", ?" * len(nut_cols) + ")",
         (sku, name, itype, unit, track_lots, cost_fields["cost_cents"],
          cost_fields["oz_per_cup"], cost_fields["pkg_price_cents"],
          cost_fields["pkg_size"], cost_fields["pkg_unit"],
-         datetime.now(timezone.utc).isoformat()),
+         datetime.now(timezone.utc).isoformat(),
+         *[nut_fields[c] for c in nut_cols]),
     )
     item_id = cur.lastrowid
     # Location-specific inventory: register the item at the given locations
@@ -9534,11 +9858,18 @@ def erp_update_item(item_id):
     if cferr:
         conn.close()
         return jsonify(error=cferr), 400
+    nut_fields, nferr = _erp_item_nutrition_fields(data, partial=True)
+    if nferr:
+        conn.close()
+        return jsonify(error=nferr), 400
     conn.execute(
         "UPDATE erp_items SET sku = ?, name = ?, type = ?, unit = ?,"
         " track_lots = ? WHERE id = ?",
         (sku, name, itype, unit, 1 if data.get("track_lots") else 0, item_id))
     for col, val in cost_fields.items():
+        conn.execute("UPDATE erp_items SET %s = ? WHERE id = ?" % col,
+                     (val, item_id))
+    for col, val in nut_fields.items():
         conn.execute("UPDATE erp_items SET %s = ? WHERE id = ?" % col,
                      (val, item_id))
     conn.commit()
@@ -10657,6 +10988,109 @@ def _erp_recipe_cost(lines, batch_size_bags):
     if batch_size_bags and batch_size_bags > 0:
         per_bag = int(round(total / batch_size_bags))
     return out, total, per_bag, unknown
+
+
+def _erp_recipe_nutrition(conn, recipe_id):
+    """Nutrition for a recipe, from its ingredient lines' nutrition facts.
+
+    Each line's amount used per batch converts into servings of that
+    item (weight/volume lines via grams and the item's serving grams;
+    each/bag lines count as one serving per unit), and the per-serving
+    nutrients scale up. Totals are divided by batch_size_bags for the
+    per-bag (per serving of finished product) figures, with FDA %DV.
+    Lines that can't be converted — no nutrition facts on the item, no
+    serving grams for a weight/volume line — are listed in `missing`
+    instead of silently counted as zero.
+    Returns a dict, or None when the recipe doesn't exist.
+    """
+    recipe = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
+                          (recipe_id,)).fetchone()
+    if not recipe:
+        return None
+    version = recipe["version"]
+    lines = conn.execute(
+        "SELECT rl.*, i.name AS item_name, i.sku AS item_sku,"
+        " i.unit AS item_unit, i.oz_per_cup,"
+        " i.nut_serving_grams, i.nut_calories, i.nut_fat_g,"
+        " i.nut_sat_fat_g, i.nut_trans_fat_g, i.nut_chol_mg,"
+        " i.nut_sodium_mg, i.nut_carb_g, i.nut_fiber_g, i.nut_sugars_g,"
+        " i.nut_added_sugars_g, i.nut_protein_g, i.nut_vit_d_mcg,"
+        " i.nut_calcium_mg, i.nut_iron_mg, i.nut_potassium_mg,"
+        " i.ingredients_text, i.allergens_text"
+        " FROM erp_recipe_lines rl"
+        " JOIN erp_items i ON i.id = rl.item_id"
+        " WHERE rl.recipe_id = ? AND rl.recipe_version = ? ORDER BY rl.id",
+        (recipe_id, version)).fetchall()
+    totals = {k: 0.0 for k in _ERP_NUTRIENT_KEYS}
+    batch_grams = 0.0
+    missing = []
+    detail = []
+    for ln in lines:
+        d = dict(ln)
+        qty = float(ln["qty_per_batch"] or 0)
+        unit = (ln["unit"] or "").strip().lower()
+        has_nut = any(ln[k] is not None for k in _ERP_NUTRIENT_KEYS)
+        if not has_nut:
+            missing.append({"item": ln["item_name"],
+                            "reason": "no nutrition facts on this item"})
+            d["servings_used"] = None
+            detail.append(d)
+            continue
+        if unit in ("each", "bag", "bags"):
+            servings = qty
+        else:
+            cup_oz, _src = _erp_cup_weight_oz(d)
+            grams = _erp_convert_qty(qty, unit, "g", cup_oz)
+            serving_grams = ln["nut_serving_grams"]
+            if grams is None or not serving_grams \
+                    or float(serving_grams) <= 0:
+                missing.append({"item": ln["item_name"],
+                                "reason": "serving grams missing or unit"
+                                          " cannot convert to grams"})
+                d["servings_used"] = None
+                detail.append(d)
+                continue
+            servings = grams / float(serving_grams)
+            batch_grams += grams
+        d["servings_used"] = servings
+        for k in _ERP_NUTRIENT_KEYS:
+            if ln[k] is not None:
+                totals[k] += servings * float(ln[k])
+        detail.append(d)
+    bags = float(recipe["batch_size_bags"] or 0)
+    per_bag = {}
+    per_bag_dv = {}
+    for k in _ERP_NUTRIENT_KEYS:
+        per_bag[k] = (totals[k] / bags) if bags > 0 else None
+        dv = _ERP_DAILY_VALUES.get(k)
+        per_bag_dv[k] = (int(round(per_bag[k] / dv * 100))
+                         if per_bag[k] is not None and dv else None)
+    ingredients = "; ".join(
+        (ln["ingredients_text"] or "").strip()
+        for ln in detail if ln.get("ingredients_text"))
+    allergens = "; ".join(
+        (ln["allergens_text"] or "").strip()
+        for ln in detail if ln.get("allergens_text"))
+    return {"recipe_id": recipe_id, "recipe_name": recipe["name"],
+            "version": version, "batch_size_bags": bags,
+            "batch_grams": batch_grams,
+            "totals_per_batch": totals, "per_bag": per_bag,
+            "per_bag_dv": per_bag_dv, "missing": missing,
+            "lines": detail, "ingredients_text": ingredients,
+            "allergens_text": allergens}
+
+
+@app.get("/api/erp/recipes/<int:recipe_id>/nutrition")
+def erp_recipe_nutrition(recipe_id):
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    result = _erp_recipe_nutrition(conn, recipe_id)
+    conn.close()
+    if result is None:
+        return jsonify(error="recipe not found"), 404
+    return jsonify(result)
 
 
 def _erp_get_batch(conn, batch_id):
