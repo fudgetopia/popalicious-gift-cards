@@ -9815,6 +9815,28 @@ def erp_suggest_sku():
     return jsonify(sku=sku)
 
 
+def _erp_is_bot_wall(html):
+    """True when a page is a bot check, not product content.
+
+    Some stores (Walmart included) answer automated fetches with HTTP 200
+    and a captcha wall instead of the product. The parser would otherwise
+    find nothing and report a vague 'fill it in by hand' — this names the
+    real cause so staff don't retry a URL that can never work this way.
+    """
+    low = (html or "").lower()
+    markers = ("<title>robot or human?</title>",
+               "px-captcha",
+               "press & hold",
+               "press and hold",
+               "hold to verify",
+               "verify you are human",
+               "verify you're human",
+               "cf-challenge",
+               "attention required",
+               "access denied")
+    return any(m in low for m in markers)
+
+
 @app.post("/api/erp/items/fetch-url")
 def erp_fetch_url():
     """Fetch a supplier listing and return what could be pulled from it.
@@ -9857,6 +9879,10 @@ def erp_fetch_url():
     if resp.status_code != 200:
         return jsonify(error="listing returned HTTP %d" % resp.status_code), \
             502
+    if _erp_is_bot_wall(resp.text):
+        return jsonify(error="that site blocked the automated read with a"
+                              " bot check, so no product details came back —"
+                              " fill the item in by hand"), 502
     found = _erp_parse_product_page(resp.text)
     if not found["name"] and not found["nutrition"] \
             and found["price_cents"] is None \
