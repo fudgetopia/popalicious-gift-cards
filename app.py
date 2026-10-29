@@ -9582,12 +9582,74 @@ def _erp_parse_product_page(html):
     og:title / <title> / <h1> for the name. Staff always reviews the
     filled form before saving — a listing that blocks bots or lays its
     facts out unusually just yields fewer fields, never a silent guess.
-    Returns {name, nutrition{...}, ingredients_text}.
+    Returns {name, nutrition{...}, ingredients_text, price_cents,
+    pkg_size, pkg_unit}.
     """
     import html as _html
     text = _html.unescape(html or "")
-    out = {"name": None, "nutrition": {}, "ingredients_text": None}
+    out = {"name": None, "nutrition": {}, "ingredients_text": None,
+           "price_cents": None, "pkg_size": None, "pkg_unit": None}
     nut = out["nutrition"]
+
+    def _to_cents(v):
+        try:
+            num = float(re.sub(r"[^0-9.]", "", str(v)))
+        except (TypeError, ValueError):
+            return None
+        return int(round(num * 100))
+
+    _PKG_UNITS = {"lb": "lb", "lbs": "lb", "pound": "lb", "pounds": "lb",
+                  "oz": "oz", "ounce": "oz", "ounces": "oz",
+                  "g": "g", "gram": "g", "grams": "g",
+                  "kg": "g", "kilogram": "g", "kilograms": "g",
+                  "cup": "cup", "cups": "cup",
+                  "tablespoon": "tablespoon", "tablespoons": "tablespoon",
+                  "teaspoon": "teaspoon", "teaspoons": "teaspoon",
+                  "each": "each", "ct": "each", "count": "each",
+                  "bag": "bag", "bags": "bag"}
+    _PKG_UNITCODES = {"LBR": "lb", "ONZ": "oz", "GRM": "g", "KGM": "g"}
+
+    def _pkg_from_weight(value):
+        """QuantitativeValue dict or a '50 lb' string -> (size, unit)."""
+        if isinstance(value, dict):
+            raw = value.get("value")
+            code = (value.get("unitCode") or "").upper()
+            unit_text = (value.get("unitText") or "").lower()
+            unit = _PKG_UNITCODES.get(code) or _PKG_UNITS.get(unit_text)
+            try:
+                size = float(raw)
+            except (TypeError, ValueError):
+                return None
+            if unit == "g" and code == "KGM":
+                size *= 1000
+            return (size, unit) if unit else None
+        if isinstance(value, (int, float)):
+            return None
+        m = re.search(
+            r"(\d+(?:\.\d+)?)\s*(lbs?|pounds?|ounces?|oz|kilograms?|kg|"
+            r"grams?|g|cups?|tablespoons?|teaspoons?|each|ct|count|bags?)\b",
+            str(value or ""), re.I)
+        if not m:
+            return None
+        size = float(m.group(1))
+        unit = _PKG_UNITS[m.group(2).lower()]
+        if unit == "g" and m.group(2).lower() in ("kg", "kilogram", "kilograms"):
+            size *= 1000
+        return (size, unit)
+
+    def _ingredients_after(blob):
+        """Text after 'Ingredients:' up to the next section heading."""
+        m = re.search(r"ingredients\s*:\s*(.{20,1200})",
+                      blob or "", re.S | re.I)
+        if not m:
+            return None
+        ing = re.sub(r"\s+", " ", m.group(1)).strip()
+        cut = re.search(r"\b(allergen|contains|nutrition facts|directions|"
+                        r"storage|warnings?)\b", ing, re.I)
+        if cut:
+            ing = ing[:cut.start()].strip()
+        ing = ing.rstrip(".,; ")
+        return ing if len(ing) >= 20 else None
     # JSON-LD blocks.
     for m in re.finditer(
             r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)'
@@ -9608,6 +9670,39 @@ def _erp_parse_product_page(html):
                 if name:
                     out["name"] = str(name).strip()
             _erp_nutrition_from_schema(obj, nut)
+            if types and "Product" in types:
+                offers = obj.get("offers")
+                if isinstance(offers, dict):
+                    offers = [offers]
+                if isinstance(offers, list):
+                    for off in offers:
+                        if not isinstance(off, dict):
+                            continue
+                        price = off.get("price")
+                        if price is None:
+                            price = off.get("lowPrice")
+                        cents = _to_cents(price) \
+                            if price is not None else None
+                        if cents is not None:
+                            out["price_cents"] = cents
+                            break
+                if out["pkg_size"] is None:
+                    for field in ("weight", "size"):
+                        parsed = _pkg_from_weight(obj.get(field))
+                        if parsed:
+                            out["pkg_size"], out["pkg_unit"] = parsed
+                            break
+                if not out["ingredients_text"]:
+                    desc = obj.get("description")
+                    if desc:
+                        out["ingredients_text"] = \
+                            _ingredients_after(str(desc))
+                    if not out["ingredients_text"]:
+                        ri = obj.get("recipeIngredient")
+                        if isinstance(ri, list) and ri:
+                            joined = ", ".join(str(x).strip() for x in ri)
+                            if len(joined) >= 20:
+                                out["ingredients_text"] = joined
     # Plain-text helpers: strip tags, collapse whitespace.
     def _clean(s):
         s = re.sub(r"<[^>]+>", " ", s or "")
@@ -9628,6 +9723,30 @@ def _erp_parse_product_page(html):
         m = re.search(r"<h1[^>]*>(.*?)</h1>", text, re.S | re.I)
         if m and _clean(m.group(1)):
             out["name"] = _clean(m.group(1))
+    # Price from meta tags (product:price:amount / og:price:amount).
+    if out["price_cents"] is None:
+        m = re.search(r'<meta[^>]+(?:property|name)=["\'](?:product:price:amount|og:price:amount)["\'][^>]+content=["\']([^"\']+)["\']', text, re.I)
+        if not m:
+            m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:product:price:amount|og:price:amount)["\']', text, re.I)
+        if m:
+            out["price_cents"] = _to_cents(m.group(1))
+    # Package size from the product name ("50 lb bag") or description.
+    if out["pkg_size"] is None and out["name"]:
+        parsed = _pkg_from_weight(out["name"])
+        if parsed:
+            out["pkg_size"], out["pkg_unit"] = parsed
+    if (out["pkg_size"] is None or not out["ingredients_text"]):
+        m = re.search(r'<meta[^>]+(?:property|name)=["\'](?:og:description|description)["\'][^>]+content=["\']([^"\']+)["\']', text, re.I)
+        if not m:
+            m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+(?:property|name)=["\'](?:og:description|description)["\']', text, re.I)
+        if m:
+            desc = _clean(m.group(1))
+            if out["pkg_size"] is None:
+                parsed = _pkg_from_weight(desc)
+                if parsed:
+                    out["pkg_size"], out["pkg_unit"] = parsed
+            if not out["ingredients_text"]:
+                out["ingredients_text"] = _ingredients_after(desc)
     # Nutrition table rows: label cell followed by a value cell.
     label_map = (("calories", "nut_calories", None),
                  ("total fat", "nut_fat_g", "g"),
@@ -9675,6 +9794,13 @@ def _erp_parse_product_page(html):
             ing = _clean(m.group(1))
             if ing:
                 out["ingredients_text"] = ing
+    # Plain-text fallback: label and list in separate elements, or the
+    # label without a colon — strip tags and read what follows it.
+    if not out["ingredients_text"]:
+        plain = _clean(text)
+        m = re.search(r"ingredients\b\s*:?\s*(.{20,1200})", plain, re.I)
+        if m:
+            out["ingredients_text"] = _ingredients_after("Ingredients: " + m.group(1))
     return out
 
 
@@ -9693,8 +9819,9 @@ def erp_suggest_sku():
 def erp_fetch_url():
     """Fetch a supplier listing and return what could be pulled from it.
 
-    Admin-only. Returns name, nutrition facts, and ingredients for the
-    staff to review in the item form — nothing is saved by this call.
+    Admin-only. Returns name, price, package size, nutrition facts,
+    and ingredients for the staff to review in the item form — nothing
+    is saved by this call.
     Rejects non-http(s) URLs and localhost/private-IP hosts.
     """
     actor, err = _require_erp_admin()
@@ -9731,8 +9858,12 @@ def erp_fetch_url():
         return jsonify(error="listing returned HTTP %d" % resp.status_code), \
             502
     found = _erp_parse_product_page(resp.text)
-    if not found["name"] and not found["nutrition"]:
-        return jsonify(error="no product name or nutrition facts found on"
+    if not found["name"] and not found["nutrition"] \
+            and found["price_cents"] is None \
+            and found["pkg_size"] is None \
+            and not found["ingredients_text"]:
+        return jsonify(error="no product name, price, package size,"
+                              " nutrition facts, or ingredients found on"
                               " that page — fill the item in by hand"), 422
     found["product_url"] = url
     return jsonify(found)
