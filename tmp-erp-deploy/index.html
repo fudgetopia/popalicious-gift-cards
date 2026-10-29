@@ -1703,10 +1703,34 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
                 if (nut[k] !== null && nut[k] !== undefined) refs.nums[k].value = nut[k];
               });
               if (res.ingredients_text) refs.ingredients.value = res.ingredients_text;
+              var extras = [];
+              if (hooks && hooks.pkg) {
+                var sizeFilled = false;
+                if (res.price_cents !== null && res.price_cents !== undefined &&
+                    hooks.pkg.price && !hooks.pkg.price.value.trim()) {
+                  hooks.pkg.price.value = (res.price_cents / 100).toFixed(2);
+                  extras.push("price $" + (res.price_cents / 100).toFixed(2));
+                }
+                if (res.pkg_size !== null && res.pkg_size !== undefined &&
+                    hooks.pkg.size && !hooks.pkg.size.value.trim()) {
+                  hooks.pkg.size.value = res.pkg_size;
+                  sizeFilled = true;
+                  extras.push("package " + res.pkg_size + " " + (res.pkg_unit || ""));
+                }
+                if (sizeFilled && res.pkg_unit && hooks.pkg.unit) {
+                  for (var oi = 0; oi < hooks.pkg.unit.options.length; oi++) {
+                    if (hooks.pkg.unit.options[oi].value === res.pkg_unit) {
+                      hooks.pkg.unit.selectedIndex = oi;
+                      break;
+                    }
+                  }
+                }
+              }
               var found = Object.keys(nut).length;
               fetchStatus.textContent = "Filled from the listing" +
                 (res.name ? " (" + res.name + ")" : "") +
                 (found ? ": " + found + " nutrition fields." : " — no nutrition facts found on that page; fill them in by hand.") +
+                (extras.length ? " Also filled: " + extras.join(", ") + "." : "") +
                 " Review everything before saving.";
             }).catch(function (error) {
               fetchBtn.disabled = false;
@@ -1877,7 +1901,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           form.appendChild(cupLabel3);
           var pkg3 = erpPkgInputs(null);
           form.appendChild(pkg3.wrap);
-          var nut3 = erpNutritionInputs(null, {nameInput: inputs.name, skuInput: inputs.sku});
+          var nut3 = erpNutritionInputs(null, {nameInput: inputs.name, skuInput: inputs.sku, pkg: pkg3});
           form.appendChild(nut3.wrap);
           var submit = document.createElement("button");
           submit.type = "submit";
@@ -2703,7 +2727,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             eform.appendChild(eCupL);
             var ePkg = erpPkgInputs(item);
             eform.appendChild(ePkg.wrap);
-            var eNut = erpNutritionInputs(item, {nameInput: eName, skuInput: eSku});
+            var eNut = erpNutritionInputs(item, {nameInput: eName, skuInput: eSku, pkg: ePkg});
             eform.appendChild(eNut.wrap);
             var eLotL = document.createElement("label");
             var eLot = document.createElement("input");
