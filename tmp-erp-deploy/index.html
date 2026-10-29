@@ -7616,6 +7616,50 @@ function renderErpSettingsDetail() {
     }).catch(function () {});
   }
   els.body.appendChild(card);
+  var danger = document.createElement("div");
+  danger.className = "admin-orders-wrap";
+  danger.style.border = "2px solid #c92e29";
+  var dh = document.createElement("h3");
+  dh.textContent = "Danger zone";
+  dh.style.color = "#c92e29";
+  danger.appendChild(dh);
+  var dp = document.createElement("p");
+  dp.textContent = "Permanently delete ALL ERP data — locations, items, stock, lots, vendors, purchase orders, counts, recipes, batches, wholesale accounts, orders, fulfillment, EDI and QuickBooks links — and start over empty. This cannot be undone. Your admin/staff logins are NOT affected.";
+  danger.appendChild(dp);
+  var wipeBtn = document.createElement("button");
+  wipeBtn.type = "button";
+  wipeBtn.textContent = "Delete all ERP data";
+  wipeBtn.style.background = "#c92e29";
+  wipeBtn.style.color = "#fff";
+  var wipeArmed = false;
+  var wipeReset = null;
+  wipeBtn.addEventListener("click", function () {
+    if (!wipeArmed) {
+      wipeArmed = true;
+      wipeBtn.textContent = "Tap again to confirm — this erases everything";
+      wipeReset = setTimeout(function () {
+        wipeArmed = false;
+        wipeBtn.textContent = "Delete all ERP data";
+      }, 6000);
+      return;
+    }
+    if (wipeReset) clearTimeout(wipeReset);
+    wipeBtn.disabled = true;
+    erpPost("/api/erp/reset", { confirm: "RESET ALL ERP DATA" }).then(function (res) {
+      var total = 0;
+      Object.keys(res.deleted || {}).forEach(function (k) { total += res.deleted[k] || 0; });
+      setAdminDetailStatus("ERP wiped clean: " + total + " rows deleted across "
+        + Object.keys(res.deleted || {}).length + " tables.");
+      loadErpSettingsDetail();
+    }).catch(function (error) {
+      wipeBtn.disabled = false;
+      wipeArmed = false;
+      wipeBtn.textContent = "Delete all ERP data";
+      setAdminDetailStatus(error.message, true);
+    });
+  });
+  danger.appendChild(wipeBtn);
+  els.body.appendChild(danger);
 }
 </script>
 </body>
