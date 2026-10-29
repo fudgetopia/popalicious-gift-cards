@@ -4650,6 +4650,45 @@ function renderErpOrderDetail(body) {
     }
     body.appendChild(h2);
 
+    // Admin-only permanent delete for ONLINE orders (test orders that
+    // were never real). Wholesale orders keep their own delete path.
+    if (source !== "wholesale" && erpIsAdmin()) {
+      var delWrap = document.createElement("div");
+      delWrap.className = "erp-toolbar";
+      var delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.textContent = "Delete order permanently";
+      delBtn.style.background = "#c92e29";
+      delBtn.style.color = "#fff";
+      var delArmed = false;
+      var delReset = null;
+      delBtn.addEventListener("click", function () {
+        if (!delArmed) {
+          delArmed = true;
+          delBtn.textContent = "Tap again to confirm — this erases the order";
+          delReset = setTimeout(function () {
+            delArmed = false;
+            delBtn.textContent = "Delete order permanently";
+          }, 6000);
+          return;
+        }
+        if (delReset) clearTimeout(delReset);
+        delBtn.disabled = true;
+        erpDelete("/api/erp/orders/" + encodeURIComponent(source) + "/" + encodeURIComponent(String(id))).then(function () {
+          erpState.selectedOrderSource = null;
+          erpState.selectedOrderId = null;
+          renderErpOrdersDetail();
+        }).catch(function (error) {
+          delBtn.disabled = false;
+          delArmed = false;
+          delBtn.textContent = "Delete order permanently";
+          setAdminDetailStatus(error.message, true);
+        });
+      });
+      delWrap.appendChild(delBtn);
+      body.appendChild(delWrap);
+    }
+
     var meta = document.createElement("div");
     meta.className = "erp-detail-meta";
     meta.appendChild(erpChip(o.status, erpOrderStatusLabel(o.status)));
