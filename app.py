@@ -11640,6 +11640,57 @@ def erp_order_set_status(source, order_id):
     return jsonify(ok=True, status=status)
 
 
+@app.delete("/api/erp/orders/<source>/<int:order_id>")
+def erp_delete_online_order(source, order_id):
+    """Permanently delete an ONLINE (stripe/paypal) order record.
+
+    Admin-only. For removing test orders that were never real. Refuses
+    when the order has production batch links or has already shipped /
+    been picked up. Fulfillment rows for the order are removed with it.
+    Gift-card balances and promo redemptions are NOT touched — this only
+    removes the order record, and the deleted row's attached codes are
+    returned so the caller can see if anything was attached.
+    """
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    if source not in ("stripe", "paypal"):
+        return jsonify(error="only online orders can be deleted here"), 400
+    conn = db()
+    order = _erp_online_order(conn, source, order_id)
+    if not order:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    linked = conn.execute(
+        "SELECT COUNT(*) AS c FROM erp_batch_orders"
+        " WHERE order_source = ? AND order_id = ?",
+        (source, order_id)).fetchone()["c"]
+    if linked:
+        conn.close()
+        return jsonify(error="order has production batch links"), 400
+    fulf = _erp_fulfillment_dict(conn, source, order_id)
+    if fulf["status"] in ("shipped", "picked_up"):
+        conn.close()
+        return jsonify(error="shipped / picked-up orders cannot be deleted"), 400
+    table = "orders" if source == "stripe" else "paypal_orders"
+    row = conn.execute(
+        "SELECT * FROM %s WHERE id = ?" % table, (order_id,)).fetchone()
+    conn.execute("DELETE FROM erp_order_fulfillment"
+                 " WHERE order_source = ? AND order_id = ?", (source, order_id))
+    conn.execute("DELETE FROM erp_fulfillment_history"
+                 " WHERE order_source = ? AND order_id = ?", (source, order_id))
+    conn.execute("DELETE FROM %s WHERE id = ?" % table, (order_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(deleted={
+        "source": source, "id": order_id, "number": order["number"],
+        "email": order["email"], "total_cents": order["total_cents"],
+        "gift_card_code": (row["gift_card_code"] if "gift_card_code" in row.keys() else "") or "",
+        "promo_code": (row["promo_code"] if "promo_code" in row.keys() else "") or "",
+        "reward_code": (row["reward_code"] if "reward_code" in row.keys() else "") or "",
+    })
+
+
 # ---------------- wholesale accounts ----------------
 
 @app.get("/api/erp/wholesale-accounts")
