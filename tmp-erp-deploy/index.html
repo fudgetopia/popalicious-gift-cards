@@ -1655,6 +1655,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           var refs = {nums: {}};
           var wrap = document.createElement("div");
           wrap.style.width = "100%";
+          refs.wrap = wrap;
           var title = document.createElement("strong");
           title.textContent = "Nutrition facts (per serving) + product listing";
           title.style.width = "100%";
