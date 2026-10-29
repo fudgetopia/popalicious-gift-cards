@@ -11857,6 +11857,69 @@ def erp_import_wholesale_accounts():
 
 # ---------------- wholesale orders ----------------
 
+# Every ERP data table, children first. Wiping these leaves the site's
+# own tables (users, staff, gift cards, store orders, subscriptions)
+# untouched, so admin/staff logins keep working.
+_ERP_RESET_TABLES = [
+    "erp_batch_ingredients",
+    "erp_batch_orders",
+    "erp_order_production_lines",
+    "erp_fulfillment_history",
+    "erp_order_fulfillment",
+    "erp_wholesale_order_lines",
+    "erp_wholesale_orders",
+    "erp_wholesale_addresses",
+    "erp_wholesale_users",
+    "erp_wholesale_accounts",
+    "erp_production_batches",
+    "erp_recipe_lines",
+    "erp_recipes",
+    "erp_inventory_count_lines",
+    "erp_inventory_counts",
+    "erp_po_lines",
+    "erp_purchase_orders",
+    "erp_reorder_rules",
+    "erp_item_locations",
+    "erp_stock_ledger",
+    "erp_lots",
+    "erp_items",
+    "erp_locations",
+    "erp_vendors",
+    "erp_edi_documents",
+    "erp_edi_partners",
+    "erp_qb_links",
+    "erp_qb_oauth",
+    "erp_qb_config",
+    "erp_sales_summaries",
+    "erp_flavor_categories",
+]
+
+
+@app.post("/api/erp/reset")
+def erp_reset():
+    """DANGER: permanently delete ALL ERP data and start over empty.
+
+    Admin-only and requires the exact confirmation phrase in the body
+    ({"confirm": "RESET ALL ERP DATA"}). Numbering restarts naturally:
+    wholesale/batch/PO numbers are COUNT-based. The flavor
+    names/categories are system seed data and are re-seeded by init_db
+    on the next backend restart.
+    """
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    if data.get("confirm") != "RESET ALL ERP DATA":
+        return jsonify(error="confirmation phrase required"), 400
+    conn = db()
+    deleted = {}
+    for table in _ERP_RESET_TABLES:
+        cur = conn.execute("DELETE FROM %s" % table)
+        deleted[table] = cur.rowcount
+    conn.commit()
+    conn.close()
+    return jsonify(reset=True, deleted=deleted)
+
 def _erp_next_wholesale_number(conn):
     count = conn.execute("SELECT COUNT(*) AS c FROM erp_wholesale_orders").fetchone()["c"]
     return "W-%d" % (1001 + int(count))
