@@ -1630,6 +1630,161 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             pkg_unit: refs.unit.value
           };
         }
+        var ERP_NUTRITION_NUM = [
+          ["nut_calories", "Calories"],
+          ["nut_fat_g", "Total fat (g)"],
+          ["nut_sat_fat_g", "Saturated fat (g)"],
+          ["nut_trans_fat_g", "Trans fat (g)"],
+          ["nut_chol_mg", "Cholesterol (mg)"],
+          ["nut_sodium_mg", "Sodium (mg)"],
+          ["nut_carb_g", "Total carbohydrate (g)"],
+          ["nut_fiber_g", "Dietary fiber (g)"],
+          ["nut_sugars_g", "Total sugars (g)"],
+          ["nut_added_sugars_g", "Added sugars (g)"],
+          ["nut_protein_g", "Protein (g)"],
+          ["nut_vit_d_mcg", "Vitamin D (mcg)"],
+          ["nut_calcium_mg", "Calcium (mg)"],
+          ["nut_iron_mg", "Iron (mg)"],
+          ["nut_potassium_mg", "Potassium (mg)"]
+        ];
+        // Nutrition facts (per serving) + product-listing import, shared by
+        // the add-item and edit-item forms. hooks: {nameInput, skuInput}
+        // are filled from a fetched listing when left blank.
+        function erpNutritionInputs(item, hooks) {
+          var existing = item || {};
+          var refs = {nums: {}};
+          var wrap = document.createElement("div");
+          wrap.style.width = "100%";
+          var title = document.createElement("strong");
+          title.textContent = "Nutrition facts (per serving) + product listing";
+          title.style.width = "100%";
+          wrap.appendChild(title);
+          var urlL = document.createElement("label");
+          urlL.textContent = "Product page URL ";
+          var urlInput = document.createElement("input");
+          urlInput.type = "url";
+          urlInput.placeholder = "https://supplier.com/product…";
+          urlInput.value = existing.product_url || "";
+          urlInput.style.width = "320px";
+          urlL.appendChild(urlInput);
+          wrap.appendChild(urlL);
+          refs.url = urlInput;
+          var fetchBtn = document.createElement("button");
+          fetchBtn.type = "button";
+          fetchBtn.textContent = "Fetch from listing";
+          fetchBtn.style.marginLeft = "6px";
+          var fetchStatus = document.createElement("p");
+          fetchStatus.className = "erp-form-status";
+          fetchBtn.addEventListener("click", function () {
+            var url = urlInput.value.trim();
+            if (!url) {
+              fetchStatus.textContent = "Paste a product URL first.";
+              return;
+            }
+            fetchBtn.disabled = true;
+            fetchStatus.textContent = "Fetching…";
+            erpPost("/api/erp/items/fetch-url", {url: url}).then(function (res) {
+              fetchBtn.disabled = false;
+              var nut = res.nutrition || {};
+              if (res.name && hooks && hooks.nameInput && !hooks.nameInput.value.trim()) {
+                hooks.nameInput.value = res.name;
+              }
+              if (res.name && hooks && hooks.skuInput && !hooks.skuInput.value.trim()) {
+                erpGet("/api/erp/items/suggest-sku?name=" + encodeURIComponent(res.name)).then(function (s) {
+                  hooks.skuInput.value = s.sku;
+                }).catch(function () {});
+              }
+              if (nut.nut_serving_size) refs.servingSize.value = nut.nut_serving_size;
+              if (nut.nut_serving_grams !== null && nut.nut_serving_grams !== undefined) {
+                refs.servingGrams.value = nut.nut_serving_grams;
+              }
+              Object.keys(refs.nums).forEach(function (k) {
+                if (nut[k] !== null && nut[k] !== undefined) refs.nums[k].value = nut[k];
+              });
+              if (res.ingredients_text) refs.ingredients.value = res.ingredients_text;
+              var found = Object.keys(nut).length;
+              fetchStatus.textContent = "Filled from the listing" +
+                (res.name ? " (" + res.name + ")" : "") +
+                (found ? ": " + found + " nutrition fields." : " — no nutrition facts found on that page; fill them in by hand.") +
+                " Review everything before saving.";
+            }).catch(function (error) {
+              fetchBtn.disabled = false;
+              fetchStatus.textContent = error.message;
+            });
+          });
+          wrap.appendChild(fetchBtn);
+          wrap.appendChild(fetchStatus);
+          var servL = document.createElement("label");
+          servL.textContent = "Serving size (as printed, e.g. 1 cup) ";
+          var servingSize = document.createElement("input");
+          servingSize.type = "text";
+          servingSize.placeholder = "e.g. 1 cup";
+          servingSize.value = existing.nut_serving_size || "";
+          servL.appendChild(servingSize);
+          wrap.appendChild(servL);
+          refs.servingSize = servingSize;
+          var gramsL = document.createElement("label");
+          gramsL.textContent = "Serving weight (g) — needed for recipe label math ";
+          var servingGrams = document.createElement("input");
+          servingGrams.type = "number";
+          servingGrams.min = "0";
+          servingGrams.step = "any";
+          servingGrams.placeholder = "e.g. 17";
+          if (existing.nut_serving_grams !== null && existing.nut_serving_grams !== undefined) {
+            servingGrams.value = existing.nut_serving_grams;
+          }
+          gramsL.appendChild(servingGrams);
+          wrap.appendChild(gramsL);
+          refs.servingGrams = servingGrams;
+          ERP_NUTRITION_NUM.forEach(function (pair) {
+            var lab = document.createElement("label");
+            lab.textContent = pair[1] + " ";
+            var inp = document.createElement("input");
+            inp.type = "number";
+            inp.min = "0";
+            inp.step = "any";
+            inp.placeholder = "optional";
+            if (existing[pair[0]] !== null && existing[pair[0]] !== undefined) {
+              inp.value = existing[pair[0]];
+            }
+            lab.appendChild(inp);
+            wrap.appendChild(lab);
+            refs.nums[pair[0]] = inp;
+          });
+          var ingL = document.createElement("label");
+          ingL.textContent = "Ingredients ";
+          var ingInput = document.createElement("textarea");
+          ingInput.rows = 3;
+          ingInput.placeholder = "As printed on the package";
+          ingInput.value = existing.ingredients_text || "";
+          ingInput.style.width = "100%";
+          ingL.appendChild(ingInput);
+          wrap.appendChild(ingL);
+          refs.ingredients = ingInput;
+          var algL = document.createElement("label");
+          algL.textContent = "Allergens (e.g. Soy, Wheat, Milk) ";
+          var algInput = document.createElement("input");
+          algInput.type = "text";
+          algInput.placeholder = "optional";
+          algInput.value = existing.allergens_text || "";
+          algL.appendChild(algInput);
+          wrap.appendChild(algL);
+          refs.allergens = algInput;
+          return refs;
+        }
+        function erpNutritionPayload(refs) {
+          var out = {
+            product_url: refs.url.value.trim() || null,
+            nut_serving_size: refs.servingSize.value.trim() || null,
+            nut_serving_grams: refs.servingGrams.value.trim() === "" ? null : Number(refs.servingGrams.value),
+            ingredients_text: refs.ingredients.value.trim() || null,
+            allergens_text: refs.allergens.value.trim() || null
+          };
+          Object.keys(refs.nums).forEach(function (k) {
+            out[k] = refs.nums[k].value.trim() === "" ? null : Number(refs.nums[k].value);
+          });
+          return out;
+        }
         function erpAddItemForm() {
           var form = document.createElement("form");
           form.className = "erp-form";
@@ -1643,7 +1798,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             label.textContent = f.label + " ";
             var input = document.createElement("input");
             input.name = f.name;
-            input.required = true;
+            input.required = (f.name === "name");
             input.placeholder = f.placeholder;
             label.appendChild(input);
             form.appendChild(label);
@@ -1721,6 +1876,8 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
           form.appendChild(cupLabel3);
           var pkg3 = erpPkgInputs(null);
           form.appendChild(pkg3.wrap);
+          var nut3 = erpNutritionInputs(null, {nameInput: inputs.name, skuInput: inputs.sku});
+          form.appendChild(nut3.wrap);
           var submit = document.createElement("button");
           submit.type = "submit";
           submit.textContent = "Save item";
@@ -1751,7 +1908,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             allLocBtn.disabled = true;
             status.textContent = "Saving…";
             var newItemId = null;
-            erpPost("/api/erp/items", {
+            var newBody = {
               sku: inputs.sku.value.trim(),
               name: inputs.name.value.trim(),
               type: typeSel.value,
@@ -1764,7 +1921,10 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
               pkg_price_cents: erpPkgPayload(pkg3).pkg_price_cents,
               pkg_size: erpPkgPayload(pkg3).pkg_size,
               pkg_unit: erpPkgPayload(pkg3).pkg_unit
-            }).then(function (res) {
+            };
+            var nutPayload3 = erpNutritionPayload(nut3);
+            Object.keys(nutPayload3).forEach(function (k) { newBody[k] = nutPayload3[k]; });
+            erpPost("/api/erp/items", newBody).then(function (res) {
               newItemId = res.item.id;
               if (!qty || !locationIds.length) return null;
               var chain = Promise.resolve();
@@ -2542,6 +2702,8 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             eform.appendChild(eCupL);
             var ePkg = erpPkgInputs(item);
             eform.appendChild(ePkg.wrap);
+            var eNut = erpNutritionInputs(item, {nameInput: eName, skuInput: eSku});
+            eform.appendChild(eNut.wrap);
             var eLotL = document.createElement("label");
             var eLot = document.createElement("input");
             eLot.type = "checkbox";
@@ -2570,7 +2732,7 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
               event.preventDefault();
               eSave.disabled = true;
               eStatus.textContent = "Saving…";
-              erpPut("/api/erp/items/" + encodeURIComponent(String(item.id)), {
+              var eBody = {
                 sku: eSku.value.trim(),
                 name: eName.value.trim(),
                 type: eType.value,
@@ -2582,7 +2744,10 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
                 pkg_price_cents: erpPkgPayload(ePkg).pkg_price_cents,
                 pkg_size: erpPkgPayload(ePkg).pkg_size,
                 pkg_unit: erpPkgPayload(ePkg).pkg_unit
-              }).then(function () {
+              };
+              var eNutPayload = erpNutritionPayload(eNut);
+              Object.keys(eNutPayload).forEach(function (k) { eBody[k] = eNutPayload[k]; });
+              erpPut("/api/erp/items/" + encodeURIComponent(String(item.id)), eBody).then(function () {
                 erpState.editingItem = false;
                 return erpGet("/api/erp/items/" + encodeURIComponent(String(item.id)));
               }).then(function (res) {
@@ -2594,6 +2759,55 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
               });
             });
             body.appendChild(eform);
+          }
+          var nutKeys = ["nut_calories", "nut_fat_g", "nut_sat_fat_g",
+            "nut_trans_fat_g", "nut_chol_mg", "nut_sodium_mg", "nut_carb_g",
+            "nut_fiber_g", "nut_sugars_g", "nut_added_sugars_g",
+            "nut_protein_g", "nut_vit_d_mcg", "nut_calcium_mg",
+            "nut_iron_mg", "nut_potassium_mg"];
+          var hasNut = nutKeys.some(function (k) {
+            return item[k] !== null && item[k] !== undefined;
+          }) || item.product_url || item.ingredients_text || item.allergens_text;
+          if (hasNut) {
+            body.appendChild(erpSectionTitle("Nutrition facts"));
+            var nutWrap = document.createElement("div");
+            nutWrap.className = "admin-orders-wrap";
+            var nutLines = [];
+            if (item.nut_serving_size) {
+              nutLines.push("Serving size: " + item.nut_serving_size +
+                (item.nut_serving_grams ? " (" + item.nut_serving_grams + "g)" : ""));
+            }
+            var nutLabels = {nut_calories: "Calories", nut_fat_g: "Total fat",
+              nut_sat_fat_g: "Saturated fat", nut_trans_fat_g: "Trans fat",
+              nut_chol_mg: "Cholesterol", nut_sodium_mg: "Sodium",
+              nut_carb_g: "Total carbohydrate", nut_fiber_g: "Dietary fiber",
+              nut_sugars_g: "Total sugars", nut_added_sugars_g: "Added sugars",
+              nut_protein_g: "Protein", nut_vit_d_mcg: "Vitamin D",
+              nut_calcium_mg: "Calcium", nut_iron_mg: "Iron",
+              nut_potassium_mg: "Potassium"};
+            nutKeys.forEach(function (k) {
+              if (item[k] !== null && item[k] !== undefined) {
+                nutLines.push(nutLabels[k] + ": " + item[k]);
+              }
+            });
+            if (item.ingredients_text) nutLines.push("Ingredients: " + item.ingredients_text);
+            if (item.allergens_text) nutLines.push("Allergens: " + item.allergens_text);
+            nutLines.forEach(function (t) {
+              var p = document.createElement("p");
+              p.textContent = t;
+              nutWrap.appendChild(p);
+            });
+            if (item.product_url) {
+              var pa = document.createElement("p");
+              var a = document.createElement("a");
+              a.href = item.product_url;
+              a.target = "_blank";
+              a.rel = "noopener";
+              a.textContent = "Product listing";
+              pa.appendChild(a);
+              nutWrap.appendChild(pa);
+            }
+            body.appendChild(nutWrap);
           }
           body.appendChild(erpSectionTitle("Stock by location"));
           var locWrap = document.createElement("div");
@@ -4143,10 +4357,232 @@ function renderErpRecipeDetail(body) {
       "standard kitchen cup weights (or the item's own '1 cup weighs' if you set one). " +
       "Ingredients only — no labor.";
     body.appendChild(costNote);
+    // Nutrition label: computed from the same per-batch amounts that drive
+    // cost (Qty per batch + unit on each line), rendered in the back-label
+    // style and printable from the system.
+    body.appendChild(erpSectionTitle("Nutrition label"));
+    var nutBox = document.createElement("div");
+    nutBox.className = "admin-orders-wrap";
+    var nutBtn = document.createElement("button");
+    nutBtn.type = "button";
+    nutBtn.textContent = "Show nutrition label";
+    nutBox.appendChild(nutBtn);
+    var nutStatus = document.createElement("p");
+    nutStatus.className = "erp-form-status";
+    nutBox.appendChild(nutStatus);
+    var nutView = document.createElement("div");
+    nutBox.appendChild(nutView);
+    nutBtn.addEventListener("click", function () {
+      nutBtn.disabled = true;
+      nutStatus.textContent = "Calculating…";
+      erpGet("/api/erp/recipes/" + encodeURIComponent(String(r.id)) + "/nutrition").then(function (nut) {
+        nutBtn.disabled = false;
+        nutStatus.textContent = "";
+        nutView.replaceChildren();
+        if (!nut.batch_size_bags || nut.batch_size_bags <= 0) {
+          nutStatus.textContent = "Set bags per batch on the recipe first.";
+          return;
+        }
+        if ((nut.missing || []).length) {
+          var warn = document.createElement("p");
+          warn.style.color = "#c92e29";
+          warn.textContent = "Not counted in the label (add nutrition facts to these items first): " +
+            nut.missing.map(function (m) { return m.item + " — " + m.reason; }).join("; ");
+          nutView.appendChild(warn);
+        }
+        var FDA_DV = {nut_fat_g: 78, nut_sat_fat_g: 20, nut_chol_mg: 300,
+          nut_sodium_mg: 2300, nut_carb_g: 275, nut_fiber_g: 28,
+          nut_protein_g: 50, nut_vit_d_mcg: 20, nut_calcium_mg: 1300,
+          nut_iron_mg: 18, nut_potassium_mg: 4700, nut_added_sugars_g: 50};
+        var servForm = document.createElement("div");
+        servForm.className = "erp-form erp-form-inline";
+        var sizeInput = document.createElement("input");
+        sizeInput.type = "text";
+        sizeInput.value = "1 cup";
+        sizeInput.style.width = "90px";
+        servForm.appendChild(erpField("Serving size", sizeInput));
+        var gramsInput = document.createElement("input");
+        gramsInput.type = "number";
+        gramsInput.min = "0";
+        gramsInput.step = "any";
+        gramsInput.value = "17";
+        gramsInput.style.width = "80px";
+        servForm.appendChild(erpField("Serving weight (g)", gramsInput));
+        var perInput = document.createElement("input");
+        perInput.type = "number";
+        perInput.min = "1";
+        perInput.step = "1";
+        perInput.style.width = "80px";
+        var bagGrams = nut.batch_grams > 0 ? nut.batch_grams / nut.batch_size_bags : 0;
+        perInput.value = bagGrams > 0 ? Math.max(1, Math.round(bagGrams / 17)) : "1";
+        servForm.appendChild(erpField("Servings per bag", perInput));
+        nutView.appendChild(servForm);
+        var sumTable = document.createElement("table");
+        sumTable.className = "admin-orders-table";
+        sumTable.innerHTML = "<thead><tr><th>Per serving</th><th>Amount</th><th>% Daily Value</th></tr></thead>";
+        var sumBody = document.createElement("tbody");
+        var NUT_ROWS = [["nut_calories", "Calories", ""],
+          ["nut_fat_g", "Total fat", "g"], ["nut_sat_fat_g", "Saturated fat", "g"],
+          ["nut_trans_fat_g", "Trans fat", "g"], ["nut_chol_mg", "Cholesterol", "mg"],
+          ["nut_sodium_mg", "Sodium", "mg"], ["nut_carb_g", "Total carbohydrate", "g"],
+          ["nut_fiber_g", "Dietary fiber", "g"], ["nut_sugars_g", "Total sugars", "g"],
+          ["nut_added_sugars_g", "Added sugars", "g"], ["nut_protein_g", "Protein", "g"],
+          ["nut_vit_d_mcg", "Vitamin D", "mcg"], ["nut_calcium_mg", "Calcium", "mg"],
+          ["nut_iron_mg", "Iron", "mg"], ["nut_potassium_mg", "Potassium", "mg"]];
+        function perServing(key) {
+          var per = Number(perInput.value) || 1;
+          var bag = nut.per_bag[key];
+          return (bag === null || bag === undefined) ? null : bag / per;
+        }
+        function fmtNum(v) {
+          if (v === null || v === undefined) return "—";
+          if (v === 0) return "0";
+          var x = Math.round(v * 10) / 10;
+          return String(x);
+        }
+        function renderSum() {
+          sumBody.replaceChildren();
+          NUT_ROWS.forEach(function (row) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Nutrient", row[1]));
+            var v = perServing(row[0]);
+            tr.appendChild(erpCell("Amount", v === null ? "—" : fmtNum(v) + row[2]));
+            var dv = FDA_DV[row[0]];
+            tr.appendChild(erpCell("% DV", (v === null || !dv) ? "—" : Math.round(v / dv * 100) + "%"));
+            sumBody.appendChild(tr);
+          });
+        }
+        [sizeInput, gramsInput, perInput].forEach(function (inp) {
+          inp.addEventListener("input", renderSum);
+        });
+        renderSum();
+        sumTable.appendChild(sumBody);
+        nutView.appendChild(sumTable);
+        var printBtn = document.createElement("button");
+        printBtn.type = "button";
+        printBtn.textContent = "Print label";
+        printBtn.style.marginTop = "10px";
+        printBtn.addEventListener("click", function () {
+          var win = window.open("", "_blank");
+          if (!win) {
+            nutStatus.textContent = "Allow pop-ups for this site to print the label.";
+            return;
+          }
+          win.document.write(erpRecipeLabelDoc(r, nut, {
+            sizeText: sizeInput.value.trim() || "1 cup",
+            grams: Number(gramsInput.value) || 17,
+            perContainer: Number(perInput.value) || 1,
+            bagGrams: bagGrams,
+            perServing: perServing,
+            fmtNum: fmtNum
+          }));
+          win.document.close();
+        });
+        nutView.appendChild(printBtn);
+        var qrNote = document.createElement("p");
+        qrNote.style.color = "var(--muted)";
+        qrNote.textContent = "Label matches the back-label style (Nutrition Facts panel, ingredients, manufacturer block). The QR code and barcode are added once this product is assigned a GTIN.";
+        nutView.appendChild(qrNote);
+      }).catch(function (error) {
+        nutBtn.disabled = false;
+        nutStatus.textContent = error.message;
+      });
+    });
+    body.appendChild(nutBox);
     setAdminDetailStatus(r.name + " v" + res.version + " — " + (res.lines || []).length + " lines.");
   }).catch(function (error) {
     setAdminDetailStatus(error.message, true);
   });
+}
+
+/* ---------- recipe nutrition label (printable, back-label style) ---------- */
+function erpRecipeLabelDoc(r, nut, serving) {
+  var esc = function (s) {
+    return String(s === null || s === undefined ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  };
+  var FDA_DV = {nut_fat_g: 78, nut_sat_fat_g: 20, nut_chol_mg: 300,
+    nut_sodium_mg: 2300, nut_carb_g: 275, nut_fiber_g: 28,
+    nut_protein_g: 50, nut_vit_d_mcg: 20, nut_calcium_mg: 1300,
+    nut_iron_mg: 18, nut_potassium_mg: 4700, nut_added_sugars_g: 50};
+  function row(key, label, unit, indent, bold) {
+    var v = serving.perServing(key);
+    var dv = FDA_DV[key];
+    var dvTxt = (v === null || !dv) ? "" : Math.round(v / dv * 100) + "%";
+    return "<div class=\"f-row" + (indent ? " f-indent" : "") + "\">" +
+      "<span" + (bold ? " class=\"f-bold\"" : "") + ">" + label + " " +
+      (v === null ? "—" : "<b>" + serving.fmtNum(v) + unit + "</b>") + "</span>" +
+      "<span>" + dvTxt + "</span></div>";
+  }
+  var cal = serving.perServing("nut_calories");
+  var netWt = "";
+  if (serving.bagGrams > 0) {
+    var oz = serving.bagGrams / 28.3495;
+    netWt = "<p><b>Net Wt: " + (Math.round(oz * 10) / 10) + " oz (" +
+      Math.round(serving.bagGrams) + "g)</b></p>";
+  }
+  return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" +
+    esc(r.name) + " — Nutrition Label</title><style>" +
+    "body{font-family:Arial,Helvetica,sans-serif;color:#000;background:#fff;margin:20px;}" +
+    ".noprint{margin-bottom:14px;}@media print{.noprint{display:none;}}" +
+    ".label{width:480px;}" +
+    ".label h1{text-align:center;font-size:24px;margin:0 0 10px;}" +
+    ".cols{display:flex;gap:14px;align-items:flex-start;}" +
+    ".facts{width:46%;border:2px solid #000;padding:6px 8px;box-sizing:border-box;}" +
+    ".facts h2{font-size:26px;margin:0;line-height:1;}" +
+    ".facts .rule{border-top:1px solid #000;margin:3px 0;}" +
+    ".facts .rule-thick{border-top:8px solid #000;margin:3px 0;}" +
+    ".facts .rule-med{border-top:4px solid #000;margin:3px 0;}" +
+    ".f-row{display:flex;justify-content:space-between;font-size:12px;" +
+    "border-top:1px solid #ccc;padding:1px 0;}" +
+    ".f-indent{padding-left:12px;}" +
+    ".f-bold{font-weight:700;}" +
+    ".f-cal{font-size:30px;font-weight:800;}" +
+    ".f-dv{text-align:right;font-size:11px;}" +
+    ".f-foot{font-size:10px;margin-top:4px;}" +
+    ".info{flex:1;font-size:12px;line-height:1.4;}" +
+    ".info p{margin:0 0 8px;}" +
+    "</style></head><body>" +
+    "<div class=\"noprint\"><button onclick=\"window.print()\">Print</button></div>" +
+    "<div class=\"label\"><h1>" + esc(r.name) + "</h1><div class=\"cols\">" +
+    "<div class=\"facts\"><h2>Nutrition Facts</h2>" +
+    "<div class=\"rule-med\"></div>" +
+    "<div><b>" + serving.perContainer + " Servings Per Container</b></div>" +
+    "<div><b>Serving Size&nbsp;&nbsp;" + esc(serving.sizeText) + " (" +
+    serving.grams + "g)</b></div><div class=\"rule-med\"></div>" +
+    "<div style=\"font-size:11px;\"><b>Amount Per Serving</b></div>" +
+    "<div class=\"f-row\" style=\"border-top:0;\"><span class=\"f-cal\">Calories</span>" +
+    "<span class=\"f-cal\">" + (cal === null ? "—" : Math.round(cal)) + "</span></div>" +
+    "<div class=\"rule-thick\"></div>" +
+    "<div class=\"f-dv\">% Daily Value *</div>" +
+    row("nut_fat_g", "Total Fat", "g", false, true) +
+    row("nut_sat_fat_g", "Saturated Fat", "g", true, false) +
+    row("nut_trans_fat_g", "Trans Fat", "g", true, false) +
+    row("nut_chol_mg", "Cholesterol", "mg", false, true) +
+    row("nut_sodium_mg", "Sodium", "mg", false, true) +
+    row("nut_carb_g", "Total Carbohydrate", "g", false, true) +
+    row("nut_fiber_g", "Dietary Fiber", "g", true, false) +
+    row("nut_sugars_g", "Total Sugars", "g", true, false) +
+    row("nut_added_sugars_g", "Includes Added Sugars", "g", true, false) +
+    row("nut_protein_g", "Protein", "g", false, true) +
+    "<div class=\"rule-thick\"></div>" +
+    row("nut_vit_d_mcg", "Vitamin D", "mcg", false, false) +
+    row("nut_calcium_mg", "Calcium", "mg", false, false) +
+    row("nut_iron_mg", "Iron", "mg", false, false) +
+    row("nut_potassium_mg", "Potassium", "mg", false, false) +
+    "<div class=\"f-foot\">* The % Daily Value (DV) tells you how much a " +
+    "nutrient in a serving of food contributes to a daily diet. 2,000 " +
+    "calories a day is used for general nutrition advice.</div></div>" +
+    "<div class=\"info\">" +
+    (nut.ingredients_text ? "<p><b>Ingredients:</b> " + esc(nut.ingredients_text) + "</p>" : "") +
+    (nut.allergens_text ? "<p><b>Contains:</b> " + esc(nut.allergens_text) + "</p>" : "") +
+    "<p>This product is made in a facility that also processes: peanuts and tree nuts.</p>" +
+    "<p><b>WARNING:</b> This bag may contain unpopped kernels. Please snack responsibly.</p>" +
+    "<p><b>Manufactured by:</b><br>Pop-A-Licious<br>6290 McLeod DR<br>Suite 120<br>Las Vegas, NV 89120</p>" +
+    netWt +
+    "<p style=\"color:#666;\">QR code and barcode are added once this product is assigned a GTIN.</p>" +
+    "</div></div></div></body></html>";
 }
 
 /* ---------- new recipe form (also used for new versions) ---------- */
