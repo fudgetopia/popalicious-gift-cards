@@ -2656,6 +2656,19 @@ if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { en
             " · total on hand " + erpQty(item.on_hand_total) + " " + (item.unit || "");
           head.appendChild(meta);
           body.appendChild(head);
+          if ((item.type === "bag" || item.type === "front_label" || item.type === "back_label") &&
+              item.pkg_price_cents !== null && item.pkg_price_cents !== undefined &&
+              item.pkg_size &&
+              ((item.type === "bag" && (item.pkg_unit === "bag" || item.pkg_unit === "each")) ||
+               (item.type !== "bag" && item.pkg_unit === "each"))) {
+            var piece = document.createElement("p");
+            var pieceName = item.type === "bag" ? "Individual bag price" :
+              (item.type === "front_label" ? "Front label cost" : "Back label cost");
+            piece.textContent = pieceName + ": " +
+              erpMoney(Math.round(item.pkg_price_cents / item.pkg_size)) +
+              (item.type === "bag" ? "" : " each");
+            body.appendChild(piece);
+          }
           if (erpIsAdmin() && erpState.editingItem) {
             var eform = document.createElement("form");
             eform.className = "erp-form";
@@ -4375,6 +4388,50 @@ function renderErpRecipeDetail(body) {
       "standard kitchen cup weights (or the item's own '1 cup weighs' if you set one). " +
       "Ingredients only — no labor.";
     body.appendChild(costNote);
+    // Packaging cost: per finished bag for bags + labels, from the same
+    // line costs as the batch total. Cost-only — this section never
+    // fetches or renders the nutrition panel.
+    body.appendChild(erpSectionTitle("Packaging cost"));
+    var pkgWrap = document.createElement("div");
+    pkgWrap.className = "admin-orders-wrap";
+    var pkgBatchTotal = 0;
+    var pkgAny = false;
+    var pkgUncosted = [];
+    [["bag", "Bag"], ["front_label", "Front label"],
+     ["back_label", "Back label"]].forEach(function (pt) {
+      var plines = (res.lines || []).filter(function (l) { return l.item_type === pt[0]; });
+      if (!plines.length) return;
+      pkgAny = true;
+      var pieceBatch = 0;
+      var ok = true;
+      plines.forEach(function (l) {
+        if (l.line_cost_cents === null || l.line_cost_cents === undefined) { ok = false; }
+        else { pieceBatch += l.line_cost_cents; }
+      });
+      var pp = document.createElement("p");
+      if (ok && res.batch_size_bags > 0) {
+        pkgBatchTotal += pieceBatch;
+        pp.textContent = pt[1] + ": " +
+          erpMoney(Math.round(pieceBatch / res.batch_size_bags)) + " per finished bag";
+      } else {
+        pkgUncosted.push(pt[1]);
+        pp.textContent = pt[1] + ": — (set package price and size on the item)";
+      }
+      pkgWrap.appendChild(pp);
+    });
+    if (!pkgAny) {
+      var pkgNone = document.createElement("p");
+      pkgNone.textContent = "No packaging lines in this recipe — add bag, front label, or back label lines to cost packaging.";
+      pkgWrap.appendChild(pkgNone);
+    } else {
+      var pkgTot = document.createElement("p");
+      pkgTot.textContent = "Packaging per finished bag: " +
+        (pkgUncosted.length || !(res.batch_size_bags > 0) ? "—" :
+          erpMoney(Math.round(pkgBatchTotal / res.batch_size_bags))) +
+        (pkgUncosted.length ? " (partial — " + pkgUncosted.join(", ") + " not costed)" : "");
+      pkgWrap.appendChild(pkgTot);
+    }
+    body.appendChild(pkgWrap);
     // Nutrition label: computed from the same per-batch amounts that drive
     // cost (Qty per batch + unit on each line), rendered as the standard
     // FDA Nutrition Facts panel and printable from the system.
