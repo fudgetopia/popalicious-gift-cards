@@ -1846,10 +1846,18 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           if (parts.nutWrap) parts.nutWrap.style.display = packaging ? "none" : "";
           if (parts.cupLabel) parts.cupLabel.style.display = packaging ? "none" : "";
           if (parts.costLabel) parts.costLabel.style.display = packaging ? "none" : "";
-          if (parts.sizeLabel) parts.sizeLabel.textContent = packaging ?
+          if (parts.sizeLabel) erpSetLabelText(parts.sizeLabel, packaging ?
             "Count — how many in the package " :
-            "Package size — how much the package holds ";
+            "Package size — how much the package holds ");
           if (parts.preview) erpRefreshPiecePreview(parts.preview, type, parts.pkg);
+        }
+        // Update a label's text WITHOUT destroying the input inside it:
+        // setting textContent on a label replaces all its children, which
+        // would delete the field itself. Update the text node in place.
+        function erpSetLabelText(label, text) {
+          var first = label.firstChild;
+          if (first && first.nodeType === 3) first.nodeValue = text;
+          else label.textContent = text;
         }
         function erpAddItemForm() {
           var form = document.createElement("form");
