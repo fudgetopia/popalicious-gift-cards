@@ -4326,6 +4326,104 @@ function erpCompleteBatchForm(b) {
 }
 
 /* ---------- recipe detail + versioning ---------- */
+function erpBarcodePictureBox(r, res) {
+  var box = document.createElement("div");
+  box.className = "admin-orders-wrap";
+  var h = document.createElement("h3");
+  h.textContent = "Barcode picture";
+  box.appendChild(h);
+  var pic = (res.recipe && res.recipe.barcode_image) || r.barcode_image || "";
+  var note = document.createElement("p");
+  note.style.color = "var(--muted)";
+  if (pic) {
+    var img = document.createElement("img");
+    img.src = pic;
+    img.alt = "Barcode picture";
+    img.style.maxWidth = "260px";
+    img.style.display = "block";
+    img.style.marginBottom = "8px";
+    box.appendChild(img);
+    note.textContent = "This picture prints in the barcode spot on the 4×6 label, in place of the generated barcode.";
+  } else {
+    var code = erpMatchFlavorCode(r.name);
+    note.textContent = code ?
+      "No picture added — the label prints the " + code.name + " barcode automatically. Add a picture here to use it instead." :
+      "No barcode picture yet — add one here and it will print in the barcode spot on the 4×6 label.";
+  }
+  box.appendChild(note);
+  if (erpIsAdmin()) {
+    var input = document.createElement("input");
+    input.type = "file";
+    input.accept = "image/png,image/jpeg,image/gif,image/webp";
+    input.style.display = "block";
+    input.style.marginBottom = "8px";
+    box.appendChild(input);
+    var status = document.createElement("p");
+    status.style.color = "var(--muted)";
+    box.appendChild(status);
+    var upBtn = document.createElement("button");
+    upBtn.type = "button";
+    upBtn.textContent = pic ? "Replace barcode picture" : "Upload barcode picture";
+    upBtn.addEventListener("click", function () {
+      var file = input.files && input.files[0];
+      if (!file) { status.textContent = "Choose a picture first."; return; }
+      if (file.size > 500 * 1024) { status.textContent = "That picture is over 500KB — pick a smaller one."; return; }
+      upBtn.disabled = true;
+      status.textContent = "Uploading…";
+      var reader = new FileReader();
+      reader.onload = function () {
+        erpPost("/api/erp/recipes/" + encodeURIComponent(String(r.id)) + "/barcode-image",
+          { image: reader.result }).then(function () {
+          renderErpProductionDetail();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          upBtn.disabled = false;
+        });
+      };
+      reader.onerror = function () {
+        status.textContent = "Could not read that file.";
+        upBtn.disabled = false;
+      };
+      reader.readAsDataURL(file);
+    });
+    box.appendChild(upBtn);
+    if (pic) {
+      var delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.textContent = "Remove picture";
+      delBtn.style.marginLeft = "8px";
+      var delArmed = false;
+      var delTimer = null;
+      delBtn.addEventListener("click", function () {
+        if (!delArmed) {
+          delArmed = true;
+          delBtn.textContent = "Tap again to remove";
+          delBtn.classList.add("erp-danger-armed");
+          delTimer = setTimeout(function () {
+            delArmed = false;
+            delBtn.textContent = "Remove picture";
+            delBtn.classList.remove("erp-danger-armed");
+          }, 4000);
+          return;
+        }
+        clearTimeout(delTimer);
+        delBtn.disabled = true;
+        erpDelete("/api/erp/recipes/" + encodeURIComponent(String(r.id)) + "/barcode-image").then(function () {
+          renderErpProductionDetail();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          delBtn.disabled = false;
+          delArmed = false;
+          delBtn.textContent = "Remove picture";
+          delBtn.classList.remove("erp-danger-armed");
+        });
+      });
+      box.appendChild(delBtn);
+    }
+  }
+  return box;
+}
+
 function renderErpRecipeDetail(body) {
   var version = erpState.selectedRecipeVersion;
   var path = "/api/erp/recipes/" + encodeURIComponent(String(erpState.selectedRecipeId)) +
@@ -4621,7 +4719,11 @@ function renderErpRecipeDetail(body) {
         var qrNote = document.createElement("p");
         qrNote.style.color = "var(--muted)";
         var flavorCode = erpMatchFlavorCode(r.name);
-        qrNote.textContent = flavorCode ?
+        var hasPic = !!(r.barcode_image);
+        qrNote.textContent = hasPic ?
+          "Prints at 4×6 with your uploaded barcode picture" +
+          (flavorCode ? " and the " + flavorCode.name + " QR code." : ".") :
+          flavorCode ?
           "Prints at 4×6 with the " + flavorCode.name + " barcode (" +
           flavorCode.upc + ") and QR code, carried over automatically." :
           "Standard FDA Nutrition Facts panel. Ingredients, manufacturer block, and net weight appear on the printed label below the panel. The QR code and barcode are added once this product is assigned a GTIN.";
@@ -4631,6 +4733,7 @@ function renderErpRecipeDetail(body) {
         nutStatus.textContent = error.message;
       });
     });
+    body.appendChild(erpBarcodePictureBox(r, res));
     body.appendChild(nutBox);
     setAdminDetailStatus(r.name + " v" + res.version + " — " + (res.lines || []).length + " lines.");
   }).catch(function (error) {
@@ -4852,17 +4955,26 @@ function erpRecipeLabelDoc(r, nut, serving) {
     netWt = "<p><b>Net Wt: " + (Math.round(oz * 10) / 10) + " oz (" +
       Math.round(serving.bagGrams) + "g)</b></p>";
   }
-  /* Flavor carry-over: a recipe named for a website flavor automatically
-     prints that flavor's barcode + QR code. Anything else keeps the note. */
+  /* Barcode slot: an uploaded barcode picture wins over the generated
+     barcode; the auto QR code still shows when the recipe matches a website
+     flavor. With neither, the GTIN note stays. */
   var code = erpMatchFlavorCode(r.name);
+  var pic = r.barcode_image || "";
+  var barHTML = "";
+  if (pic) {
+    barHTML = "<img src=\"" + esc(pic) + "\" alt=\"Barcode\" " +
+      "style=\"width:1.25in;max-height:0.9in;object-fit:contain;flex:none;\"/>";
+  } else if (code) {
+    barHTML = "<div style=\"width:1.25in;flex:none;\">" +
+      erpUpcBarcodeSVG(code.upc) + "</div>";
+  }
   var codesHTML = "";
-  if (code) {
+  if (code || pic) {
     codesHTML = "<div style=\"display:flex;justify-content:flex-end;" +
       "align-items:flex-end;gap:0.06in;margin-top:6px;\">" +
-      "<img src=\"" + code.qr + "\" alt=\"QR code\" " +
-      "style=\"width:0.65in;height:0.65in;flex:none;\"/>" +
-      "<div style=\"width:1.25in;flex:none;\">" +
-      erpUpcBarcodeSVG(code.upc) + "</div></div>";
+      (code ? "<img src=\"" + code.qr + "\" alt=\"QR code\" " +
+      "style=\"width:0.65in;height:0.65in;flex:none;\"/>" : "") +
+      barHTML + "</div>";
   } else {
     codesHTML = "<p style=\"color:#666;font-size:11px;margin-top:6px;\">" +
       "QR code and barcode are added once this product is assigned a " +
