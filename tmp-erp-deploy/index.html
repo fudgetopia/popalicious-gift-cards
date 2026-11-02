@@ -1338,7 +1338,7 @@ document.getElementById("forgotBtn").addEventListener("click", async function ()
   }
 });
 document.getElementById("logoutBtn").addEventListener("click", function () { doLogout(); });
-if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { enterApp(); } else { showLogin(); }
+/* (boot line lives at the very end of this script — see the note there) */
 
 /* ================= ERP Phase 1: Inventory + Purchasing (lifted from site build) ================= */
         var erpState = {
@@ -8240,6 +8240,16 @@ function renderErpSettingsDetail() {
   danger.appendChild(wipeBtn);
   els.body.appendChild(danger);
 }
+
+/* ---------- boot (MUST stay last) ---------- */
+// This line used to sit mid-script, before the ERP state (erpState) was
+// assigned. On a refresh while signed in it ran enterApp() -> renderRoute()
+// -> the Inventory/Production branch touched erpState while it was still
+// undefined, throwing and aborting the rest of the script: blank page, dead
+// tabs, with only Dashboard (which never touches erpState) still working.
+// Running it here, after every section has initialized, makes a refresh
+// behave exactly like a fresh sign-in, where the whole script already ran.
+if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { enterApp(); } else { showLogin(); }
 </script>
 </body>
 </html>
