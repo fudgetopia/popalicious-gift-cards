@@ -422,6 +422,14 @@ def init_db():
         conn.execute("ALTER TABLE staff ADD COLUMN referral_code TEXT NOT NULL DEFAULT ''")
     if "verified" not in scols:
         conn.execute("ALTER TABLE staff ADD COLUMN verified INTEGER NOT NULL DEFAULT 1")
+    # Migration: barcode picture on recipes (prints on the 4x6 label).
+    rexists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_recipes'"
+    ).fetchone()
+    if rexists:
+        rcols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_recipes)").fetchall()]
+        if "barcode_image" not in rcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN barcode_image TEXT NOT NULL DEFAULT ''")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS staff_verification_tokens (
             token TEXT PRIMARY KEY,
@@ -769,7 +777,8 @@ def init_db():
             active INTEGER NOT NULL DEFAULT 1,
             notes TEXT NOT NULL DEFAULT '',
             created_by TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            barcode_image TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS erp_recipe_lines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -11428,7 +11437,8 @@ def erp_list_recipes():
         " WHERE rl.recipe_id = r.id) AS versions"
         " FROM erp_recipes r WHERE r.active = 1 ORDER BY r.name").fetchall()
     conn.close()
-    return jsonify(recipes=[dict(r) for r in rows])
+    return jsonify(recipes=[{k: v for k, v in dict(r).items()
+                             if k != "barcode_image"} for r in rows])
 
 
 @app.post("/api/erp/recipes")
@@ -11549,6 +11559,62 @@ def erp_update_recipe(recipe_id):
     lines = _erp_recipe_lines(conn, recipe_id, new_version)
     conn.close()
     return jsonify(recipe=dict(row), lines=[dict(l) for l in lines])
+
+
+@app.post("/api/erp/recipes/<int:recipe_id>/barcode-image")
+def erp_set_recipe_barcode_image(recipe_id):
+    """Save a barcode picture on a recipe (admin). Stored as a data URI; the
+    4x6 print label shows it in the barcode spot, in place of the generated
+    barcode. The auto QR code still shows when the recipe matches a website
+    flavor."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    image = data.get("image") or ""
+    if not isinstance(image, str) or not image.startswith("data:image/"):
+        return jsonify(error="image must be an image data URI"), 400
+    try:
+        header, b64 = image.split(",", 1)
+    except ValueError:
+        return jsonify(error="image must be an image data URI"), 400
+    mime = header[len("data:"):].split(";", 1)[0]
+    if mime not in ("image/png", "image/jpeg", "image/gif", "image/webp"):
+        return jsonify(error="barcode picture must be PNG, JPEG, GIF, or WebP"), 400
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        return jsonify(error="image is not valid base64"), 400
+    if len(raw) > 500 * 1024:
+        return jsonify(error="barcode picture is too large (max 500KB)"), 400
+    conn = db()
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    conn.execute("UPDATE erp_recipes SET barcode_image = ? WHERE id = ?",
+                 (image, recipe_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.delete("/api/erp/recipes/<int:recipe_id>/barcode-image")
+def erp_delete_recipe_barcode_image(recipe_id):
+    """Remove a recipe's barcode picture (admin)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    conn.execute("UPDATE erp_recipes SET barcode_image = '' WHERE id = ?",
+                 (recipe_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
 
 
 @app.delete("/api/erp/recipes/<int:recipe_id>")
