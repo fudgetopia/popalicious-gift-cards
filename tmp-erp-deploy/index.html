@@ -1620,7 +1620,8 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           note.className = "erp-form-status";
           note.textContent = "Recipe cost = package price ÷ package size × amount used.";
           wrap.appendChild(note);
-          return {wrap: wrap, price: price, size: size, unit: unit};
+          return {wrap: wrap, price: price, size: size, unit: unit,
+                  priceLabel: priceL, sizeLabel: sizeL};
         }
         function erpPkgPayload(refs) {
           return {
@@ -1810,6 +1811,46 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           });
           return out;
         }
+        // Packaging items (bags, front labels, back labels) never carry
+        // nutrition: their form shows only count (package size) + price
+        // (package price), and the system calculates the individual
+        // per-piece cost live from those two numbers.
+        function erpIsPackagingType(t) {
+          return t === "bag" || t === "front_label" || t === "back_label";
+        }
+        function erpRefreshPiecePreview(el, type, pkg) {
+          if (!erpIsPackagingType(type)) {
+            el.textContent = "";
+            el.style.display = "none";
+            return;
+          }
+          el.style.display = "";
+          var price = parseFloat(pkg.price.value);
+          var size = parseFloat(pkg.size.value);
+          var unit = pkg.unit.value;
+          var okUnit = (type === "bag" && (unit === "bag" || unit === "each")) ||
+                       (type !== "bag" && unit === "each");
+          if (isFinite(price) && price > 0 && isFinite(size) && size > 0 && okUnit) {
+            var name = type === "bag" ? "Individual bag price" :
+              (type === "front_label" ? "Front label cost" : "Back label cost");
+            el.textContent = name + ": " +
+              erpMoney(Math.round(price * 100 / size)) + (type === "bag" ? "" : " each");
+          } else {
+            el.textContent = "Enter a package price and count" +
+              (okUnit ? "" : " (package unit must be bags for bags, each for labels)") +
+              " to see the individual cost.";
+          }
+        }
+        function erpApplyPackagingState(type, parts) {
+          var packaging = erpIsPackagingType(type);
+          if (parts.nutWrap) parts.nutWrap.style.display = packaging ? "none" : "";
+          if (parts.cupLabel) parts.cupLabel.style.display = packaging ? "none" : "";
+          if (parts.costLabel) parts.costLabel.style.display = packaging ? "none" : "";
+          if (parts.sizeLabel) parts.sizeLabel.textContent = packaging ?
+            "Count — how many in the package " :
+            "Package size — how much the package holds ";
+          if (parts.preview) erpRefreshPiecePreview(parts.preview, type, parts.pkg);
+        }
         function erpAddItemForm() {
           var form = document.createElement("form");
           form.className = "erp-form";
@@ -1903,6 +1944,20 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           form.appendChild(pkg3.wrap);
           var nut3 = erpNutritionInputs(null, {nameInput: inputs.name, skuInput: inputs.sku, pkg: pkg3});
           form.appendChild(nut3.wrap);
+          var piecePreview3 = document.createElement("p");
+          piecePreview3.className = "erp-form-status";
+          pkg3.wrap.appendChild(piecePreview3);
+          function applyAddTypeState() {
+            erpApplyPackagingState(typeSel.value, {
+              nutWrap: nut3.wrap, cupLabel: cupLabel3, costLabel: costLabel3,
+              sizeLabel: pkg3.sizeLabel, preview: piecePreview3, pkg: pkg3
+            });
+          }
+          typeSel.addEventListener("change", applyAddTypeState);
+          pkg3.price.addEventListener("input", applyAddTypeState);
+          pkg3.size.addEventListener("input", applyAddTypeState);
+          pkg3.unit.addEventListener("change", applyAddTypeState);
+          applyAddTypeState();
           var submit = document.createElement("button");
           submit.type = "submit";
           submit.textContent = "Save item";
@@ -1948,6 +2003,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               pkg_unit: erpPkgPayload(pkg3).pkg_unit
             };
             var nutPayload3 = erpNutritionPayload(nut3);
+            if (erpIsPackagingType(typeSel.value)) {
+              Object.keys(nutPayload3).forEach(function (k) { nutPayload3[k] = null; });
+            }
             Object.keys(nutPayload3).forEach(function (k) { newBody[k] = nutPayload3[k]; });
             erpPost("/api/erp/items", newBody).then(function (res) {
               newItemId = res.item.id;
@@ -2742,6 +2800,20 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             eform.appendChild(ePkg.wrap);
             var eNut = erpNutritionInputs(item, {nameInput: eName, skuInput: eSku, pkg: ePkg});
             eform.appendChild(eNut.wrap);
+            var ePiecePreview = document.createElement("p");
+            ePiecePreview.className = "erp-form-status";
+            ePkg.wrap.appendChild(ePiecePreview);
+            function applyEditTypeState() {
+              erpApplyPackagingState(eType.value, {
+                nutWrap: eNut.wrap, cupLabel: eCupL, costLabel: eCostL,
+                sizeLabel: ePkg.sizeLabel, preview: ePiecePreview, pkg: ePkg
+              });
+            }
+            eType.addEventListener("change", applyEditTypeState);
+            ePkg.price.addEventListener("input", applyEditTypeState);
+            ePkg.size.addEventListener("input", applyEditTypeState);
+            ePkg.unit.addEventListener("change", applyEditTypeState);
+            applyEditTypeState();
             var eLotL = document.createElement("label");
             var eLot = document.createElement("input");
             eLot.type = "checkbox";
@@ -2784,6 +2856,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
                 pkg_unit: erpPkgPayload(ePkg).pkg_unit
               };
               var eNutPayload = erpNutritionPayload(eNut);
+              if (erpIsPackagingType(eType.value)) {
+                Object.keys(eNutPayload).forEach(function (k) { eNutPayload[k] = null; });
+              }
               Object.keys(eNutPayload).forEach(function (k) { eBody[k] = eNutPayload[k]; });
               erpPut("/api/erp/items/" + encodeURIComponent(String(item.id)), eBody).then(function () {
                 erpState.editingItem = false;
@@ -2806,7 +2881,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           var hasNut = nutKeys.some(function (k) {
             return item[k] !== null && item[k] !== undefined;
           }) || item.product_url || item.ingredients_text || item.allergens_text;
-          if (hasNut) {
+          if (hasNut && !erpIsPackagingType(item.type)) {
             body.appendChild(erpSectionTitle("Nutrition facts"));
             var nutWrap = document.createElement("div");
             nutWrap.className = "admin-orders-wrap";
