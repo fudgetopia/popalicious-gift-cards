@@ -128,172 +128,6 @@ def _promo_is_active(promo, now=None):
     today = (now or datetime.now(timezone.utc)).astimezone(_LA_TZ).date().isoformat()
     return any(start <= today <= end for start, end in windows)
 
-# ---------------- National-day promo codes (37, approved Oct 29, 2026) ----------------
-# Scoped patch: separate dict, existing PROMOS entries untouched. See
-# promo-codes-37/codes.md for the table and the apply notes.
-
-NATIONAL_ALL_FLAVORS = [
-    "Alien Mix", "Bacon", "Banana Pudding", "Birthday Cake", "Buffalo Ranch",
-    "Caramel", "Cheddar", "Cheddar Jalapeño", "Cheeseburger", "Churro",
-    "Cinnamon Roll", "Cookies N' Creme", "Dill Pickle", "Garlic Butter",
-    "Garlic Parmesan", "Kettle Corn", "Lemonade", "Muddy Buddy", "Pizza",
-    "Salt and Vinegar", "Snickerdoodle", "Strawberry Cheesecake",
-    "Sugar Cookie", "White Cheddar", "Nashville Hot",
-]
-
-NATIONAL_SWEET_FLAVORS = [
-    "Banana Pudding", "Birthday Cake", "Caramel", "Churro", "Cinnamon Roll",
-    "Cookies N' Creme", "Kettle Corn", "Muddy Buddy", "Snickerdoodle",
-    "Strawberry Cheesecake", "Sugar Cookie",
-]
-
-# Each entry: code -> {day, label, flavors or "ALL", type, percent_off or None}
-# "day" is "MM-DD" for a single annual day, "first-saturday-september" or
-# "october" for the two special cases. "flavors": list, or "ALL" for sitewide.
-NATIONAL_DAY_CODES = {
-    "HOTSPICY16": {"day": "01-16", "label": "International Hot & Spicy Food Day",
-                  "flavors": ["Nashville Hot", "Cheddar Jalapeño"], "type": "flavor_percent", "percent_off": 15},
-    "POPCORN19": {"day": "01-19", "label": "National Popcorn Day — FLAGSHIP",
-                  "flavors": "ALL", "type": "sitewide_percent", "percent_off": 15},
-    "CHEESE20": {"day": "01-20", "label": "National Cheese Lovers Day",
-                 "flavors": ["Cheddar", "White Cheddar", "Garlic Parmesan"], "type": "flavor_percent", "percent_off": 15},
-    "HOTSAUCE22": {"day": "01-22", "label": "National Hot Sauce Day",
-                  "flavors": ["Nashville Hot", "Cheddar Jalapeño", "Buffalo Ranch"], "type": "flavor_percent", "percent_off": 15},
-    "PIZZA09": {"day": "02-09", "label": "National Pizza Day — FLAGSHIP",
-                "flavors": ["Pizza"], "type": "flavor_percent", "percent_off": 15},
-    "CHEDDAR13": {"day": "02-13", "label": "National Cheddar Day",
-                  "flavors": ["Cheddar", "White Cheddar"], "type": "flavor_percent", "percent_off": 15},
-    "STRAWBERRY27": {"day": "02-27", "label": "National Strawberry Day",
-                     "flavors": ["Strawberry Cheesecake"], "type": "flavor_percent", "percent_off": 15},
-    "CREME06": {"day": "03-06", "label": "National Oreo Day (close fit)",
-                "flavors": ["Cookies N' Creme"], "type": "flavor_percent", "percent_off": 15},
-    "RANCH10": {"day": "03-10", "label": "National Ranch Day",
-                "flavors": ["Buffalo Ranch"], "type": "flavor_percent", "percent_off": 15},
-    "SALTVIN14": {"day": "03-14", "label": "National Potato Chip Day (close fit)",
-                  "flavors": ["Salt and Vinegar"], "type": "flavor_percent", "percent_off": 15},
-    "CARAMEL05": {"day": "04-05", "label": "National Caramel Day",
-                  "flavors": ["Caramel"], "type": "flavor_percent", "percent_off": 15},
-    "CARAMELPOP06": {"day": "04-06", "label": "National Caramel Popcorn Day",
-                     "flavors": ["Caramel"], "type": "flavor_percent", "percent_off": 15},
-    "GARLIC19": {"day": "04-19", "label": "National Garlic Day",
-                 "flavors": ["Garlic Butter", "Garlic Parmesan"], "type": "flavor_percent", "percent_off": 15},
-    "BURGER28": {"day": "05-28", "label": "National Hamburger Day",
-                 "flavors": ["Cheeseburger"], "type": "flavor_percent", "percent_off": 15},
-    "CHEESE04": {"day": "06-04", "label": "National Cheese Day",
-                 "flavors": ["Cheddar", "White Cheddar", "Garlic Parmesan"], "type": "flavor_percent", "percent_off": 15},
-    "CHURRO06": {"day": "06-06", "label": "National Churro Day (unofficial)",
-                 "flavors": ["Churro"], "type": "flavor_percent", "percent_off": 15},
-    "ALIEN02": {"day": "07-02", "label": "World UFO Day",
-                "flavors": ["Alien Mix"], "type": "flavor_percent", "percent_off": 15},
-    "SUGAR09": {"day": "07-09", "label": "National Sugar Cookie Day",
-                "flavors": ["Sugar Cookie"], "type": "flavor_percent", "percent_off": 15},
-    "JUNK21": {"day": "07-21", "label": "National Junk Food Day (close fit) — bundle",
-               "flavors": NATIONAL_ALL_FLAVORS, "type": "bundle_3_for_2000", "percent_off": None},
-    "WING29": {"day": "07-29", "label": "National Chicken Wing Day",
-               "flavors": ["Buffalo Ranch"], "type": "flavor_percent", "percent_off": 15},
-    "CHEESECAKE30": {"day": "07-30", "label": "National Cheesecake Day — FLAGSHIP",
-                     "flavors": ["Strawberry Cheesecake"], "type": "flavor_percent", "percent_off": 15},
-    "HOTSPICY19": {"day": "08-19", "label": "National Hot and Spicy Food Day",
-                   "flavors": ["Nashville Hot", "Cheddar Jalapeño", "Buffalo Ranch"], "type": "flavor_percent", "percent_off": 15},
-    "LEMONADE20": {"day": "08-20", "label": "National Lemonade Day",
-                   "flavors": ["Lemonade"], "type": "flavor_percent", "percent_off": 15},
-    "BACON20": {"day": "08-20", "label": "National Bacon Lovers Day",
-                "flavors": ["Bacon"], "type": "flavor_percent", "percent_off": 15},
-    "BANANA29": {"day": "08-29", "label": "National Banana Pudding Day",
-                 "flavors": ["Banana Pudding"], "type": "flavor_percent", "percent_off": 15},
-    "MUDDY31": {"day": "08-31", "label": "National Trail Mix Day (close fit)",
-                "flavors": ["Muddy Buddy"], "type": "flavor_percent", "percent_off": 15},
-    "BACONINTL": {"day": "first-saturday-september", "label": "International Bacon Day",
-                  "flavors": ["Bacon"], "type": "flavor_percent", "percent_off": 15},
-    "CHEESEPIZZA05": {"day": "09-05", "label": "National Cheese Pizza Day",
-                      "flavors": ["Pizza"], "type": "flavor_percent", "percent_off": 15},
-    "CHEESEBURGER18": {"day": "09-18", "label": "National Cheeseburger Day — FLAGSHIP",
-                       "flavors": ["Cheeseburger"], "type": "flavor_percent", "percent_off": 15},
-    "HOMEMADE01": {"day": "10-01", "label": "National Homemade Cookies Day",
-                   "flavors": ["Snickerdoodle", "Sugar Cookie", "Cookies N' Creme"], "type": "flavor_percent", "percent_off": 15},
-    "CINNAMON04": {"day": "10-04", "label": "National Cinnamon Roll Day",
-                   "flavors": ["Cinnamon Roll"], "type": "flavor_percent", "percent_off": 15},
-    "DESSERT14": {"day": "10-14", "label": "National Dessert Day — bundle",
-                  "flavors": NATIONAL_SWEET_FLAVORS, "type": "bundle_3_for_2000", "percent_off": None},
-    "PIZZAMONTH": {"day": "october", "label": "National Pizza Month",
-                   "flavors": ["Pizza"], "type": "flavor_percent", "percent_off": 15},
-    "PICKLE14": {"day": "11-14", "label": "National Pickle Day",
-                 "flavors": ["Dill Pickle"], "type": "flavor_percent", "percent_off": 15},
-    "CAKE26": {"day": "11-26", "label": "National Cake Day",
-               "flavors": ["Birthday Cake"], "type": "flavor_percent", "percent_off": 15},
-    "COOKIE04": {"day": "12-04", "label": "National Cookie Day — FLAGSHIP",
-                 "flavors": ["Cookies N' Creme", "Sugar Cookie", "Snickerdoodle"], "type": "flavor_percent", "percent_off": 15},
-    "BACON30": {"day": "12-30", "label": "National Bacon Day — FLAGSHIP",
-                "flavors": ["Bacon"], "type": "flavor_percent", "percent_off": 15},
-}
-
-NATIONAL_BAG_PRICE_CENTS = 800
-NATIONAL_BUNDLE_TRIO_CENTS = 2000
-
-
-def _national_norm(name):
-    """Normalize a cart item name to a canonical flavor name (or None)."""
-    n = (name or "").strip().lower()
-    n = n.replace("’", "'").replace("cookies n' creme", "cookies n' creme")
-    aliases = {
-        "cookie and cream": "cookies n' creme",
-        "cookies and cream": "cookies n' creme",
-        "cookies n creme": "cookies n' creme",
-        "cheddar jalapeno": "cheddar jalapeño",
-    }
-    n = aliases.get(n, n)
-    for f in NATIONAL_ALL_FLAVORS:
-        if f.lower() == n:
-            return f
-    return None
-
-
-def _national_is_active(code, today):
-    """True when `today` (a date) falls in the code's annual window, PT date."""
-    entry = NATIONAL_DAY_CODES.get(code)
-    if not entry:
-        return False
-    day = entry["day"]
-    if day == "first-saturday-september":
-        return today.month == 9 and today.day <= 7 and today.weekday() == 5
-    if day == "october":
-        return today.month == 10
-    return today.strftime("%m-%d") == day
-
-
-def _national_discount_for(code, items, today):
-    """Return (discount_cents, error_or_None) for a cart.
-
-    items: [{name, amount_cents, quantity}]. Sitewide codes return their
-    percent_off and let the caller use the existing percent path; flavor and
-    bundle codes return an exact amount in cents (eligible popcorn only).
-    """
-    entry = NATIONAL_DAY_CODES.get(code)
-    if not entry:
-        return 0, "code not found"
-    if not _national_is_active(code, today):
-        return 0, "code is not active today"
-    if entry["type"] == "sitewide_percent":
-        return 0, None  # caller uses entry["percent_off"] on the existing path
-    eligible_flavors = set(entry["flavors"])
-    eligible_subtotal = 0
-    eligible_qty = 0
-    for it in items:
-        flavor = _national_norm(it.get("name"))
-        if flavor in eligible_flavors:
-            eligible_subtotal += int(it["amount_cents"]) * int(it["quantity"])
-            eligible_qty += int(it["quantity"])
-    if eligible_qty == 0:
-        return 0, "this code is only for: " + ", ".join(entry["flavors"])
-    if entry["type"] == "flavor_percent":
-        return round(eligible_subtotal * entry["percent_off"] / 100), None
-    if entry["type"] == "bundle_3_for_2000":
-        trios = eligible_qty // 3
-        if trios == 0:
-            return 0, "this bundle needs at least 3 eligible bags"
-        return trios * (3 * NATIONAL_BAG_PRICE_CENTS - NATIONAL_BUNDLE_TRIO_CENTS), None
-    return 0, "unknown promo type"
-
 MIN_AMOUNT_CENTS = 500      # $5
 MAX_AMOUNT_CENTS = 50000    # $500
 # When true, the gift card checkout also accepts a $0.50 test amount
@@ -1330,16 +1164,16 @@ def send_gift_card_email(to_email, purchaser_name, recipient_name, code, message
 _MAIL_TEST_DOUBLE = None
 
 
-def send_email(to_email, subject, html):
+def send_email(to_email, subject, html, from_email=None):
     # Test hook: tests assign backend._MAIL_TEST_DOUBLE to a list to capture
     # outbound mail instead of calling Resend.
     if _MAIL_TEST_DOUBLE is not None:
-        _MAIL_TEST_DOUBLE.append({"to": to_email, "subject": subject, "html": html})
+        _MAIL_TEST_DOUBLE.append({"to": to_email, "subject": subject, "html": html, "from": from_email or EMAIL_FROM})
         return {"id": "test-mail-captured"}
     resp = requests.post(
         "https://api.resend.com/emails",
         headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
-        json={"from": EMAIL_FROM, "to": [to_email], "subject": subject, "html": html},
+        json={"from": from_email or EMAIL_FROM, "to": [to_email], "subject": subject, "html": html},
         timeout=15,
     )
     resp.raise_for_status()
@@ -1950,16 +1784,6 @@ def validate_discount():
     if code in PROMOS and _promo_is_active(PROMOS[code]):
         p = PROMOS[code]
         return jsonify(type="promo", code=code, label=p["label"], description=p["description"])
-    if code in NATIONAL_DAY_CODES and _national_is_active(code, datetime.now(timezone.utc).astimezone(_LA_TZ).date()):
-        p = NATIONAL_DAY_CODES[code]
-        flavors = "All flavors" if p["flavors"] == "ALL" else ", ".join(p["flavors"])
-        if p["type"] == "bundle_3_for_2000":
-            desc = "Any 3 eligible bags for $20"
-        elif p["type"] == "sitewide_percent":
-            desc = f"{p['percent_off']}% off your order"
-        else:
-            desc = f"{p['percent_off']}% off {flavors}"
-        return jsonify(type="promo", code=code, label=p["label"], description=desc, flavors=flavors)
     conn = db()
     row = conn.execute(
         "SELECT balance_cents, active FROM gift_cards WHERE code = ?", (code,)
@@ -2706,7 +2530,6 @@ def _compute_order(data):
         "promo_code": "",
         "promo_label": "",
         "promo_percent_off": 0,
-        "promo_discount_cents": 0,
         "gift_card_code": "",
         "gift_card_discount_cents": 0,
         "reward_code": "",
@@ -2735,31 +2558,6 @@ def _compute_order(data):
                 return None, (jsonify(error="free shipping needs a $50+ order"), 400)
             order["shipping_cents"] = 0
             order["shipping_label"] = f"FREE ({code})"
-    elif code in NATIONAL_DAY_CODES:
-        # National-day promo code: same one-use-per-email, one-per-order rules.
-        if not email:
-            return None, (jsonify(error="an email address is required to use a promo code"), 400)
-        conn = db()
-        used = conn.execute(
-            "SELECT 1 FROM promo_redemptions WHERE code = ? AND email = ?", (code, email)
-        ).fetchone()
-        conn.close()
-        if used:
-            return None, (jsonify(error="this code has already been used"), 400)
-        today_pt = datetime.now(timezone.utc).astimezone(_LA_TZ).date()
-        if not _national_is_active(code, today_pt):
-            return None, (jsonify(error="this code is not active today"), 400)
-        entry = NATIONAL_DAY_CODES[code]
-        disc, err = _national_discount_for(code, items, today_pt)
-        if err:
-            return None, (jsonify(error=err), 400)
-        order["discount_kind"] = "promo"
-        order["promo_code"] = code
-        order["promo_label"] = entry["label"]
-        if entry["type"] == "sitewide_percent":
-            order["promo_percent_off"] = entry["percent_off"]
-        else:
-            order["promo_discount_cents"] = disc
     elif code:
         conn = db()
         reward = conn.execute(
@@ -2851,17 +2649,7 @@ def create_order_checkout():
 
     discounts = []
     try:
-        if order["discount_kind"] == "promo" and order.get("promo_discount_cents"):
-            coupon = stripe.Coupon.create(
-                amount_off=order["promo_discount_cents"],
-                currency="usd",
-                duration="once",
-                max_redemptions=1,
-                redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
-                metadata={"promo_code": order["promo_code"]},
-            )
-            discounts = [{"coupon": coupon.id}]
-        elif order["discount_kind"] == "promo" and order["promo_percent_off"]:
+        if order["discount_kind"] == "promo" and order["promo_percent_off"]:
             coupon = stripe.Coupon.create(
                 percent_off=order["promo_percent_off"],
                 duration="once",
@@ -2978,9 +2766,7 @@ def paypal_create_order():
 
     merch = order["merchandise_total"]
     ship = order["shipping_cents"]
-    if order["discount_kind"] == "promo" and order.get("promo_discount_cents"):
-        disc = order["promo_discount_cents"]
-    elif order["discount_kind"] == "promo" and order["promo_percent_off"]:
+    if order["discount_kind"] == "promo" and order["promo_percent_off"]:
         disc = round((merch + ship) * order["promo_percent_off"] / 100)
     elif order["discount_kind"] == "gift_card":
         disc = order["gift_card_discount_cents"]
@@ -6056,16 +5842,52 @@ def admin_marketing_campaigns():
     conn.close()
     return jsonify(campaigns=[dict(r) for r in rows])
 
+NEWSLETTER_WELCOME_SUBJECT = "Welcome to Pop-A-Licious! \U0001F37F"
+_NEWSLETTER_WELCOME_FROM = "Pop-A-Licious Customer Service <customerservice@pop-a-licious.com>"
+
+def _newsletter_welcome_html():
+    # Approved Oct 29, 2026 (v2): real site logo at top, no street address.
+    return """\
+<html><body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+<p style="text-align:center;"><img src="https://pop-a-licious.com/img-eaa941e29daa2e55.webp" alt="Pop-A-Licious" style="max-width:280px;"></p>
+<h1 style="color: #16130f; font-size: 28px; text-align:center;">Welcome to Pop-A-Licious! \U0001F37F</h1>
+<p style="text-align:center; font-size: 17px;">You're officially on the list &mdash; and the good stuff is on its way.</p>
+<p>Hi there,</p>
+<p>Thanks for joining the Pop-A-Licious newsletter. You'll be first to hear about new flavors, special offers, and events.</p>
+<p>To say thanks, here's <strong>10% off your next order</strong>:</p>
+<p style="text-align:center; background: #fff3e6; border: 2px dashed #e63946; border-radius: 10px; padding: 20px; font-size: 28px; letter-spacing: 2px; font-weight: bold; color: #16130f;">WELCOME10</p>
+<p>Enter it under &ldquo;Add discount&rdquo; at checkout. One code per order.</p>
+<p style="text-align:center;"><a href="https://pop-a-licious.com/#shop" style="display:inline-block;background:#e63946;color:#ffffff;text-decoration:none;padding:14px 28px;border-radius:8px;font-weight:bold;">Shop Popcorn</a></p>
+<p>Questions? Just reply to this email or write to us at customerservice@pop-a-licious.com.</p>
+<p>Stay delicious,<br><strong>The Pop-A-Licious Team</strong></p>
+<p style="font-size: 12px; color: #777;">You received this email because you signed up for the Pop-A-Licious newsletter. If you no longer want these emails, you can unsubscribe at any time.</p>
+</body></html>"""
+
+def _send_newsletter_welcome_email(email):
+    """Welcome email for a new newsletter signup. Never raises, so a
+    mail failure never breaks the signup itself."""
+    try:
+        send_email(email, NEWSLETTER_WELCOME_SUBJECT, _newsletter_welcome_html(),
+                   from_email=_NEWSLETTER_WELCOME_FROM)
+    except Exception:
+        pass
+
 @app.post("/api/newsletter/subscribe")
 def newsletter_subscribe():
     """Public newsletter signup (Offers page form). Stores the address for
     marketing campaigns; unsubscribes via /api/marketing/unsubscribe still
-    apply, since _marketing_audience filters on marketing_unsubscribes."""
+    apply, since _marketing_audience filters on marketing_unsubscribes.
+    New subscribers get the approved welcome email; already-active
+    subscribers do not get it again on a duplicate signup."""
     data = request.get_json(silent=True) or {}
     email = (data.get("email") or "").strip().lower()
     if not email or not EMAIL_RE.match(email):
         return jsonify(error="Enter a valid email address."), 400
     conn = db()
+    existing = conn.execute(
+        "SELECT active FROM newsletter_subscribers WHERE email = ?", (email,)
+    ).fetchone()
+    is_new = existing is None or not existing[0]
     conn.execute(
         "INSERT INTO newsletter_subscribers (email, created_at, active)"
         " VALUES (?, ?, 1)"
@@ -6074,6 +5896,8 @@ def newsletter_subscribe():
     )
     conn.commit()
     conn.close()
+    if is_new:
+        _send_newsletter_welcome_email(email)
     return jsonify(subscribed=True)
 
 @app.get("/api/marketing/unsubscribe")
@@ -8926,7 +8750,6 @@ def demo_checkout():
     total = order["merchandise_total"] + order["shipping_cents"]
     total -= order["gift_card_discount_cents"]
     total -= order["reward_discount_cents"]
-    total -= order.get("promo_discount_cents", 0)
     if order["promo_percent_off"]:
         total = int(round(total * (100 - order["promo_percent_off"]) / 100))
     total = max(total, 0)
@@ -11372,7 +11195,9 @@ def _erp_recipe_nutrition(conn, recipe_id):
     per-bag (per serving of finished product) figures, with FDA %DV.
     Lines that can't be converted — no nutrition facts on the item, no
     serving grams for a weight/volume line — are listed in `missing`
-    instead of silently counted as zero.
+    instead of silently counted as zero. Packaging lines (bags, front
+    and back labels) are skipped entirely: they have no nutrition and
+    must never appear in `missing` or trigger the label panel.
     Returns a dict, or None when the recipe doesn't exist.
     """
     recipe = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
@@ -11382,6 +11207,7 @@ def _erp_recipe_nutrition(conn, recipe_id):
     version = recipe["version"]
     lines = conn.execute(
         "SELECT rl.*, i.name AS item_name, i.sku AS item_sku,"
+        " i.type AS item_type,"
         " i.unit AS item_unit, i.oz_per_cup,"
         " i.nut_serving_grams, i.nut_calories, i.nut_fat_g,"
         " i.nut_sat_fat_g, i.nut_trans_fat_g, i.nut_chol_mg,"
@@ -11401,6 +11227,8 @@ def _erp_recipe_nutrition(conn, recipe_id):
         d = dict(ln)
         qty = float(ln["qty_per_batch"] or 0)
         unit = (ln["unit"] or "").strip().lower()
+        if (ln["item_type"] or "") != "ingredient":
+            continue
         has_nut = any(ln[k] is not None for k in _ERP_NUTRIENT_KEYS)
         if not has_nut:
             missing.append({"item": ln["item_name"],
