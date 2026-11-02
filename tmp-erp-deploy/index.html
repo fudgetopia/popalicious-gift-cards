@@ -4409,10 +4409,10 @@ function renderErpRecipeDetail(body) {
         else { pieceBatch += l.line_cost_cents; }
       });
       var pp = document.createElement("p");
-      if (ok && res.batch_size_bags > 0) {
+      if (ok && r.batch_size_bags > 0) {
         pkgBatchTotal += pieceBatch;
         pp.textContent = pt[1] + ": " +
-          erpMoney(Math.round(pieceBatch / res.batch_size_bags)) + " per finished bag";
+          erpMoney(Math.round(pieceBatch / r.batch_size_bags)) + " per finished bag";
       } else {
         pkgUncosted.push(pt[1]);
         pp.textContent = pt[1] + ": — (set package price and size on the item)";
@@ -4426,8 +4426,8 @@ function renderErpRecipeDetail(body) {
     } else {
       var pkgTot = document.createElement("p");
       pkgTot.textContent = "Packaging per finished bag: " +
-        (pkgUncosted.length || !(res.batch_size_bags > 0) ? "—" :
-          erpMoney(Math.round(pkgBatchTotal / res.batch_size_bags))) +
+        (pkgUncosted.length || !(r.batch_size_bags > 0) ? "—" :
+          erpMoney(Math.round(pkgBatchTotal / r.batch_size_bags))) +
         (pkgUncosted.length ? " (partial — " + pkgUncosted.join(", ") + " not costed)" : "");
       pkgWrap.appendChild(pkgTot);
     }
