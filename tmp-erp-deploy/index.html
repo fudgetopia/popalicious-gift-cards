@@ -222,16 +222,32 @@ button { font-family: inherit; }
         .app-header { gap: 12px; padding: 0 12px; }
         .app-nav { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
         .app-nav a { white-space: nowrap; flex-shrink: 0; padding: 14px 10px; }
+        .app-user button { min-height: 44px; padding: 10px 16px; }
         .app-main { padding: 12px 12px 48px; }
         .app-main h2 { font-size: 22px; }
         .admin-stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .erp-toolbar input[type="search"] { min-width: 0; flex: 1 1 100%; }
         .erp-form button, .erp-toolbar button { min-height: 44px; }
+        .erp-subtabs button { min-height: 44px; }
+        .erp-back { min-height: 44px; }
+        /* Tables swipe sideways instead of squeezing or pushing the page wide. */
+        .admin-orders-table { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
+        .admin-orders-table th, .admin-orders-table td { white-space: nowrap; }
+        .admin-orders-table button { min-height: 44px; margin-right: 8px; }
+        .admin-orders-table button:last-child { margin-right: 0; }
+        /* Barcode and other pictures never overflow their box. */
+        .admin-orders-wrap img { max-width: 100%; height: auto; }
         /* 16px inputs stop iOS Safari auto-zoom on focus. */
         .erp-form input, .erp-form select, .erp-form textarea,
         .erp-toolbar input, .erp-toolbar select,
         .login-card input, .login-card select { font-size: 16px; }
         .login-card { padding: 24px 18px; }
+      }
+      @media (max-width: 640px) {
+        /* One field per row on phones so nothing sits side by side and cramped. */
+        .erp-form label { flex: 1 1 100%; }
+        .erp-form label input, .erp-form label select { flex: 1; min-width: 0; }
+        .erp-recipe-line-row select { min-width: 0; flex: 1 1 100%; }
       }
       @media (min-width: 641px) and (max-width: 1100px) {
         .admin-stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -239,6 +255,22 @@ button { font-family: inherit; }
       @media (max-width: 420px) {
         .ws-topbar button { padding: 10px 10px; font-size: 13px; }
         .ws-brand { font-size: 16px; }
+        .admin-stat-grid { grid-template-columns: 1fr; }
+      }
+
+      /* ============ Print-label view (same tab, no pop-up) ============ */
+      /* Pop-up windows print blank on some phones/tablets, so the label
+         prints from this page: the app hides, only the label shows, and
+         the browser prints the real document. Back restores the app. */
+      #erpPrintView { display: none; }
+      body.erp-printing > :not(#erpPrintView) { display: none !important; }
+      body.erp-printing #erpPrintView { display: block; }
+      #erpPrintView .erp-print-bar { margin: 12px; }
+      #erpPrintView .erp-print-bar button { min-height: 44px; margin-right: 8px; }
+      #erpPrintView .erp-print-help { color: var(--muted); font-size: 14px; }
+      @media print {
+        body.erp-printing > :not(#erpPrintView) { display: none !important; }
+        #erpPrintView .erp-print-bar { display: none !important; }
       }
 </style>
 </head>
@@ -4700,20 +4732,14 @@ function renderErpRecipeDetail(body) {
         printBtn.textContent = "Print label";
         printBtn.style.marginTop = "10px";
         printBtn.addEventListener("click", function () {
-          var win = window.open("", "_blank");
-          if (!win) {
-            nutStatus.textContent = "Allow pop-ups for this site to print the label.";
-            return;
-          }
-          win.document.write(erpRecipeLabelDoc(r, nut, {
+          erpShowPrintLabel(r, nut, {
             sizeText: sizeInput.value.trim() || "1 cup",
             grams: Number(gramsInput.value) || 17,
             perContainer: Number(perInput.value) || 1,
             bagGrams: bagGrams,
             perServing: perServing,
             fmtNum: fmtNum
-          }));
-          win.document.close();
+          });
         });
         nutView.appendChild(printBtn);
         var qrNote = document.createElement("p");
@@ -4936,7 +4962,7 @@ function erpSocialIconsHTML() {
 }
 
 /* ---------- recipe nutrition label (printable, standard FDA panel) ---------- */
-function erpRecipeLabelDoc(r, nut, serving) {
+function erpRecipeLabelParts(r, nut, serving) {
   var esc = function (s) {
     return String(s === null || s === undefined ? "" : s)
       .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -4980,8 +5006,11 @@ function erpRecipeLabelDoc(r, nut, serving) {
       "QR code and barcode are added once this product is assigned a " +
       "GTIN.</p>";
   }
-  return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" +
-    esc(r.name) + " \u2014 Nutrition Label</title><style>" +
+  return {
+    title: esc(r.name) + " \u2014 Nutrition Label",
+    style:
+    "#erpPrintView *{box-sizing:content-box;}" +
+    "#erpPrintView .label{box-sizing:border-box;}" +
     "@page{size:4in 6in;margin:0;}" +
     "html,body{margin:0;padding:0;}" +
     "body{font-family:Arial,Helvetica,sans-serif;color:#000;background:#eee;}" +
@@ -4999,9 +5028,8 @@ function erpRecipeLabelDoc(r, nut, serving) {
     ".botleft{flex:1;min-width:0;font-size:11px;line-height:1.35;}" +
     ".botleft p{margin:0 0 8px;}" +
     ".botright{width:2.0in;flex:none;}" +
-    "</style></head><body>" +
-    "<div class=\"noprint\"><button onclick=\"window.print()\">Print</button> " +
-    "Label prints at 4&times;6 inches.</div>" +
+    "",
+    label:
     "<div class=\"label\"><h1>" + esc(r.name) + "</h1>" +
     "<div class=\"cols\"><div class=\"panelcol\"><div style=\"zoom:0.62;\">" +
     panel + "</div></div>" +
@@ -5017,7 +5045,48 @@ function erpRecipeLabelDoc(r, nut, serving) {
     "Suite 120<br>Las Vegas, NV 89120</p>" + netWt + "</div>" +
     "<div class=\"botright\"><div style=\"text-align:right;\">" +
     erpSocialIconsHTML() + "</div>" + codesHTML +
-    "</div></div></div></body></html>";
+    "</div></div></div>"
+  };
+}
+/* Full standalone label document (used by previews and tests). The live
+   Print button uses erpShowPrintLabel instead, which prints from this page
+   so phone/tablet browsers cannot lose the label to a pop-up window. */
+function erpRecipeLabelDoc(r, nut, serving) {
+  var p = erpRecipeLabelParts(r, nut, serving);
+  return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" +
+    p.title + "</title><style>" + p.style + "</style></head><body>" +
+    "<div class=\"noprint\"><button onclick=\"window.print()\">Print</button> " +
+    "Label prints at 4&times;6 inches.</div>" + p.label + "</body></html>";
+}
+/* Print the label from this page: hide the app, show only the label, and
+   let the browser print the real document. Pop-up windows print blank on
+   some phones/tablets, and Safari ignores @page size, so the bar also
+   tells the user to pick 4x6 paper and 100% scale in the dialog. */
+function erpShowPrintLabel(r, nut, serving) {
+  var p = erpRecipeLabelParts(r, nut, serving);
+  var view = document.getElementById("erpPrintView");
+  if (!view) {
+    view = document.createElement("div");
+    view.id = "erpPrintView";
+    document.body.appendChild(view);
+  }
+  view.innerHTML = "<style>" + p.style + "</style>" +
+    "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
+    "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
+    "<p class=\"erp-print-help\">In the print dialog, choose paper size " +
+    "4&times;6 and scale 100% (not Fit to page). On iPhone/iPad: Share, " +
+    "then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
+  document.body.classList.add("erp-printing");
+  window.scrollTo(0, 0);
+  document.getElementById("erpPrintGo").addEventListener("click", function () {
+    window.print();
+  });
+  document.getElementById("erpPrintBack").addEventListener("click", erpHidePrintLabel);
+}
+function erpHidePrintLabel() {
+  var view = document.getElementById("erpPrintView");
+  if (view) view.innerHTML = "";
+  document.body.classList.remove("erp-printing");
 }
 /* ---------- new recipe form (also used for new versions) ---------- */
 function erpNewRecipeForm(existing) {
