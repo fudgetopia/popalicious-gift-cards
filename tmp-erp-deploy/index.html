@@ -5040,10 +5040,10 @@ function erpRecipeLabelParts(r, nut, serving) {
     ".label h1{font-size:19px;text-align:center;margin:0 0 6px;}" +
     ".cols{display:flex;gap:0.05in;}" +
     ".panelcol{width:1.625in;flex:none;}" +
-    ".ingcol{flex:1;min-width:0;font-size:9.5px;line-height:1.2;}" +
+    ".ingcol{flex:1;min-width:0;font-size:8pt;line-height:1.2;}" +
     ".ingcol p{margin:0 0 8px;}" +
     ".bot{display:flex;gap:0.05in;margin-top:4px;}" +
-    ".botleft{flex:1;min-width:0;font-size:10.5px;line-height:1.35;}" +
+    ".botleft{flex:1;min-width:0;font-size:8pt;line-height:1.35;}" +
     ".botleft p{margin:0 0 8px;}" +
     ".botright{width:2.0in;flex:none;}" +
     "",
@@ -5094,7 +5094,7 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v5 &mdash; On screen the label is " +
+    "<p class=\"erp-print-help\">Label v6 &mdash; On screen the label is " +
     "enlarged for readability; it always prints at true 4&times;6. On " +
     "iPhone/iPad: Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
