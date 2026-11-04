@@ -277,6 +277,7 @@ button { font-family: inherit; }
         body.erp-printing > :not(#erpPrintView) { display: none !important; }
         body.erp-printing #erpPrintView { padding-top: 0; }
         #erpPrintView .erp-print-bar { display: none !important; }
+        #erpPrintView .label { zoom: 1 !important; }
       }
 </style>
 </head>
@@ -5026,18 +5027,18 @@ function erpRecipeLabelParts(r, nut, serving) {
     "background:#fff;margin:0 auto;overflow:hidden;" +
     "print-color-adjust:exact;-webkit-print-color-adjust:exact;}" +
     ".label h1{font-size:19px;text-align:center;margin:0 0 6px;}" +
-    ".cols{display:flex;gap:0.1in;}" +
-    ".panelcol{width:1.95in;flex:none;}" +
-    ".ingcol{flex:1;min-width:0;font-size:10.5px;line-height:1.25;}" +
+    ".cols{display:flex;gap:0.05in;}" +
+    ".panelcol{width:1.625in;flex:none;}" +
+    ".ingcol{flex:1;min-width:0;font-size:9.5px;line-height:1.2;}" +
     ".ingcol p{margin:0 0 8px;}" +
-    ".bot{display:flex;gap:0.1in;margin-top:8px;}" +
-    ".botleft{flex:1;min-width:0;font-size:11px;line-height:1.35;}" +
+    ".bot{display:flex;gap:0.05in;margin-top:4px;}" +
+    ".botleft{flex:1;min-width:0;font-size:10.5px;line-height:1.35;}" +
     ".botleft p{margin:0 0 8px;}" +
     ".botright{width:2.0in;flex:none;}" +
     "",
     label:
     "<div class=\"label\"><div class=\"labelfit\"><h1>" + esc(r.name) + "</h1>" +
-    "<div class=\"cols\"><div class=\"panelcol\"><div style=\"zoom:0.62;\">" +
+    "<div class=\"cols\"><div class=\"panelcol\"><div style=\"zoom:0.52;\">" +
     panel + "</div></div>" +
     "<div class=\"ingcol\">" +
     (nut.ingredients_text ? "<p><b>Ingredients:</b> " + esc(nut.ingredients_text) + "</p>" : "") +
@@ -5066,8 +5067,9 @@ function erpRecipeLabelDoc(r, nut, serving) {
     "Label prints at 4&times;6 inches.</div>" + p.label + "</body></html>";
 }
 /* Print the label from this page: hide the app, show only the label, and
-   let the browser print the real document. The label renders on screen
-   exactly as it prints (white, no shadow); the Print/Back bar floats
+   let the browser print the real document. On screen the label is
+   enlarged to fill the window (print CSS resets it to true 4x6);
+   the Print/Back bar floats
    above it and is hidden in print. Safari ignores @page size, so the bar
    notes iPhone/iPad users must pick 4x6 paper. */
 function erpShowPrintLabel(r, nut, serving) {
@@ -5081,9 +5083,9 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">On iPhone/iPad: Share, then Print, " +
-    "then pick your 4&times;6 label paper. Other browsers print this " +
-    "label exactly as shown.</p></div>" + p.label;
+    "<p class=\"erp-print-help\">On screen the label is enlarged for " +
+    "readability; it always prints at true 4&times;6. On iPhone/iPad: " +
+    "Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
   window.scrollTo(0, 0);
   /* Fit the whole label in the 4x6 box: a long ingredient list
@@ -5098,12 +5100,27 @@ function erpShowPrintLabel(r, nut, serving) {
     fitEl.style.transform = "scale(" + (labelEl.clientHeight / fitEl.scrollHeight) + ")";
     fitEl.style.transformOrigin = "top center";
   }
+  /* Screen only: enlarge the label to fill the window, so on a wide
+     desktop screen it does not sit as a tiny 4in column in a sea of
+     white. Print CSS resets zoom to 1, so printing stays true 4x6. */
+  erpPrintScreenZoom();
+  window.addEventListener("resize", erpPrintScreenZoom);
   document.getElementById("erpPrintGo").addEventListener("click", function () {
     window.print();
   });
   document.getElementById("erpPrintBack").addEventListener("click", erpHidePrintLabel);
 }
+function erpPrintScreenZoom() {
+  if (!document.body.classList.contains("erp-printing")) return;
+  var labelEl = document.querySelector("#erpPrintView .label");
+  if (!labelEl || !labelEl.offsetWidth) return;
+  labelEl.style.zoom = "";
+  var zw = (window.innerWidth - 24) / labelEl.offsetWidth;
+  var zh = (window.innerHeight - 130) / labelEl.offsetHeight;
+  labelEl.style.zoom = Math.max(1, Math.min(zw, zh, 2.5));
+}
 function erpHidePrintLabel() {
+  window.removeEventListener("resize", erpPrintScreenZoom);
   var view = document.getElementById("erpPrintView");
   if (view) view.innerHTML = "";
   document.body.classList.remove("erp-printing");
