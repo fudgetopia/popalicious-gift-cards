@@ -278,6 +278,17 @@ button { font-family: inherit; }
         body.erp-printing #erpPrintView { padding-top: 0; }
         #erpPrintView .erp-print-bar { display: none !important; }
         #erpPrintView .label { zoom: 1 !important; }
+        /* Print uses a plain block/float layout, not flexbox: some
+           browsers mishandle flex in print and can drop the bottom
+           band. Proportions stay the photo split: panel 1.625in,
+           gap 0.05in, ingredients take the rest; bottom-left takes
+           the label width minus the 2.0in codes column and gap. */
+        #erpPrintView .cols { display: block !important; overflow: hidden !important; }
+        #erpPrintView .panelcol { float: left !important; }
+        #erpPrintView .ingcol { margin-left: 1.675in !important; }
+        #erpPrintView .bot { display: block !important; overflow: hidden !important; }
+        #erpPrintView .botleft { float: left !important; width: calc(100% - 2.05in) !important; }
+        #erpPrintView .botright { float: right !important; }
       }
 </style>
 </head>
@@ -5068,8 +5079,8 @@ function erpRecipeLabelDoc(r, nut, serving) {
 }
 /* Print the label from this page: hide the app, show only the label, and
    let the browser print the real document. On screen the label is
-   enlarged to fill the window (print CSS resets it to true 4x6);
-   the Print/Back bar floats
+   enlarged to fill the window via a screen-only zoom rule; print
+   uses a plain 4x6 block layout. The Print/Back bar floats
    above it and is hidden in print. Safari ignores @page size, so the bar
    notes iPhone/iPad users must pick 4x6 paper. */
 function erpShowPrintLabel(r, nut, serving) {
@@ -5083,9 +5094,9 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">On screen the label is enlarged for " +
-    "readability; it always prints at true 4&times;6. On iPhone/iPad: " +
-    "Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
+    "<p class=\"erp-print-help\">Label v5 &mdash; On screen the label is " +
+    "enlarged for readability; it always prints at true 4&times;6. On " +
+    "iPhone/iPad: Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
   window.scrollTo(0, 0);
   /* Fit the whole label in the 4x6 box: a long ingredient list
@@ -5102,7 +5113,9 @@ function erpShowPrintLabel(r, nut, serving) {
   }
   /* Screen only: enlarge the label to fill the window, so on a wide
      desktop screen it does not sit as a tiny 4in column in a sea of
-     white. Print CSS resets zoom to 1, so printing stays true 4x6. */
+     white. The zoom lives in a screen-media rule only, so it cannot
+     leak into print the way an inline zoom could if a browser
+     ignored a print reset. Print uses the plain 4x6 layout below. */
   erpPrintScreenZoom();
   window.addEventListener("resize", erpPrintScreenZoom);
   document.getElementById("erpPrintGo").addEventListener("click", function () {
@@ -5112,12 +5125,21 @@ function erpShowPrintLabel(r, nut, serving) {
 }
 function erpPrintScreenZoom() {
   if (!document.body.classList.contains("erp-printing")) return;
-  var labelEl = document.querySelector("#erpPrintView .label");
-  if (!labelEl || !labelEl.offsetWidth) return;
-  labelEl.style.zoom = "";
+  var view = document.getElementById("erpPrintView");
+  var labelEl = view ? view.querySelector(".label") : null;
+  if (!view || !labelEl) return;
+  var st = document.getElementById("erpPrintZoomStyle");
+  if (!st) {
+    st = document.createElement("style");
+    st.id = "erpPrintZoomStyle";
+    view.appendChild(st);
+  }
+  st.textContent = "";
+  if (!labelEl.offsetWidth) return;
   var zw = (window.innerWidth - 24) / labelEl.offsetWidth;
   var zh = (window.innerHeight - 130) / labelEl.offsetHeight;
-  labelEl.style.zoom = Math.max(1, Math.min(zw, zh, 2.5));
+  var z = Math.max(1, Math.min(zw, zh, 2.5));
+  st.textContent = "@media screen{#erpPrintView .label{zoom:" + z + ";}}";
 }
 function erpHidePrintLabel() {
   window.removeEventListener("resize", erpPrintScreenZoom);
