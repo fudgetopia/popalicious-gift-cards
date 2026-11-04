@@ -265,11 +265,17 @@ button { font-family: inherit; }
       #erpPrintView { display: none; }
       body.erp-printing > :not(#erpPrintView) { display: none !important; }
       body.erp-printing #erpPrintView { display: block; }
-      #erpPrintView .erp-print-bar { margin: 12px; }
+      /* Screen only: the bar floats above the label, so the label itself
+         renders exactly as it prints — white, no shadow, no gray surround. */
+      @media screen {
+        body.erp-printing #erpPrintView { padding-top: 120px; }
+        #erpPrintView .erp-print-bar { position: fixed; top: 0; left: 0; right: 0; z-index: 10; background: #fff; padding: 8px 12px; margin: 0; box-shadow: 0 1px 4px rgba(0,0,0,0.2); }
+      }
       #erpPrintView .erp-print-bar button { min-height: 44px; margin-right: 8px; }
-      #erpPrintView .erp-print-help { color: var(--muted); font-size: 14px; }
+      #erpPrintView .erp-print-help { color: var(--muted); font-size: 14px; margin: 4px 0 0; }
       @media print {
         body.erp-printing > :not(#erpPrintView) { display: none !important; }
+        body.erp-printing #erpPrintView { padding-top: 0; }
         #erpPrintView .erp-print-bar { display: none !important; }
       }
 </style>
@@ -5013,12 +5019,12 @@ function erpRecipeLabelParts(r, nut, serving) {
     "#erpPrintView .label{box-sizing:border-box;}" +
     "@page{size:4in 6in;margin:0;}" +
     "html,body{margin:0;padding:0;}" +
-    "body{font-family:Arial,Helvetica,sans-serif;color:#000;background:#eee;}" +
+    "body{font-family:Arial,Helvetica,sans-serif;color:#000;background:#fff;}" +
     ".noprint{margin:12px;}@media print{.noprint{display:none;}" +
     "body{background:#fff;}.label{box-shadow:none;}}" +
     ".label{width:4in;height:6in;padding:0.10in 0.14in;box-sizing:border-box;" +
     "background:#fff;margin:0 auto;overflow:hidden;" +
-    "box-shadow:0 2px 12px rgba(0,0,0,0.25);}" +
+    "print-color-adjust:exact;-webkit-print-color-adjust:exact;}" +
     ".label h1{font-size:19px;text-align:center;margin:0 0 6px;}" +
     ".cols{display:flex;gap:0.1in;}" +
     ".panelcol{width:1.95in;flex:none;}" +
@@ -5059,9 +5065,10 @@ function erpRecipeLabelDoc(r, nut, serving) {
     "Label prints at 4&times;6 inches.</div>" + p.label + "</body></html>";
 }
 /* Print the label from this page: hide the app, show only the label, and
-   let the browser print the real document. Pop-up windows print blank on
-   some phones/tablets, and Safari ignores @page size, so the bar also
-   tells the user to pick 4x6 paper and 100% scale in the dialog. */
+   let the browser print the real document. The label renders on screen
+   exactly as it prints (white, no shadow); the Print/Back bar floats
+   above it and is hidden in print. Safari ignores @page size, so the bar
+   notes iPhone/iPad users must pick 4x6 paper. */
 function erpShowPrintLabel(r, nut, serving) {
   var p = erpRecipeLabelParts(r, nut, serving);
   var view = document.getElementById("erpPrintView");
@@ -5073,9 +5080,9 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">In the print dialog, choose paper size " +
-    "4&times;6 and scale 100% (not Fit to page). On iPhone/iPad: Share, " +
-    "then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
+    "<p class=\"erp-print-help\">On iPhone/iPad: Share, then Print, " +
+    "then pick your 4&times;6 label paper. Other browsers print this " +
+    "label exactly as shown.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
   window.scrollTo(0, 0);
   document.getElementById("erpPrintGo").addEventListener("click", function () {
