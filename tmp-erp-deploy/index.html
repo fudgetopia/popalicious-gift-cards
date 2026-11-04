@@ -5036,7 +5036,7 @@ function erpRecipeLabelParts(r, nut, serving) {
     ".botright{width:2.0in;flex:none;}" +
     "",
     label:
-    "<div class=\"label\"><h1>" + esc(r.name) + "</h1>" +
+    "<div class=\"label\"><div class=\"labelfit\"><h1>" + esc(r.name) + "</h1>" +
     "<div class=\"cols\"><div class=\"panelcol\"><div style=\"zoom:0.62;\">" +
     panel + "</div></div>" +
     "<div class=\"ingcol\">" +
@@ -5048,10 +5048,11 @@ function erpRecipeLabelParts(r, nut, serving) {
     "<p><b>WARNING:</b> This bag may contain unpopped kernels. " +
     "Please snack responsibly.</p>" +
     "<p><b>Manufactured by:</b><br>Pop-A-Licious<br>6290 McLeod DR<br>" +
-    "Suite 120<br>Las Vegas, NV 89120</p>" + netWt + "</div>" +
+    "Suite 120<br>Las Vegas, NV 89120</p>" +
+    "<p><b>www.pop-a-licious.com</b></p>" + netWt + "</div>" +
     "<div class=\"botright\"><div style=\"text-align:right;\">" +
     erpSocialIconsHTML() + "</div>" + codesHTML +
-    "</div></div></div>"
+    "</div></div></div></div>"
   };
 }
 /* Full standalone label document (used by previews and tests). The live
@@ -5085,6 +5086,18 @@ function erpShowPrintLabel(r, nut, serving) {
     "label exactly as shown.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
   window.scrollTo(0, 0);
+  /* Fit the whole label in the 4x6 box: a long ingredient list
+     (e.g. Birthday Cake) otherwise pushes the bottom band — WARNING,
+     address, Net Wt, QR code, barcode — past the box, where
+     overflow:hidden clips it away. Scale the inner wrapper with
+     transform (painting only, layout untouched) so the rendered
+     content fits the fixed 6in box. Shrink only when it overflows. */
+  var labelEl = view.querySelector(".label");
+  var fitEl = view.querySelector(".labelfit");
+  if (labelEl && fitEl && fitEl.scrollHeight > labelEl.clientHeight) {
+    fitEl.style.transform = "scale(" + (labelEl.clientHeight / fitEl.scrollHeight) + ")";
+    fitEl.style.transformOrigin = "top center";
+  }
   document.getElementById("erpPrintGo").addEventListener("click", function () {
     window.print();
   });
