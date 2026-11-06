@@ -165,6 +165,51 @@ def db():
     conn.row_factory = sqlite3.Row
     return conn
 
+
+# ---- ERP per-staff permissions (Nov 2026) ----
+# "admin" (Matt/DJ) can do everything. Staff get ONLY the permissions Matt
+# or DJ assign them, stored per staff member in erp_staff_perms. Staff
+# management, QuickBooks, Settings, seed/reset, master data (items,
+# locations, reorder rules, flavor categories) and all deletions stay
+# admin-only and are never grantable. Defined here (before init_db) so the
+# one-time migration seed can run at import.
+_ERP_GRANTABLE_PERMS = (
+    "inventory.read", "inventory.adjust", "inventory.transfer",
+    "inventory.receive",
+    "purchasing.read", "purchasing.write",
+    "recipes.read", "recipes.write",
+    "batches.read", "batches.write",
+    "orders.read", "orders.write",
+    "accounts.read", "accounts.write",
+    "edi.read", "edi.write",
+    "reports.read",
+)
+# What staff could do before per-staff grants existed. Existing staff rows
+# are seeded with exactly this set once; new staff start with no grants.
+_ERP_LEGACY_STAFF_PERMS = frozenset({
+    "inventory.read", "inventory.adjust", "inventory.transfer",
+    "inventory.receive",
+    "recipes.read", "batches.read",
+    "orders.read", "accounts.read", "edi.read",
+})
+
+
+def _erp_seed_staff_perms(conn):
+    """One-time seed, run from init_db: staff rows created before
+    per-staff grants keep exactly the access they had. Rows created after
+    get perms_migrated=1 at creation, so they are never seeded."""
+    conn.execute("""CREATE TABLE IF NOT EXISTS erp_staff_perms (
+        staff_id INTEGER NOT NULL, perm TEXT NOT NULL,
+        UNIQUE(staff_id, perm))""")
+    scols = [r[1] for r in conn.execute("PRAGMA table_info(staff)").fetchall()]
+    if "perms_migrated" not in scols:
+        conn.execute("ALTER TABLE staff ADD COLUMN perms_migrated INTEGER NOT NULL DEFAULT 0")
+    for row in conn.execute("SELECT id FROM staff WHERE perms_migrated = 0").fetchall():
+        for perm in sorted(_ERP_LEGACY_STAFF_PERMS):
+            conn.execute("INSERT OR IGNORE INTO erp_staff_perms (staff_id, perm) VALUES (?, ?)",
+                         (row[0], perm))
+        conn.execute("UPDATE staff SET perms_migrated = 1 WHERE id = ?", (row[0],))
+
 def init_db():
     conn = db()
     conn.executescript(
@@ -430,6 +475,19 @@ def init_db():
         rcols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_recipes)").fetchall()]
         if "barcode_image" not in rcols:
             conn.execute("ALTER TABLE erp_recipes ADD COLUMN barcode_image TEXT NOT NULL DEFAULT ''")
+        # Migration: label settings on recipes (Nov 2026) — serving size,
+        # serving weight, servings per bag, saved on the recipe so the
+        # Nutrition Facts panel and the 4x6 label reuse them. NULL means
+        # "automatic" (1 cup / 17g / computed from batch weight).
+        if "serving_size" not in rcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN serving_size TEXT")
+        if "serving_grams" not in rcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN serving_grams REAL")
+        if "servings_per_bag" not in rcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN servings_per_bag INTEGER")
+    # Migration: per-staff ERP permissions (Nov 2026). Existing staff keep
+    # exactly the access they had; new staff start with no grants.
+    _erp_seed_staff_perms(conn)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS staff_verification_tokens (
             token TEXT PRIMARY KEY,
@@ -778,7 +836,10 @@ def init_db():
             notes TEXT NOT NULL DEFAULT '',
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
-            barcode_image TEXT NOT NULL DEFAULT ''
+            barcode_image TEXT NOT NULL DEFAULT '',
+            serving_size TEXT,
+            serving_grams REAL,
+            servings_per_bag INTEGER
         );
         CREATE TABLE IF NOT EXISTS erp_recipe_lines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5686,7 +5747,7 @@ def admin_create_staff():
     try:
         ref_code = "STF-" + secrets.token_hex(3).upper()
         cur = conn.execute(
-            "INSERT INTO staff (email, name, password_hash, referral_code, verified, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+            "INSERT INTO staff (email, name, password_hash, referral_code, verified, created_at, perms_migrated) VALUES (?, ?, ?, ?, 0, ?, 1)",
             (email, name or email.split("@")[0], generate_password_hash(password),
              ref_code, datetime.now(timezone.utc).isoformat()),
         )
@@ -5715,6 +5776,67 @@ def admin_create_staff():
     except Exception:
         pass
     return jsonify(ok=True)
+
+# ---------------- admin: per-staff ERP permissions ----------------
+# Only Matt/DJ (admins) can list or assign permissions. Assignments take
+# effect immediately on the backend; staff see new menus next sign-in.
+@app.get("/api/erp/admin/staff-permissions")
+def erp_admin_list_staff_perms():
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, name, email, active FROM staff ORDER BY name, email").fetchall()
+    out = []
+    for r in rows:
+        perms = [p[0] for p in conn.execute(
+            "SELECT perm FROM erp_staff_perms WHERE staff_id = ? ORDER BY perm",
+            (r["id"],)).fetchall()]
+        out.append({"id": r["id"], "name": r["name"], "email": r["email"],
+                    "active": bool(r["active"]), "perms": perms})
+    conn.close()
+    return jsonify(staff=out, grantable=list(_ERP_GRANTABLE_PERMS))
+
+
+@app.put("/api/erp/admin/staff-permissions/<int:staff_id>")
+def erp_admin_set_staff_perms(staff_id):
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    data = request.get_json(force=True) or {}
+    perms = data.get("perms")
+    if not isinstance(perms, list) or any(
+            not isinstance(p, str) or p not in _ERP_GRANTABLE_PERMS for p in perms):
+        return jsonify(error="perms must be a list of valid permissions"), 400
+    conn = db()
+    if not conn.execute("SELECT id FROM staff WHERE id = ?",
+                        (staff_id,)).fetchone():
+        conn.close()
+        return jsonify(error="staff member not found"), 404
+    conn.execute("DELETE FROM erp_staff_perms WHERE staff_id = ?", (staff_id,))
+    for perm in sorted(set(perms)):
+        conn.execute("INSERT INTO erp_staff_perms (staff_id, perm) VALUES (?, ?)",
+                     (staff_id, perm))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, staff_id=staff_id, perms=sorted(set(perms)))
+
+
+@app.get("/api/erp/session")
+def erp_session_info():
+    """Current caller's ERP role + permissions, for menu/route gating.
+    Admins get the full grantable list; staff get their assigned grants."""
+    role = _erp_role()
+    if role == "admin":
+        return jsonify(role="admin", perms=list(_ERP_GRANTABLE_PERMS))
+    if role == "staff":
+        staff = _staff_from_request()
+        return jsonify(role="staff",
+                       perms=_erp_staff_perms(staff["id"]) if staff else [])
+    if role == "wholesale":
+        return jsonify(role="wholesale", perms=[])
+    return jsonify(error="login required"), 401
 
 # ---------------- Marketing emails (promos + merch drops) ----------------
 # Audience = deduplicated: active+verified users + order emails (Stripe +
@@ -9140,24 +9262,31 @@ def _erp_actor():
     return ""
 
 
-# ---- ERP permission model (Phase 4 formalization; spec section 6) ----
-# Two roles. "admin" (Matt/DJ) can do everything. "staff" can read inventory,
-# recipes, batches, orders, wholesale accounts and EDI documents, and can
-# perform inventory adjust/transfer/receive. Everything else — vendors, POs,
-# costing, recipe/batch writes, wholesale writes, EDI writes, reports,
-# QuickBooks — is admin-only.
-# Behavior is unchanged from Phases 1-3; the matrix below just documents it
-# in one place and every gate now routes through _erp_check_perm().
-_ERP_PERMS = {
-    "admin": frozenset({"*"}),
-    "staff": frozenset({
-        "erp.access",
-        "inventory.read", "inventory.adjust", "inventory.transfer",
-        "inventory.receive",
-        "recipes.read", "batches.read",
-        "orders.read", "accounts.read", "edi.read",
-    }),
-}
+# ---- ERP permission model (Phase 4 formalization; spec section 6,
+# per-staff grants added Nov 2026) ----
+# Two roles. "admin" (Matt/DJ) can do everything. Staff get only the
+# permissions Matt or DJ assign them (see _ERP_GRANTABLE_PERMS, defined
+# before init_db); everything else — staff management, QuickBooks,
+# Settings, seed/reset, master data, deletions — is admin-only.
+# Every gate routes through _erp_check_perm().
+def _erp_staff_perms(staff_id):
+    conn = db()
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT perm FROM erp_staff_perms WHERE staff_id = ? ORDER BY perm",
+            (staff_id,)).fetchall()]
+    finally:
+        conn.close()
+
+
+def _erp_staff_has_perm(staff_id, perm):
+    conn = db()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM erp_staff_perms WHERE staff_id = ? AND perm = ?",
+            (staff_id, perm)).fetchone() is not None
+    finally:
+        conn.close()
 
 
 def _erp_role():
@@ -9178,14 +9307,20 @@ def _erp_check_perm(perm):
     """Single permission gate for ERP endpoints.
 
     Returns (actor, None) when allowed, else (None, (resp, code)).
-    "admin" grants every permission. Status codes/messages match the
-    pre-Phase-4 gates exactly (401 anon, 403 customer/staff as before).
+    "admin" grants every permission. Staff are allowed only the
+    permissions Matt or DJ assigned them; erp.access lets any active
+    staff member open the app shell, while each endpoint still enforces
+    its own permission. Status codes/messages match the pre-Phase-4 gates
+    exactly (401 anon, 403 customer/staff as before).
     """
     role = _erp_role()
     if role == "admin":
         return _erp_actor(), None
     if role == "staff":
-        if perm in _ERP_PERMS["staff"]:
+        if perm == "erp.access":
+            return _erp_actor(), None
+        staff = _staff_from_request()
+        if staff and _erp_staff_has_perm(staff["id"], perm):
             return _erp_actor(), None
         return None, (jsonify(error="admin required"), 403)
     if role == "wholesale":
@@ -9295,7 +9430,7 @@ def _erp_po_summary(conn, po):
 
 @app.get("/api/erp/locations")
 def erp_list_locations():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.read")
     if err:
         return err
     conn = db()
@@ -9410,7 +9545,7 @@ def erp_delete_location(location_id):
 
 @app.get("/api/erp/items")
 def erp_list_items():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.read")
     if err:
         return err
     conn = db()
@@ -10084,7 +10219,7 @@ def erp_update_item(item_id):
 
 @app.get("/api/erp/items/<int:item_id>")
 def erp_get_item(item_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.read")
     if err:
         return err
     conn = db()
@@ -10135,7 +10270,7 @@ def erp_delete_item(item_id):
 
 @app.get("/api/erp/stock")
 def erp_stock():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.read")
     if err:
         return err
     conn = db()
@@ -10179,7 +10314,7 @@ def erp_stock():
 
 @app.get("/api/erp/ledger")
 def erp_ledger():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.read")
     if err:
         return err
     conn = db()
@@ -10210,7 +10345,7 @@ def erp_ledger():
 
 @app.post("/api/erp/adjust")
 def erp_adjust():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.adjust")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -10276,7 +10411,7 @@ def _erp_inventory_email_html(count_date, location_name, zero_lines, base_url):
 
 @app.post("/api/erp/inventory-counts")
 def erp_start_inventory_count():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.adjust")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -10316,7 +10451,7 @@ def erp_start_inventory_count():
 
 @app.get("/api/erp/inventory-counts")
 def erp_list_inventory_counts():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.read")
     if err:
         return err
     conn = db()
@@ -10330,7 +10465,7 @@ def erp_list_inventory_counts():
 
 @app.get("/api/erp/inventory-counts/<int:count_id>")
 def erp_get_inventory_count(count_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.read")
     if err:
         return err
     conn = db()
@@ -10353,7 +10488,7 @@ def erp_get_inventory_count(count_id):
 
 @app.put("/api/erp/inventory-counts/<int:count_id>")
 def erp_save_inventory_count(count_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.adjust")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -10397,7 +10532,7 @@ def erp_save_inventory_count(count_id):
 
 @app.post("/api/erp/inventory-counts/<int:count_id>/complete")
 def erp_complete_inventory_count(count_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.adjust")
     if err:
         return err
     conn = db()
@@ -10501,7 +10636,7 @@ def erp_cron_inventory_reminder():
 
 @app.post("/api/erp/transfer")
 def erp_transfer():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.transfer")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -10546,7 +10681,7 @@ def erp_transfer():
 
 @app.get("/api/erp/vendors")
 def erp_list_vendors():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("purchasing.read")
     if err:
         return err
     conn = db()
@@ -10561,7 +10696,7 @@ def erp_list_vendors():
 
 @app.post("/api/erp/vendors")
 def erp_create_vendor():
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("purchasing.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -10591,7 +10726,7 @@ def erp_create_vendor():
 
 @app.post("/api/erp/vendors/<int:vendor_id>/deactivate")
 def erp_deactivate_vendor(vendor_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("purchasing.write")
     if err:
         return err
     conn = db()
@@ -10608,7 +10743,7 @@ def erp_deactivate_vendor(vendor_id):
 
 @app.get("/api/erp/purchase-orders")
 def erp_list_pos():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("purchasing.read")
     if err:
         return err
     conn = db()
@@ -10627,7 +10762,7 @@ def erp_list_pos():
 
 @app.post("/api/erp/purchase-orders")
 def erp_create_po():
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("purchasing.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -10703,7 +10838,7 @@ def erp_create_po():
 
 @app.get("/api/erp/purchase-orders/<int:po_id>")
 def erp_get_po(po_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("purchasing.read")
     if err:
         return err
     conn = db()
@@ -10726,7 +10861,7 @@ def erp_get_po(po_id):
 
 @app.post("/api/erp/purchase-orders/<int:po_id>/receive")
 def erp_po_receive(po_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.receive")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -10828,7 +10963,7 @@ def erp_po_receive(po_id):
 
 @app.post("/api/erp/purchase-orders/<int:po_id>/status")
 def erp_po_status(po_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("purchasing.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -10925,7 +11060,7 @@ def erp_upsert_reorder_rule():
 
 @app.get("/api/erp/alerts/low-stock")
 def erp_low_stock():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("inventory.read")
     if err:
         return err
     conn = db()
@@ -11291,7 +11426,7 @@ def _erp_recipe_nutrition(conn, recipe_id):
 
 @app.get("/api/erp/recipes/<int:recipe_id>/nutrition")
 def erp_recipe_nutrition(recipe_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("recipes.read")
     if err:
         return err
     conn = db()
@@ -11426,7 +11561,7 @@ def _erp_batch_shortfalls(conn, lines, planned_qty, batch_size, location_id):
 
 @app.get("/api/erp/recipes")
 def erp_list_recipes():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("recipes.read")
     if err:
         return err
     conn = db()
@@ -11443,7 +11578,7 @@ def erp_list_recipes():
 
 @app.post("/api/erp/recipes")
 def erp_create_recipe():
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("recipes.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -11483,7 +11618,7 @@ def erp_create_recipe():
 
 @app.get("/api/erp/recipes/<int:recipe_id>")
 def erp_get_recipe(recipe_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("recipes.read")
     if err:
         return err
     conn = db()
@@ -11513,7 +11648,7 @@ def erp_get_recipe(recipe_id):
 @app.put("/api/erp/recipes/<int:recipe_id>")
 def erp_update_recipe(recipe_id):
     """Edit a recipe by creating a new version. Old batches keep the old version."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("recipes.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -11561,13 +11696,87 @@ def erp_update_recipe(recipe_id):
     return jsonify(recipe=dict(row), lines=[dict(l) for l in lines])
 
 
+@app.put("/api/erp/recipes/<int:recipe_id>/label-settings")
+def erp_update_recipe_label_settings(recipe_id):
+    """Rename a recipe and/or save its label serving settings, in place.
+
+    The name prints on the 4x6 label and decides the barcode + QR code
+    (a rename to a website flavor picks up that flavor's codes). Serving
+    size / serving weight / servings per bag print on the Nutrition Facts
+    panel and set the Net Wt. Blank serving fields clear the saved value
+    back to automatic (1 cup / 17g / computed from batch weight).
+    No new version: the recipe content and cost are untouched, so batches
+    already made are unaffected.
+    """
+    actor, err = _erp_check_perm("recipes.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    name = recipe["name"]
+    if "name" in data:
+        name = (data.get("name") or "").strip()
+        if not name:
+            conn.close()
+            return jsonify(error="name must not be blank"), 400
+    serving_size = recipe["serving_size"]
+    if "serving_size" in data:
+        v = data.get("serving_size")
+        serving_size = None if v is None or str(v).strip() == "" else str(v).strip()
+    serving_grams = recipe["serving_grams"]
+    if "serving_grams" in data:
+        v = data.get("serving_grams")
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            serving_grams = None
+        else:
+            try:
+                serving_grams = float(v)
+            except (TypeError, ValueError):
+                conn.close()
+                return jsonify(error="serving_grams must be a number"), 400
+            if serving_grams <= 0:
+                conn.close()
+                return jsonify(error="serving_grams must be greater than zero"), 400
+    servings_per_bag = recipe["servings_per_bag"]
+    if "servings_per_bag" in data:
+        v = data.get("servings_per_bag")
+        if v is None or (isinstance(v, str) and v.strip() == ""):
+            servings_per_bag = None
+        else:
+            try:
+                if isinstance(v, bool):
+                    raise ValueError("not a whole number")
+                if isinstance(v, float) and v != int(v):
+                    raise ValueError("not a whole number")
+                servings_per_bag = int(v)
+            except (TypeError, ValueError):
+                conn.close()
+                return jsonify(error="servings_per_bag must be a whole number"), 400
+            if servings_per_bag < 1:
+                conn.close()
+                return jsonify(error="servings_per_bag must be at least 1"), 400
+    conn.execute(
+        "UPDATE erp_recipes SET name = ?, serving_size = ?, serving_grams = ?,"
+        " servings_per_bag = ? WHERE id = ?",
+        (name, serving_size, serving_grams, servings_per_bag, recipe_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
+                       (recipe_id,)).fetchone()
+    conn.close()
+    return jsonify(recipe={k: row[k] for k in row.keys() if k != "barcode_image"})
+
+
 @app.post("/api/erp/recipes/<int:recipe_id>/barcode-image")
 def erp_set_recipe_barcode_image(recipe_id):
     """Save a barcode picture on a recipe (admin). Stored as a data URI; the
     4x6 print label shows it in the barcode spot, in place of the generated
     barcode. The auto QR code still shows when the recipe matches a website
     flavor."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("recipes.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -11602,7 +11811,7 @@ def erp_set_recipe_barcode_image(recipe_id):
 @app.delete("/api/erp/recipes/<int:recipe_id>/barcode-image")
 def erp_delete_recipe_barcode_image(recipe_id):
     """Remove a recipe's barcode picture (admin)."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("recipes.write")
     if err:
         return err
     conn = db()
@@ -11730,7 +11939,7 @@ def _erp_batch_dict(conn, batch):
 
 @app.get("/api/erp/batches")
 def erp_list_batches():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("batches.read")
     if err:
         return err
     status = (request.args.get("status") or "").strip()
@@ -11749,7 +11958,7 @@ def erp_list_batches():
 
 @app.post("/api/erp/batches")
 def erp_create_batch():
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("batches.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -11802,7 +12011,7 @@ def erp_create_batch():
 
 @app.get("/api/erp/batches/<int:batch_id>")
 def erp_get_batch(batch_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("batches.read")
     if err:
         return err
     conn = db()
@@ -11836,7 +12045,7 @@ def erp_get_batch(batch_id):
 
 @app.post("/api/erp/batches/<int:batch_id>/start")
 def erp_batch_start(batch_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("batches.write")
     if err:
         return err
     conn = db()
@@ -11860,7 +12069,7 @@ def erp_batch_start(batch_id):
 def erp_batch_complete(batch_id):
     """Complete a batch: consume ingredients (FIFO lots) via production_out
     movements, snapshot costs, stamp lot code + 6-month expiry. All-or-nothing."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("batches.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -11964,7 +12173,7 @@ def erp_batch_complete(batch_id):
 
 @app.post("/api/erp/batches/<int:batch_id>/cancel")
 def erp_batch_cancel(batch_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("batches.write")
     if err:
         return err
     conn = db()
@@ -11986,7 +12195,7 @@ def erp_batch_cancel(batch_id):
 def erp_batch_reverse(batch_id):
     """Reverse a completed batch: post compensating production_reversal movements
     (stock back in) and mark the batch reversed. Never edits history."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("batches.write")
     if err:
         return err
     conn = db()
@@ -12017,7 +12226,7 @@ def erp_batch_reverse(batch_id):
 @app.get("/api/erp/batches/<int:batch_id>/trace")
 def erp_batch_trace(batch_id):
     """Lot traceability: finished lot -> ingredient lots used."""
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("batches.read")
     if err:
         return err
     conn = db()
@@ -12219,7 +12428,7 @@ def _erp_order_links(conn, source, order_id):
 @app.get("/api/erp/orders")
 def erp_order_queue():
     """Unified order queue: stripe + paypal (read-only) + wholesale."""
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("orders.read")
     if err:
         return err
     source = (request.args.get("source") or "").strip()
@@ -12261,7 +12470,7 @@ def erp_order_queue():
 
 @app.get("/api/erp/orders/<source>/<int:order_id>")
 def erp_order_detail(source, order_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("orders.read")
     if err:
         return err
     if source not in _ERP_ORDER_SOURCES:
@@ -12308,7 +12517,7 @@ def erp_order_detail(source, order_id):
 
 @app.post("/api/erp/orders/<source>/<int:order_id>/status")
 def erp_order_set_status(source, order_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("orders.write")
     if err:
         return err
     if source not in _ERP_ORDER_SOURCES:
@@ -12395,7 +12604,7 @@ def erp_delete_online_order(source, order_id):
 
 @app.get("/api/erp/wholesale-accounts")
 def erp_list_wholesale_accounts():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("accounts.read")
     if err:
         return err
     conn = db()
@@ -12407,7 +12616,7 @@ def erp_list_wholesale_accounts():
 
 @app.post("/api/erp/wholesale-accounts")
 def erp_create_wholesale_account():
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("accounts.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -12470,7 +12679,7 @@ def erp_create_wholesale_account():
 
 @app.get("/api/erp/wholesale-accounts/<int:account_id>")
 def erp_get_wholesale_account(account_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("accounts.read")
     if err:
         return err
     conn = db()
@@ -12489,7 +12698,7 @@ def erp_get_wholesale_account(account_id):
 
 @app.put("/api/erp/wholesale-accounts/<int:account_id>")
 def erp_update_wholesale_account(account_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("accounts.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -12561,7 +12770,7 @@ def erp_import_wholesale_accounts():
     same pattern as the recipe import."""
     import csv
     import io
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("accounts.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -12678,7 +12887,7 @@ def _erp_next_wholesale_number(conn):
 
 @app.get("/api/erp/wholesale-orders")
 def erp_list_wholesale_orders():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("orders.read")
     if err:
         return err
     conn = db()
@@ -12690,7 +12899,7 @@ def erp_list_wholesale_orders():
 
 @app.post("/api/erp/wholesale-orders")
 def erp_create_wholesale_order():
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("orders.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -12760,7 +12969,7 @@ def erp_create_wholesale_order():
 
 @app.get("/api/erp/wholesale-orders/<int:order_id>")
 def erp_get_wholesale_order(order_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("orders.read")
     if err:
         return err
     conn = db()
@@ -13247,7 +13456,7 @@ def erp_wholesale_order_by_number(order_number):
 
 @app.post("/api/erp/wholesale-accounts/<int:account_id>/invite")
 def erp_invite_wholesale_customer(account_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("accounts.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -13297,7 +13506,7 @@ def erp_invite_wholesale_customer(account_id):
 
 @app.post("/api/erp/wholesale-accounts/<int:account_id>/deactivate")
 def erp_deactivate_wholesale_account(account_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("accounts.write")
     if err:
         return err
     conn = db()
@@ -13317,7 +13526,7 @@ def erp_deactivate_wholesale_account(account_id):
 
 @app.post("/api/erp/wholesale-accounts/<int:account_id>/reactivate")
 def erp_reactivate_wholesale_account(account_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("accounts.write")
     if err:
         return err
     conn = db()
@@ -13374,7 +13583,7 @@ def erp_delete_wholesale_account(account_id):
 
 @app.post("/api/erp/wholesale-orders/<int:order_id>/accept")
 def erp_accept_wholesale_order(order_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("orders.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -13404,7 +13613,7 @@ def erp_accept_wholesale_order(order_id):
 
 @app.post("/api/erp/wholesale-orders/<int:order_id>/decline")
 def erp_decline_wholesale_order(order_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("orders.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -13437,7 +13646,7 @@ def erp_decline_wholesale_order(order_id):
 def erp_add_wholesale_order_line(order_id):
     # Admin adds a product to an existing wholesale order — the product name is
     # free text, so this covers off-catalog / not-on-the-site products.
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("orders.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -13499,7 +13708,7 @@ def erp_add_wholesale_order_line(order_id):
 
 @app.get("/api/erp/wholesale-orders/<int:order_id>/production")
 def erp_wholesale_production(order_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("orders.write")
     if err:
         return err
     conn = db()
@@ -13518,7 +13727,7 @@ def erp_wholesale_production(order_id):
 
 @app.post("/api/erp/wholesale-orders/<int:order_id>/production/<int:line_id>/done")
 def erp_wholesale_production_done(order_id, line_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("orders.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -13541,7 +13750,7 @@ def erp_wholesale_production_done(order_id, line_id):
 
 @app.get("/api/erp/wholesale-accounts/<int:account_id>/addresses")
 def erp_list_wholesale_addresses(account_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("accounts.read")
     if err:
         return err
     conn = db()
@@ -13559,7 +13768,7 @@ def erp_list_wholesale_addresses(account_id):
 
 @app.post("/api/erp/wholesale-accounts/<int:account_id>/addresses")
 def erp_add_wholesale_address(account_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("accounts.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -13591,7 +13800,7 @@ def erp_add_wholesale_address(account_id):
 
 @app.put("/api/erp/wholesale-accounts/addresses/<int:addr_id>")
 def erp_update_wholesale_address(addr_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("accounts.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -13657,7 +13866,7 @@ def erp_update_flavor_categories():
 
 @app.get("/api/erp/batches/<int:batch_id>/orders")
 def erp_batch_order_links(batch_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("batches.read")
     if err:
         return err
     conn = db()
@@ -13674,7 +13883,7 @@ def erp_batch_order_links(batch_id):
 
 @app.post("/api/erp/batches/<int:batch_id>/orders")
 def erp_link_batch_order(batch_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("batches.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -13723,7 +13932,7 @@ def erp_link_batch_order(batch_id):
 
 @app.delete("/api/erp/batches/<int:batch_id>/orders/<int:link_id>")
 def erp_unlink_batch_order(batch_id, link_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("batches.write")
     if err:
         return err
     conn = db()
@@ -13749,7 +13958,7 @@ def erp_unlink_batch_order(batch_id, link_id):
 @app.get("/api/erp/orders/<source>/<int:order_id>/trace")
 def erp_order_trace(source, order_id):
     """Traceability: order -> production batches -> ingredient lots."""
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("orders.read")
     if err:
         return err
     if source not in _ERP_ORDER_SOURCES:
@@ -14242,7 +14451,7 @@ def _edi_parse_and_store_inbound(conn, partner, content, actor):
 
 @app.get("/api/erp/edi-partners")
 def erp_list_edi_partners():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("edi.read")
     if err:
         return err
     conn = db()
@@ -14254,7 +14463,7 @@ def erp_list_edi_partners():
 
 @app.post("/api/erp/edi-partners")
 def erp_create_edi_partner():
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("edi.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -14289,7 +14498,7 @@ def erp_create_edi_partner():
 
 @app.get("/api/erp/edi-partners/<int:partner_id>")
 def erp_get_edi_partner(partner_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("edi.read")
     if err:
         return err
     conn = db()
@@ -14305,7 +14514,7 @@ def erp_get_edi_partner(partner_id):
 
 @app.put("/api/erp/edi-partners/<int:partner_id>")
 def erp_update_edi_partner(partner_id):
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("edi.write")
     if err:
         return err
     data = request.get_json(force=True) or {}
@@ -14356,7 +14565,7 @@ def erp_update_edi_partner(partner_id):
 
 @app.get("/api/erp/edi-documents")
 def erp_list_edi_documents():
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("edi.read")
     if err:
         return err
     direction = (request.args.get("direction") or "").strip()
@@ -14388,7 +14597,7 @@ def erp_list_edi_documents():
 
 @app.get("/api/erp/edi-documents/<int:doc_id>")
 def erp_get_edi_document(doc_id):
-    actor, err = _require_erp()
+    actor, err = _erp_check_perm("edi.read")
     if err:
         return err
     conn = db()
@@ -14405,7 +14614,7 @@ def erp_get_edi_document(doc_id):
 @app.post("/api/erp/edi-documents/upload")
 def erp_edi_upload():
     """Manual X12 upload: parse -> preview. Confirm via POST .../id/map."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("edi.write")
     if err:
         return err
     content = ""
@@ -14460,7 +14669,7 @@ def erp_edi_upload():
 @app.post("/api/erp/edi-documents/<int:doc_id>/map")
 def erp_edi_map_document(doc_id):
     """Confirm: map a parsed inbound 850 to a wholesale order."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("edi.write")
     if err:
         return err
     conn = db()
@@ -14511,7 +14720,7 @@ def _edi_doc_dict_careful(d):
 @app.post("/api/erp/edi-documents/<int:doc_id>/retry")
 def erp_edi_retry_document(doc_id):
     """Re-run parse/map for inbound docs; re-queue or mark sent for outbound."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("edi.write")
     if err:
         return err
     data = request.get_json(force=True, silent=True) or {}
@@ -14553,7 +14762,7 @@ def erp_edi_retry_document(doc_id):
 @app.post("/api/erp/wholesale-orders/<int:order_id>/edi-810")
 def erp_wholesale_order_edi810(order_id):
     """Generate an 810 invoice X12 for a wholesale order (queued for transport)."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("edi.write")
     if err:
         return err
     data = request.get_json(force=True, silent=True) or {}
@@ -14617,7 +14826,7 @@ def erp_wholesale_order_edi810(order_id):
 @app.post("/api/erp/orders/<source>/<int:order_id>/edi-856")
 def erp_order_edi856(source, order_id):
     """Generate an 856 ship-notice X12 for an order (queued for transport)."""
-    actor, err = _require_erp_admin()
+    actor, err = _erp_check_perm("edi.write")
     if err:
         return err
     data = request.get_json(force=True, silent=True) or {}
