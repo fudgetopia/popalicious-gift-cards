@@ -5121,6 +5121,7 @@ function erpRecipeLabelParts(r, nut, serving) {
     ".label h1{font-size:19px;text-align:center;margin:0 0 6px;}" +
     ".cols{display:flex;gap:0.05in;}" +
     ".panelcol{width:1.625in;flex:none;}" +
+    ".panelwarn{font-size:8pt;line-height:1.35;margin:6px 0 0;}" +
     ".ingcol{flex:1;min-width:0;font-size:8pt;line-height:1.2;}" +
     ".ingcol p{margin:0 0 8px;}" +
     ".bot{display:flex;gap:0.05in;margin-top:4px;}" +
@@ -5131,15 +5132,16 @@ function erpRecipeLabelParts(r, nut, serving) {
     label:
     "<div class=\"label\"><div class=\"labelfit\"><h1>" + esc(r.name) + "</h1>" +
     "<div class=\"cols\"><div class=\"panelcol\"><div style=\"zoom:0.52;\">" +
-    panel + "</div></div>" +
+    panel + "</div>" +
+    "<p class=\"panelwarn\"><b>WARNING:</b> This bag may contain unpopped kernels. " +
+    "Please snack responsibly.</p></div>" +
     "<div class=\"ingcol\">" +
     (nut.ingredients_text ? "<p><b>Ingredients:</b> " + esc(nut.ingredients_text) + "</p>" : "") +
     (nut.allergens_text ? "<p><b>Contains:</b> " + esc(nut.allergens_text) + "</p>" : "") +
     "<p>This product is made in a facility that also processes: " +
     "peanuts and tree nuts.</p></div></div>" +
     "<div class=\"bot\"><div class=\"botleft\">" +
-    "<p><b>WARNING:</b> This bag may contain unpopped kernels. " +
-    "Please snack responsibly.</p>" +
+
     "<p><b>Manufactured by:</b><br>Pop-A-Licious<br>6290 McLeod DR<br>" +
     "Suite 120<br>Las Vegas, NV 89120</p>" +
     "<p><b>www.pop-a-licious.com</b></p>" + netWt + "</div>" +
@@ -5175,14 +5177,14 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v6 &mdash; On screen the label is " +
+    "<p class=\"erp-print-help\">Label v7 &mdash; On screen the label is " +
     "enlarged for readability; it always prints at true 4&times;6. On " +
     "iPhone/iPad: Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
   window.scrollTo(0, 0);
   /* Fit the whole label in the 4x6 box: a long ingredient list
-     (e.g. Birthday Cake) otherwise pushes the bottom band — WARNING,
-     address, Net Wt, QR code, barcode — past the box, where
+     (e.g. Birthday Cake) otherwise pushes the bottom band — address,
+     Net Wt, QR code, barcode — past the box, where
      overflow:hidden clips it away. Scale the inner wrapper with
      transform (painting only, layout untouched) so the rendered
      content fits the fixed 6in box. Shrink only when it overflows. */
