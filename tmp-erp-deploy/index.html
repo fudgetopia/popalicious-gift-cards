@@ -5057,7 +5057,7 @@ function erpSocialIconsHTML() {
     "4.1 1.9 6.5 1.9 7.8 0 12.1-6.5 12.1-12.1v-.6c.8-.6 1.5-1.3 2.1-2.2z\"/></svg>";
   return "<div style=\"display:flex;gap:8px;justify-content:center;\">" +
     ig + tw + "</div><div style=\"font-size:15px;font-weight:700;text-align:center;" +
-    "margin-top:2px;\">popaliciouslv</div>";
+    "margin-top:0;\">popaliciouslv</div>";
 }
 
 /* ---------- recipe nutrition label (printable, standard FDA panel) ---------- */
@@ -5096,7 +5096,7 @@ function erpRecipeLabelParts(r, nut, serving) {
   var codesHTML = "";
   if (code || pic) {
     codesHTML = "<div style=\"display:flex;justify-content:flex-end;" +
-      "align-items:flex-end;gap:0.06in;margin-top:6px;\">" +
+      "align-items:flex-end;gap:0.06in;margin-top:4px;\">" +
       (code ? "<img src=\"" + code.qr + "\" alt=\"QR code\" " +
       "style=\"width:0.65in;height:0.65in;flex:none;\"/>" : "") +
       barHTML + "</div>";
@@ -5115,37 +5115,38 @@ function erpRecipeLabelParts(r, nut, serving) {
     "body{font-family:Arial,Helvetica,sans-serif;color:#000;background:#fff;}" +
     ".noprint{margin:12px;}@media print{.noprint{display:none;}" +
     "body{background:#fff;}.label{box-shadow:none;}}" +
-    ".label{width:4in;height:6in;padding:0.10in 0.14in;box-sizing:border-box;" +
+    ".label{width:4in;height:6in;padding:0.08in 0.14in;box-sizing:border-box;" +
     "background:#fff;margin:0 auto;overflow:hidden;" +
     "print-color-adjust:exact;-webkit-print-color-adjust:exact;}" +
-    ".label h1{font-size:19px;text-align:center;margin:0 0 6px;}" +
+    ".label h1{font-size:19px;text-align:center;margin:0 0 2px;}" +
     ".cols{display:flex;gap:0.05in;}" +
     ".panelcol{width:1.625in;flex:none;}" +
-    ".panelwarn{font-size:8pt;line-height:1.35;margin:6px 0 0;}" +
+    ".panelwarn{font-size:8pt;line-height:1.35;margin:4px 0 0;}" +
+    ".panelmfg{font-size:8pt;line-height:1.25;margin:4px 0 0;}" +
+    ".panelmfg p{margin:0 0 8px;}" +
     ".ingcol{flex:1;min-width:0;font-size:8pt;line-height:1.2;}" +
     ".ingcol p{margin:0 0 8px;}" +
-    ".bot{display:flex;gap:0.05in;margin-top:4px;}" +
+    ".bot{display:flex;gap:0.05in;margin-top:2px;justify-content:flex-end;}" +
     ".botleft{flex:1;min-width:0;font-size:8pt;line-height:1.35;}" +
     ".botleft p{margin:0 0 8px;}" +
     ".botright{width:2.0in;flex:none;}" +
     "",
     label:
     "<div class=\"label\"><div class=\"labelfit\"><h1>" + esc(r.name) + "</h1>" +
-    "<div class=\"cols\"><div class=\"panelcol\"><div style=\"zoom:0.52;\">" +
+    "<div class=\"cols\"><div class=\"panelcol\"><div style=\"zoom:0.49;\">" +
     panel + "</div>" +
     "<p class=\"panelwarn\"><b>WARNING:</b> This bag may contain unpopped kernels. " +
-    "Please snack responsibly.</p></div>" +
+    "Please snack responsibly.</p>" +
+    "<div class=\"panelmfg\">" +
+    "<p><b>Manufactured by:</b><br>Pop-A-Licious<br>6290 McLeod DR<br>" +
+    "Suite 120<br>Las Vegas, NV 89120</p>" +
+    "<p><b>www.pop-a-licious.com</b></p>" + netWt + "</div></div>" +
     "<div class=\"ingcol\">" +
     (nut.ingredients_text ? "<p><b>Ingredients:</b> " + esc(nut.ingredients_text) + "</p>" : "") +
     (nut.allergens_text ? "<p><b>Contains:</b> " + esc(nut.allergens_text) + "</p>" : "") +
     "<p>This product is made in a facility that also processes: " +
     "peanuts and tree nuts.</p></div></div>" +
-    "<div class=\"bot\"><div class=\"botleft\">" +
-
-    "<p><b>Manufactured by:</b><br>Pop-A-Licious<br>6290 McLeod DR<br>" +
-    "Suite 120<br>Las Vegas, NV 89120</p>" +
-    "<p><b>www.pop-a-licious.com</b></p>" + netWt + "</div>" +
-    "<div class=\"botright\"><div style=\"text-align:right;\">" +
+    "<div class=\"bot\"><div class=\"botright\"><div style=\"width:1.25in;margin-left:auto;\">" +
     erpSocialIconsHTML() + "</div>" + codesHTML +
     "</div></div></div></div>"
   };
@@ -5177,7 +5178,7 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v8 &mdash; On screen the label is " +
+    "<p class=\"erp-print-help\">Label v9 &mdash; On screen the label is " +
     "enlarged for readability; it always prints at true 4&times;6. On " +
     "iPhone/iPad: Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
