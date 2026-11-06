@@ -5055,8 +5055,8 @@ function erpSocialIconsHTML() {
     "1.7-.4v.1c0 1.8 1.3 3.3 3 3.7-.3.1-.7.2-1 .2-.3 0-.5 0-.8-.1.5 " +
     "1.7 2.1 2.9 4 3-1.5 1.1-3.3 1.8-5.3 1.8-.3 0-.7 0-1-.1 1.9 1.2 " +
     "4.1 1.9 6.5 1.9 7.8 0 12.1-6.5 12.1-12.1v-.6c.8-.6 1.5-1.3 2.1-2.2z\"/></svg>";
-  return "<div style=\"display:flex;gap:8px;justify-content:flex-end;\">" +
-    ig + tw + "</div><div style=\"font-size:15px;font-weight:700;" +
+  return "<div style=\"display:flex;gap:8px;justify-content:center;\">" +
+    ig + tw + "</div><div style=\"font-size:15px;font-weight:700;text-align:center;" +
     "margin-top:2px;\">popaliciouslv</div>";
 }
 
@@ -5177,7 +5177,7 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v7 &mdash; On screen the label is " +
+    "<p class=\"erp-print-help\">Label v8 &mdash; On screen the label is " +
     "enlarged for readability; it always prints at true 4&times;6. On " +
     "iPhone/iPad: Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
