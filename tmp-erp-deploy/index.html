@@ -4376,6 +4376,85 @@ function erpCompleteBatchForm(b) {
 }
 
 /* ---------- recipe detail + versioning ---------- */
+function erpLabelSettingsBox(r, res) {
+  var box = document.createElement("div");
+  box.className = "admin-orders-wrap";
+  var h = document.createElement("h3");
+  h.textContent = "Label settings";
+  box.appendChild(h);
+  var note = document.createElement("p");
+  note.style.color = "var(--muted)";
+  note.textContent = "The name prints on the 4\u00d76 label and decides the barcode and QR code. " +
+    "Serving size, serving weight, and servings per bag print on the Nutrition Facts panel and set the Net Wt. " +
+    "Leave a serving field blank to use the automatic value.";
+  box.appendChild(note);
+  var form = document.createElement("div");
+  form.className = "erp-form";
+  /* In the permissions build erpCan gates this on recipes.write; in the
+     pre-permissions live file erpCan does not exist and everyone with
+     recipe access can save, as with every other recipe control there. */
+  var canWrite = (typeof erpCan !== "function") || erpCan("recipes.write");
+  var nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.value = r.name || "";
+  nameInput.disabled = !canWrite;
+  form.appendChild(erpField("Recipe name", nameInput));
+  var sizeInput = document.createElement("input");
+  sizeInput.type = "text";
+  sizeInput.placeholder = "1 cup";
+  sizeInput.value = r.serving_size || "";
+  sizeInput.disabled = !canWrite;
+  form.appendChild(erpField("Serving size", sizeInput));
+  var gramsInput = document.createElement("input");
+  gramsInput.type = "number";
+  gramsInput.min = "0";
+  gramsInput.step = "any";
+  gramsInput.placeholder = "17";
+  gramsInput.value = (r.serving_grams !== null && r.serving_grams !== undefined) ? r.serving_grams : "";
+  gramsInput.disabled = !canWrite;
+  form.appendChild(erpField("Serving weight (g)", gramsInput));
+  var perInput = document.createElement("input");
+  perInput.type = "number";
+  perInput.min = "1";
+  perInput.step = "1";
+  perInput.placeholder = "Auto";
+  perInput.value = (r.servings_per_bag !== null && r.servings_per_bag !== undefined) ? r.servings_per_bag : "";
+  perInput.disabled = !canWrite;
+  form.appendChild(erpField("Servings per bag", perInput));
+  box.appendChild(form);
+  var status = document.createElement("p");
+  status.className = "erp-form-status";
+  box.appendChild(status);
+  if (canWrite) {
+    var saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.textContent = "Save label settings";
+    saveBtn.addEventListener("click", function () {
+      saveBtn.disabled = true;
+      status.textContent = "Saving\u2026";
+      erpPut("/api/erp/recipes/" + encodeURIComponent(String(r.id)) + "/label-settings", {
+        name: nameInput.value.trim(),
+        serving_size: sizeInput.value.trim(),
+        serving_grams: gramsInput.value.trim(),
+        servings_per_bag: perInput.value.trim()
+      }).then(function () {
+        status.textContent = "Saved.";
+        renderErpProductionDetail();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        saveBtn.disabled = false;
+      });
+    });
+    box.appendChild(saveBtn);
+  } else {
+    var ro = document.createElement("p");
+    ro.style.color = "var(--muted)";
+    ro.textContent = "Only admins and staff with recipe permission can change these.";
+    box.appendChild(ro);
+  }
+  return box;
+}
+
 function erpBarcodePictureBox(r, res) {
   var box = document.createElement("div");
   box.className = "admin-orders-wrap";
@@ -4700,14 +4779,14 @@ function renderErpRecipeDetail(body) {
         servForm.className = "erp-form erp-form-inline";
         var sizeInput = document.createElement("input");
         sizeInput.type = "text";
-        sizeInput.value = "1 cup";
+        sizeInput.value = r.serving_size || "1 cup";
         sizeInput.style.width = "90px";
         servForm.appendChild(erpField("Serving size", sizeInput));
         var gramsInput = document.createElement("input");
         gramsInput.type = "number";
         gramsInput.min = "0";
         gramsInput.step = "any";
-        gramsInput.value = "17";
+        gramsInput.value = (r.serving_grams !== null && r.serving_grams !== undefined) ? r.serving_grams : "17";
         gramsInput.style.width = "80px";
         servForm.appendChild(erpField("Serving weight (g)", gramsInput));
         var perInput = document.createElement("input");
@@ -4716,7 +4795,8 @@ function renderErpRecipeDetail(body) {
         perInput.step = "1";
         perInput.style.width = "80px";
         var bagGrams = nut.batch_grams > 0 ? nut.batch_grams / nut.batch_size_bags : 0;
-        perInput.value = bagGrams > 0 ? Math.max(1, Math.round(bagGrams / 17)) : "1";
+        perInput.value = (r.servings_per_bag !== null && r.servings_per_bag !== undefined) ? r.servings_per_bag :
+          (bagGrams > 0 ? Math.max(1, Math.round(bagGrams / (Number(gramsInput.value) || 17))) : "1");
         servForm.appendChild(erpField("Servings per bag", perInput));
         var panelWrap = document.createElement("div");
         nutView.appendChild(servForm);
@@ -4777,6 +4857,7 @@ function renderErpRecipeDetail(body) {
         nutStatus.textContent = error.message;
       });
     });
+    body.appendChild(erpLabelSettingsBox(r, res));
     body.appendChild(erpBarcodePictureBox(r, res));
     body.appendChild(nutBox);
     setAdminDetailStatus(r.name + " v" + res.version + " — " + (res.lines || []).length + " lines.");
