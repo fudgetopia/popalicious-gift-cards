@@ -5103,7 +5103,7 @@ function erpRecipeLabelParts(r, nut, serving) {
   var codesHTML = "";
   if (code || pic) {
     codesHTML = "<div style=\"display:flex;justify-content:flex-end;" +
-      "align-items:flex-end;gap:0.06in;margin-top:4px;\">" +
+      "align-items:center;gap:0.06in;margin-top:4px;\">" +
       (code ? "<img src=\"" + code.qr + "\" alt=\"QR code\" " +
       "style=\"width:0.65in;height:0.65in;flex:none;\"/>" : "") +
       barHTML + "</div>";
@@ -5186,7 +5186,7 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v10 &mdash; On screen the label is " +
+    "<p class=\"erp-print-help\">Label v11 &mdash; On screen the label is " +
     "enlarged for readability; it always prints at true 4&times;6. On " +
     "iPhone/iPad: Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
