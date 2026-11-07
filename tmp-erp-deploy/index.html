@@ -280,12 +280,12 @@ button { font-family: inherit; }
         #erpPrintView .label { zoom: 1 !important; }
         /* Print uses a plain block/float layout, not flexbox: some
            browsers mishandle flex in print and can drop the bottom
-           band. Proportions stay the photo split: panel 1.625in,
-           gap 0.05in, ingredients take the rest; bottom-left takes
-           the label width minus the 2.0in codes column and gap. */
+           band. Proportions stay the photo split: panel 1.70in,
+           gap 0.07in, ingredients take the rest; the codes live in
+           the ingredients column (bottom-aligned on screen). */
         #erpPrintView .cols { display: block !important; overflow: hidden !important; }
         #erpPrintView .panelcol { float: left !important; }
-        #erpPrintView .ingcol { margin-left: 1.675in !important; }
+        #erpPrintView .ingcol { margin-left: 1.77in !important; }
         #erpPrintView .bot { display: block !important; overflow: hidden !important; }
         #erpPrintView .botleft { float: left !important; width: calc(100% - 2.05in) !important; }
         #erpPrintView .botright { float: right !important; }
@@ -4900,7 +4900,7 @@ function erpFdaPanelHTML(opt) {
       (key === "nut_calories" ? String(Math.round(v)) : fmt(v) + unit);
     var left = bold ? "<b>" + label + " " + amt + "</b>" : label + " " + amt;
     return "<div style=\"display:flex;justify-content:space-between;" +
-      "font-size:13px;border-top:1px solid #ccc;padding:1px 0;" +
+      "font-size:13px;border-top:1px solid #ccc;padding:" + rowPad + ";" +
       (indent ? "padding-left:" + (indent * 12) + "px;" : "") + "\">" +
       "<span>" + left + "</span><span>" + dvTxt + "</span></div>";
   }
@@ -4910,10 +4910,14 @@ function erpFdaPanelHTML(opt) {
       Math.round(v / 50 * 100) + "%";
     var amt = (v === null || v === undefined) ? "—" : fmt(v) + "g";
     return "<div style=\"display:flex;justify-content:space-between;" +
-      "font-size:13px;border-top:1px solid #ccc;padding:1px 0;" +
+      "font-size:13px;border-top:1px solid #ccc;padding:" + rowPad + ";" +
       "padding-left:24px;\"><span>Includes " + amt +
       " Added Sugars</span><span>" + dvTxt + "</span></div>";
   }
+  var rowPad = opt.roomy ? "6px 0" : "1px 0";
+  var fsHead = opt.roomy ? "36px" : "32px";
+  var fsCal = opt.roomy ? "32px" : "28px";
+  var fsCalNum = opt.roomy ? "44px" : "38px";
   var cal = opt.value("nut_calories");
   var calTxt = (cal === null || cal === undefined) ? "—" :
     String(Math.round(cal));
@@ -4922,7 +4926,7 @@ function erpFdaPanelHTML(opt) {
   var html = "<div style=\"width:300px;border:2px solid #000;background:#fff;" +
     "color:#000;font-family:Arial,Helvetica,sans-serif;padding:6px 8px;" +
     "box-sizing:border-box;line-height:1.25;\">" +
-    "<div style=\"font-size:32px;font-weight:900;line-height:1;\">" +
+    "<div style=\"font-size:" + fsHead + ";font-weight:900;line-height:1;\">" +
     "Nutrition Facts</div>" +
     "<div style=\"border-top:10px solid #000;margin:4px 0;\"></div>";
   if (opt.servings !== null && opt.servings !== undefined) {
@@ -4934,8 +4938,8 @@ function erpFdaPanelHTML(opt) {
     "<div style=\"border-top:5px solid #000;margin:4px 0;\"></div>" +
     "<div style=\"font-size:12px;\"><b>Amount per serving</b></div>" +
     "<div style=\"display:flex;justify-content:space-between;" +
-    "align-items:baseline;\"><span style=\"font-size:28px;" +
-    "font-weight:900;\">Calories</span><span style=\"font-size:38px;" +
+    "align-items:baseline;\"><span style=\"font-size:" + fsCal + ";" +
+    "font-weight:900;\">Calories</span><span style=\"font-size:" + fsCalNum + ";" +
     "font-weight:900;\">" + calTxt + "</span></div>" +
     "<div style=\"border-top:8px solid #000;margin:4px 0;\"></div>" +
     "<div style=\"text-align:right;font-size:11px;font-weight:700;\">" +
@@ -5031,30 +5035,32 @@ function erpUpcBarcodeSVG(upc) {
       var start = k;
       while (k + 1 < bits.length && bits[k + 1] === "1") k++;
       rects += "<rect x=\"" + (start + 10) + "\" y=\"0\" width=\"" +
-        (k - start + 1) + "\" height=\"40\"/>";
+        (k - start + 1) + "\" height=\"60\"/>";
     }
   }
   var human = digits[0] + " " + digits.slice(1, 6) + " " +
     digits.slice(6, 11) + " " + digits[11];
-  return "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 115 52\" " +
+  return "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 115 80\" " +
     "style=\"display:block;width:100%;height:auto;\" aria-label=\"Barcode " +
     digits + "\"><g fill=\"#000\">" + rects + "</g>" +
-    "<text x=\"57.5\" y=\"51\" font-family=\"Arial,Helvetica,sans-serif\" " +
-    "font-size=\"8\" text-anchor=\"middle\">" + human + "</text></svg>";
+    "<text x=\"57.5\" y=\"76\" font-family=\"Arial,Helvetica,sans-serif\" " +
+    "font-size=\"11\" text-anchor=\"middle\">" + human + "</text></svg>";
 }
 function erpSocialIconsHTML() {
   var ig = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" " +
-    "width=\"22\" height=\"22\"><rect x=\"2.5\" y=\"2.5\" width=\"19\" height=\"19\" " +
-    "rx=\"5\" fill=\"none\" stroke=\"#000\" stroke-width=\"2\"/><circle cx=\"12\" " +
-    "cy=\"12\" r=\"4.2\" fill=\"none\" stroke=\"#000\" stroke-width=\"2\"/>" +
-    "<circle cx=\"17.6\" cy=\"6.4\" r=\"1.4\" fill=\"#000\"/></svg>";
+    "width=\"32\" height=\"32\"><rect x=\"0\" y=\"0\" width=\"24\" height=\"24\" " +
+    "rx=\"5\" fill=\"#000\"/><rect x=\"4.5\" y=\"4.5\" width=\"15\" height=\"15\" " +
+    "rx=\"4\" fill=\"none\" stroke=\"#fff\" stroke-width=\"1.8\"/><circle cx=\"12\" " +
+    "cy=\"12\" r=\"3.6\" fill=\"none\" stroke=\"#fff\" stroke-width=\"1.8\"/>" +
+    "<circle cx=\"16.8\" cy=\"7.2\" r=\"1.2\" fill=\"#fff\"/></svg>";
   var tw = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\" " +
-    "width=\"22\" height=\"22\"><path fill=\"#000\" d=\"M22 5.5c-.7.3-1.5.6-2.3.7 " +
+    "width=\"32\" height=\"32\"><rect x=\"0\" y=\"0\" width=\"24\" height=\"24\" " +
+    "rx=\"5\" fill=\"#000\"/><g transform=\"translate(3,3) scale(0.75)\"><path fill=\"#fff\" d=\"M22 5.5c-.7.3-1.5.6-2.3.7 " +
     ".8-.5 1.4-1.3 1.7-2.2-.8.5-1.6.8-2.5 1A3.7 3.7 0 0 0 12.5 8c0 .3 0 " +
     ".6.1.9A10.5 10.5 0 0 1 4.9 4.6a3.7 3.7 0 0 0 1.1 4.9c-.6 0-1.2-.2-" +
     "1.7-.4v.1c0 1.8 1.3 3.3 3 3.7-.3.1-.7.2-1 .2-.3 0-.5 0-.8-.1.5 " +
     "1.7 2.1 2.9 4 3-1.5 1.1-3.3 1.8-5.3 1.8-.3 0-.7 0-1-.1 1.9 1.2 " +
-    "4.1 1.9 6.5 1.9 7.8 0 12.1-6.5 12.1-12.1v-.6c.8-.6 1.5-1.3 2.1-2.2z\"/></svg>";
+    "4.1 1.9 6.5 1.9 7.8 0 12.1-6.5 12.1-12.1v-.6c.8-.6 1.5-1.3 2.1-2.2z\"/></g></svg>";
   return "<div style=\"display:flex;gap:8px;justify-content:center;\">" +
     ig + tw + "</div><div style=\"font-size:15px;font-weight:700;text-align:center;" +
     "margin-top:0;\">popaliciouslv</div>";
@@ -5072,12 +5078,13 @@ function erpRecipeLabelParts(r, nut, serving) {
     servingSize: serving.sizeText,
     servingGrams: serving.grams,
     value: serving.perServing,
-    fmt: serving.fmtNum
+    fmt: serving.fmtNum,
+    roomy: true
   });
   var netWt = "";
   if (serving.bagGrams > 0) {
     var oz = serving.bagGrams / 28.3495;
-    netWt = "<p><b>Net Wt: " + (Math.round(oz * 10) / 10) + " oz (" +
+    netWt = "<p style=\"font-size:11pt;\"><b>Net Wt: " + (Math.round(oz * 10) / 10) + " oz (" +
       Math.round(serving.bagGrams) + "g)</b></p>";
   }
   /* Barcode slot: an uploaded barcode picture wins over the generated
@@ -5115,25 +5122,26 @@ function erpRecipeLabelParts(r, nut, serving) {
     "body{font-family:Arial,Helvetica,sans-serif;color:#000;background:#fff;}" +
     ".noprint{margin:12px;}@media print{.noprint{display:none;}" +
     "body{background:#fff;}.label{box-shadow:none;}}" +
-    ".label{width:4in;height:6in;padding:0.08in 0.14in;box-sizing:border-box;" +
+    ".label{width:4in;height:6in;padding:0.05in 0.06in;box-sizing:border-box;" +
     "background:#fff;margin:0 auto;overflow:hidden;" +
     "print-color-adjust:exact;-webkit-print-color-adjust:exact;}" +
     ".label h1{font-size:19px;text-align:center;margin:0 0 2px;}" +
-    ".cols{display:flex;gap:0.05in;}" +
-    ".panelcol{width:1.625in;flex:none;}" +
-    ".panelwarn{font-size:8pt;line-height:1.35;margin:4px 0 0;}" +
-    ".panelmfg{font-size:8pt;line-height:1.25;margin:4px 0 0;}" +
+    ".cols{display:flex;gap:0.07in;}" +
+    ".panelcol{width:1.70in;flex:none;}" +
+    ".panelwarn{font-size:8pt;line-height:1.35;margin:4px 0 0;font-weight:700;}" +
+    ".panelmfg{font-size:8pt;line-height:1.25;margin:4px 0 0;font-weight:700;}" +
     ".panelmfg p{margin:0 0 8px;}" +
-    ".ingcol{flex:1;min-width:0;font-size:8pt;line-height:1.2;}" +
+    ".ingcol{flex:1;min-width:0;font-size:7.5pt;line-height:1.2;display:flex;flex-direction:column;}" +
+    ".ingcol p:not(:first-child){font-size:8pt;}" +
     ".ingcol p{margin:0 0 8px;}" +
     ".bot{display:flex;gap:0.05in;margin-top:2px;justify-content:flex-end;}" +
     ".botleft{flex:1;min-width:0;font-size:8pt;line-height:1.35;}" +
     ".botleft p{margin:0 0 8px;}" +
-    ".botright{width:2.0in;flex:none;}" +
+    ".botright{width:2.0in;flex:none;margin-top:auto;margin-left:auto;}" +
     "",
     label:
     "<div class=\"label\"><div class=\"labelfit\"><h1>" + esc(r.name) + "</h1>" +
-    "<div class=\"cols\"><div class=\"panelcol\"><div style=\"zoom:0.49;\">" +
+    "<div class=\"cols\"><div class=\"panelcol\"><div style=\"zoom:0.54;\">" +
     panel + "</div>" +
     "<p class=\"panelwarn\"><b>WARNING:</b> This bag may contain unpopped kernels. " +
     "Please snack responsibly.</p>" +
@@ -5143,12 +5151,12 @@ function erpRecipeLabelParts(r, nut, serving) {
     "<p><b>www.pop-a-licious.com</b></p>" + netWt + "</div></div>" +
     "<div class=\"ingcol\">" +
     (nut.ingredients_text ? "<p><b>Ingredients:</b> " + esc(nut.ingredients_text) + "</p>" : "") +
-    (nut.allergens_text ? "<p><b>Contains:</b> " + esc(nut.allergens_text) + "</p>" : "") +
-    "<p>This product is made in a facility that also processes: " +
-    "peanuts and tree nuts.</p></div></div>" +
-    "<div class=\"bot\"><div class=\"botright\"><div style=\"width:1.25in;margin-left:auto;\">" +
+    (nut.allergens_text ? "<p><b>Contains: " + esc(nut.allergens_text) + "</b></p>" : "") +
+    "<p><b>This product is made in a facility that also processes: " +
+    "peanuts and tree nuts.</b></p>" +
+    "<div class=\"botright\"><div style=\"width:1.25in;margin-left:auto;\">" +
     erpSocialIconsHTML() + "</div>" + codesHTML +
-    "</div></div></div></div>"
+    "</div></div></div></div></div>"
   };
 }
 /* Full standalone label document (used by previews and tests). The live
@@ -5178,7 +5186,7 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v9 &mdash; On screen the label is " +
+    "<p class=\"erp-print-help\">Label v10 &mdash; On screen the label is " +
     "enlarged for readability; it always prints at true 4&times;6. On " +
     "iPhone/iPad: Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
