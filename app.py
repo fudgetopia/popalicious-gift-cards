@@ -1110,7 +1110,8 @@ def init_db():
                      ("sweet_price_cents", "INTEGER NOT NULL DEFAULT 400"),
                      ("default_po", "TEXT NOT NULL DEFAULT ''"),
                      ("pricing_mode", "TEXT NOT NULL DEFAULT 'bag'"),
-                     ("account_status", "TEXT NOT NULL DEFAULT 'active'")):
+                     ("account_status", "TEXT NOT NULL DEFAULT 'active'"),
+                     ("staff_managed", "INTEGER NOT NULL DEFAULT 0")):
         if col not in wacols:
             conn.execute("ALTER TABLE erp_wholesale_accounts ADD COLUMN %s %s" % (col, ddl))
     wocols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_orders)").fetchall()]
@@ -12384,6 +12385,8 @@ def _erp_wholesale_account_dict(conn, a):
                      " WHERE account_id = ?", (a["id"],)).fetchone()["c"]
     d = dict(a)
     d["order_count"] = n
+    # Staff-managed accounts: we create their orders; no portal invite needed.
+    d["staff_managed"] = bool(a["staff_managed"]) if "staff_managed" in a.keys() else False
     return d
 
 
@@ -12672,15 +12675,16 @@ def erp_create_wholesale_account():
         "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
         " price_per_bag_cents, payment_terms, notes, active, created_by, created_at,"
         " contact_person, savory_price_cents, sweet_price_cents, default_po,"
-        " pricing_mode, account_status)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 'active')",
+        " pricing_mode, staff_managed, account_status)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
         (name, (data.get("contact_name") or "").strip(),
          (data.get("email") or "").strip(), (data.get("phone") or "").strip(),
          (data.get("address") or "").strip(), price,
          (data.get("payment_terms") or "").strip(),
          (data.get("notes") or "").strip(), actor, now,
          (data.get("contact_person") or "").strip(), savory, sweet,
-         (data.get("default_po") or "").strip(), pricing_mode))
+         (data.get("default_po") or "").strip(), pricing_mode,
+         1 if data.get("staff_managed") else 0))
     account_id = cur.lastrowid
     # Main delivery location: the customer manages further addresses themselves
     # in the portal; the admin sees the profile read-only.
@@ -12774,6 +12778,8 @@ def erp_update_wholesale_account(account_id):
         fields["pricing_mode"] = pm
     if "active" in data:
         fields["active"] = 1 if data.get("active") else 0
+    if "staff_managed" in data:
+        fields["staff_managed"] = 1 if data.get("staff_managed") else 0
     if "name" in fields and not fields["name"]:
         conn.close()
         return jsonify(error="name is required"), 400
@@ -13495,6 +13501,9 @@ def erp_invite_wholesale_customer(account_id):
     if acct["account_status"] == "deactivated" or not acct["active"]:
         conn.close()
         return jsonify(error="account is deactivated"), 400
+    if "staff_managed" in acct.keys() and acct["staff_managed"]:
+        conn.close()
+        return jsonify(error="this account is staff-managed — we create their orders, so no portal invite is needed"), 400
     email = (acct["email"] or "").strip().lower()
     if not email or not EMAIL_RE.match(email):
         conn.close()
