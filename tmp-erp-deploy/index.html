@@ -335,9 +335,11 @@ button { font-family: inherit; }
       <a href="#/orders" data-route="orders">Order hub</a>
       <a href="#/edi" data-route="edi">EDI</a>
       <a href="#/reports" data-route="reports">Reports</a>
+      <a href="#/accounting" data-route="accounting">Accounting</a>
       <a href="#/settings" data-route="settings">Settings</a>
+      <a href="#/staff-perms" data-route="staff-perms">Staff &amp; permissions</a>
     </nav>
-    <div class="app-user"><span id="userLabel"></span><button type="button" id="logoutBtn">Log out</button></div>
+    <div class="app-user"><span id="userLabel"></span><a href="https://pop-a-licious.com/" id="viewStorefrontLink" target="_blank" rel="noopener">View storefront</a><button type="button" id="logoutBtn">Log out</button></div>
   </header>
   <main class="app-main">
     <p id="appStatus" class="app-status"></p>
@@ -361,14 +363,16 @@ function erpSession() {
     };
   } catch (e) { return { token: "", name: "", email: "", role: "" }; }
 }
-function isLoggedIn() { return !!erpSession().token; }
+function isLoggedIn() { var s = erpSession(); return !!s.token || !!s.role; }
 
 async function authFetch(path, options) {
   var request = Object.assign({}, options || {});
   var headers = new Headers(request.headers || {});
   var token = erpSession().token;
   if (token && !headers.has("Authorization")) headers.set("Authorization", "Bearer " + token);
+  headers.set("X-ERP-Request", "1");
   request.headers = headers;
+  request.credentials = "include";
   var response = await fetch(API_BASE + path, request);
   lastAuthStatus = response.status;
   return response;
@@ -423,6 +427,7 @@ async function doLogin(event) {
     if (loginMode === "admin") {
       var resp = await fetch(API_BASE + "/api/auth/login", {
         method: "POST",
+        credentials: "include",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email: email, password: password })
       });
@@ -470,6 +475,7 @@ function saveSession(token, name, email, role) {
   } catch (e) {}
 }
 function doLogout(message) {
+  try { fetch(API_BASE + "/api/auth/logout", { method: "POST", credentials: "include" }).catch(function () {}); } catch (e) {}
   try {
     sessionStorage.removeItem("erpAuthToken");
     sessionStorage.removeItem("erpUserName");
@@ -587,6 +593,8 @@ function enterApp() {
   if (nav) nav.style.display = s.role === "wholesale" ? "none" : "";
   var brand = document.querySelector(".app-brand");
   if (brand) brand.textContent = s.role === "wholesale" ? "Pop-A-Licious Wholesale" : "Pop-A-Licious ERP";
+  var vsLink = document.getElementById("viewStorefrontLink");
+  if (vsLink) vsLink.style.display = s.role === "admin" ? "" : "none";
   if ((location.hash || "#/") === "#/") location.hash = "#/";
   renderRoute();
 }
@@ -1203,7 +1211,9 @@ function currentRoute() {
   if (h.indexOf("#/orders") === 0) return "orders";
   if (h.indexOf("#/edi") === 0) return "edi";
   if (h.indexOf("#/reports") === 0) return "reports";
+  if (h.indexOf("#/accounting") === 0) return "accounting";
   if (h.indexOf("#/settings") === 0) return "settings";
+  if (h.indexOf("#/staff-perms") === 0) return "staff-perms";
   return "home";
 }
 function renderRoute() {
@@ -1227,7 +1237,7 @@ function renderRoute() {
     a.classList.toggle("active", a.getAttribute("data-route") === r);
     // Phase 4: Reports and Settings are admin-only (permission matrix).
     var dr = a.getAttribute("data-route");
-    if (dr === "reports" || dr === "settings") {
+    if (dr === "reports" || dr === "settings" || dr === "accounting" || dr === "staff-perms") {
       a.style.display = erpIsAdmin() ? "" : "none";
     }
   });
@@ -1269,6 +1279,9 @@ function renderRoute() {
       erpState.ediPostDoc = null;
     }
     loadErpEdiDetail();
+  } else if (r === "accounting") {
+    document.title = "Accounting \u00b7 Pop-A-Licious ERP";
+    loadErpAccountingDetail();
   } else if (r === "reports") {
     document.title = "Reports \u00b7 Pop-A-Licious ERP";
     if (!erpIsAdmin()) { location.hash = "#/"; return; }
@@ -1277,6 +1290,10 @@ function renderRoute() {
     document.title = "Settings \u00b7 Pop-A-Licious ERP";
     if (!erpIsAdmin()) { location.hash = "#/"; return; }
     loadErpSettingsDetail();
+  } else if (r === "staff-perms") {
+    document.title = "Staff & permissions \u00b7 Pop-A-Licious ERP";
+    if (!erpIsAdmin()) { location.hash = "#/"; return; }
+    loadErpStaffPermsDetail();
   } else {
     document.title = "Dashboard \u00b7 Pop-A-Licious ERP";
     renderHome();
@@ -1394,7 +1411,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
         var erpState = {
           items: [], locations: [], stock: [], vendors: [], pos: [],
           alerts: [], selectedItemId: null, selectedPOId: null,
-          stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false
+          stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: ""
         };
         function erpQty(q) {
           var n = Number(q);
@@ -3318,6 +3335,2676 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           els.body.appendChild(poToolbar);
           if (erpState.showNewPO) els.body.appendChild(erpNewPOForm());
           els.body.appendChild(erpPOTable());
+        }
+        /* ---------------- Accounting: ledger + chart of accounts ---------------- */
+        function erpAcctCanWrite() { return true; }
+        function erpAcctCanRead() { return erpIsAdmin(); }
+        function erpTaxCanWrite() { return true; }
+        function erpTaxCanRead() { return erpIsAdmin(); }
+        function erpPayrollCanWrite() { return true; }
+        function erpPayrollCanRead() { return erpIsAdmin(); }
+        function erpAcctAccountById(id) {
+          for (var i = 0; i < erpState.acctAccounts.length; i++) {
+            if (String(erpState.acctAccounts[i].id) === String(id)) return erpState.acctAccounts[i];
+          }
+          return null;
+        }
+        async function loadErpAccountingDetail() {
+          setAdminDetailStatus("Loading accounting\u2026");
+          try {
+            var results = await Promise.all([
+              erpGet("/api/erp/accounting/accounts"),
+              erpGet("/api/erp/accounting/journal"),
+              erpGet("/api/erp/accounting/trial-balance"),
+              erpGet("/api/erp/accounting/invoices"),
+              erpGet("/api/erp/accounting/bills"),
+              erpGet("/api/erp/accounting/aging"),
+              erpGet("/api/erp/vendors").catch(function () { return { vendors: [] }; }),
+              erpGet("/api/erp/wholesale-accounts").catch(function () { return { accounts: [] }; }),
+              erpGet("/api/erp/accounting/bank-accounts"),
+              erpGet("/api/erp/accounting/tax/rates").catch(function () { return { rates: [] }; }),
+              erpGet("/api/erp/accounting/tax/liability").catch(function () { return null; }),
+              erpGet("/api/erp/accounting/tax/filings").catch(function () { return { filings: [] }; }),
+              erpGet("/api/erp/accounting/payroll/employees").catch(function () { return { employees: [] }; }),
+              erpGet("/api/erp/accounting/payroll/runs").catch(function () { return { runs: [] }; }),
+              erpGet("/api/erp/accounting/payroll/tax-filings").catch(function () { return { quarters: [] }; })
+            ]);
+            erpState.acctAccounts = results[0].accounts || [];
+            erpState.acctJournal = results[1].entries || [];
+            erpState.acctTrial = results[2] || null;
+            erpState.acctInvoices = results[3].invoices || [];
+            erpState.acctBills = results[4].bills || [];
+            erpState.acctAging = results[5] || null;
+            erpState.acctVendors = results[6].vendors || [];
+            erpState.acctWholesale = results[7].accounts || [];
+            erpState.acctBankAccounts = results[8].bank_accounts || [];
+            erpState.acctTaxRates = results[9].rates || [];
+            erpState.acctTaxLiability = results[10] || null;
+            erpState.acctTaxFilings = results[11].filings || [];
+            erpState.acctPayrollEmployees = results[12].employees || [];
+            erpState.acctPayrollRuns = results[13].runs || [];
+            erpState.acctPayrollFilings = results[14].quarters || [];
+            renderErpAccountingDetail();
+            setAdminDetailStatus(erpState.acctAccounts.length + (erpState.acctAccounts.length === 1 ? " account." : " accounts."));
+          } catch (error) {
+            setAdminDetailStatus(error instanceof TypeError ? "We couldn't connect to load accounting." : error.message, true);
+          }
+        }
+        function renderErpAccountingDetail() {
+          var els = adminDetailEls();
+          els.body.replaceChildren();
+          els.body.appendChild(erpSectionTitle("Accounting"));
+          var tabs = document.createElement("div");
+          tabs.className = "erp-toolbar";
+          var acctTabs = [["accounts", "Chart of accounts"], ["journal", "Journal"], ["trial", "Trial balance"], ["invoices", "Invoices"], ["bills", "Bills"], ["aging", "Aging"], ["banking", "Banking"]];
+          if (erpAcctCanRead()) acctTabs.push(["reports", "Reports"]);
+          if (erpTaxCanRead()) acctTabs.push(["tax", "Sales Tax"]);
+          if (erpPayrollCanRead()) acctTabs.push(["payroll", "Payroll"]);
+          acctTabs.forEach(function (t) {
+            var b = document.createElement("button");
+            b.type = "button";
+            b.textContent = t[1];
+            if (erpState.acctView === t[0]) b.disabled = true;
+            b.addEventListener("click", function () {
+              erpState.acctView = t[0];
+              renderErpAccountingDetail();
+            });
+            tabs.appendChild(b);
+          });
+          els.body.appendChild(tabs);
+          if (erpState.acctView === "journal") {
+            var jToolbar = document.createElement("div");
+            jToolbar.className = "erp-toolbar";
+            var newEntryBtn = document.createElement("button");
+            newEntryBtn.type = "button";
+            newEntryBtn.textContent = erpState.showNewEntry ? "Cancel" : "New journal entry";
+            newEntryBtn.addEventListener("click", function () {
+              erpState.showNewEntry = !erpState.showNewEntry;
+              renderErpAccountingDetail();
+            });
+            if (erpAcctCanWrite()) jToolbar.appendChild(newEntryBtn);
+            els.body.appendChild(jToolbar);
+            if (erpState.showNewEntry && erpAcctCanWrite()) els.body.appendChild(erpAcctNewEntryForm());
+            els.body.appendChild(erpAcctJournalTable());
+          } else if (erpState.acctView === "trial") {
+            els.body.appendChild(erpAcctTrialBalanceTable());
+          } else if (erpState.acctView === "invoices") {
+            var iToolbar = document.createElement("div");
+            iToolbar.className = "erp-toolbar";
+            var newInvBtn = document.createElement("button");
+            newInvBtn.type = "button";
+            newInvBtn.textContent = erpState.showNewInvoice ? "Cancel" : "New invoice";
+            newInvBtn.addEventListener("click", function () {
+              erpState.showNewInvoice = !erpState.showNewInvoice;
+              renderErpAccountingDetail();
+            });
+            if (erpAcctCanWrite()) iToolbar.appendChild(newInvBtn);
+            els.body.appendChild(iToolbar);
+            if (erpState.showNewInvoice && erpAcctCanWrite()) els.body.appendChild(erpAcctNewInvoiceForm());
+            if (erpState.payInvoiceId) {
+              var _pinv = erpAcctInvoiceById(erpState.payInvoiceId);
+              if (_pinv) els.body.appendChild(erpAcctPayInvoiceForm(_pinv));
+            }
+            els.body.appendChild(erpAcctInvoicesTable());
+          } else if (erpState.acctView === "bills") {
+            var bToolbar = document.createElement("div");
+            bToolbar.className = "erp-toolbar";
+            var newBillBtn = document.createElement("button");
+            newBillBtn.type = "button";
+            newBillBtn.textContent = erpState.showNewBill ? "Cancel" : "New bill";
+            newBillBtn.addEventListener("click", function () {
+              erpState.showNewBill = !erpState.showNewBill;
+              renderErpAccountingDetail();
+            });
+            if (erpAcctCanWrite()) bToolbar.appendChild(newBillBtn);
+            els.body.appendChild(bToolbar);
+            if (erpState.showNewBill && erpAcctCanWrite()) els.body.appendChild(erpAcctNewBillForm());
+            if (erpState.payBillId) {
+              var _pbill = erpAcctBillById(erpState.payBillId);
+              if (_pbill) els.body.appendChild(erpAcctPayBillForm(_pbill));
+            }
+            els.body.appendChild(erpAcctBillsTable());
+          } else if (erpState.acctView === "aging") {
+            els.body.appendChild(erpAcctAgingTable());
+          } else if (erpState.acctView === "banking") {
+            var kToolbar = document.createElement("div");
+            kToolbar.className = "erp-toolbar";
+            var syncBtn = document.createElement("button");
+            syncBtn.type = "button";
+            syncBtn.textContent = "Sync bank feed";
+            syncBtn.addEventListener("click", function () {
+              erpState.bankSyncMsg = "Syncing\u2026";
+              renderErpAccountingDetail();
+              erpPost("/api/erp/accounting/bank-sync", {}).then(function (res) {
+                erpState.bankSyncMsg = res.feed === "not_configured"
+                  ? res.message
+                  : ("Synced: " + res.inserted + " new, " + res.skipped + " already in the feed, " + res.auto_matched + " auto-matched."
+                     + (res.errors && res.errors.length ? " Errors: " + res.errors.join("; ") : ""));
+                return loadErpAccountingDetail();
+              }).then(function () {
+                if (erpState.selectedBankAccountId) return loadErpAcctBankDetail();
+              }).catch(function (error) {
+                erpState.bankSyncMsg = error.message;
+                renderErpAccountingDetail();
+              });
+            });
+            if (erpAcctCanWrite()) kToolbar.appendChild(syncBtn);
+            var addBankBtn = document.createElement("button");
+            addBankBtn.type = "button";
+            addBankBtn.textContent = erpState.showAddBankAcct ? "Cancel" : "Add bank account";
+            addBankBtn.addEventListener("click", function () {
+              erpState.showAddBankAcct = !erpState.showAddBankAcct;
+              renderErpAccountingDetail();
+            });
+            if (erpAcctCanWrite()) kToolbar.appendChild(addBankBtn);
+            els.body.appendChild(kToolbar);
+            if (erpState.bankSyncMsg) {
+              var syncMsg = document.createElement("p");
+              syncMsg.textContent = erpState.bankSyncMsg;
+              els.body.appendChild(syncMsg);
+            }
+            if (erpState.showAddBankAcct && erpAcctCanWrite()) els.body.appendChild(erpAcctAddBankAccountForm());
+            els.body.appendChild(erpAcctBankAccountsTable());
+            if (erpState.selectedBankAccountId) {
+              if (erpState.matchTxnId) {
+                var _mtxn = null;
+                (erpState.acctBankTxns || []).forEach(function (t) {
+                  if (String(t.id) === String(erpState.matchTxnId)) _mtxn = t;
+                });
+                if (_mtxn) els.body.appendChild(erpAcctMatchTxnForm(_mtxn));
+              }
+              els.body.appendChild(erpAcctBankTxnsTable());
+              els.body.appendChild(erpAcctReconSection());
+            }
+          } else if (erpState.acctView === "reports") {
+            if (erpAcctCanRead()) {
+              els.body.appendChild(erpAcctReportsSection());
+            } else {
+              var noAccess = document.createElement("p");
+              noAccess.textContent = "Admin access required.";
+              els.body.appendChild(noAccess);
+            }
+          } else if (erpState.acctView === "tax") {
+            if (erpTaxCanRead()) {
+              els.body.appendChild(erpAcctTaxSection());
+            } else {
+              var noAccess = document.createElement("p");
+              noAccess.textContent = "Admin access required.";
+              els.body.appendChild(noAccess);
+            }
+          } else if (erpState.acctView === "payroll") {
+            if (erpPayrollCanRead()) {
+              els.body.appendChild(erpAcctPayrollSection());
+            } else {
+              var noAccess = document.createElement("p");
+              noAccess.textContent = "Admin access required.";
+              els.body.appendChild(noAccess);
+            }
+          } else {
+            var aToolbar = document.createElement("div");
+            aToolbar.className = "erp-toolbar";
+            var addAcctBtn = document.createElement("button");
+            addAcctBtn.type = "button";
+            addAcctBtn.textContent = erpState.showAddAcct ? "Cancel" : "Add account";
+            addAcctBtn.addEventListener("click", function () {
+              erpState.showAddAcct = !erpState.showAddAcct;
+              renderErpAccountingDetail();
+            });
+            if (erpAcctCanWrite()) aToolbar.appendChild(addAcctBtn);
+            els.body.appendChild(aToolbar);
+            if (erpState.showAddAcct && erpAcctCanWrite()) els.body.appendChild(erpAcctAddAccountForm());
+            els.body.appendChild(erpAcctAccountsTable());
+          }
+        }
+        function erpAcctAccountsTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Code", "Account", "Type", "Parent", "Status", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          if (!erpState.acctAccounts.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 6;
+            td.textContent = "No accounts yet.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          erpState.acctAccounts.forEach(function (a) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Code", a.code));
+            tr.appendChild(erpCell("Account", a.name));
+            tr.appendChild(erpCell("Type", a.type));
+            var parent = a.parent_id ? erpAcctAccountById(a.parent_id) : null;
+            tr.appendChild(erpCell("Parent", parent ? parent.code : ""));
+            tr.appendChild(erpCell("Status", a.active ? "Active" : "Inactive"));
+            var actionCell = document.createElement("td");
+            actionCell.setAttribute("data-label", "Action");
+            if (a.active) {
+              var deact = document.createElement("button");
+              deact.type = "button";
+              deact.textContent = "Deactivate";
+              deact.addEventListener("click", function () {
+                if (deact.textContent === "Deactivate") {
+                  deact.textContent = "Confirm deactivate";
+                  return;
+                }
+                deact.disabled = true;
+                erpPost("/api/erp/accounting/accounts/" + encodeURIComponent(String(a.id)) + "/deactivate", {}).then(function () {
+                  return loadErpAccountingDetail();
+                }).catch(function (error) {
+                  deact.disabled = false;
+                  deact.textContent = "Deactivate";
+                  setAdminDetailStatus(error.message, true);
+                });
+              });
+              if (erpAcctCanWrite()) actionCell.appendChild(deact);
+            }
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+          });
+          return table;
+        }
+        function erpAcctAddAccountForm() {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var inputs = {};
+          [["code", "Code", true], ["name", "Account name", true]].forEach(function (f) {
+            var label = document.createElement("label");
+            label.textContent = f[1] + " ";
+            var input = document.createElement("input");
+            input.name = f[0];
+            if (f[2]) input.required = true;
+            label.appendChild(input);
+            form.appendChild(label);
+            inputs[f[0]] = input;
+          });
+          var typeLabel = document.createElement("label");
+          typeLabel.textContent = "Type ";
+          var typeSel = document.createElement("select");
+          ["asset", "liability", "equity", "income", "expense"].forEach(function (t) {
+            var opt = document.createElement("option");
+            opt.value = t;
+            opt.textContent = t.charAt(0).toUpperCase() + t.slice(1);
+            typeSel.appendChild(opt);
+          });
+          typeLabel.appendChild(typeSel);
+          form.appendChild(typeLabel);
+          var parentLabel = document.createElement("label");
+          parentLabel.textContent = "Parent ";
+          var parentSel = document.createElement("select");
+          var noneOpt = document.createElement("option");
+          noneOpt.value = "";
+          noneOpt.textContent = "None";
+          parentSel.appendChild(noneOpt);
+          erpState.acctAccounts.forEach(function (a) {
+            if (!a.active) return;
+            var opt = document.createElement("option");
+            opt.value = String(a.id);
+            opt.textContent = a.code + " \u2014 " + a.name;
+            parentSel.appendChild(opt);
+          });
+          parentLabel.appendChild(parentSel);
+          form.appendChild(parentLabel);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Save account";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            submit.disabled = true;
+            status.textContent = "Saving\u2026";
+            var body = { code: inputs.code.value.trim(), name: inputs.name.value.trim(),
+                         type: typeSel.value, parent_id: parentSel.value ? Number(parentSel.value) : null };
+            erpPost("/api/erp/accounting/accounts", body).then(function () {
+              erpState.showAddAcct = false;
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctJournalTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Date", "Memo", "Source", "Debits", "Credits", "Status", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          if (!erpState.acctJournal.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 7;
+            td.textContent = "No journal entries yet.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          erpState.acctJournal.forEach(function (e) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Date", e.date));
+            tr.appendChild(erpCell("Memo", e.memo));
+            tr.appendChild(erpCell("Source", e.source));
+            tr.appendChild(erpCell("Debits", erpMoney(e.total_debits)));
+            tr.appendChild(erpCell("Credits", erpMoney(e.total_credits)));
+            tr.appendChild(erpCell("Status", e.reversed_by ? "Reversed" : "Posted"));
+            var actionCell = document.createElement("td");
+            actionCell.setAttribute("data-label", "Action");
+            if (!e.reversed_by) {
+              var rev = document.createElement("button");
+              rev.type = "button";
+              rev.textContent = "Reverse";
+              rev.addEventListener("click", function () {
+                if (rev.textContent === "Reverse") {
+                  rev.textContent = "Confirm reverse";
+                  return;
+                }
+                rev.disabled = true;
+                erpPost("/api/erp/accounting/journal/" + encodeURIComponent(String(e.id)) + "/reverse", {}).then(function () {
+                  return loadErpAccountingDetail();
+                }).catch(function (error) {
+                  rev.disabled = false;
+                  rev.textContent = "Reverse";
+                  setAdminDetailStatus(error.message, true);
+                });
+              });
+              if (erpAcctCanWrite()) actionCell.appendChild(rev);
+            }
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+            var linesRow = document.createElement("tr");
+            var linesCell = document.createElement("td");
+            linesCell.colSpan = 7;
+            linesCell.textContent = (e.lines || []).map(function (l) {
+              return l.account_code + " " + l.account_name + " " +
+                (l.debit_cents ? "Dr " + erpMoney(l.debit_cents) : "Cr " + erpMoney(l.credit_cents));
+            }).join(" \u00b7 ");
+            linesRow.appendChild(linesCell);
+            table.appendChild(linesRow);
+          });
+          return table;
+        }
+        function erpAcctNewEntryForm() {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var dateLabel = document.createElement("label");
+          dateLabel.textContent = "Date ";
+          var dateInput = document.createElement("input");
+          dateInput.type = "date";
+          dateInput.name = "date";
+          dateInput.required = true;
+          dateInput.value = new Date().toISOString().slice(0, 10);
+          dateLabel.appendChild(dateInput);
+          form.appendChild(dateLabel);
+          var memoLabel = document.createElement("label");
+          memoLabel.textContent = "Memo ";
+          var memoInput = document.createElement("input");
+          memoInput.name = "memo";
+          memoLabel.appendChild(memoInput);
+          form.appendChild(memoLabel);
+          var linesWrap = document.createElement("div");
+          form.appendChild(linesWrap);
+          var lineRows = [];
+          var addLineBtn = document.createElement("button");
+          addLineBtn.type = "button";
+          addLineBtn.textContent = "Add line";
+          addLineBtn.addEventListener("click", function () { addLineRow(); updateTotals(); });
+          form.appendChild(addLineBtn);
+          var totals = document.createElement("p");
+          totals.className = "erp-form-status";
+          form.appendChild(totals);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Post entry";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          function updateTotals() {
+            var d = 0, c = 0, bad = false, effective = 0;
+            lineRows.forEach(function (lr) {
+              var dv = erpDollarsToCents(lr.debit.value || "0");
+              var cv = erpDollarsToCents(lr.credit.value || "0");
+              if (dv === null || cv === null) { bad = true; return; }
+              if (dv && cv) { bad = true; return; }
+              if (!dv && !cv) return;
+              effective++;
+              d += dv; c += cv;
+            });
+            totals.textContent = "Debits " + erpMoney(d) + " \u00b7 Credits " + erpMoney(c) +
+              (d === c && d > 0 ? " \u00b7 Balanced" : " \u00b7 Out of balance by " + erpMoney(Math.abs(d - c)));
+            submit.disabled = bad || d !== c || d <= 0 || effective < 2;
+          }
+          function addLineRow() {
+            var row = document.createElement("div");
+            row.className = "erp-acct-line";
+            var sel = document.createElement("select");
+            erpState.acctAccounts.forEach(function (a) {
+              if (!a.active) return;
+              var opt = document.createElement("option");
+              opt.value = String(a.id);
+              opt.textContent = a.code + " \u2014 " + a.name;
+              sel.appendChild(opt);
+            });
+            var debit = document.createElement("input");
+            debit.type = "number"; debit.min = "0"; debit.step = "0.01";
+            debit.placeholder = "Debit $";
+            var credit = document.createElement("input");
+            credit.type = "number"; credit.min = "0"; credit.step = "0.01";
+            credit.placeholder = "Credit $";
+            var memo = document.createElement("input");
+            memo.placeholder = "Line memo";
+            var remove = document.createElement("button");
+            remove.type = "button";
+            remove.textContent = "Remove";
+            var lr = { sel: sel, debit: debit, credit: credit, memo: memo, row: row };
+            remove.addEventListener("click", function () {
+              var idx = lineRows.indexOf(lr);
+              if (idx >= 0) lineRows.splice(idx, 1);
+              if (row.parentNode) row.parentNode.removeChild(row);
+              updateTotals();
+            });
+            debit.addEventListener("input", updateTotals);
+            credit.addEventListener("input", updateTotals);
+            row.appendChild(sel); row.appendChild(debit); row.appendChild(credit);
+            row.appendChild(memo); row.appendChild(remove);
+            linesWrap.appendChild(row);
+            lineRows.push(lr);
+            return lr;
+          }
+          addLineRow();
+          addLineRow();
+          updateTotals();
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            var lines = [];
+            var bad = false;
+            lineRows.forEach(function (lr) {
+              var dv = erpDollarsToCents(lr.debit.value || "0");
+              var cv = erpDollarsToCents(lr.credit.value || "0");
+              if (dv === null || cv === null || (dv && cv)) { bad = true; return; }
+              if (!dv && !cv) return;
+              lines.push({ account_id: Number(lr.sel.value), debit_cents: dv, credit_cents: cv, memo: lr.memo.value.trim() });
+            });
+            if (bad || lines.length < 2) { status.textContent = "Each line needs exactly one of debit or credit."; return; }
+            var d = 0, c = 0;
+            lines.forEach(function (l) { d += l.debit_cents; c += l.credit_cents; });
+            if (d !== c || d <= 0) { status.textContent = "Debits must equal credits."; return; }
+            submit.disabled = true;
+            status.textContent = "Posting\u2026";
+            erpPost("/api/erp/accounting/journal", { date: dateInput.value, memo: memoInput.value.trim(), lines: lines }).then(function () {
+              erpState.showNewEntry = false;
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctTrialBalanceTable() {
+          var tb = erpState.acctTrial;
+          var wrap = document.createElement("div");
+          if (!tb) {
+            var p = document.createElement("p");
+            p.textContent = "Trial balance unavailable.";
+            wrap.appendChild(p);
+            return wrap;
+          }
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Code", "Account", "Type", "Debits", "Credits", "Balance"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          (tb.accounts || []).forEach(function (a) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Code", a.code));
+            tr.appendChild(erpCell("Account", a.name));
+            tr.appendChild(erpCell("Type", a.type));
+            tr.appendChild(erpCell("Debits", erpMoney(a.debits)));
+            tr.appendChild(erpCell("Credits", erpMoney(a.credits)));
+            tr.appendChild(erpCell("Balance", erpMoney(a.balance_cents)));
+            table.appendChild(tr);
+          });
+          var foot = document.createElement("tr");
+          foot.appendChild(erpCell("Code", ""));
+          foot.appendChild(erpCell("Account", "Totals"));
+          foot.appendChild(erpCell("Type", ""));
+          foot.appendChild(erpCell("Debits", erpMoney(tb.total_debits)));
+          foot.appendChild(erpCell("Credits", erpMoney(tb.total_credits)));
+          foot.appendChild(erpCell("Balance", erpMoney(tb.total_debits - tb.total_credits)));
+          table.appendChild(foot);
+          wrap.appendChild(table);
+          var note = document.createElement("p");
+          note.className = "erp-form-status";
+          note.textContent = tb.balanced ? "Balanced \u2014 debits equal credits." : "OUT OF BALANCE \u2014 debits do not equal credits.";
+          wrap.appendChild(note);
+          return wrap;
+        }
+
+
+        function erpAcctReportKindLabel(kind) {
+          if (kind === "balance-sheet") return "Balance sheet";
+          if (kind === "cash-flow") return "Cash flow";
+          return "Profit & loss";
+        }
+        function erpAcctReportCsvUrl() {
+          var k = erpState.acctReportKind;
+          if (k === "balance-sheet") {
+            return "/api/erp/accounting/reports/balance-sheet.csv?as_of=" + encodeURIComponent(erpState.acctReportAsOf || "");
+          }
+          return "/api/erp/accounting/reports/" + k + ".csv?start=" + encodeURIComponent(erpState.acctReportStart || "") + "&end=" + encodeURIComponent(erpState.acctReportEnd || "");
+        }
+        async function erpAcctRunReport() {
+          var k = erpState.acctReportKind;
+          var path;
+          if (k === "balance-sheet") {
+            path = "/api/erp/accounting/reports/balance-sheet?as_of=" + encodeURIComponent(erpState.acctReportAsOf || "");
+          } else {
+            path = "/api/erp/accounting/reports/" + k + "?start=" + encodeURIComponent(erpState.acctReportStart || "") + "&end=" + encodeURIComponent(erpState.acctReportEnd || "");
+          }
+          erpState.acctReportError = "";
+          erpState.acctReport = null;
+          renderErpAccountingDetail();
+          try {
+            erpState.acctReport = await erpGet(path);
+          } catch (error) {
+            erpState.acctReportError = error.message;
+          }
+          renderErpAccountingDetail();
+        }
+        function erpAcctReportHead(table, headers) {
+          var head = document.createElement("tr");
+          headers.forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+        }
+        function erpAcctReportRow(table, label, amount, prior, amountLabel) {
+          var tr = document.createElement("tr");
+          tr.appendChild(erpCell("Account", label));
+          tr.appendChild(erpCell(amountLabel || "Amount", erpMoney(amount)));
+          if (prior !== undefined && prior !== null) tr.appendChild(erpCell("Prior period", erpMoney(prior)));
+          table.appendChild(tr);
+        }
+        function erpAcctReportTable() {
+          var rep = erpState.acctReport;
+          var kind = erpState.acctReportKind;
+          var wrap = document.createElement("div");
+          var title = document.createElement("h3");
+          title.textContent = erpAcctReportKindLabel(kind);
+          wrap.appendChild(title);
+          if (kind === "profit-loss") {
+            var showPrior = !!erpState.acctReportCompare;
+            var table = document.createElement("table");
+            table.className = "admin-orders-table";
+            erpAcctReportHead(table, showPrior ? ["Account", "Amount", "Prior period"] : ["Account", "Amount"]);
+            (rep.income || []).forEach(function (r) {
+              erpAcctReportRow(table, r.code + " " + r.name, r.amount_cents, showPrior ? r.prior_cents : null);
+            });
+            erpAcctReportRow(table, "Total income", rep.total_income_cents, showPrior ? rep.prior_total_income_cents : null);
+            (rep.expenses || []).forEach(function (r) {
+              erpAcctReportRow(table, r.code + " " + r.name, r.amount_cents, showPrior ? r.prior_cents : null);
+            });
+            erpAcctReportRow(table, "Total expenses", rep.total_expense_cents, showPrior ? rep.prior_total_expense_cents : null);
+            erpAcctReportRow(table, "Net income", rep.net_income_cents, showPrior ? rep.prior_net_income_cents : null);
+            wrap.appendChild(table);
+            var note = document.createElement("p");
+            note.textContent = "Period " + rep.start + " to " + rep.end + (showPrior ? " \u00b7 compared to " + rep.prior_start + " to " + rep.prior_end + "." : ".");
+            wrap.appendChild(note);
+          } else if (kind === "balance-sheet") {
+            var btable = document.createElement("table");
+            btable.className = "admin-orders-table";
+            erpAcctReportHead(btable, ["Account", "Balance"]);
+            (rep.assets || []).forEach(function (a) {
+              erpAcctReportRow(btable, a.code + " " + a.name, a.balance_cents, "Balance");
+            });
+            erpAcctReportRow(btable, "Total assets", rep.total_assets_cents, "Balance");
+            (rep.liabilities || []).forEach(function (a) {
+              erpAcctReportRow(btable, a.code + " " + a.name, a.balance_cents, "Balance");
+            });
+            erpAcctReportRow(btable, "Total liabilities", rep.total_liabilities_cents, "Balance");
+            (rep.equity || []).forEach(function (a) {
+              erpAcctReportRow(btable, a.code + " " + a.name, a.balance_cents, "Balance");
+            });
+            erpAcctReportRow(btable, "Retained earnings (prior years)", rep.retained_earnings_cents, "Balance");
+            erpAcctReportRow(btable, "Net income (current year)", rep.current_net_income_cents, "Balance");
+            erpAcctReportRow(btable, "Total equity", rep.total_equity_cents, "Balance");
+            erpAcctReportRow(btable, "Total liabilities + equity", rep.total_liabilities_equity_cents, "Balance");
+            wrap.appendChild(btable);
+            var bnote = document.createElement("p");
+            bnote.className = "erp-form-status";
+            bnote.textContent = rep.balanced ? "Balanced \u2014 assets equal liabilities + equity." : "OUT OF BALANCE \u2014 difference " + erpMoney(rep.difference_cents) + ".";
+            wrap.appendChild(bnote);
+          } else {
+            var ctable = document.createElement("table");
+            ctable.className = "admin-orders-table";
+            erpAcctReportHead(ctable, ["Account", "Amount"]);
+            [["operating", "Operating"], ["investing", "Investing"], ["financing", "Financing"]].forEach(function (s) {
+              var sec = rep[s[0]] || { lines: [], total_cents: 0 };
+              (sec.lines || []).forEach(function (r) {
+                erpAcctReportRow(ctable, r.code + " " + r.name, r.amount_cents);
+              });
+              erpAcctReportRow(ctable, "Total " + s[1].toLowerCase(), sec.total_cents);
+            });
+            erpAcctReportRow(ctable, "Net change in cash", rep.net_cash_change_cents);
+            erpAcctReportRow(ctable, "Cash at start of period", rep.beginning_cash_cents);
+            erpAcctReportRow(ctable, "Cash at end of period", rep.ending_cash_cents);
+            wrap.appendChild(ctable);
+            var cnote = document.createElement("p");
+            cnote.className = "erp-form-status";
+            cnote.textContent = rep.check_ok ? "Check passed \u2014 net change " + erpMoney(rep.net_cash_change_cents) + " equals the change in cash balances." : "CHECK FAILED \u2014 difference " + erpMoney(rep.difference_cents) + ".";
+            wrap.appendChild(cnote);
+          }
+          return wrap;
+        }
+
+        function erpTaxRateLabel(bps) {
+          var s = ((Number(bps) || 0) / 1000).toFixed(3);
+          s = s.replace(/0+$/, "").replace(/\.$/, "");
+          return s + "%";
+        }
+        function erpTaxDateLabel(iso) {
+          if (!iso) return "\u2014";
+          var parts = String(iso).split("-");
+          var months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+          return months[Number(parts[1]) - 1] + " " + Number(parts[2]) + ", " + parts[0];
+        }
+        function erpTaxFilingById(id) {
+          for (var i = 0; i < (erpState.acctTaxFilings || []).length; i++) {
+            if (String(erpState.acctTaxFilings[i].id) === String(id)) return erpState.acctTaxFilings[i];
+          }
+          return null;
+        }
+        function erpAcctTaxSection() {
+          var wrap = document.createElement("div");
+          wrap.appendChild(erpSectionTitle("Sales tax owed"));
+          var liab = erpState.acctTaxLiability;
+          if (!liab) {
+            var loading = document.createElement("p");
+            loading.textContent = "Loading sales tax\u2026";
+            wrap.appendChild(loading);
+          } else {
+            var due = document.createElement("p");
+            due.textContent = "Next filing due " + erpTaxDateLabel(liab.next_due_date)
+              + " (" + (liab.next_due_period || "") + " period). Nevada returns are due by the 20th of the month after the reporting period.";
+            wrap.appendChild(due);
+            var owed = document.createElement("p");
+            owed.textContent = "Total owed: " + erpMoney(liab.outstanding_cents)
+              + " \u2014 collected " + erpMoney(liab.collected_cents)
+              + ", remitted " + erpMoney(liab.remitted_cents)
+              + " (" + liab.start + " to " + liab.end + ").";
+            wrap.appendChild(owed);
+            (liab.by_jurisdiction || []).forEach(function (j) {
+              var p = document.createElement("p");
+              p.textContent = j.jurisdiction + ": collected " + erpMoney(j.collected_cents)
+                + ", remitted " + erpMoney(j.remitted_cents)
+                + ", owed " + erpMoney(j.outstanding_cents)
+                + " on " + erpMoney(j.taxable_sales_cents) + " taxable sales.";
+              wrap.appendChild(p);
+            });
+          }
+          wrap.appendChild(erpSectionTitle("Tax rates"));
+          var rToolbar = document.createElement("div");
+          rToolbar.className = "erp-toolbar";
+          var addRateBtn = document.createElement("button");
+          addRateBtn.type = "button";
+          addRateBtn.textContent = erpState.showAddTaxRate ? "Cancel" : "Add rate";
+          addRateBtn.addEventListener("click", function () {
+            erpState.showAddTaxRate = !erpState.showAddTaxRate;
+            renderErpAccountingDetail();
+          });
+          if (erpTaxCanWrite()) rToolbar.appendChild(addRateBtn);
+          wrap.appendChild(rToolbar);
+          if (erpState.showAddTaxRate && erpTaxCanWrite()) wrap.appendChild(erpAcctTaxRateForm());
+          wrap.appendChild(erpAcctTaxRatesTable());
+          wrap.appendChild(erpSectionTitle("Filings"));
+          var fToolbar = document.createElement("div");
+          fToolbar.className = "erp-toolbar";
+          var newFilingBtn = document.createElement("button");
+          newFilingBtn.type = "button";
+          newFilingBtn.textContent = erpState.showNewTaxFiling ? "Cancel" : "New filing";
+          newFilingBtn.addEventListener("click", function () {
+            erpState.showNewTaxFiling = !erpState.showNewTaxFiling;
+            renderErpAccountingDetail();
+          });
+          if (erpTaxCanWrite()) fToolbar.appendChild(newFilingBtn);
+          wrap.appendChild(fToolbar);
+          if (erpState.showNewTaxFiling && erpTaxCanWrite()) wrap.appendChild(erpAcctNewTaxFilingForm());
+          wrap.appendChild(erpAcctTaxFilingsTable());
+          if (erpState.remitTaxFilingId) {
+            var _rf = erpTaxFilingById(erpState.remitTaxFilingId);
+            if (_rf) wrap.appendChild(erpAcctTaxRemitForm(_rf));
+          }
+          if (erpState.acctTaxError) {
+            var err = document.createElement("p");
+            err.className = "erp-form-status";
+            err.textContent = erpState.acctTaxError;
+            wrap.appendChild(err);
+          }
+          return wrap;
+        }
+        function erpAcctTaxRatesTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Jurisdiction", "Rate", "Effective from", "Effective to", "Source", "Status"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          var rates = erpState.acctTaxRates || [];
+          if (!rates.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 6;
+            td.textContent = "No tax rates yet.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          rates.forEach(function (r) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Jurisdiction", r.jurisdiction));
+            tr.appendChild(erpCell("Rate", erpTaxRateLabel(r.rate_bps)));
+            tr.appendChild(erpCell("Effective from", r.effective_from));
+            tr.appendChild(erpCell("Effective to", r.effective_to || ""));
+            tr.appendChild(erpCell("Source", r.source || ""));
+            tr.appendChild(erpCell("Status", r.effective_to ? "Expired" : "Current"));
+            table.appendChild(tr);
+          });
+          return table;
+        }
+        function erpAcctTaxRateForm() {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var hint = document.createElement("p");
+          hint.textContent = "Adding a rate ends the current rate for this jurisdiction the day before it takes effect.";
+          form.appendChild(hint);
+          var jLabel = document.createElement("label");
+          jLabel.textContent = "Jurisdiction ";
+          var jInput = document.createElement("input");
+          jInput.name = "jurisdiction";
+          jInput.value = "Clark County";
+          jLabel.appendChild(jInput);
+          form.appendChild(jLabel);
+          var rLabel = document.createElement("label");
+          rLabel.textContent = "Rate % ";
+          var rInput = document.createElement("input");
+          rInput.type = "number";
+          rInput.min = "0";
+          rInput.step = "0.001";
+          rInput.name = "rate_percent";
+          rInput.required = true;
+          rLabel.appendChild(rInput);
+          form.appendChild(rLabel);
+          var fLabel = document.createElement("label");
+          fLabel.textContent = "Effective from ";
+          var fInput = document.createElement("input");
+          fInput.type = "date";
+          fInput.name = "effective_from";
+          fInput.required = true;
+          fInput.value = new Date().toISOString().slice(0, 10);
+          fLabel.appendChild(fInput);
+          form.appendChild(fLabel);
+          var sLabel = document.createElement("label");
+          sLabel.textContent = "Source ";
+          var sInput = document.createElement("input");
+          sInput.name = "source";
+          sInput.placeholder = "Where this rate was verified";
+          sLabel.appendChild(sInput);
+          form.appendChild(sLabel);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Save rate";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (ev) {
+            ev.preventDefault();
+            erpPost("/api/erp/accounting/tax/rates", {
+              jurisdiction: jInput.value,
+              rate_percent: Number(rInput.value),
+              effective_from: fInput.value,
+              source: sInput.value
+            }).then(function () {
+              erpState.showAddTaxRate = false;
+              erpState.acctTaxError = "";
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctTaxFilingsTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Period", "Jurisdiction", "Taxable sales", "Collected", "Remitted", "Outstanding", "Status", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          var filings = erpState.acctTaxFilings || [];
+          if (!filings.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 8;
+            td.textContent = "No filings yet.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          filings.forEach(function (f) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Period", f.period_start + " to " + f.period_end));
+            tr.appendChild(erpCell("Jurisdiction", f.jurisdiction));
+            tr.appendChild(erpCell("Taxable sales", erpMoney(f.taxable_sales_cents)));
+            tr.appendChild(erpCell("Collected", erpMoney(f.tax_collected_cents)));
+            tr.appendChild(erpCell("Remitted", erpMoney(f.tax_remitted_cents)));
+            tr.appendChild(erpCell("Outstanding", erpMoney(f.outstanding_cents)));
+            tr.appendChild(erpCell("Status", f.status));
+            var actionCell = document.createElement("td");
+            actionCell.setAttribute("data-label", "Action");
+            if (f.status === "open" && erpTaxCanWrite()) {
+              if (f.outstanding_cents > 0) {
+                var remit = document.createElement("button");
+                remit.type = "button";
+                remit.textContent = "Remit";
+                remit.addEventListener("click", function () {
+                  erpState.remitTaxFilingId = f.id;
+                  renderErpAccountingDetail();
+                });
+                actionCell.appendChild(remit);
+              }
+              var fileBtn = document.createElement("button");
+              fileBtn.type = "button";
+              fileBtn.textContent = "File";
+              fileBtn.addEventListener("click", function () {
+                if (fileBtn.textContent === "File") {
+                  fileBtn.textContent = "Confirm file";
+                  return;
+                }
+                fileBtn.disabled = true;
+                erpPost("/api/erp/accounting/tax/filings/" + encodeURIComponent(String(f.id)) + "/file", {}).then(function () {
+                  erpState.remitTaxFilingId = null;
+                  return loadErpAccountingDetail();
+                }).catch(function (error) {
+                  fileBtn.disabled = false;
+                  fileBtn.textContent = "File";
+                  erpState.acctTaxError = error.message;
+                  renderErpAccountingDetail();
+                });
+              });
+              actionCell.appendChild(fileBtn);
+            }
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+          });
+          return table;
+        }
+        function erpAcctNewTaxFilingForm() {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var hint = document.createElement("p");
+          hint.textContent = "Taxable sales and tax collected are computed from invoices in the period \u2014 nothing to enter by hand.";
+          form.appendChild(hint);
+          var sLabel = document.createElement("label");
+          sLabel.textContent = "Period start ";
+          var sInput = document.createElement("input");
+          sInput.type = "date";
+          sInput.name = "period_start";
+          sInput.required = true;
+          sLabel.appendChild(sInput);
+          form.appendChild(sLabel);
+          var eLabel = document.createElement("label");
+          eLabel.textContent = "Period end ";
+          var eInput = document.createElement("input");
+          eInput.type = "date";
+          eInput.name = "period_end";
+          eInput.required = true;
+          eLabel.appendChild(eInput);
+          form.appendChild(eLabel);
+          var jLabel = document.createElement("label");
+          jLabel.textContent = "Jurisdiction ";
+          var jInput = document.createElement("input");
+          jInput.name = "jurisdiction";
+          jInput.value = "Clark County";
+          jLabel.appendChild(jInput);
+          form.appendChild(jLabel);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Create filing";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (ev) {
+            ev.preventDefault();
+            erpPost("/api/erp/accounting/tax/filings", {
+              period_start: sInput.value,
+              period_end: eInput.value,
+              jurisdiction: jInput.value
+            }).then(function () {
+              erpState.showNewTaxFiling = false;
+              erpState.acctTaxError = "";
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctTaxRemitForm(filing) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var title = document.createElement("p");
+          title.textContent = "Record remittance \u2014 " + filing.jurisdiction + " " + filing.period_start + " to " + filing.period_end + " \u2014 outstanding " + erpMoney(filing.outstanding_cents);
+          form.appendChild(title);
+          var aLabel = document.createElement("label");
+          aLabel.textContent = "Amount $ ";
+          var aInput = document.createElement("input");
+          aInput.type = "number";
+          aInput.min = "0";
+          aInput.step = "0.01";
+          aInput.name = "amount";
+          aInput.value = (filing.outstanding_cents / 100).toFixed(2);
+          aLabel.appendChild(aInput);
+          form.appendChild(aLabel);
+          var dLabel = document.createElement("label");
+          dLabel.textContent = "Date ";
+          var dInput = document.createElement("input");
+          dInput.type = "date";
+          dInput.name = "date";
+          dInput.required = true;
+          dInput.value = new Date().toISOString().slice(0, 10);
+          dLabel.appendChild(dInput);
+          form.appendChild(dLabel);
+          var rLabel = document.createElement("label");
+          rLabel.textContent = "Reference ";
+          var rInput = document.createElement("input");
+          rInput.name = "reference";
+          rInput.placeholder = "Confirmation or check number";
+          rLabel.appendChild(rInput);
+          form.appendChild(rLabel);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Record remittance";
+          form.appendChild(submit);
+          var cancel = document.createElement("button");
+          cancel.type = "button";
+          cancel.textContent = "Cancel";
+          cancel.addEventListener("click", function () {
+            erpState.remitTaxFilingId = null;
+            renderErpAccountingDetail();
+          });
+          form.appendChild(cancel);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (ev) {
+            ev.preventDefault();
+            var cents = erpDollarsToCents(aInput.value);
+            if (cents === null) { status.textContent = "Amount must be a dollar amount of zero or more."; return; }
+            erpPost("/api/erp/accounting/tax/filings/" + encodeURIComponent(String(filing.id)) + "/remit", {
+              amount_cents: cents,
+              date: dInput.value,
+              reference: rInput.value
+            }).then(function () {
+              erpState.remitTaxFilingId = null;
+              erpState.acctTaxError = "";
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        /* ---------------- Accounting: payroll structure ---------------- */
+        function erpPayrollEmployeeById(id) {
+          for (var i = 0; i < (erpState.acctPayrollEmployees || []).length; i++) {
+            if (String(erpState.acctPayrollEmployees[i].id) === String(id)) return erpState.acctPayrollEmployees[i];
+          }
+          return null;
+        }
+        function erpPayrollRunById(id) {
+          for (var i = 0; i < (erpState.acctPayrollRuns || []).length; i++) {
+            if (String(erpState.acctPayrollRuns[i].id) === String(id)) return erpState.acctPayrollRuns[i];
+          }
+          return null;
+        }
+        function erpPayrollFilingStatusLabel(s) {
+          if (s === "married_jointly") return "Married filing jointly";
+          if (s === "married_separately") return "Married filing separately";
+          if (s === "head_of_household") return "Head of household";
+          return "Single";
+        }
+        function erpAcctPayrollSection() {
+          var wrap = document.createElement("div");
+          wrap.appendChild(erpSectionTitle("Payroll"));
+          var note = document.createElement("p");
+          note.textContent = "No one is paid yet \\u2014 this is the payroll structure, ready the day pay starts. Withholding is federal only (Nevada has no state income tax) and is computed by the server from the 2026 IRS percentage-method tables. Nothing here is live pay.";
+          wrap.appendChild(note);
+          wrap.appendChild(erpSectionTitle("Employees"));
+          var eToolbar = document.createElement("div");
+          eToolbar.className = "erp-toolbar";
+          var addEmpBtn = document.createElement("button");
+          addEmpBtn.type = "button";
+          addEmpBtn.textContent = (erpState.showAddPayrollEmployee || erpState.editPayrollEmployeeId) ? "Cancel" : "Add employee";
+          addEmpBtn.addEventListener("click", function () {
+            erpState.showAddPayrollEmployee = !erpState.showAddPayrollEmployee;
+            erpState.editPayrollEmployeeId = null;
+            renderErpAccountingDetail();
+          });
+          if (erpPayrollCanWrite()) eToolbar.appendChild(addEmpBtn);
+          wrap.appendChild(eToolbar);
+          if ((erpState.showAddPayrollEmployee || erpState.editPayrollEmployeeId) && erpPayrollCanWrite()) {
+            wrap.appendChild(erpAcctPayrollEmployeeForm(erpState.editPayrollEmployeeId ? erpPayrollEmployeeById(erpState.editPayrollEmployeeId) : null));
+          }
+          wrap.appendChild(erpAcctPayrollEmployeesTable());
+          wrap.appendChild(erpSectionTitle("Pay runs"));
+          var rToolbar = document.createElement("div");
+          rToolbar.className = "erp-toolbar";
+          var newRunBtn = document.createElement("button");
+          newRunBtn.type = "button";
+          newRunBtn.textContent = erpState.showNewPayrollRun ? "Cancel" : "New pay run";
+          newRunBtn.addEventListener("click", function () {
+            erpState.showNewPayrollRun = !erpState.showNewPayrollRun;
+            renderErpAccountingDetail();
+          });
+          if (erpPayrollCanWrite()) rToolbar.appendChild(newRunBtn);
+          wrap.appendChild(rToolbar);
+          if (erpState.showNewPayrollRun && erpPayrollCanWrite()) wrap.appendChild(erpAcctPayrollRunForm());
+          wrap.appendChild(erpAcctPayrollRunsTable());
+          if (erpState.selectedPayrollRunId) {
+            var _run = erpPayrollRunById(erpState.selectedPayrollRunId);
+            if (_run) wrap.appendChild(erpAcctPayrollRunDetail(_run));
+          }
+          wrap.appendChild(erpSectionTitle("Payroll tax filings"));
+          wrap.appendChild(erpAcctPayrollFilingsTable());
+          if (erpState.acctPayrollError) {
+            var err = document.createElement("p");
+            err.className = "erp-form-status";
+            err.textContent = erpState.acctPayrollError;
+            wrap.appendChild(err);
+          }
+          return wrap;
+        }
+        function erpAcctPayrollEmployeesTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Employee", "Pay", "Schedule", "Filing status", "W-4", "Status", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          var emps = erpState.acctPayrollEmployees || [];
+          if (!emps.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 7;
+            td.textContent = "No employees yet.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          emps.forEach(function (e) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Employee", e.first_name + " " + e.last_name));
+            tr.appendChild(erpCell("Pay", (e.pay_type === "salary" ? "Salary " : "Hourly ") + erpMoney(e.rate_cents) + (e.pay_type === "salary" ? " / year" : " / hour")));
+            tr.appendChild(erpCell("Schedule", e.pay_schedule));
+            tr.appendChild(erpCell("Filing status", erpPayrollFilingStatusLabel(e.filing_status)));
+            var w4 = [];
+            if (e.step2_checkbox) w4.push("Step 2 checked");
+            if (e.step3_credit_cents) w4.push("Step 3 credit " + erpMoney(e.step3_credit_cents) + "/yr");
+            if (e.step4a_cents) w4.push("Step 4(a) " + erpMoney(e.step4a_cents) + "/yr");
+            if (e.step4b_cents) w4.push("Step 4(b) " + erpMoney(e.step4b_cents) + "/yr");
+            if (e.step4c_cents) w4.push("Step 4(c) " + erpMoney(e.step4c_cents) + "/period");
+            if (e.exempt) w4.push("Exempt");
+            tr.appendChild(erpCell("W-4", w4.join(", ") || "\\u2014"));
+            tr.appendChild(erpCell("Status", e.active ? "Active" : "Inactive"));
+            var actionCell = document.createElement("td");
+            actionCell.setAttribute("data-label", "Action");
+            if (erpPayrollCanWrite() && e.active) {
+              var editBtn = document.createElement("button");
+              editBtn.type = "button";
+              editBtn.textContent = "Edit";
+              editBtn.addEventListener("click", function () {
+                erpState.editPayrollEmployeeId = e.id;
+                erpState.showAddPayrollEmployee = true;
+                renderErpAccountingDetail();
+              });
+              actionCell.appendChild(editBtn);
+              var deBtn = document.createElement("button");
+              deBtn.type = "button";
+              deBtn.textContent = "Deactivate";
+              deBtn.addEventListener("click", function () {
+                if (deBtn.textContent === "Deactivate") {
+                  deBtn.textContent = "Confirm deactivate";
+                  return;
+                }
+                deBtn.disabled = true;
+                erpPost("/api/erp/accounting/payroll/employees/" + encodeURIComponent(String(e.id)) + "/deactivate", {}).then(function () {
+                  return loadErpAccountingDetail();
+                }).catch(function (error) {
+                  deBtn.disabled = false;
+                  deBtn.textContent = "Deactivate";
+                  erpState.acctPayrollError = error.message;
+                  renderErpAccountingDetail();
+                });
+              });
+              actionCell.appendChild(deBtn);
+            }
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+          });
+          return table;
+        }
+        function erpAcctPayrollEmployeeForm(emp) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var hint = document.createElement("p");
+          hint.textContent = emp ? "Update this employee's pay profile. Withholding is computed from the 2020+ Form W-4 fields below." : "Add an employee to the payroll structure. Pay is not running yet \\u2014 this only records the pay profile.";
+          form.appendChild(hint);
+          function _input(name, labelText, type, value, required) {
+            var l = document.createElement("label");
+            l.textContent = labelText + " ";
+            var i = document.createElement("input");
+            i.name = name;
+            if (type) i.type = type;
+            if (value !== undefined && value !== null) i.value = value;
+            if (required) i.required = true;
+            l.appendChild(i);
+            form.appendChild(l);
+            return i;
+          }
+          function _select(name, labelText, options, value) {
+            var l = document.createElement("label");
+            l.textContent = labelText + " ";
+            var s = document.createElement("select");
+            s.name = name;
+            options.forEach(function (o) {
+              var opt = document.createElement("option");
+              opt.value = o[0];
+              opt.textContent = o[1];
+              s.appendChild(opt);
+            });
+            if (value) s.value = value;
+            l.appendChild(s);
+            form.appendChild(l);
+            return s;
+          }
+          function _check(name, labelText, checked) {
+            var l = document.createElement("label");
+            var c = document.createElement("input");
+            c.type = "checkbox";
+            c.name = name;
+            c.checked = !!checked;
+            l.appendChild(c);
+            l.appendChild(document.createTextNode(" " + labelText));
+            form.appendChild(l);
+            return c;
+          }
+          var firstInput = _input("first_name", "First name", null, emp ? emp.first_name : "", true);
+          var lastInput = _input("last_name", "Last name", null, emp ? emp.last_name : "", true);
+          var typeSel = _select("pay_type", "Pay type", [["salary", "Salary"], ["hourly", "Hourly"]], emp ? emp.pay_type : "salary");
+          var rateInput = _input("rate", "Rate $ (annual salary, or hourly rate)", "number", emp ? (emp.rate_cents / 100) : "", true);
+          rateInput.step = "0.01";
+          rateInput.min = "0";
+          var schedSel = _select("pay_schedule", "Pay schedule", [["weekly", "Weekly"], ["biweekly", "Biweekly"], ["monthly", "Monthly"]], emp ? emp.pay_schedule : "biweekly");
+          var statusSel = _select("filing_status", "Filing status", [["single", "Single"], ["married_jointly", "Married filing jointly"], ["married_separately", "Married filing separately"], ["head_of_household", "Head of household"]], emp ? emp.filing_status : "single");
+          var step2 = _check("step2_checkbox", "Step 2 checkbox (two jobs / spouse works)", emp && emp.step2_checkbox);
+          var step3 = _input("step3_credit", "Step 3 credit $ / year", "number", emp && emp.step3_credit_cents ? (emp.step3_credit_cents / 100) : "");
+          step3.step = "0.01";
+          step3.min = "0";
+          var step4a = _input("step4a", "Step 4(a) other income $ / year", "number", emp && emp.step4a_cents ? (emp.step4a_cents / 100) : "");
+          step4a.step = "0.01";
+          step4a.min = "0";
+          var step4b = _input("step4b", "Step 4(b) deductions $ / year", "number", emp && emp.step4b_cents ? (emp.step4b_cents / 100) : "");
+          step4b.step = "0.01";
+          step4b.min = "0";
+          var step4c = _input("step4c", "Step 4(c) extra withholding $ / period", "number", emp && emp.step4c_cents ? (emp.step4c_cents / 100) : "");
+          step4c.step = "0.01";
+          step4c.min = "0";
+          var exempt = _check("exempt", "Exempt from federal withholding", emp && emp.exempt);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = emp ? "Save employee" : "Add employee";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (ev) {
+            ev.preventDefault();
+            var body = {
+              first_name: firstInput.value,
+              last_name: lastInput.value,
+              pay_type: typeSel.value,
+              rate_cents: erpDollarsToCents(rateInput.value),
+              pay_schedule: schedSel.value,
+              filing_status: statusSel.value,
+              step2_checkbox: step2.checked,
+              step3_credit_cents: erpDollarsToCents(step3.value) || 0,
+              step4a_cents: erpDollarsToCents(step4a.value) || 0,
+              step4b_cents: erpDollarsToCents(step4b.value) || 0,
+              step4c_cents: erpDollarsToCents(step4c.value) || 0,
+              exempt: exempt.checked
+            };
+            if (body.rate_cents === null) { status.textContent = "Enter a valid rate."; return; }
+            var path = emp ? "/api/erp/accounting/payroll/employees/" + encodeURIComponent(String(emp.id)) : "/api/erp/accounting/payroll/employees";
+            erpPost(path, body).then(function () {
+              erpState.showAddPayrollEmployee = false;
+              erpState.editPayrollEmployeeId = null;
+              erpState.acctPayrollError = "";
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctPayrollRunsTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Period", "Pay date", "Status", "Gross", "Federal", "SS", "Medicare", "Employer tax", "Net", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          var runs = erpState.acctPayrollRuns || [];
+          if (!runs.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 10;
+            td.textContent = "No pay runs yet.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          runs.forEach(function (run) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Period", run.period_start + " to " + run.period_end));
+            tr.appendChild(erpCell("Pay date", run.pay_date));
+            tr.appendChild(erpCell("Status", run.status));
+            tr.appendChild(erpCell("Gross", erpMoney(run.gross_cents)));
+            tr.appendChild(erpCell("Federal", erpMoney(run.federal_withheld_cents)));
+            tr.appendChild(erpCell("SS", erpMoney(run.ss_cents)));
+            tr.appendChild(erpCell("Medicare", erpMoney(run.medicare_cents)));
+            tr.appendChild(erpCell("Employer tax", erpMoney(run.employer_tax_cents)));
+            tr.appendChild(erpCell("Net", erpMoney(run.net_cents)));
+            var actionCell = document.createElement("td");
+            actionCell.setAttribute("data-label", "Action");
+            var viewBtn = document.createElement("button");
+            viewBtn.type = "button";
+            viewBtn.textContent = erpState.selectedPayrollRunId === run.id ? "Hide" : "View";
+            viewBtn.addEventListener("click", function () {
+              erpState.selectedPayrollRunId = erpState.selectedPayrollRunId === run.id ? null : run.id;
+              renderErpAccountingDetail();
+            });
+            actionCell.appendChild(viewBtn);
+            if (erpPayrollCanWrite() && run.status === "draft") {
+              var approveBtn = document.createElement("button");
+              approveBtn.type = "button";
+              approveBtn.textContent = "Approve";
+              approveBtn.addEventListener("click", function () {
+                if (approveBtn.textContent === "Approve") {
+                  approveBtn.textContent = "Confirm approve";
+                  return;
+                }
+                approveBtn.disabled = true;
+                erpPost("/api/erp/accounting/payroll/runs/" + encodeURIComponent(String(run.id)) + "/approve", {}).then(function () {
+                  erpState.acctPayrollError = "";
+                  return loadErpAccountingDetail();
+                }).catch(function (error) {
+                  approveBtn.disabled = false;
+                  approveBtn.textContent = "Approve";
+                  erpState.acctPayrollError = error.message;
+                  renderErpAccountingDetail();
+                });
+              });
+              actionCell.appendChild(approveBtn);
+            }
+            if (erpPayrollCanWrite() && run.status === "approved") {
+              var payBtn = document.createElement("button");
+              payBtn.type = "button";
+              payBtn.textContent = "Pay";
+              payBtn.addEventListener("click", function () {
+                if (payBtn.textContent === "Pay") {
+                  payBtn.textContent = "Confirm pay";
+                  return;
+                }
+                payBtn.disabled = true;
+                erpPost("/api/erp/accounting/payroll/runs/" + encodeURIComponent(String(run.id)) + "/pay", {}).then(function () {
+                  erpState.acctPayrollError = "";
+                  return loadErpAccountingDetail();
+                }).catch(function (error) {
+                  payBtn.disabled = false;
+                  payBtn.textContent = "Pay";
+                  erpState.acctPayrollError = error.message;
+                  renderErpAccountingDetail();
+                });
+              });
+              actionCell.appendChild(payBtn);
+            }
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+          });
+          return table;
+        }
+        function erpAcctPayrollRunForm() {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var hint = document.createElement("p");
+          hint.textContent = "Withholding is computed by the server from the seeded federal tables \\u2014 nothing to enter by hand except hours for hourly employees.";
+          form.appendChild(hint);
+          var sLabel = document.createElement("label");
+          sLabel.textContent = "Period start ";
+          var sInput = document.createElement("input");
+          sInput.type = "date";
+          sInput.name = "period_start";
+          sInput.required = true;
+          sLabel.appendChild(sInput);
+          form.appendChild(sLabel);
+          var eLabel = document.createElement("label");
+          eLabel.textContent = "Period end ";
+          var eInput = document.createElement("input");
+          eInput.type = "date";
+          eInput.name = "period_end";
+          eInput.required = true;
+          eLabel.appendChild(eInput);
+          form.appendChild(eLabel);
+          var pLabel = document.createElement("label");
+          pLabel.textContent = "Pay date ";
+          var pInput = document.createElement("input");
+          pInput.type = "date";
+          pInput.name = "pay_date";
+          pInput.required = true;
+          pLabel.appendChild(pInput);
+          form.appendChild(pLabel);
+          var emps = (erpState.acctPayrollEmployees || []).filter(function (e) { return e.active; });
+          var picks = [];
+          emps.forEach(function (e) {
+            var l = document.createElement("label");
+            var c = document.createElement("input");
+            c.type = "checkbox";
+            c.name = "emp_" + e.id;
+            l.appendChild(c);
+            l.appendChild(document.createTextNode(" " + e.first_name + " " + e.last_name + " (" + e.pay_type + ")"));
+            form.appendChild(l);
+            var hours = null;
+            if (e.pay_type === "hourly") {
+              var hLabel = document.createElement("label");
+              hLabel.textContent = "Hours ";
+              hours = document.createElement("input");
+              hours.type = "number";
+              hours.name = "hours_" + e.id;
+              hours.step = "0.25";
+              hours.min = "0";
+              hLabel.appendChild(hours);
+              form.appendChild(hLabel);
+            }
+            picks.push({ emp: e, check: c, hours: hours });
+          });
+          if (!emps.length) {
+            var none = document.createElement("p");
+            none.textContent = "Add an active employee first.";
+            form.appendChild(none);
+          }
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Create pay run";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (ev) {
+            ev.preventDefault();
+            var lines = [];
+            picks.forEach(function (p) {
+              if (!p.check.checked) return;
+              var line = { employee_id: p.emp.id };
+              if (p.hours && p.hours.value !== "") line.hours = Number(p.hours.value);
+              lines.push(line);
+            });
+            if (!lines.length) { status.textContent = "Pick at least one employee."; return; }
+            erpPost("/api/erp/accounting/payroll/runs", {
+              period_start: sInput.value,
+              period_end: eInput.value,
+              pay_date: pInput.value,
+              lines: lines
+            }).then(function () {
+              erpState.showNewPayrollRun = false;
+              erpState.acctPayrollError = "";
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctPayrollRunDetail(run) {
+          var wrap = document.createElement("div");
+          wrap.appendChild(erpSectionTitle("Pay run " + run.period_start + " to " + run.period_end));
+          var meta = document.createElement("p");
+          meta.textContent = "Pay date " + run.pay_date + " \\u2014 status " + run.status
+            + " \\u2014 gross " + erpMoney(run.gross_cents) + ", federal " + erpMoney(run.federal_withheld_cents)
+            + ", Social Security " + erpMoney(run.ss_cents) + ", Medicare " + erpMoney(run.medicare_cents)
+            + ", employer tax " + erpMoney(run.employer_tax_cents) + ", net " + erpMoney(run.net_cents) + ".";
+          wrap.appendChild(meta);
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Employee", "Hours", "Gross", "Federal", "SS", "Medicare", "Net"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          (run.lines || []).forEach(function (l) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Employee", l.employee_name));
+            tr.appendChild(erpCell("Hours", l.hours === null || l.hours === undefined ? "\\u2014" : String(l.hours)));
+            tr.appendChild(erpCell("Gross", erpMoney(l.gross_cents)));
+            tr.appendChild(erpCell("Federal", erpMoney(l.federal_cents)));
+            tr.appendChild(erpCell("SS", erpMoney(l.ss_cents)));
+            tr.appendChild(erpCell("Medicare", erpMoney(l.medicare_cents)));
+            tr.appendChild(erpCell("Net", erpMoney(l.net_cents)));
+            table.appendChild(tr);
+          });
+          wrap.appendChild(table);
+          wrap.appendChild(erpSectionTitle("Pay stubs"));
+          (run.lines || []).forEach(function (l) {
+            var stub = l.pay_stub;
+            if (!stub) return;
+            var p = document.createElement("p");
+            p.textContent = stub.employee_name + " \\u2014 " + stub.period_start + " to " + stub.period_end
+              + ", pay date " + stub.pay_date + ": gross " + erpMoney(stub.gross_cents)
+              + ", federal " + erpMoney(stub.federal_cents) + ", Social Security " + erpMoney(stub.ss_cents)
+              + ", Medicare " + erpMoney(stub.medicare_cents) + ", net " + erpMoney(stub.net_cents)
+              + ", year-to-date gross " + erpMoney(stub.ytd_gross_cents) + ".";
+            wrap.appendChild(p);
+          });
+          return wrap;
+        }
+        function erpAcctPayrollFilingsTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Quarter", "Gross", "Federal withheld", "Social Security", "Medicare", "Employer tax", "Net", "Runs", "Status", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          var quarters = erpState.acctPayrollFilings || [];
+          if (!quarters.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 10;
+            td.textContent = "No paid pay runs yet \\u2014 nothing withheld to file.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          quarters.forEach(function (q) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Quarter", q.quarter));
+            tr.appendChild(erpCell("Gross", erpMoney(q.gross_cents)));
+            tr.appendChild(erpCell("Federal withheld", erpMoney(q.federal_cents)));
+            tr.appendChild(erpCell("Social Security", erpMoney(q.ss_cents)));
+            tr.appendChild(erpCell("Medicare", erpMoney(q.medicare_cents)));
+            tr.appendChild(erpCell("Employer tax", erpMoney(q.employer_tax_cents)));
+            tr.appendChild(erpCell("Net", erpMoney(q.net_cents)));
+            tr.appendChild(erpCell("Runs", String(q.run_count)));
+            tr.appendChild(erpCell("Status", q.status));
+            var actionCell = document.createElement("td");
+            actionCell.setAttribute("data-label", "Action");
+            if (q.status === "owed" && erpPayrollCanWrite()) {
+              var fileBtn = document.createElement("button");
+              fileBtn.type = "button";
+              fileBtn.textContent = "Mark filed";
+              fileBtn.addEventListener("click", function () {
+                if (fileBtn.textContent === "Mark filed") {
+                  fileBtn.textContent = "Confirm mark filed";
+                  return;
+                }
+                fileBtn.disabled = true;
+                erpPost("/api/erp/accounting/payroll/tax-filings", { quarter: q.quarter }).then(function () {
+                  erpState.acctPayrollError = "";
+                  return loadErpAccountingDetail();
+                }).catch(function (error) {
+                  fileBtn.disabled = false;
+                  fileBtn.textContent = "Mark filed";
+                  erpState.acctPayrollError = error.message;
+                  renderErpAccountingDetail();
+                });
+              });
+              actionCell.appendChild(fileBtn);
+            }
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+          });
+          return table;
+        }
+        function erpAcctReportsSection() {
+          var wrap = document.createElement("div");
+          var picker = document.createElement("div");
+          picker.className = "erp-toolbar";
+          [["profit-loss", "Profit & loss"], ["balance-sheet", "Balance sheet"], ["cash-flow", "Cash flow"]].forEach(function (k) {
+            var b = document.createElement("button");
+            b.type = "button";
+            b.textContent = k[1];
+            if (erpState.acctReportKind === k[0]) b.disabled = true;
+            b.addEventListener("click", function () {
+              erpState.acctReportKind = k[0];
+              erpState.acctReport = null;
+              erpState.acctReportError = "";
+              renderErpAccountingDetail();
+            });
+            picker.appendChild(b);
+          });
+          wrap.appendChild(picker);
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var startInput = null, endInput = null, asOfInput = null, compareInput = null;
+          if (erpState.acctReportKind === "balance-sheet") {
+            var al = document.createElement("label");
+            al.textContent = "As of ";
+            asOfInput = document.createElement("input");
+            asOfInput.type = "date";
+            asOfInput.name = "as_of";
+            asOfInput.value = erpState.acctReportAsOf || "";
+            al.appendChild(asOfInput);
+            form.appendChild(al);
+          } else {
+            var sl = document.createElement("label");
+            sl.textContent = "Start ";
+            startInput = document.createElement("input");
+            startInput.type = "date";
+            startInput.name = "start";
+            startInput.value = erpState.acctReportStart || "";
+            sl.appendChild(startInput);
+            form.appendChild(sl);
+            var el = document.createElement("label");
+            el.textContent = "End ";
+            endInput = document.createElement("input");
+            endInput.type = "date";
+            endInput.name = "end";
+            endInput.value = erpState.acctReportEnd || "";
+            el.appendChild(endInput);
+            form.appendChild(el);
+            if (erpState.acctReportKind === "profit-loss") {
+              var cl = document.createElement("label");
+              cl.textContent = "Compare to prior period ";
+              compareInput = document.createElement("input");
+              compareInput.type = "checkbox";
+              compareInput.name = "compare";
+              compareInput.checked = !!erpState.acctReportCompare;
+              cl.appendChild(compareInput);
+              form.appendChild(cl);
+            }
+          }
+          var runBtn = document.createElement("button");
+          runBtn.type = "submit";
+          runBtn.textContent = "Run report";
+          form.appendChild(runBtn);
+          form.addEventListener("submit", function (ev) {
+            ev.preventDefault();
+            if (asOfInput) erpState.acctReportAsOf = asOfInput.value || "";
+            if (startInput) erpState.acctReportStart = startInput.value || "";
+            if (endInput) erpState.acctReportEnd = endInput.value || "";
+            if (compareInput) erpState.acctReportCompare = !!compareInput.checked;
+            erpAcctRunReport();
+          });
+          wrap.appendChild(form);
+          if (erpState.acctReportError) {
+            var err = document.createElement("p");
+            err.className = "erp-form-status";
+            err.textContent = erpState.acctReportError;
+            wrap.appendChild(err);
+          }
+          if (erpState.acctReport) {
+            wrap.appendChild(erpAcctReportTable());
+            var csvBtn = document.createElement("button");
+            csvBtn.type = "button";
+            csvBtn.textContent = "Export CSV";
+            csvBtn.addEventListener("click", function () {
+              window.open(erpAcctReportCsvUrl());
+            });
+            wrap.appendChild(csvBtn);
+          }
+          return wrap;
+        }
+        function erpAcctInvoiceById(id) {
+          for (var i = 0; i < erpState.acctInvoices.length; i++) {
+            if (String(erpState.acctInvoices[i].id) === String(id)) return erpState.acctInvoices[i];
+          }
+          return null;
+        }
+        function erpAcctBillById(id) {
+          for (var i = 0; i < erpState.acctBills.length; i++) {
+            if (String(erpState.acctBills[i].id) === String(id)) return erpState.acctBills[i];
+          }
+          return null;
+        }
+        function erpAcctInvoicesTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Customer", "Date", "Due", "Total", "Balance", "Status", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          if (!erpState.acctInvoices.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 7;
+            td.textContent = "No invoices yet.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          erpState.acctInvoices.forEach(function (inv) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Customer", inv.customer_name));
+            tr.appendChild(erpCell("Date", inv.date));
+            tr.appendChild(erpCell("Due", inv.due_date));
+            tr.appendChild(erpCell("Total", erpMoney(inv.total_cents)));
+            tr.appendChild(erpCell("Balance", erpMoney(inv.balance_cents)));
+            tr.appendChild(erpCell("Status", inv.status));
+            var actionCell = document.createElement("td");
+            actionCell.setAttribute("data-label", "Action");
+            if (inv.status === "open") {
+              var pay = document.createElement("button");
+              pay.type = "button";
+              pay.textContent = "Pay";
+              pay.addEventListener("click", function () {
+                erpState.payInvoiceId = inv.id;
+                renderErpAccountingDetail();
+              });
+              if (erpAcctCanWrite()) actionCell.appendChild(pay);
+              var voidBtn = document.createElement("button");
+              voidBtn.type = "button";
+              voidBtn.textContent = "Void";
+              voidBtn.addEventListener("click", function () {
+                if (voidBtn.textContent === "Void") {
+                  voidBtn.textContent = "Confirm void";
+                  return;
+                }
+                voidBtn.disabled = true;
+                erpPost("/api/erp/accounting/invoices/" + encodeURIComponent(String(inv.id)) + "/void", {}).then(function () {
+                  return loadErpAccountingDetail();
+                }).catch(function (error) {
+                  voidBtn.disabled = false;
+                  voidBtn.textContent = "Void";
+                  setAdminDetailStatus(error.message, true);
+                });
+              });
+              if (erpAcctCanWrite()) actionCell.appendChild(voidBtn);
+            }
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+          });
+          return table;
+        }
+        function erpAcctNewInvoiceForm() {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var custLabel = document.createElement("label");
+          custLabel.textContent = "Customer ";
+          var custSel = document.createElement("select");
+          custSel.name = "wholesale_account_id";
+          var otherOpt = document.createElement("option");
+          otherOpt.value = "";
+          otherOpt.textContent = "Other customer\u2026";
+          custSel.appendChild(otherOpt);
+          erpState.acctWholesale.forEach(function (a) {
+            var opt = document.createElement("option");
+            opt.value = String(a.id);
+            opt.textContent = a.name;
+            custSel.appendChild(opt);
+          });
+          custLabel.appendChild(custSel);
+          form.appendChild(custLabel);
+          var nameLabel = document.createElement("label");
+          nameLabel.textContent = "Customer name ";
+          var nameInput = document.createElement("input");
+          nameInput.name = "customer_name";
+          nameInput.placeholder = "Name for a customer without a wholesale account";
+          nameLabel.appendChild(nameInput);
+          form.appendChild(nameLabel);
+          var today = new Date().toISOString().slice(0, 10);
+          var dueDefault = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+          var dateLabel = document.createElement("label");
+          dateLabel.textContent = "Date ";
+          var dateInput = document.createElement("input");
+          dateInput.type = "date";
+          dateInput.name = "date";
+          dateInput.required = true;
+          dateInput.value = today;
+          dateLabel.appendChild(dateInput);
+          form.appendChild(dateLabel);
+          var dueLabel = document.createElement("label");
+          dueLabel.textContent = "Due ";
+          var dueInput = document.createElement("input");
+          dueInput.type = "date";
+          dueInput.name = "due_date";
+          dueInput.required = true;
+          dueInput.value = dueDefault;
+          dueLabel.appendChild(dueInput);
+          form.appendChild(dueLabel);
+          var taxLabel = document.createElement("label");
+          taxLabel.textContent = "Tax $ ";
+          var taxInput = document.createElement("input");
+          taxInput.type = "number";
+          taxInput.min = "0";
+          taxInput.step = "0.01";
+          taxInput.name = "tax";
+          taxInput.value = "0";
+          taxLabel.appendChild(taxInput);
+          form.appendChild(taxLabel);
+          var linesWrap = document.createElement("div");
+          form.appendChild(linesWrap);
+          var lineRows = [];
+          var addLineBtn = document.createElement("button");
+          addLineBtn.type = "button";
+          addLineBtn.textContent = "Add line";
+          addLineBtn.addEventListener("click", function () { addLineRow(); updateTotals(); });
+          form.appendChild(addLineBtn);
+          var totals = document.createElement("p");
+          totals.className = "erp-form-status";
+          form.appendChild(totals);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Save invoice";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          function updateTotals() {
+            var sub = 0, bad = false, effective = 0;
+            lineRows.forEach(function (lr) {
+              var hasDesc = lr.desc.value.trim() !== "";
+              var hasQty = lr.qty.value !== "";
+              var hasRate = lr.rate.value !== "";
+              if (!hasDesc && !hasQty && !hasRate) return;
+              var qty = Number(lr.qty.value);
+              var rate = erpDollarsToCents(lr.rate.value || "0");
+              if (!hasDesc || !isFinite(qty) || qty < 1 || Math.floor(qty) !== qty || rate === null) { bad = true; return; }
+              effective++;
+              sub += qty * rate;
+            });
+            var tax = erpDollarsToCents(taxInput.value || "0");
+            if (tax === null) bad = true;
+            var total = sub + (tax || 0);
+            totals.textContent = "Subtotal " + erpMoney(sub) + " \u00b7 Tax " + erpMoney(tax || 0) + " \u00b7 Total " + erpMoney(total);
+            var customerOk = custSel.value !== "" || nameInput.value.trim() !== "";
+            submit.disabled = bad || effective < 1 || total <= 0 || !customerOk;
+          }
+          function addLineRow() {
+            var row = document.createElement("div");
+            row.className = "erp-acct-line";
+            var desc = document.createElement("input");
+            desc.placeholder = "Description";
+            var qty = document.createElement("input");
+            qty.type = "number"; qty.min = "1"; qty.step = "1";
+            qty.placeholder = "Qty";
+            var rate = document.createElement("input");
+            rate.type = "number"; rate.min = "0"; rate.step = "0.01";
+            rate.placeholder = "Rate $";
+            var remove = document.createElement("button");
+            remove.type = "button";
+            remove.textContent = "Remove";
+            var lr = { desc: desc, qty: qty, rate: rate, row: row };
+            remove.addEventListener("click", function () {
+              var idx = lineRows.indexOf(lr);
+              if (idx >= 0) lineRows.splice(idx, 1);
+              if (row.parentNode) row.parentNode.removeChild(row);
+              updateTotals();
+            });
+            desc.addEventListener("input", updateTotals);
+            qty.addEventListener("input", updateTotals);
+            rate.addEventListener("input", updateTotals);
+            row.appendChild(desc); row.appendChild(qty); row.appendChild(rate);
+            row.appendChild(remove);
+            linesWrap.appendChild(row);
+            lineRows.push(lr);
+            return lr;
+          }
+          custSel.addEventListener("change", updateTotals);
+          nameInput.addEventListener("input", updateTotals);
+          taxInput.addEventListener("input", updateTotals);
+          addLineRow();
+          updateTotals();
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            var lines = [];
+            var bad = false;
+            lineRows.forEach(function (lr) {
+              var hasDesc = lr.desc.value.trim() !== "";
+              var hasQty = lr.qty.value !== "";
+              var hasRate = lr.rate.value !== "";
+              if (!hasDesc && !hasQty && !hasRate) return;
+              var qty = Number(lr.qty.value);
+              var rate = erpDollarsToCents(lr.rate.value || "0");
+              if (!hasDesc || !isFinite(qty) || qty < 1 || Math.floor(qty) !== qty || rate === null) { bad = true; return; }
+              lines.push({ description: lr.desc.value.trim(), qty: qty, rate_cents: rate });
+            });
+            var tax = erpDollarsToCents(taxInput.value || "0");
+            if (bad || lines.length < 1 || tax === null) { status.textContent = "Each line needs a description, a quantity of at least 1, and a rate."; return; }
+            var body = { date: dateInput.value, due_date: dueInput.value, lines: lines, tax_cents: tax };
+            if (custSel.value !== "") body.wholesale_account_id = Number(custSel.value);
+            else body.customer_name = nameInput.value.trim();
+            if (!body.customer_name && !body.wholesale_account_id) { status.textContent = "Choose a wholesale customer or enter a name."; return; }
+            submit.disabled = true;
+            status.textContent = "Saving\u2026";
+            erpPost("/api/erp/accounting/invoices", body).then(function () {
+              erpState.showNewInvoice = false;
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctPayInvoiceForm(inv) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var title = document.createElement("p");
+          title.textContent = "Record payment \u2014 " + inv.customer_name + " \u2014 balance " + erpMoney(inv.balance_cents);
+          form.appendChild(title);
+          var amtLabel = document.createElement("label");
+          amtLabel.textContent = "Amount $ ";
+          var amtInput = document.createElement("input");
+          amtInput.type = "number"; amtInput.min = "0"; amtInput.step = "0.01";
+          amtInput.name = "amount";
+          amtInput.value = (inv.balance_cents / 100).toFixed(2);
+          amtLabel.appendChild(amtInput);
+          form.appendChild(amtLabel);
+          var methodLabel = document.createElement("label");
+          methodLabel.textContent = "Method ";
+          var methodSel = document.createElement("select");
+          ["cash", "check", "card", "bank transfer", "other"].forEach(function (m) {
+            var opt = document.createElement("option");
+            opt.value = m;
+            opt.textContent = m.charAt(0).toUpperCase() + m.slice(1);
+            methodSel.appendChild(opt);
+          });
+          methodLabel.appendChild(methodSel);
+          form.appendChild(methodLabel);
+          var bankLabel = document.createElement("label");
+          bankLabel.textContent = "Bank account ";
+          var bankSel = document.createElement("select");
+          var defOpt = document.createElement("option");
+          defOpt.value = "";
+          defOpt.textContent = "Checking \u2014 Operating (1010)";
+          bankSel.appendChild(defOpt);
+          (erpState.acctBankAccounts || []).forEach(function (b) {
+            var opt = document.createElement("option");
+            opt.value = String(b.id);
+            opt.textContent = b.name;
+            bankSel.appendChild(opt);
+          });
+          bankLabel.appendChild(bankSel);
+          form.appendChild(bankLabel);
+          var dateLabel = document.createElement("label");
+          dateLabel.textContent = "Date ";
+          var dateInput = document.createElement("input");
+          dateInput.type = "date";
+          dateInput.name = "date";
+          dateInput.required = true;
+          dateInput.value = new Date().toISOString().slice(0, 10);
+          dateLabel.appendChild(dateInput);
+          form.appendChild(dateLabel);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Record payment";
+          form.appendChild(submit);
+          var cancel = document.createElement("button");
+          cancel.type = "button";
+          cancel.textContent = "Cancel";
+          cancel.addEventListener("click", function () {
+            erpState.payInvoiceId = null;
+            renderErpAccountingDetail();
+          });
+          form.appendChild(cancel);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            var cents = erpDollarsToCents(amtInput.value || "0");
+            if (cents === null || cents < 1 || cents > inv.balance_cents) {
+              status.textContent = "Amount must be between $0.01 and " + erpMoney(inv.balance_cents) + ".";
+              return;
+            }
+            submit.disabled = true;
+            status.textContent = "Saving\u2026";
+            erpPost("/api/erp/accounting/invoices/" + encodeURIComponent(String(inv.id)) + "/pay",
+              { amount_cents: cents, method: methodSel.value, date: dateInput.value,
+                bank_account_id: bankSel.value === "" ? null : Number(bankSel.value) }).then(function () {
+              erpState.payInvoiceId = null;
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctBillsTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Vendor", "Date", "Due", "Total", "Balance", "Status", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          if (!erpState.acctBills.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 7;
+            td.textContent = "No bills yet.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          erpState.acctBills.forEach(function (bill) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Vendor", bill.vendor_name));
+            tr.appendChild(erpCell("Date", bill.date));
+            tr.appendChild(erpCell("Due", bill.due_date));
+            tr.appendChild(erpCell("Total", erpMoney(bill.total_cents)));
+            tr.appendChild(erpCell("Balance", erpMoney(bill.balance_cents)));
+            tr.appendChild(erpCell("Status", bill.status));
+            var actionCell = document.createElement("td");
+            actionCell.setAttribute("data-label", "Action");
+            if (bill.status === "open") {
+              var pay = document.createElement("button");
+              pay.type = "button";
+              pay.textContent = "Pay";
+              pay.addEventListener("click", function () {
+                erpState.payBillId = bill.id;
+                renderErpAccountingDetail();
+              });
+              if (erpAcctCanWrite()) actionCell.appendChild(pay);
+              var voidBtn = document.createElement("button");
+              voidBtn.type = "button";
+              voidBtn.textContent = "Void";
+              voidBtn.addEventListener("click", function () {
+                if (voidBtn.textContent === "Void") {
+                  voidBtn.textContent = "Confirm void";
+                  return;
+                }
+                voidBtn.disabled = true;
+                erpPost("/api/erp/accounting/bills/" + encodeURIComponent(String(bill.id)) + "/void", {}).then(function () {
+                  return loadErpAccountingDetail();
+                }).catch(function (error) {
+                  voidBtn.disabled = false;
+                  voidBtn.textContent = "Void";
+                  setAdminDetailStatus(error.message, true);
+                });
+              });
+              if (erpAcctCanWrite()) actionCell.appendChild(voidBtn);
+            }
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+          });
+          return table;
+        }
+        function erpAcctNewBillForm() {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var vendorLabel = document.createElement("label");
+          vendorLabel.textContent = "Vendor ";
+          var vendorSel = document.createElement("select");
+          vendorSel.name = "vendor_id";
+          erpState.acctVendors.forEach(function (v) {
+            var opt = document.createElement("option");
+            opt.value = String(v.id);
+            opt.textContent = v.name;
+            vendorSel.appendChild(opt);
+          });
+          vendorLabel.appendChild(vendorSel);
+          form.appendChild(vendorLabel);
+          var today = new Date().toISOString().slice(0, 10);
+          var dueDefault = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+          var dateLabel = document.createElement("label");
+          dateLabel.textContent = "Date ";
+          var dateInput = document.createElement("input");
+          dateInput.type = "date";
+          dateInput.name = "date";
+          dateInput.required = true;
+          dateInput.value = today;
+          dateLabel.appendChild(dateInput);
+          form.appendChild(dateLabel);
+          var dueLabel = document.createElement("label");
+          dueLabel.textContent = "Due ";
+          var dueInput = document.createElement("input");
+          dueInput.type = "date";
+          dueInput.name = "due_date";
+          dueInput.required = true;
+          dueInput.value = dueDefault;
+          dueLabel.appendChild(dueInput);
+          form.appendChild(dueLabel);
+          var linesWrap = document.createElement("div");
+          form.appendChild(linesWrap);
+          var lineRows = [];
+          var addLineBtn = document.createElement("button");
+          addLineBtn.type = "button";
+          addLineBtn.textContent = "Add line";
+          addLineBtn.addEventListener("click", function () { addLineRow(); updateTotals(); });
+          form.appendChild(addLineBtn);
+          var totals = document.createElement("p");
+          totals.className = "erp-form-status";
+          form.appendChild(totals);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Save bill";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          function updateTotals() {
+            var total = 0, bad = false, effective = 0;
+            lineRows.forEach(function (lr) {
+              var hasDesc = lr.desc.value.trim() !== "";
+              var hasAmt = lr.amount.value !== "";
+              if (!hasDesc && !hasAmt) return;
+              var amt = erpDollarsToCents(lr.amount.value || "0");
+              if (!hasDesc || amt === null || amt < 1) { bad = true; return; }
+              effective++;
+              total += amt;
+            });
+            totals.textContent = "Total " + erpMoney(total);
+            submit.disabled = bad || effective < 1 || total <= 0 || vendorSel.value === "";
+          }
+          function addLineRow() {
+            var row = document.createElement("div");
+            row.className = "erp-acct-line";
+            var desc = document.createElement("input");
+            desc.placeholder = "Description";
+            var amount = document.createElement("input");
+            amount.type = "number"; amount.min = "0"; amount.step = "0.01";
+            amount.placeholder = "Amount $";
+            var sel = document.createElement("select");
+            var defaultId = null;
+            erpState.acctAccounts.forEach(function (a) {
+              if (!a.active) return;
+              if (a.type !== "expense" && a.type !== "asset") return;
+              var opt = document.createElement("option");
+              opt.value = String(a.id);
+              opt.textContent = a.code + " \u2014 " + a.name;
+              sel.appendChild(opt);
+              if (a.code === "6900") defaultId = String(a.id);
+            });
+            if (defaultId) sel.value = defaultId;
+            var remove = document.createElement("button");
+            remove.type = "button";
+            remove.textContent = "Remove";
+            var lr = { desc: desc, amount: amount, sel: sel, row: row };
+            remove.addEventListener("click", function () {
+              var idx = lineRows.indexOf(lr);
+              if (idx >= 0) lineRows.splice(idx, 1);
+              if (row.parentNode) row.parentNode.removeChild(row);
+              updateTotals();
+            });
+            desc.addEventListener("input", updateTotals);
+            amount.addEventListener("input", updateTotals);
+            row.appendChild(desc); row.appendChild(amount); row.appendChild(sel);
+            row.appendChild(remove);
+            linesWrap.appendChild(row);
+            lineRows.push(lr);
+            return lr;
+          }
+          addLineRow();
+          updateTotals();
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            var lines = [];
+            var bad = false;
+            lineRows.forEach(function (lr) {
+              var hasDesc = lr.desc.value.trim() !== "";
+              var hasAmt = lr.amount.value !== "";
+              if (!hasDesc && !hasAmt) return;
+              var amt = erpDollarsToCents(lr.amount.value || "0");
+              if (!hasDesc || amt === null || amt < 1) { bad = true; return; }
+              lines.push({ description: lr.desc.value.trim(), amount_cents: amt, account_id: Number(lr.sel.value) });
+            });
+            if (bad || lines.length < 1 || vendorSel.value === "") { status.textContent = "Each line needs a description and an amount, and a vendor must be chosen."; return; }
+            submit.disabled = true;
+            status.textContent = "Saving\u2026";
+            erpPost("/api/erp/accounting/bills", { vendor_id: Number(vendorSel.value), date: dateInput.value, due_date: dueInput.value, lines: lines }).then(function () {
+              erpState.showNewBill = false;
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctPayBillForm(bill) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var title = document.createElement("p");
+          title.textContent = "Record payment \u2014 " + bill.vendor_name + " \u2014 balance " + erpMoney(bill.balance_cents);
+          form.appendChild(title);
+          var note = document.createElement("p");
+          note.textContent = "Bill payments are recorded with your approval as the signed-in admin.";
+          form.appendChild(note);
+          var amtLabel = document.createElement("label");
+          amtLabel.textContent = "Amount $ ";
+          var amtInput = document.createElement("input");
+          amtInput.type = "number"; amtInput.min = "0"; amtInput.step = "0.01";
+          amtInput.name = "amount";
+          amtInput.value = (bill.balance_cents / 100).toFixed(2);
+          amtLabel.appendChild(amtInput);
+          form.appendChild(amtLabel);
+          var methodLabel = document.createElement("label");
+          methodLabel.textContent = "Method ";
+          var methodSel = document.createElement("select");
+          ["cash", "check", "card", "bank transfer", "other"].forEach(function (m) {
+            var opt = document.createElement("option");
+            opt.value = m;
+            opt.textContent = m.charAt(0).toUpperCase() + m.slice(1);
+            methodSel.appendChild(opt);
+          });
+          methodLabel.appendChild(methodSel);
+          form.appendChild(methodLabel);
+          var bankLabel = document.createElement("label");
+          bankLabel.textContent = "Bank account ";
+          var bankSel = document.createElement("select");
+          var defOpt = document.createElement("option");
+          defOpt.value = "";
+          defOpt.textContent = "Checking \u2014 Operating (1010)";
+          bankSel.appendChild(defOpt);
+          (erpState.acctBankAccounts || []).forEach(function (b) {
+            var opt = document.createElement("option");
+            opt.value = String(b.id);
+            opt.textContent = b.name;
+            bankSel.appendChild(opt);
+          });
+          bankLabel.appendChild(bankSel);
+          form.appendChild(bankLabel);
+          var dateLabel = document.createElement("label");
+          dateLabel.textContent = "Date ";
+          var dateInput = document.createElement("input");
+          dateInput.type = "date";
+          dateInput.name = "date";
+          dateInput.required = true;
+          dateInput.value = new Date().toISOString().slice(0, 10);
+          dateLabel.appendChild(dateInput);
+          form.appendChild(dateLabel);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Record payment";
+          form.appendChild(submit);
+          var cancel = document.createElement("button");
+          cancel.type = "button";
+          cancel.textContent = "Cancel";
+          cancel.addEventListener("click", function () {
+            erpState.payBillId = null;
+            renderErpAccountingDetail();
+          });
+          form.appendChild(cancel);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            var cents = erpDollarsToCents(amtInput.value || "0");
+            if (cents === null || cents < 1 || cents > bill.balance_cents) {
+              status.textContent = "Amount must be between $0.01 and " + erpMoney(bill.balance_cents) + ".";
+              return;
+            }
+            submit.disabled = true;
+            status.textContent = "Saving\u2026";
+            erpPost("/api/erp/accounting/bills/" + encodeURIComponent(String(bill.id)) + "/pay",
+              { amount_cents: cents, method: methodSel.value, date: dateInput.value,
+                bank_account_id: bankSel.value === "" ? null : Number(bankSel.value) }).then(function () {
+              erpState.payBillId = null;
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctAgingSection(firstLabel, data) {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          [firstLabel, "Current", "1\u201330 days", "31\u201360 days", "61\u201390 days", "91+ days", "Total"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          if (!data.rows.length) {
+            var empty = document.createElement("tr");
+            var td = document.createElement("td");
+            td.colSpan = 7;
+            td.textContent = "No open balances.";
+            empty.appendChild(td);
+            table.appendChild(empty);
+            return table;
+          }
+          data.rows.forEach(function (r) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell(firstLabel, r.name));
+            tr.appendChild(erpCell("Current", erpMoney(r.current)));
+            tr.appendChild(erpCell("1\u201330 days", erpMoney(r.d1_30)));
+            tr.appendChild(erpCell("31\u201360 days", erpMoney(r.d31_60)));
+            tr.appendChild(erpCell("61\u201390 days", erpMoney(r.d61_90)));
+            tr.appendChild(erpCell("91+ days", erpMoney(r.d91_plus)));
+            tr.appendChild(erpCell("Total", erpMoney(r.total_cents)));
+            table.appendChild(tr);
+          });
+          var foot = document.createElement("tr");
+          foot.appendChild(erpCell(firstLabel, "Totals"));
+          foot.appendChild(erpCell("Current", erpMoney(data.totals.current)));
+          foot.appendChild(erpCell("1\u201330 days", erpMoney(data.totals.d1_30)));
+          foot.appendChild(erpCell("31\u201360 days", erpMoney(data.totals.d31_60)));
+          foot.appendChild(erpCell("61\u201390 days", erpMoney(data.totals.d61_90)));
+          foot.appendChild(erpCell("91+ days", erpMoney(data.totals.d91_plus)));
+          foot.appendChild(erpCell("Total", erpMoney(data.totals.total_cents)));
+          table.appendChild(foot);
+          return table;
+        }
+        function erpAcctAgingTable() {
+          var wrap = document.createElement("div");
+          var ag = erpState.acctAging;
+          if (!ag) {
+            var p = document.createElement("p");
+            p.textContent = "Aging unavailable.";
+            wrap.appendChild(p);
+            return wrap;
+          }
+          var asOf = document.createElement("p");
+          asOf.textContent = "As of " + ag.as_of;
+          wrap.appendChild(asOf);
+          wrap.appendChild(erpSectionTitle("Accounts receivable"));
+          wrap.appendChild(erpAcctAgingSection("Customer", ag.ar));
+          wrap.appendChild(erpSectionTitle("Accounts payable"));
+          wrap.appendChild(erpAcctAgingSection("Vendor", ag.ap));
+          return wrap;
+        }
+
+        function erpAcctBankAccountById(id) {
+          for (var i = 0; i < erpState.acctBankAccounts.length; i++) {
+            if (String(erpState.acctBankAccounts[i].id) === String(id)) return erpState.acctBankAccounts[i];
+          }
+          return null;
+        }
+        async function loadErpAcctBankDetail() {
+          var id = erpState.selectedBankAccountId;
+          if (!id) return;
+          setAdminDetailStatus("Loading banking\u2026");
+          try {
+            var results = await Promise.all([
+              erpGet("/api/erp/accounting/bank-accounts/" + encodeURIComponent(String(id)) + "/transactions"),
+              erpGet("/api/erp/accounting/reconciliation/" + encodeURIComponent(String(id)))
+            ]);
+            erpState.acctBankTxns = results[0].transactions || [];
+            erpState.acctRecon = results[1] || null;
+            renderErpAccountingDetail();
+            setAdminDetailStatus(erpState.acctBankTxns.length + (erpState.acctBankTxns.length === 1 ? " transaction." : " transactions."));
+          } catch (error) {
+            setAdminDetailStatus(error instanceof TypeError ? "We couldn't connect to load banking." : error.message, true);
+          }
+        }
+        function erpAcctBankAccountsTable() {
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Bank account", "Type", "Linked GL account", "Book balance", "Bank balance", "Last reconciled", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          erpState.acctBankAccounts.forEach(function (b) {
+            var tr = document.createElement("tr");
+            [b.name, b.type, b.gl_account ? (b.gl_account.code + " \u2014 " + b.gl_account.name) : "\u2014",
+             erpMoney(b.book_balance_cents), erpMoney(b.bank_balance_cents),
+             b.last_reconciled_at ? b.last_reconciled_at.slice(0, 10) : "Never"].forEach(function (v) {
+              var td = document.createElement("td");
+              td.textContent = v;
+              tr.appendChild(td);
+            });
+            var actionCell = document.createElement("td");
+            var view = document.createElement("button");
+            view.type = "button";
+            view.textContent = erpState.selectedBankAccountId === b.id ? "Selected" : "View";
+            if (erpState.selectedBankAccountId === b.id) view.disabled = true;
+            view.addEventListener("click", function () {
+              erpState.selectedBankAccountId = b.id;
+              erpState.acctBankTxns = null;
+              erpState.acctRecon = null;
+              erpState.matchTxnId = null;
+              renderErpAccountingDetail();
+              loadErpAcctBankDetail();
+            });
+            actionCell.appendChild(view);
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+          });
+          return table;
+        }
+        function erpAcctAddBankAccountForm() {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var inputs = {};
+          var nameLabel = document.createElement("label");
+          nameLabel.textContent = "Bank account name ";
+          var nameInput = document.createElement("input");
+          nameInput.name = "name";
+          nameInput.required = true;
+          nameLabel.appendChild(nameInput);
+          form.appendChild(nameLabel);
+          inputs.name = nameInput;
+          var typeLabel = document.createElement("label");
+          typeLabel.textContent = "Type ";
+          var typeSel = document.createElement("select");
+          ["checking", "savings", "credit_card", "loan", "other"].forEach(function (t) {
+            var opt = document.createElement("option");
+            opt.value = t;
+            opt.textContent = t;
+            typeSel.appendChild(opt);
+          });
+          typeLabel.appendChild(typeSel);
+          form.appendChild(typeLabel);
+          var glLabel = document.createElement("label");
+          glLabel.textContent = "Linked GL account ";
+          var glSel = document.createElement("select");
+          erpState.acctAccounts.forEach(function (a) {
+            if (!a.active) return;
+            if (a.type !== "asset" && a.type !== "liability") return;
+            var opt = document.createElement("option");
+            opt.value = String(a.id);
+            opt.textContent = a.code + " \u2014 " + a.name;
+            glSel.appendChild(opt);
+          });
+          glLabel.appendChild(glSel);
+          form.appendChild(glLabel);
+          var openLabel = document.createElement("label");
+          openLabel.textContent = "Opening balance $ ";
+          var openInput = document.createElement("input");
+          openInput.type = "number"; openInput.step = "0.01";
+          openInput.name = "opening_balance";
+          openInput.value = "0";
+          openLabel.appendChild(openInput);
+          form.appendChild(openLabel);
+          inputs.opening_balance = openInput;
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Save bank account";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            var opening = erpDollarsToCents(openInput.value || "0");
+            if (opening === null) {
+              status.textContent = "Opening balance must be a dollar amount.";
+              return;
+            }
+            submit.disabled = true;
+            status.textContent = "Saving\u2026";
+            erpPost("/api/erp/accounting/bank-accounts", {
+              name: nameInput.value.trim(), type: typeSel.value,
+              gl_account_id: Number(glSel.value), opening_balance_cents: opening
+            }).then(function () {
+              erpState.showAddBankAcct = false;
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctBankTxnsTable() {
+          var wrap = document.createElement("div");
+          var bank = erpAcctBankAccountById(erpState.selectedBankAccountId);
+          wrap.appendChild(erpSectionTitle("Transactions \u2014 " + (bank ? bank.name : "")));
+          if (!erpState.acctBankTxns) {
+            var loading = document.createElement("p");
+            loading.textContent = "Loading transactions\u2026";
+            wrap.appendChild(loading);
+            return wrap;
+          }
+          if (!erpState.acctBankTxns.length) {
+            var empty = document.createElement("p");
+            empty.textContent = "No feed transactions yet. Sync the bank feed to pull them in.";
+            wrap.appendChild(empty);
+            return wrap;
+          }
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Date", "Description", "Amount", "Status", "Matched entry", "Action"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          erpState.acctBankTxns.forEach(function (t) {
+            var tr = document.createElement("tr");
+            [t.date, t.description, erpMoney(-t.amount_cents), t.status,
+             t.matched_entry_id ? ("Entry #" + t.matched_entry_id) : "\u2014"].forEach(function (v) {
+              var td = document.createElement("td");
+              td.textContent = v;
+              tr.appendChild(td);
+            });
+            var actionCell = document.createElement("td");
+            if (t.status === "unmatched" && erpAcctCanWrite()) {
+              var match = document.createElement("button");
+              match.type = "button";
+              match.textContent = "Match";
+              match.addEventListener("click", function () {
+                erpState.matchTxnId = t.id;
+                renderErpAccountingDetail();
+              });
+              actionCell.appendChild(match);
+            } else if (t.status === "matched" && erpAcctCanWrite()) {
+              var unmatch = document.createElement("button");
+              unmatch.type = "button";
+              unmatch.textContent = "Unmatch";
+              unmatch.addEventListener("click", function () {
+                erpPost("/api/erp/accounting/bank-accounts/" + encodeURIComponent(String(erpState.selectedBankAccountId)) + "/unmatch",
+                  { txn_id: t.id }).then(function () {
+                  return loadErpAcctBankDetail();
+                }).catch(function (error) {
+                  setAdminDetailStatus(error.message, true);
+                });
+              });
+              actionCell.appendChild(unmatch);
+            }
+            tr.appendChild(actionCell);
+            table.appendChild(tr);
+          });
+          wrap.appendChild(table);
+          return wrap;
+        }
+        function erpAcctMatchTxnForm(txn) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var title = document.createElement("p");
+          title.textContent = "Match \u2014 " + txn.description + " (" + erpMoney(-txn.amount_cents) + ", " + txn.date + ")";
+          form.appendChild(title);
+          var entryLabel = document.createElement("label");
+          entryLabel.textContent = "Journal entry ";
+          var entrySel = document.createElement("select");
+          erpState.acctJournal.forEach(function (e) {
+            var opt = document.createElement("option");
+            opt.value = String(e.id);
+            opt.textContent = "#" + e.id + " \u2014 " + e.date + " \u2014 " + (e.memo || "");
+            entrySel.appendChild(opt);
+          });
+          entryLabel.appendChild(entrySel);
+          form.appendChild(entryLabel);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Match transaction";
+          form.appendChild(submit);
+          var cancel = document.createElement("button");
+          cancel.type = "button";
+          cancel.textContent = "Cancel";
+          cancel.addEventListener("click", function () {
+            erpState.matchTxnId = null;
+            renderErpAccountingDetail();
+          });
+          form.appendChild(cancel);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            if (!entrySel.value) {
+              status.textContent = "Pick a journal entry to match.";
+              return;
+            }
+            submit.disabled = true;
+            status.textContent = "Saving\u2026";
+            erpPost("/api/erp/accounting/bank-accounts/" + encodeURIComponent(String(erpState.selectedBankAccountId)) + "/match",
+              { txn_id: txn.id, entry_id: Number(entrySel.value) }).then(function () {
+              erpState.matchTxnId = null;
+              return loadErpAcctBankDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctReconSection() {
+          var wrap = document.createElement("div");
+          wrap.appendChild(erpSectionTitle("Reconciliation"));
+          var rec = erpState.acctRecon;
+          if (!rec) {
+            var loading = document.createElement("p");
+            loading.textContent = "Loading reconciliation\u2026";
+            wrap.appendChild(loading);
+            return wrap;
+          }
+          var lines = [
+            ["Book balance", erpMoney(rec.book_balance_cents)],
+            ["Bank balance", erpMoney(rec.bank_balance_cents)],
+            ["Difference", erpMoney(rec.difference_cents)],
+            ["Matched", String(rec.counts.matched.count) + " (" + erpMoney(-rec.counts.matched.total_cents) + ")"],
+            ["Unmatched", String(rec.counts.unmatched.count) + " (" + erpMoney(-rec.counts.unmatched.total_cents) + ")"],
+            ["Needs review", String(rec.counts.review.count)]
+          ];
+          lines.forEach(function (l) {
+            var p = document.createElement("p");
+            p.textContent = l[0] + ": " + l[1];
+            wrap.appendChild(p);
+          });
+          if (rec.last_snapshot) {
+            var snap = document.createElement("p");
+            snap.textContent = "Last closed " + rec.last_snapshot.closed_at.slice(0, 10)
+              + " \u2014 book " + erpMoney(rec.last_snapshot.book_balance_cents)
+              + ", bank " + erpMoney(rec.last_snapshot.bank_balance_cents)
+              + (rec.last_snapshot.forced ? " (forced: " + rec.last_snapshot.reason + ")" : "");
+            wrap.appendChild(snap);
+          }
+          if (erpAcctCanWrite()) {
+            var form = document.createElement("form");
+            form.className = "erp-form";
+            var status = document.createElement("p");
+            status.className = "erp-form-status";
+            if (rec.counts.unmatched.count > 0) {
+              var guard = document.createElement("p");
+              guard.textContent = rec.counts.unmatched.count + " unmatched transaction(s) remain. Match or review them before closing, or force-close with a reason.";
+              form.appendChild(guard);
+              var reasonLabel = document.createElement("label");
+              reasonLabel.textContent = "Reason for force-close ";
+              var reasonInput = document.createElement("input");
+              reasonInput.name = "reason";
+              reasonLabel.appendChild(reasonInput);
+              form.appendChild(reasonLabel);
+              var force = document.createElement("button");
+              force.type = "submit";
+              force.textContent = "Force close period";
+              form.appendChild(force);
+              form.addEventListener("submit", function (event) {
+                event.preventDefault();
+                if (!reasonInput.value.trim()) {
+                  status.textContent = "A reason is required to force-close with unmatched items.";
+                  return;
+                }
+                force.disabled = true;
+                status.textContent = "Closing\u2026";
+                erpPost("/api/erp/accounting/bank-accounts/" + encodeURIComponent(String(erpState.selectedBankAccountId)) + "/close-period",
+                  { force: true, reason: reasonInput.value.trim() }).then(function () {
+                  return loadErpAccountingDetail();
+                }).then(function () {
+                  return loadErpAcctBankDetail();
+                }).catch(function (error) {
+                  force.disabled = false;
+                  status.textContent = error.message;
+                });
+              });
+            } else {
+              var close = document.createElement("button");
+              close.type = "submit";
+              close.textContent = "Close period";
+              form.appendChild(close);
+              form.addEventListener("submit", function (event) {
+                event.preventDefault();
+                close.disabled = true;
+                status.textContent = "Closing\u2026";
+                erpPost("/api/erp/accounting/bank-accounts/" + encodeURIComponent(String(erpState.selectedBankAccountId)) + "/close-period",
+                  {}).then(function () {
+                  return loadErpAccountingDetail();
+                }).then(function () {
+                  return loadErpAcctBankDetail();
+                }).catch(function (error) {
+                  close.disabled = false;
+                  status.textContent = error.message;
+                });
+              });
+            }
+            form.appendChild(status);
+            wrap.appendChild(form);
+          }
+          return wrap;
         }
         function erpAddVendorForm() {
           var form = document.createElement("form");
@@ -8711,6 +11398,129 @@ function renderErpOrderQbSection(body, o, orderId, refresh) {
 }
 
 /* ---------------- Settings (QuickBooks) ---------------- */
+/* ---------- Staff & permissions (admin only) ---------- */
+var ERP_PERM_GROUPS = [
+  ["Inventory", [["inventory.read", "View inventory"], ["inventory.adjust", "Adjust stock + counts"], ["inventory.transfer", "Transfer stock"], ["inventory.receive", "Receive goods"]]],
+  ["Purchasing", [["purchasing.read", "View vendors + purchase orders"], ["purchasing.write", "Manage vendors + purchase orders"]]],
+  ["Production", [["recipes.read", "View recipes"], ["recipes.write", "Create + edit recipes"], ["batches.read", "View batches"], ["batches.write", "Run batches"]]],
+  ["Order hub", [["orders.read", "View orders"], ["orders.write", "Update + manage orders"]]],
+  ["Wholesale accounts", [["accounts.read", "View wholesale accounts"], ["accounts.write", "Manage wholesale accounts"]]],
+  ["EDI", [["edi.read", "View EDI documents"], ["edi.write", "Manage EDI"]]],
+  ["Reports", [["reports.read", "View reports"]]],
+  ["Accounting", [["accounting.read", "View accounting"], ["accounting.write", "Manage accounting"], ["tax.read", "View sales tax"], ["tax.write", "Manage sales tax"], ["payroll.read", "View payroll"], ["payroll.write", "Manage payroll"]]]
+];
+async function loadErpStaffPermsDetail() {
+  setAdminDetailStatus("Loading staff permissions…");
+  try {
+    var data = await erpGet("/api/erp/admin/staff-permissions");
+    renderErpStaffPermsDetail(data);
+    setAdminDetailStatus(data.staff.length + " staff member" + (data.staff.length === 1 ? "." : "s."));
+  } catch (error) {
+    setAdminDetailStatus(error instanceof TypeError ?
+      "We couldn't connect to load staff permissions." : error.message, true);
+  }
+}
+function renderErpStaffPermsDetail(data) {
+  var els = adminDetailEls();
+  els.body.replaceChildren();
+  var h2 = document.createElement("h2");
+  h2.textContent = "Staff & permissions";
+  els.body.appendChild(h2);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Only Matt and DJ can change these. Changes apply immediately; staff see new menus next time they sign in. Staff management, QuickBooks, Settings, and all deletions stay admin-only and are never listed here.";
+  els.body.appendChild(note);
+  // Add a staff member (starts with no permissions — tick their boxes below).
+  var addCard = document.createElement("div");
+  addCard.className = "erp-form";
+  var addTitle = document.createElement("h3");
+  addTitle.textContent = "Add staff member";
+  addCard.appendChild(addTitle);
+  var addNote = document.createElement("p");
+  addNote.className = "admin-orders-empty";
+  addNote.textContent = "They get a setup email to verify their account. New staff start with no permissions.";
+  addCard.appendChild(addNote);
+  var nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.placeholder = "Name";
+  addCard.appendChild(erpField("Name", nameInput));
+  var emailInput = document.createElement("input");
+  emailInput.type = "email";
+  emailInput.placeholder = "Email";
+  addCard.appendChild(erpField("Email", emailInput));
+  var passInput = document.createElement("input");
+  passInput.type = "password";
+  passInput.placeholder = "Temporary password (8+ characters)";
+  addCard.appendChild(erpField("Password", passInput));
+  var addStatus = document.createElement("p");
+  addStatus.style.color = "var(--muted)";
+  addStatus.style.flex = "1 1 100%";
+  addCard.appendChild(addStatus);
+  var addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.textContent = "Add staff member";
+  addBtn.addEventListener("click", function () {
+    addBtn.disabled = true;
+    addStatus.textContent = "Adding…";
+    erpPost("/api/admin/staff", { name: nameInput.value, email: emailInput.value, password: passInput.value }).then(function () {
+      loadErpStaffPermsDetail();
+    }).catch(function (error) {
+      addStatus.textContent = error.message;
+      addBtn.disabled = false;
+    });
+  });
+  addCard.appendChild(addBtn);
+  els.body.appendChild(addCard);
+  (data.staff || []).forEach(function (s) {
+    var card = document.createElement("div");
+    card.className = "erp-form";
+    var h3 = document.createElement("h3");
+    h3.textContent = s.name + " (" + s.email + ")" + (s.active ? "" : " — inactive");
+    h3.style.flex = "1 1 100%";
+    card.appendChild(h3);
+    var boxes = {};
+    ERP_PERM_GROUPS.forEach(function (g) {
+      var gdiv = document.createElement("div");
+      gdiv.style.flex = "1 1 100%";
+      var gh = document.createElement("h4");
+      gh.textContent = g[0];
+      gdiv.appendChild(gh);
+      g[1].forEach(function (p) {
+        var lab = document.createElement("label");
+        var cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.checked = (s.perms || []).indexOf(p[0]) !== -1;
+        boxes[p[0]] = cb;
+        lab.appendChild(cb);
+        lab.appendChild(document.createTextNode(" " + p[1]));
+        gdiv.appendChild(lab);
+      });
+      card.appendChild(gdiv);
+    });
+    var status = document.createElement("p");
+    status.style.color = "var(--muted)";
+    status.style.flex = "1 1 100%";
+    card.appendChild(status);
+    var saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.textContent = "Save permissions";
+    saveBtn.addEventListener("click", function () {
+      var perms = Object.keys(boxes).filter(function (k) { return boxes[k].checked; });
+      saveBtn.disabled = true;
+      status.textContent = "Saving…";
+      erpPut("/api/erp/admin/staff-permissions/" + encodeURIComponent(String(s.id)), { perms: perms }).then(function () {
+        status.textContent = "Saved.";
+        saveBtn.disabled = false;
+      }).catch(function (error) {
+        status.textContent = error.message;
+        saveBtn.disabled = false;
+      });
+    });
+    card.appendChild(saveBtn);
+    els.body.appendChild(card);
+  });
+}
+
 async function loadErpSettingsDetail() {
   setAdminDetailStatus("Loading…");
   try {
@@ -8730,6 +11540,12 @@ function renderErpSettingsDetail() {
   var h2 = document.createElement("h2");
   h2.textContent = "Settings";
   els.body.appendChild(h2);
+  var staffLink = document.createElement("p");
+  var staffA = document.createElement("a");
+  staffA.href = "#/staff-perms";
+  staffA.textContent = "Staff & permissions \u2014 choose what each staff member can use";
+  staffLink.appendChild(staffA);
+  els.body.appendChild(staffLink);
   var st = erpState.qbStatus;
   var card = document.createElement("div");
   card.className = "admin-orders-wrap";
@@ -8886,7 +11702,26 @@ function renderErpSettingsDetail() {
 // tabs, with only Dashboard (which never touches erpState) still working.
 // Running it here, after every section has initialized, makes a refresh
 // behave exactly like a fresh sign-in, where the whole script already ran.
-if (wholesaleSetupToken()) { showWholesaleSetup(); } else if (isLoggedIn()) { enterApp(); } else { showLogin(); }
+async function erpRestoreSession() {
+  // Phase 2 single sign-in: no token in storage -> the shared pal_session
+  // cookie may already carry this admin's login from the storefront.
+  try {
+    var resp = await fetch(API_BASE + "/api/erp/session", { credentials: "include" });
+    if (!resp.ok) return false;
+    var data = await resp.json().catch(function () { return {}; });
+    if (!data || data.role !== "admin") return false;
+    var me = await fetch(API_BASE + "/api/auth/me", { credentials: "include" });
+    if (!me.ok) return false;
+    var meData = await me.json().catch(function () { return {}; });
+    if (!meData.is_admin) return false;
+    saveSession("", meData.name || meData.email || "", meData.email || "", "admin");
+    enterApp();
+    return true;
+  } catch (e) { return false; }
+}
+if (wholesaleSetupToken()) { showWholesaleSetup(); }
+else if (isLoggedIn()) { enterApp(); }
+else { erpRestoreSession().then(function (restored) { if (!restored) showLogin(); }); }
 </script>
 </body>
 </html>
