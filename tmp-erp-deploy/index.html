@@ -7011,16 +7011,8 @@ function renderErpAccountDetail(body) {
       body.appendChild(notes);
     }
     if (erpIsAdmin()) {
-      var editBtn = document.createElement("button");
-      editBtn.type = "button";
-      editBtn.textContent = erpState.showEditAccount ? "Cancel edit" : "Edit account";
-      editBtn.addEventListener("click", function () {
-        erpState.showEditAccount = !erpState.showEditAccount;
-        renderErpAccountDetail(body);
-      });
       var etool = document.createElement("div");
       etool.className = "erp-toolbar";
-      etool.appendChild(editBtn);
       // Phase 5: invite the customer to the ordering portal.
       var inviteBtn = document.createElement("button");
       inviteBtn.type = "button";
@@ -7038,6 +7030,15 @@ function renderErpAccountDetail(body) {
         }).finally(function () { inviteBtn.disabled = false; });
       });
       etool.appendChild(inviteBtn);
+      // Edit sits next to Deactivate so the two account actions are together.
+      var editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.textContent = erpState.showEditAccount ? "Cancel edit" : "Edit account";
+      editBtn.addEventListener("click", function () {
+        erpState.showEditAccount = !erpState.showEditAccount;
+        renderErpAccountDetail(body);
+      });
+      etool.appendChild(editBtn);
       // Deactivate / reactivate the customer. Deactivating blocks their
       // portal login immediately; the button flips to Reactivate as the undo.
       var deactBtn = document.createElement("button");
