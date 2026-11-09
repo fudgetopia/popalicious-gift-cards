@@ -1447,7 +1447,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
         var ERP_RECIPE_UNITS = ["cup", "tablespoon", "teaspoon", "oz", "lb", "g", "each", "bag"];
         function erpMoney(cents) { return money((Number(cents) || 0) / 100); }
         function erpTypeLabel(t) {
-          var labels = {ingredient: "Ingredient", bag: "Bag", front_label: "Front label", back_label: "Back label"};
+          var labels = {ingredient: "Ingredient", bag: "Bag", front_label: "Front label", back_label: "Back label", popcorn: "Popcorn"};
           return labels[t] || t;
         }
         function erpCell(label, text) {
@@ -1932,7 +1932,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           typeLabel.textContent = "Type ";
           var typeSel = document.createElement("select");
           typeSel.name = "type";
-          ["ingredient", "bag", "front_label", "back_label"].forEach(function (t) {
+          ["ingredient", "bag", "front_label", "back_label", "popcorn"].forEach(function (t) {
             var o = document.createElement("option");
             o.value = t;
             o.textContent = erpTypeLabel(t);
@@ -2809,7 +2809,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             var eTypeL = document.createElement("label");
             eTypeL.textContent = "Type ";
             var eType = document.createElement("select");
-            ["ingredient", "bag", "front_label", "back_label"].forEach(function (t) {
+            ["ingredient", "bag", "front_label", "back_label", "popcorn"].forEach(function (t) {
               var o = document.createElement("option");
               o.value = t;
               o.textContent = erpTypeLabel(t);
@@ -3495,7 +3495,14 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             var row = document.createElement("div");
             row.className = "erp-po-line";
             var itemSel = document.createElement("select");
-            erpState.items.forEach(function (it) {
+            var popcornItems = erpState.items.filter(function (it) { return it.type === "popcorn"; });
+            if (!popcornItems.length) {
+              var noneOpt = document.createElement("option");
+              noneOpt.value = "";
+              noneOpt.textContent = "No popcorn flavors yet — add a popcorn item first.";
+              itemSel.appendChild(noneOpt);
+            }
+            popcornItems.forEach(function (it) {
               var o = document.createElement("option");
               o.value = it.id;
               o.textContent = it.sku + " — " + it.name;
