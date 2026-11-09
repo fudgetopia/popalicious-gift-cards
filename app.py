@@ -184,6 +184,9 @@ _ERP_GRANTABLE_PERMS = (
     "accounts.read", "accounts.write",
     "edi.read", "edi.write",
     "reports.read",
+    "instagram.read", "instagram.write",
+    "newsletter.read", "newsletter.write",
+    "support.read", "support.write",
 )
 # What staff could do before per-staff grants existed. Existing staff rows
 # are seeded with exactly this set once; new staff start with no grants.
@@ -697,8 +700,131 @@ def init_db():
             recipient_count INTEGER NOT NULL DEFAULT 0,
             sent_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS erp_mkt_ig_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            caption TEXT NOT NULL DEFAULT '',
+            media_json TEXT NOT NULL DEFAULT '{"files": [], "covers": []}',
+            promo_date TEXT,
+            status TEXT NOT NULL DEFAULT 'draft',
+            publish_at TEXT,
+            container_expires_at TEXT,
+            ig_media_id TEXT,
+            ig_url TEXT,
+            failure_note TEXT,
+            publish_path TEXT,
+            check_requested_at TEXT,
+            last_checked_at TEXT,
+            check_live INTEGER,
+            check_caption_intact INTEGER,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            approved_by TEXT,
+            approved_at TEXT,
+            published_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_ig_insights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL,
+            ig_media_id TEXT,
+            window TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            captured_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_ig_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending',
+            result_note TEXT,
+            created_at TEXT NOT NULL,
+            done_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_newsletters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_month TEXT NOT NULL,
+            theme TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL DEFAULT '',
+            body_html TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'draft',
+            campaign_key TEXT NOT NULL,
+            approved_by TEXT,
+            approved_at TEXT,
+            sent_at TEXT,
+            recipient_count INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_mkt_newsletters_month
+            ON erp_mkt_newsletters (issue_month);
+        CREATE TABLE IF NOT EXISTS erp_mkt_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL DEFAULT 'manual',
+            message_id TEXT,
+            customer_email TEXT NOT NULL,
+            customer_name TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            order_source TEXT,
+            order_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resolved_by TEXT,
+            resolved_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_mkt_tickets_message
+            ON erp_mkt_tickets (message_id) WHERE message_id IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS erp_mkt_ticket_replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL,
+            author TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            is_internal_note INTEGER NOT NULL DEFAULT 0,
+            sent_via TEXT,
+            sent_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id INTEGER,
+            detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
         """
     )
+    # Seed the first Instagram schedule records from the approved promo
+    # schedule draft (one-stop Phase 3, spec section 6 step 2): the next 4
+    # upcoming entries. Drafts only — approval happens in the ERP.
+    if conn.execute("SELECT COUNT(*) AS c FROM erp_mkt_ig_posts").fetchone()["c"] == 0:
+        _mkt_now = datetime.now(timezone.utc).isoformat()
+        for _kind, _cap, _files, _promo, _pub in (
+                ("post",
+                 "Pickle people are loyal \u2014 give them their day. Dill Pickle, 15% off today.",
+                 ["ad20d5dd03e863b0b25cfd118f2b33cb8b1c1db5d782ad1a069dd012422158af.jpg"],
+                 "2026-11-14", "2026-11-15T02:00:00+00:00"),
+                ("post",
+                 "Every day is someone's birthday. Birthday Cake, 15% off today.",
+                 ["a34ae8828587d87669b243542fcad4798ce37eba183e85a708e7fcd01d697daf.jpg"],
+                 "2026-11-26", "2026-11-27T00:00:00+00:00"),
+                ("carousel",
+                 "Holiday gifting: cookie trio, 15% off today \u2014 or any 3 cookie flavors for $20.",
+                 ["0568b3a85283b0bf4acf851eb4bb391b03546af5e5a8ce6dd3e538e8d3adfcfd.jpg",
+                  "4054cff2ed9c1e496789a8e2bfab12cebb316273f71430d9868bc3f2ca106b21.jpg",
+                  "50914e76e8b578fac0ca29a5bf1be9d304677733dbd48ce819beaad150452aef.jpg"],
+                 "2026-12-04", "2026-12-05T02:00:00+00:00"),
+                ("post",
+                 "Year-end savory closer. Bacon, 15% off today.",
+                 ["7b3dd89a572074294c4bca4681205e96931050584da6696201ccae523d762ddf.jpg"],
+                 "2026-12-30", "2026-12-31T00:00:00+00:00")):
+            conn.execute(
+                "INSERT INTO erp_mkt_ig_posts (kind, caption, media_json, promo_date,"
+                " status, publish_at, created_by, created_at)"
+                " VALUES (?, ?, ?, ?, 'draft', ?, 'seed', ?)",
+                (_kind, _cap, json.dumps({"files": _files, "covers": []}),
+                 _promo, _pub, _mkt_now))
     # Migration: Stripe customer id on users for subscription billing.
     if "stripe_customer_id" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT NOT NULL DEFAULT ''")
@@ -6199,7 +6325,1021 @@ def cron_marketing_send():
     conn.close()
     return jsonify(ok=True, sent=sent, campaign=campaign["name"])
 
+
+# ---- Marketing & service (one-stop Phase 3) ----
+# Instagram schedule + insights, newsletter issues, support inbox.
+# Instagram account is pinned to popaliciouslv — no account parameter is
+# ever accepted from a caller. The Railway backend cannot run the
+# instagram-cli (it lives on the VM); VM-side jobs drive the CLI and talk
+# to the ERP through the X-Cron-Secret endpoints below. No DMs anywhere:
+# no endpoint, table, or job touches Instagram messages.
+_MKT_IG_ACCOUNT = "popaliciouslv"
+_MKT_IG_KINDS = ("post", "reel", "carousel", "story")
+_MKT_IG_WINDOWS = ("last-7d", "last-14d", "last-28d", "last-90d", "lifetime")
+_MKT_TICKET_STATUSES = ("open", "in-progress", "waiting", "resolved", "closed")
+_MKT_REFUND_POLICY = (
+    "Orders are guaranteed to arrive in perfect condition. A dissatisfied"
+    " customer must contact Customer Service within 30 days of receipt with"
+    " a detailed description and photo(s). The remedy is reshipment or"
+    " replacement/exchange with an equal-or-greater-value item within 5 days."
+    " Refunds are not offered \u2014 replacement or exchange only."
+)
+
+
+def _mkt_audit(conn, actor, action, target_type, target_id, detail=""):
+    """Audit line for a Phase 3 write, mirroring erp_acct_audit."""
+    conn.execute(
+        "INSERT INTO erp_mkt_audit (actor, action, target_type, target_id,"
+        " detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (actor or "", action, target_type, target_id, detail or "",
+         datetime.now(timezone.utc).isoformat()))
+
+
+def _mkt_cron_auth():
+    """X-Cron-Secret check, same pattern as the marketing send cron.
+    Returns an error response tuple or None."""
+    if not CRON_SECRET:
+        return jsonify(error="cron is not configured"), 503
+    if request.headers.get("X-Cron-Secret", "") != CRON_SECRET:
+        return jsonify(error="forbidden"), 403
+    return None
+
+
+def _mkt_parse_dt(value):
+    """Parse an ISO 8601 datetime; returns an aware UTC datetime or None.
+    A naive value is read as Pacific time: the ERP's datetime-local inputs
+    send naive values and every human-entered publish time is PT."""
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_LA_TZ)
+    return dt.astimezone(timezone.utc)
+
+
+def _mkt_media_error(media):
+    """Validate the media block {"files": [...], "covers": [...]}.
+    Files must live under ~/workspace/; returns an error string or None."""
+    if not isinstance(media, dict):
+        return "media must be an object with files + covers"
+    files = media.get("files", [])
+    covers = media.get("covers", [])
+    if not isinstance(files, list) or not isinstance(covers, list):
+        return "media files/covers must be lists"
+    for f in files + covers:
+        if not isinstance(f, str) or not f.strip():
+            return "media entries must be non-empty strings"
+        if ".." in f:
+            return "media paths must stay under ~/workspace/"
+        if f.startswith("/") and not f.startswith(os.path.expanduser("~/workspace/")):
+            return "media paths must stay under ~/workspace/"
+    return None
+
+
+def _mkt_media_ready_error(kind, caption, media):
+    """Approve-time media rules: a post needs real media before it can be
+    approved. Muddy Buddy has no real bag photo, so a Muddy Buddy post with
+    no media stays blocked here with that reason."""
+    files = media.get("files", [])
+    covers = media.get("covers", [])
+    if not files:
+        if "muddy buddy" in (caption or "").lower():
+            return "Muddy Buddy has no real bag photo \u2014 this post stays blocked until one exists"
+        return "a post needs at least one real bag photo before it can be approved"
+    if kind == "story" and len(files) != 1:
+        return "a story takes exactly one file"
+    if kind == "carousel" and len(files) < 2:
+        return "a carousel takes two or more files"
+    if kind in ("post", "reel") and len(files) != 1:
+        return "a post or reel takes exactly one file"
+    videos = [f for f in files if f.lower().endswith((".mp4", ".mov"))]
+    if len(covers) < len(videos):
+        return "each video needs a cover image"
+    return None
+
+
+def _mkt_ig_post_dict(row):
+    d = dict(row)
+    try:
+        d["media"] = json.loads(row["media_json"] or '{"files": [], "covers": []}')
+    except (ValueError, TypeError):
+        d["media"] = {"files": [], "covers": []}
+    d.pop("media_json", None)
+    return d
+
+
+def _mkt_orders_by_email(conn, email):
+    """Order briefs across stripe / paypal / wholesale for one email."""
+    out = []
+    if not email:
+        return out
+    for r in conn.execute(
+            "SELECT id FROM orders WHERE lower(email) = lower(?)", (email,)).fetchall():
+        o = _erp_order_brief(conn, "stripe", r["id"])
+        if o:
+            out.append(o)
+    for r in conn.execute(
+            "SELECT id FROM paypal_orders WHERE lower(email) = lower(?)", (email,)).fetchall():
+        o = _erp_order_brief(conn, "paypal", r["id"])
+        if o:
+            out.append(o)
+    for r in conn.execute(
+            "SELECT o.id FROM erp_wholesale_orders o"
+            " JOIN erp_wholesale_accounts a ON a.id = o.account_id"
+            " WHERE lower(a.email) = lower(?)", (email,)).fetchall():
+        o = _erp_order_brief(conn, "wholesale", r["id"])
+        if o:
+            out.append(o)
+    return out
+
+
+def _mkt_order_detail(conn, source, order_id):
+    """Full order detail for a ticket, same shape as the order hub detail."""
+    if source == "wholesale":
+        w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                         (order_id,)).fetchone()
+        if not w:
+            return None
+        order = _erp_wholesale_order_brief(conn, w)
+        order["lines"] = [dict(l) for l in conn.execute(
+            "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
+            (order_id,)).fetchall()]
+        acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                            (w["account_id"],)).fetchone()
+        order["account"] = dict(acct) if acct else None
+        order["notes"] = w["notes"]
+        order["order_date"] = w["order_date"]
+        order["tracking_number"] = ""
+        order["shipping_address"] = acct["address"] if acct else ""
+        qb_link = _qb_pushed(conn, "wholesale_order", order_id, "invoice")
+        order["qb_invoice_id"] = qb_link["qb_id"] if qb_link else None
+    else:
+        order = _erp_online_order(conn, source, order_id)
+        if not order:
+            return None
+        order["due_date"] = ""
+        order["via_edi"] = False
+        order["account_name"] = ""
+        order["account"] = None
+        order["lines"] = None
+        order["notes"] = ""
+        order["order_date"] = ""
+    fulf = _erp_fulfillment_dict(conn, source, order_id)
+    order["status"] = fulf["status"]
+    order["fulfillment"] = fulf
+    order["linked_batches"] = _erp_order_links(conn, source, order_id)
+    return order
+
+
+# ---------- Instagram: dashboard ----------
+@app.get("/api/erp/marketing/instagram/dashboard")
+def mkt_ig_dashboard():
+    actor, err = _erp_check_perm("instagram.read")
+    if err:
+        return err
+    conn = db()
+    now = datetime.now(timezone.utc)
+    posts = [_mkt_ig_post_dict(r) for r in conn.execute(
+        "SELECT * FROM erp_mkt_ig_posts ORDER BY publish_at ASC, id ASC").fetchall()]
+    upcoming = [p for p in posts if p["status"] in ("approved", "scheduled")]
+    drafts = [p for p in posts if p["status"] == "draft"]
+    published = [p for p in posts if p["status"] == "published"]
+    # Latest lifetime insight snapshot per published post (verbatim).
+    latest = {}
+    for r in conn.execute(
+            "SELECT * FROM erp_mkt_ig_insights WHERE scope = 'post'"
+            " AND window = 'lifetime' ORDER BY captured_at DESC").fetchall():
+        if r["ig_media_id"] not in latest:
+            latest[r["ig_media_id"]] = r
+    for p in published:
+        snap = latest.get(p["ig_media_id"]) if p["ig_media_id"] else None
+        p["insights"] = json.loads(snap["metrics_json"]) if snap else None
+        p["insights_captured_at"] = snap["captured_at"] if snap else None
+    snapshot = None
+    snap7 = None
+    for r in conn.execute(
+            "SELECT * FROM erp_mkt_ig_insights WHERE scope = 'account'"
+            " ORDER BY captured_at DESC").fetchall():
+        d = {"window": r["window"],
+             "metrics": json.loads(r["metrics_json"]),
+             "captured_at": r["captured_at"]}
+        if r["window"] == "last-28d" and snapshot is None:
+            snapshot = d
+        if r["window"] == "last-7d" and snap7 is None:
+            snap7 = d
+    attention = []
+    for p in posts:
+        files = (p["media"] or {}).get("files", [])
+        if p["status"] == "failed":
+            attention.append({"kind": "failed", "post_id": p["id"],
+                              "note": p["failure_note"] or "publish failed"})
+        elif p["status"] == "scheduled" and p["container_expires_at"]:
+            exp = _mkt_parse_dt(p["container_expires_at"])
+            if exp and (exp - now) <= timedelta(hours=24):
+                attention.append({"kind": "expiring", "post_id": p["id"],
+                                  "note": "scheduled container expires within 24 hours"})
+        if p["status"] in ("approved", "scheduled") and (
+                not (p["caption"] or "").strip() or not files):
+            attention.append({"kind": "no-caption-or-media", "post_id": p["id"],
+                              "note": "scheduled item has no approved caption or media"})
+        if p["status"] == "published" and not (p["caption"] or "").strip():
+            attention.append({"kind": "captionless", "post_id": p["id"],
+                              "note": "published post has an empty caption"})
+        if p["status"] == "published" and p["check_caption_intact"] == 0:
+            attention.append({"kind": "caption-mismatch", "post_id": p["id"],
+                              "note": "live caption does not match the approved caption"})
+    conn.close()
+    return jsonify(upcoming=upcoming, drafts=drafts, published=published,
+                   snapshot=snapshot, snapshot_7d=snap7,
+                   needs_attention=attention)
+
+
+@app.get("/api/erp/marketing/instagram/posts/<int:post_id>")
+def mkt_ig_post_detail(post_id):
+    actor, err = _erp_check_perm("instagram.read")
+    if err:
+        return err
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (post_id,)).fetchone()
+    conn.close()
+    if not r:
+        return jsonify(error="post not found"), 404
+    return jsonify(post=_mkt_ig_post_dict(r))
+
+
+# ---------- Instagram: schedule CRUD ----------
+@app.post("/api/erp/marketing/instagram/posts")
+def mkt_ig_post_create():
+    actor, err = _erp_check_perm("instagram.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    kind = (data.get("kind") or "").strip()
+    if kind not in _MKT_IG_KINDS:
+        return jsonify(error="kind must be post, reel, carousel, or story"), 400
+    caption = data.get("caption") or ""
+    if not isinstance(caption, str) or len(caption) > 2200:
+        return jsonify(error="caption must be at most 2200 characters"), 400
+    media = data.get("media") or {"files": [], "covers": []}
+    if isinstance(media, list):
+        media = {"files": media, "covers": []}
+    merr = _mkt_media_error(media)
+    if merr:
+        return jsonify(error=merr), 400
+    publish_at = None
+    if data.get("publish_at"):
+        dt = _mkt_parse_dt(data.get("publish_at"))
+        if not dt:
+            return jsonify(error="publish_at must be an ISO 8601 datetime"), 400
+        publish_at = dt.isoformat()
+    promo_date = (data.get("promo_date") or "").strip() or None
+    if promo_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", promo_date):
+        return jsonify(error="promo_date must be YYYY-MM-DD"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_mkt_ig_posts (kind, caption, media_json, promo_date,"
+        " status, publish_at, created_by, created_at)"
+        " VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)",
+        (kind, caption, json.dumps(media), promo_date, publish_at, actor, now))
+    pid = cur.lastrowid
+    _mkt_audit(conn, actor, "ig_post_create", "ig_post", pid, kind)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, post_id=pid), 201
+
+
+@app.post("/api/erp/marketing/instagram/posts/<int:post_id>/approve")
+def mkt_ig_post_approve(post_id):
+    actor, err = _erp_check_perm("instagram.write")
+    if err:
+        return err
+    if _erp_role() != "admin":
+        return jsonify(error="admin required"), 403
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (post_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="post not found"), 404
+    if r["status"] != "draft":
+        conn.close()
+        return jsonify(error="only a draft can be approved"), 400
+    media = json.loads(r["media_json"] or '{"files": [], "covers": []}')
+    merr = _mkt_media_ready_error(r["kind"], r["caption"], media)
+    if merr:
+        conn.close()
+        return jsonify(error=merr), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_mkt_ig_posts SET status = 'approved',"
+                 " approved_by = ?, approved_at = ? WHERE id = ?",
+                 (actor, now, post_id))
+    _mkt_audit(conn, actor, "ig_post_approve", "ig_post", post_id, r["kind"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, status="approved")
+
+
+@app.post("/api/erp/marketing/instagram/posts/<int:post_id>/schedule")
+def mkt_ig_post_schedule(post_id):
+    actor, err = _erp_check_perm("instagram.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (post_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="post not found"), 404
+    if r["status"] != "approved":
+        conn.close()
+        return jsonify(error="only an approved post can be scheduled"), 400
+    dt = _mkt_parse_dt(data.get("publish_at") or r["publish_at"])
+    if not dt:
+        conn.close()
+        return jsonify(error="publish_at is required to schedule"), 400
+    conn.execute("UPDATE erp_mkt_ig_posts SET status = 'scheduled',"
+                 " publish_at = ?, container_expires_at = ? WHERE id = ?",
+                 (dt.isoformat(), (dt + timedelta(hours=24)).isoformat(), post_id))
+    _mkt_audit(conn, actor, "ig_post_schedule", "ig_post", post_id,
+               dt.isoformat())
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, status="scheduled", publish_at=dt.isoformat())
+
+
+@app.post("/api/erp/marketing/instagram/posts/<int:post_id>/publish-now")
+def mkt_ig_post_publish_now(post_id):
+    actor, err = _erp_check_perm("instagram.write")
+    if err:
+        return err
+    if _erp_role() != "admin":
+        return jsonify(error="admin required"), 403
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (post_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="post not found"), 404
+    if r["status"] != "approved":
+        conn.close()
+        return jsonify(error="only an approved post can be published now"), 400
+    now = datetime.now(timezone.utc)
+    conn.execute("UPDATE erp_mkt_ig_posts SET status = 'scheduled',"
+                 " publish_at = ?, container_expires_at = ? WHERE id = ?",
+                 (now.isoformat(), (now + timedelta(hours=24)).isoformat(), post_id))
+    _mkt_audit(conn, actor, "ig_post_publish_now", "ig_post", post_id,
+               "queued for the publish job")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, status="scheduled",
+                   note="queued for the VM publish job (next run, within 15 minutes)")
+
+
+@app.post("/api/erp/marketing/instagram/posts/<int:post_id>/check")
+def mkt_ig_post_check(post_id):
+    actor, err = _erp_check_perm("instagram.write")
+    if err:
+        return err
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (post_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="post not found"), 404
+    if r["status"] != "published" or not r["ig_media_id"]:
+        conn.close()
+        return jsonify(error="only a published post with an Instagram id can be checked"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_mkt_ig_posts SET check_requested_at = ? WHERE id = ?",
+                 (now, post_id))
+    _mkt_audit(conn, actor, "ig_post_check_request", "ig_post", post_id, "")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, note="re-check queued for the VM sync job")
+
+
+# ---------- Instagram: comment / hide / archive (queued for the VM job) ----------
+def _mkt_ig_queue_action(conn, actor, post_id, action, payload):
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_mkt_ig_actions (post_id, action, payload_json,"
+        " status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+        (post_id, action, json.dumps(payload), now))
+    _mkt_audit(conn, actor, "ig_action_" + action, "ig_post", post_id,
+               json.dumps(payload))
+    return cur.lastrowid
+
+
+@app.post("/api/erp/marketing/instagram/posts/<int:post_id>/comment-reply")
+def mkt_ig_comment_reply(post_id):
+    actor, err = _erp_check_perm("instagram.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    text = (data.get("text") or "").strip()
+    comment_id = (data.get("comment_id") or "").strip()
+    if not text or not comment_id or data.get("approved") is not True:
+        return jsonify(error="comment_id, text, and approved=true are required"), 400
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (post_id,)).fetchone()
+    if not r or r["status"] != "published" or not r["ig_media_id"]:
+        conn.close()
+        return jsonify(error="post not found or not published"), 404
+    aid = _mkt_ig_queue_action(conn, actor, post_id, "comment-reply",
+                               {"comment_id": comment_id, "text": text,
+                                "ig_media_id": r["ig_media_id"]})
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, action_id=aid, queued=True), 201
+
+
+@app.post("/api/erp/marketing/instagram/posts/<int:post_id>/hide-comment")
+def mkt_ig_hide_comment(post_id):
+    actor, err = _erp_check_perm("instagram.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    comment_id = (data.get("comment_id") or "").strip()
+    hidden = data.get("hidden")
+    if not comment_id or not isinstance(hidden, bool) or data.get("approved") is not True:
+        return jsonify(error="comment_id, hidden (true/false), and approved=true are required"), 400
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (post_id,)).fetchone()
+    if not r or r["status"] != "published" or not r["ig_media_id"]:
+        conn.close()
+        return jsonify(error="post not found or not published"), 404
+    aid = _mkt_ig_queue_action(conn, actor, post_id, "hide-comment",
+                               {"comment_id": comment_id, "hidden": hidden,
+                                "ig_media_id": r["ig_media_id"]})
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, action_id=aid, queued=True), 201
+
+
+@app.post("/api/erp/marketing/instagram/posts/<int:post_id>/archive")
+def mkt_ig_archive(post_id):
+    actor, err = _erp_check_perm("instagram.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    if data.get("approved") is not True:
+        return jsonify(error="approved=true is required to archive a post"), 400
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (post_id,)).fetchone()
+    if not r or r["status"] != "published" or not r["ig_media_id"]:
+        conn.close()
+        return jsonify(error="post not found or not published"), 404
+    aid = _mkt_ig_queue_action(conn, actor, post_id, "archive",
+                               {"ig_media_id": r["ig_media_id"]})
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, action_id=aid, queued=True), 201
+
+
+# ---------- Instagram: VM job endpoints (X-Cron-Secret) ----------
+@app.get("/api/erp/marketing/instagram/due")
+def mkt_ig_due():
+    auth_err = _mkt_cron_auth()
+    if auth_err:
+        return auth_err
+    conn = db()
+    now = datetime.now(timezone.utc)
+    due = [_mkt_ig_post_dict(r) for r in conn.execute(
+        "SELECT * FROM erp_mkt_ig_posts WHERE status = 'scheduled'"
+        " AND publish_at IS NOT NULL AND publish_at <= ?"
+        " ORDER BY publish_at ASC", (now.isoformat(),)).fetchall()]
+    actions = [dict(r) for r in conn.execute(
+        "SELECT a.*, p.ig_media_id FROM erp_mkt_ig_actions a"
+        " JOIN erp_mkt_ig_posts p ON p.id = a.post_id"
+        " WHERE a.status = 'pending' ORDER BY a.id ASC").fetchall()]
+    check_posts = [_mkt_ig_post_dict(r) for r in conn.execute(
+        "SELECT * FROM erp_mkt_ig_posts WHERE status = 'published'"
+        " AND check_requested_at IS NOT NULL").fetchall()]
+    cutoff = (now - timedelta(days=90)).isoformat()
+    published_recent = [_mkt_ig_post_dict(r) for r in conn.execute(
+        "SELECT * FROM erp_mkt_ig_posts WHERE status = 'published'"
+        " AND ig_media_id IS NOT NULL AND published_at IS NOT NULL"
+        " AND published_at >= ? ORDER BY published_at DESC",
+        (cutoff,)).fetchall()]
+    conn.close()
+    return jsonify(due=due, actions=actions, check_posts=check_posts,
+                   published_recent=published_recent)
+
+
+@app.post("/api/erp/marketing/instagram/publish-result")
+def mkt_ig_publish_result():
+    auth_err = _mkt_cron_auth()
+    if auth_err:
+        return auth_err
+    data = request.get_json(force=True) or {}
+    post_id = data.get("post_id")
+    outcome = (data.get("outcome") or "").strip()
+    if outcome not in ("published", "failed", "expired"):
+        return jsonify(error="outcome must be published, failed, or expired"), 400
+    publish_path = (data.get("publish_path") or "scheduled").strip()
+    if publish_path not in ("scheduled", "immediate-fallback"):
+        return jsonify(error="publish_path must be scheduled or immediate-fallback"), 400
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (post_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="post not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    if outcome == "published":
+        conn.execute("UPDATE erp_mkt_ig_posts SET status = 'published',"
+                     " ig_media_id = ?, ig_url = ?, published_at = ?,"
+                     " publish_path = ?, failure_note = NULL WHERE id = ?",
+                     (data.get("ig_media_id"), data.get("ig_url"), now,
+                      publish_path, post_id))
+    else:
+        conn.execute("UPDATE erp_mkt_ig_posts SET status = ?,"
+                     " failure_note = ?, publish_path = ? WHERE id = ?",
+                     (outcome, (data.get("failure_note") or ""),
+                      publish_path, post_id))
+    _mkt_audit(conn, "cron", "ig_publish_" + outcome, "ig_post", post_id,
+               publish_path)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, status=outcome)
+
+
+@app.post("/api/erp/marketing/instagram/check-result")
+def mkt_ig_check_result():
+    auth_err = _mkt_cron_auth()
+    if auth_err:
+        return auth_err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_posts WHERE id = ?",
+                     (data.get("post_id"),)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="post not found"), 404
+    live = 1 if data.get("live") is True else 0
+    intact = 1 if data.get("caption_intact") is True else 0
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_mkt_ig_posts SET check_requested_at = NULL,"
+                 " last_checked_at = ?, check_live = ?,"
+                 " check_caption_intact = ? WHERE id = ?",
+                 (now, live, intact, r["id"]))
+    _mkt_audit(conn, "cron", "ig_check_result", "ig_post", r["id"],
+               "live=%s caption_intact=%s" % (live, intact))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/marketing/instagram/action-result")
+def mkt_ig_action_result():
+    auth_err = _mkt_cron_auth()
+    if auth_err:
+        return auth_err
+    data = request.get_json(force=True) or {}
+    outcome = (data.get("outcome") or "").strip()
+    if outcome not in ("done", "failed"):
+        return jsonify(error="outcome must be done or failed"), 400
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_ig_actions WHERE id = ?",
+                     (data.get("action_id"),)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="action not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_mkt_ig_actions SET status = ?, result_note = ?,"
+                 " done_at = ? WHERE id = ?",
+                 (outcome, (data.get("result_note") or ""), now, r["id"]))
+    _mkt_audit(conn, "cron", "ig_action_" + outcome, "ig_action", r["id"],
+               r["action"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/marketing/instagram/sync")
+def mkt_ig_sync():
+    auth_err = _mkt_cron_auth()
+    if auth_err:
+        return auth_err
+    data = request.get_json(force=True) or {}
+    # Account pinning: the sync job may only ever store popaliciouslv data.
+    # Anything else fails loudly and stores nothing.
+    if (data.get("account") or "").strip() != _MKT_IG_ACCOUNT:
+        return jsonify(error="account mismatch: expected popaliciouslv"), 400
+    window = (data.get("window") or "").strip()
+    if window not in _MKT_IG_WINDOWS:
+        return jsonify(error="window must be last-7d, last-14d, last-28d, last-90d, or lifetime"), 400
+    metrics = data.get("metrics")
+    if not isinstance(metrics, dict):
+        return jsonify(error="metrics must be an object"), 400
+    posts = data.get("posts") or []
+    if not isinstance(posts, list):
+        return jsonify(error="posts must be a list"), 400
+    conn = db()
+    for p in posts:
+        if not isinstance(p, dict) or not p.get("ig_media_id") or not isinstance(p.get("metrics"), dict):
+            conn.close()
+            return jsonify(error="each post needs ig_media_id + metrics"), 400
+        known = conn.execute(
+            "SELECT id FROM erp_mkt_ig_posts WHERE ig_media_id = ? AND status = 'published'",
+            (p["ig_media_id"],)).fetchone()
+        if not known:
+            conn.close()
+            return jsonify(error="unknown published post: %s" % p["ig_media_id"]), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("INSERT INTO erp_mkt_ig_insights (scope, ig_media_id, window,"
+                 " metrics_json, captured_at) VALUES ('account', NULL, ?, ?, ?)",
+                 (window, json.dumps(metrics), now))
+    stored_posts = 0
+    for p in posts:
+        conn.execute("INSERT INTO erp_mkt_ig_insights (scope, ig_media_id, window,"
+                     " metrics_json, captured_at) VALUES ('post', ?, 'lifetime', ?, ?)",
+                     (p["ig_media_id"], json.dumps(p["metrics"]), now))
+        stored_posts += 1
+    _mkt_audit(conn, "cron", "ig_sync", "ig_insights", None,
+               "%s account + %d posts" % (window, stored_posts))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, stored_account=1, stored_posts=stored_posts)
+
+
+# ---------- Newsletter: issues ----------
+@app.get("/api/erp/marketing/newsletters")
+def mkt_newsletters_list():
+    actor, err = _erp_check_perm("newsletter.read")
+    if err:
+        return err
+    conn = db()
+    issues = [dict(r) for r in conn.execute(
+        "SELECT * FROM erp_mkt_newsletters ORDER BY issue_month DESC").fetchall()]
+    sub_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM newsletter_subscribers WHERE active = 1").fetchone()["c"]
+    campaigns = [dict(r) for r in conn.execute(
+        "SELECT name, subject, recipient_count, sent_at FROM marketing_campaigns"
+        " ORDER BY sent_at DESC LIMIT 50").fetchall()]
+    conn.close()
+    return jsonify(issues=issues, subscriber_count=sub_count, campaigns=campaigns)
+
+
+@app.post("/api/erp/marketing/newsletters")
+def mkt_newsletter_create():
+    actor, err = _erp_check_perm("newsletter.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    month = (data.get("issue_month") or "").strip()
+    if not re.match(r"^\d{4}-\d{2}$", month) or not 1 <= int(month[5:7]) <= 12:
+        return jsonify(error="issue_month must be YYYY-MM"), 400
+    theme = (data.get("theme") or "").strip()
+    if not theme:
+        return jsonify(error="theme is required"), 400
+    subject = (data.get("subject") or "").strip()
+    body = data.get("body_html") or ""
+    if not isinstance(body, str):
+        return jsonify(error="body_html must be a string"), 400
+    conn = db()
+    if conn.execute("SELECT id FROM erp_mkt_newsletters WHERE issue_month = ?",
+                    (month,)).fetchone():
+        conn.close()
+        return jsonify(error="an issue already exists for that month"), 400
+    cur = conn.execute(
+        "INSERT INTO erp_mkt_newsletters (issue_month, theme, subject, body_html,"
+        " status, campaign_key) VALUES (?, ?, ?, ?, 'draft', ?)",
+        (month, theme, subject, body, "newsletter-" + month))
+    iid = cur.lastrowid
+    _mkt_audit(conn, actor, "newsletter_create", "newsletter", iid, month)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, issue_id=iid), 201
+
+
+@app.post("/api/erp/marketing/newsletters/<int:issue_id>/approve")
+def mkt_newsletter_approve(issue_id):
+    actor, err = _erp_check_perm("newsletter.write")
+    if err:
+        return err
+    if _erp_role() != "admin":
+        return jsonify(error="admin required"), 403
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_newsletters WHERE id = ?",
+                     (issue_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="issue not found"), 404
+    if r["status"] != "draft":
+        conn.close()
+        return jsonify(error="only a draft can be approved"), 400
+    if not (r["subject"] or "").strip() or not (r["body_html"] or "").strip():
+        conn.close()
+        return jsonify(error="an issue needs a subject and a body before it can be approved"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_mkt_newsletters SET status = 'approved',"
+                 " approved_by = ?, approved_at = ? WHERE id = ?",
+                 (actor, now, issue_id))
+    _mkt_audit(conn, actor, "newsletter_approve", "newsletter", issue_id,
+               r["issue_month"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, status="approved")
+
+
+@app.post("/api/erp/marketing/newsletters/<int:issue_id>/send")
+def mkt_newsletter_send(issue_id):
+    actor, err = _erp_check_perm("newsletter.write")
+    if err:
+        return err
+    if _erp_role() != "admin":
+        return jsonify(error="admin required"), 403
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_newsletters WHERE id = ?",
+                     (issue_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="issue not found"), 404
+    already = conn.execute(
+        "SELECT recipient_count, sent_at FROM marketing_campaigns WHERE name = ?",
+        (r["campaign_key"],)).fetchone()
+    if already:
+        if r["status"] != "sent":
+            conn.execute("UPDATE erp_mkt_newsletters SET status = 'sent',"
+                         " sent_at = ?, recipient_count = ? WHERE id = ?",
+                         (already["sent_at"], already["recipient_count"], issue_id))
+            conn.commit()
+        conn.close()
+        return jsonify(ok=True, sent=0, note="already sent")
+    if r["status"] != "approved":
+        conn.close()
+        return jsonify(error="only an approved issue can be sent"), 400
+    today = datetime.now(timezone.utc).date().isoformat()
+    send_after = r["issue_month"] + "-01"
+    if today < send_after:
+        conn.close()
+        return jsonify(error="planned send date is %s" % send_after), 400
+    audience = _marketing_audience(conn)
+    sent = 0
+    for i in range(0, len(audience), 100):
+        chunk = audience[i:i + 100]
+        batch = []
+        for person in chunk:
+            email = person["email"]
+            qs = urlencode({"email": email, "token": _unsub_token(email)})
+            unsub_url = f"https://pop-a-licious.com/api/marketing/unsubscribe?{qs}"
+            batch.append({
+                "to": email,
+                "subject": r["subject"],
+                "html": _marketing_email_html(r["body_html"], email),
+                "unsub_url": unsub_url,
+            })
+        try:
+            _send_marketing_batch(batch)
+            sent += len(batch)
+        except Exception as e:
+            conn.close()
+            return jsonify(error=f"send failed after {sent} emails: {e}"), 502
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO marketing_campaigns (name, subject, audience, recipient_count, sent_at)"
+        " VALUES (?, ?, 'all', ?, ?)",
+        (r["campaign_key"], r["subject"], sent, now))
+    conn.execute("UPDATE erp_mkt_newsletters SET status = 'sent', sent_at = ?,"
+                 " recipient_count = ? WHERE id = ?", (now, sent, issue_id))
+    _mkt_audit(conn, actor, "newsletter_send", "newsletter", issue_id,
+               "%d recipients" % sent)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, sent=sent)
+
+
+# ---------- Support inbox ----------
+@app.get("/api/erp/marketing/support/tickets")
+def mkt_tickets_list():
+    actor, err = _erp_check_perm("support.read")
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    q = (request.args.get("q") or "").strip().lower()
+    if status and status not in _MKT_TICKET_STATUSES:
+        return jsonify(error="unknown status"), 400
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_mkt_tickets ORDER BY id DESC").fetchall()
+    out = []
+    for r in rows:
+        if status and r["status"] != status:
+            continue
+        if q and q not in (r["customer_email"] or "").lower()                 and q not in (r["customer_name"] or "").lower()                 and q not in (r["subject"] or "").lower():
+            continue
+        d = dict(r)
+        d["order"] = None
+        if r["order_source"] and r["order_id"]:
+            d["order"] = _erp_order_brief(conn, r["order_source"], r["order_id"])
+        out.append(d)
+    conn.close()
+    return jsonify(tickets=out)
+
+
+@app.post("/api/erp/marketing/support/tickets")
+def mkt_ticket_create():
+    actor, err = _erp_check_perm("support.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    email = (data.get("customer_email") or "").strip()
+    if "@" not in email or "." not in email.split("@", 1)[1]:
+        return jsonify(error="a valid customer email is required"), 400
+    subject = (data.get("subject") or "").strip()
+    body = (data.get("body") or "").strip()
+    if not subject or not body:
+        return jsonify(error="subject and body are required"), 400
+    order_source = (data.get("order_source") or "").strip() or None
+    order_id = data.get("order_id")
+    conn = db()
+    if order_source or order_id:
+        if order_source not in ("stripe", "paypal", "wholesale") or not order_id:
+            conn.close()
+            return jsonify(error="order_source and order_id go together"), 400
+        if not _erp_order_brief(conn, order_source, order_id):
+            conn.close()
+            return jsonify(error="order not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_mkt_tickets (source, customer_email, customer_name,"
+        " subject, body, status, order_source, order_id, created_at, updated_at)"
+        " VALUES ('manual', ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
+        (email, (data.get("customer_name") or "").strip(), subject, body,
+         order_source, order_id, now, now))
+    tid = cur.lastrowid
+    _mkt_audit(conn, actor, "ticket_create", "ticket", tid, email)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, ticket_id=tid), 201
+
+
+@app.get("/api/erp/marketing/support/tickets/<int:ticket_id>")
+def mkt_ticket_detail(ticket_id):
+    actor, err = _erp_check_perm("support.read")
+    if err:
+        return err
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_tickets WHERE id = ?",
+                     (ticket_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="ticket not found"), 404
+    d = dict(r)
+    d["replies"] = [dict(x) for x in conn.execute(
+        "SELECT * FROM erp_mkt_ticket_replies WHERE ticket_id = ? ORDER BY id",
+        (ticket_id,)).fetchall()]
+    d["order"] = None
+    if r["order_source"] and r["order_id"]:
+        d["order"] = _mkt_order_detail(conn, r["order_source"], r["order_id"])
+    d["orders_by_email"] = _mkt_orders_by_email(conn, r["customer_email"])
+    d["refund_policy"] = _MKT_REFUND_POLICY
+    conn.close()
+    return jsonify(ticket=d)
+
+
+@app.post("/api/erp/marketing/support/tickets/<int:ticket_id>/status")
+def mkt_ticket_set_status(ticket_id):
+    actor, err = _erp_check_perm("support.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    status = (data.get("status") or "").strip()
+    if status not in _MKT_TICKET_STATUSES:
+        return jsonify(error="status must be open, in-progress, waiting, resolved, or closed"), 400
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_tickets WHERE id = ?",
+                     (ticket_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="ticket not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    if status in ("resolved", "closed"):
+        conn.execute("UPDATE erp_mkt_tickets SET status = ?, updated_at = ?,"
+                     " resolved_by = ?, resolved_at = ? WHERE id = ?",
+                     (status, now, actor, now, ticket_id))
+    else:
+        conn.execute("UPDATE erp_mkt_tickets SET status = ?, updated_at = ?,"
+                     " resolved_by = NULL, resolved_at = NULL WHERE id = ?",
+                     (status, now, ticket_id))
+    _mkt_audit(conn, actor, "ticket_status", "ticket", ticket_id, status)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, status=status)
+
+
+@app.post("/api/erp/marketing/support/tickets/<int:ticket_id>/link-order")
+def mkt_ticket_link_order(ticket_id):
+    actor, err = _erp_check_perm("support.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    order_source = (data.get("order_source") or "").strip()
+    order_id = data.get("order_id")
+    if order_source not in ("stripe", "paypal", "wholesale") or not order_id:
+        return jsonify(error="order_source and order_id are required"), 400
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_tickets WHERE id = ?",
+                     (ticket_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="ticket not found"), 404
+    if not _erp_order_brief(conn, order_source, order_id):
+        conn.close()
+        return jsonify(error="order not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_mkt_tickets SET order_source = ?, order_id = ?,"
+                 " updated_at = ? WHERE id = ?",
+                 (order_source, order_id, now, ticket_id))
+    _mkt_audit(conn, actor, "ticket_link_order", "ticket", ticket_id,
+               "%s/%s" % (order_source, order_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/marketing/support/tickets/<int:ticket_id>/replies")
+def mkt_ticket_reply(ticket_id):
+    actor, err = _erp_check_perm("support.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify(error="reply body is required"), 400
+    is_note = 1 if data.get("is_internal_note") is True else 0
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_mkt_tickets WHERE id = ?",
+                     (ticket_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="ticket not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    # v1: replies are drafts only — sent_via / sent_at stay NULL. Nothing
+    # is sent anywhere until the email source (IMAP) send step is built.
+    cur = conn.execute(
+        "INSERT INTO erp_mkt_ticket_replies (ticket_id, author, body,"
+        " is_internal_note, created_at) VALUES (?, ?, ?, ?, ?)",
+        (ticket_id, actor, body, is_note, now))
+    rid = cur.lastrowid
+    _mkt_audit(conn, actor, "ticket_note" if is_note else "ticket_reply_draft",
+               "ticket", ticket_id, "")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, reply_id=rid, sent=False), 201
+
+
+@app.post("/api/erp/marketing/support/import")
+def mkt_support_import():
+    auth_err = _mkt_cron_auth()
+    if auth_err:
+        return auth_err
+    data = request.get_json(force=True) or {}
+    emails = data.get("emails")
+    if not isinstance(emails, list) or not emails:
+        return jsonify(error="emails must be a non-empty list"), 400
+    if len(emails) > 100:
+        return jsonify(error="at most 100 emails per call"), 400
+    conn = db()
+    created = 0
+    for e in emails:
+        if not isinstance(e, dict):
+            continue
+        email = (e.get("from_email") or "").strip()
+        msg_id = (e.get("message_id") or "").strip() or None
+        if "@" not in email or not msg_id:
+            continue
+        now = datetime.now(timezone.utc).isoformat()
+        received = e.get("received_at") or now
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO erp_mkt_tickets (source, message_id,"
+            " customer_email, customer_name, subject, body, status,"
+            " created_at, updated_at) VALUES ('email-import', ?, ?, ?, ?, ?,"
+            " 'open', ?, ?)",
+            (msg_id, email, (e.get("from_name") or "").strip(),
+             (e.get("subject") or "").strip(), (e.get("body") or "").strip(),
+             received, now))
+        if cur.rowcount:
+            created += 1
+            _mkt_audit(conn, "cron", "ticket_import", "ticket",
+                       cur.lastrowid, msg_id)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, created=created, skipped=len(emails) - created)
+
+
 @app.get("/api/admin/dashboard")
+
 def admin_dashboard():
     """Key site stats for the admin dashboard."""
     user = _current_member()
