@@ -21,6 +21,7 @@ import re
 import secrets
 import sqlite3
 import string
+import unicodedata
 import hmac
 import hashlib
 import base64
@@ -1155,6 +1156,28 @@ def init_db():
             ("Strawberry Cheesecake", "sweet"), ("Sugar Cookie", "sweet")):
         conn.execute("INSERT OR IGNORE INTO erp_flavor_categories (flavor_name, category)"
                      " VALUES (?, ?)", (_flv, _cat))
+    # Seed one finished-popcorn item per flavor: purchase orders carry
+    # popcorn only, so the PO picker lists these. Runs on every import;
+    # the name check + SKU loop keep it idempotent and pick up flavors
+    # added to erp_flavor_categories later.
+    _now = datetime.now(timezone.utc).isoformat()
+    for _frow in conn.execute("SELECT flavor_name FROM erp_flavor_categories").fetchall():
+        _fname = _frow["flavor_name"]
+        if conn.execute("SELECT 1 FROM erp_items WHERE type = 'popcorn' AND name = ?",
+                        (_fname + " Popcorn",)).fetchone():
+            continue
+        _ascii = unicodedata.normalize("NFKD", _fname).encode("ascii", "ignore").decode("ascii")
+        _slug = re.sub(r"[^A-Z0-9]+", "-", _ascii.upper()).strip("-") or "FLAVOR"
+        _sku = "POP-" + _slug
+        _n = 2
+        while conn.execute("SELECT 1 FROM erp_items WHERE sku = ?", (_sku,)).fetchone():
+            _sku = "POP-%s-%d" % (_slug, _n)
+            _n += 1
+        conn.execute(
+            "INSERT INTO erp_items (sku, name, type, unit, track_lots,"
+            " avg_cost_cents, cost_cents, active, created_at)"
+            " VALUES (?, ?, 'popcorn', 'each', 0, 0, NULL, 1, ?)",
+            (_sku, _fname + " Popcorn", _now))
     conn.commit()
     conn.close()
 
@@ -9234,7 +9257,7 @@ def admin_demo_cleanup():
 # tracks only ingredients, bags, front labels, and back labels. Every stock
 # change is an immutable row in erp_stock_ledger; on-hand is SUM(qty_change).
 
-ERP_ITEM_TYPES = ("ingredient", "bag", "front_label", "back_label")
+ERP_ITEM_TYPES = ("ingredient", "bag", "front_label", "back_label", "popcorn")
 ERP_ITEM_UNITS = ("lb", "oz", "bag", "each", "roll")
 ERP_ADJUST_REASONS = ("count_correction", "damage", "spoilage", "sample",
                       "wholesale_shipment")
@@ -10786,6 +10809,9 @@ def erp_create_po():
         if not item or not item["active"]:
             conn.close()
             return jsonify(error="every line needs a valid item_id"), 400
+        if (item["type"] or "") != "popcorn":
+            conn.close()
+            return jsonify(error="only popcorn can be added to a purchase order"), 400
         try:
             qty = float(entry.get("qty_ordered") or 0)
         except (TypeError, ValueError):
