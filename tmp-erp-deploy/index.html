@@ -1394,7 +1394,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
         var erpState = {
           items: [], locations: [], stock: [], vendors: [], pos: [],
           alerts: [], selectedItemId: null, selectedPOId: null,
-          stockSearch: "", showAddItem: false, showAddVendor: false, showNewPO: false
+          stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false
         };
         function erpQty(q) {
           var n = Number(q);
@@ -3299,6 +3299,11 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           els.body.appendChild(vToolbar);
           if (erpState.showAddVendor) els.body.appendChild(erpAddVendorForm());
           els.body.appendChild(erpVendorTable());
+          if (erpState.editVendorId) {
+            var ev = null;
+            erpState.vendors.forEach(function (vv) { if (vv.id === erpState.editVendorId) ev = vv; });
+            if (ev) els.body.appendChild(erpEditVendorForm(ev));
+          }
           els.body.appendChild(erpSectionTitle("Purchase orders"));
           var poToolbar = document.createElement("div");
           poToolbar.className = "erp-toolbar";
@@ -3353,6 +3358,46 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           });
           return form;
         }
+        function erpEditVendorForm(v) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var inputs = {};
+          [["name", "Vendor name", true, v.name], ["contact_name", "Contact", false, v.contact_name],
+           ["email", "Email", false, v.email], ["phone", "Phone", false, v.phone],
+           ["payment_terms", "Payment terms", false, v.payment_terms]].forEach(function (f) {
+            var label = document.createElement("label");
+            label.textContent = f[1] + " ";
+            var input = document.createElement("input");
+            input.name = f[0];
+            input.value = f[3] || "";
+            if (f[2]) input.required = true;
+            label.appendChild(input);
+            form.appendChild(label);
+            inputs[f[0]] = input;
+          });
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Save changes";
+          form.appendChild(submit);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            submit.disabled = true;
+            status.textContent = "Saving…";
+            var body = {};
+            Object.keys(inputs).forEach(function (k) { body[k] = inputs[k].value.trim(); });
+            erpPut("/api/erp/vendors/" + encodeURIComponent(String(v.id)), body).then(function () {
+              erpState.editVendorId = null;
+              return loadErpPurchasingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
         function erpVendorTable() {
           var wrap = document.createElement("div");
           wrap.className = "admin-orders-wrap";
@@ -3376,6 +3421,14 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             tr.appendChild(erpCell("Terms", v.payment_terms));
             var actionCell = document.createElement("td");
             actionCell.setAttribute("data-label", "Action");
+            var editBtn = document.createElement("button");
+            editBtn.type = "button";
+            editBtn.textContent = erpState.editVendorId === v.id ? "Cancel" : "Edit";
+            editBtn.addEventListener("click", function () {
+              erpState.editVendorId = erpState.editVendorId === v.id ? null : v.id;
+              renderErpPurchasingDetail();
+            });
+            actionCell.appendChild(editBtn);
             var deact = document.createElement("button");
             deact.type = "button";
             deact.textContent = "Deactivate";
