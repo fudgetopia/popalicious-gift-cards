@@ -157,7 +157,7 @@ stripe.api_key = STRIPE_SECRET_KEY
 app = Flask(__name__)
 _cors_origins = "*" if CORS_ORIGINS.strip() == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 CORS(app, origins=_cors_origins, supports_credentials=True,
-     allow_headers=["Content-Type", "Authorization"])
+     allow_headers=["Content-Type", "Authorization", "X-ERP-Request"])
 
 # ---------------------------------------------------------------- db
 
@@ -9338,6 +9338,13 @@ def _erp_check_perm(perm):
     exactly (401 anon, 403 customer/staff as before).
     """
     role = _erp_role()
+    # Phase 2 CSRF guard: a cookie-authenticated write must carry either the
+    # Authorization header (Bearer <redacted>) or the X-ERP-Request marker header.
+    # A bare cross-site cookie-only POST (plain form or no-cors fetch) has
+    # neither and is rejected. Anonymous requests still get 401 below.
+    if role is not None and request.method not in ("GET", "HEAD", "OPTIONS"):
+        if not request.headers.get("Authorization") and request.headers.get("X-ERP-Request", "") != "1":
+            return None, (jsonify(error="missing request header"), 403)
     if role == "admin":
         return _erp_actor(), None
     if role == "staff":
