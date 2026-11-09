@@ -293,7 +293,14 @@ button { font-family: inherit; }
 </style>
 </head>
 <body>
-<div id="loginView" class="login-wrap">
+<div id="bootView" class="login-wrap">
+  <div class="login-card">
+    <h1>Pop-A-Licious ERP</h1>
+    <p class="login-sub">Loading&hellip;</p>
+    <noscript><p>JavaScript is required for the ERP. Please enable it and reload.</p></noscript>
+  </div>
+</div>
+<div id="loginView" class="login-wrap" hidden>
   <div class="login-card">
     <h1>Pop-A-Licious ERP</h1>
     <p class="login-sub">Inventory &amp; Purchasing</p>
@@ -335,6 +342,7 @@ button { font-family: inherit; }
       <a href="#/orders" data-route="orders">Order hub</a>
       <a href="#/edi" data-route="edi">EDI</a>
       <a href="#/reports" data-route="reports">Reports</a>
+      <a href="#/marketing" data-route="marketing">Marketing &amp; Service</a>
       <a href="#/accounting" data-route="accounting">Accounting</a>
       <a href="#/settings" data-route="settings">Settings</a>
       <a href="#/staff-perms" data-route="staff-perms">Staff &amp; permissions</a>
@@ -349,17 +357,43 @@ button { font-family: inherit; }
 <script>
 "use strict";
 
+/* ---------- boot loading state (no login flash) ---------- */
+// The login form used to be the page's default paint, so a signed-in admin
+// arriving on the shared cookie saw it for the seconds the session check
+// takes. The form is now hidden in the HTML and a "Loading…" card paints
+// instead; the check then reveals the app or the form. This watchdog is
+// registered first, so it still fires if later code throws: after 10s with
+// no view revealed, fall back to the login form rather than sitting on
+// "Loading…" forever.
+function hideBoot() {
+  var b = document.getElementById("bootView");
+  if (b) b.hidden = true;
+}
+setTimeout(function () {
+  var b = document.getElementById("bootView");
+  var l = document.getElementById("loginView");
+  var a = document.getElementById("appView");
+  if (b && !b.hidden && l && l.hidden && a && a.hidden) { b.hidden = true; l.hidden = false; }
+}, 10000);
+
 /* ============ Standalone ERP shell ============ */
 var API_BASE = "https://popalicious-gift-cards-production.up.railway.app";
 var lastAuthStatus = 0;
 
+function erpStoredPerms() {
+  try {
+    var p = JSON.parse(sessionStorage.getItem("erpUserPerms") || "[]");
+    return Array.isArray(p) ? p : [];
+  } catch (e) { return []; }
+}
 function erpSession() {
   try {
     return {
       token: sessionStorage.getItem("erpAuthToken") || "",
       name: sessionStorage.getItem("erpUserName") || "",
       email: sessionStorage.getItem("erpUserEmail") || "",
-      role: sessionStorage.getItem("erpUserRole") || ""
+      role: sessionStorage.getItem("erpUserRole") || "",
+      perms: erpStoredPerms()
     };
   } catch (e) { return { token: "", name: "", email: "", role: "" }; }
 }
@@ -474,6 +508,9 @@ function saveSession(token, name, email, role) {
     sessionStorage.setItem("erpUserRole", role);
   } catch (e) {}
 }
+function erpSavePerms(perms) {
+  try { sessionStorage.setItem("erpUserPerms", JSON.stringify(perms || [])); } catch (e) {}
+}
 function doLogout(message) {
   try { fetch(API_BASE + "/api/auth/logout", { method: "POST", credentials: "include" }).catch(function () {}); } catch (e) {}
   try {
@@ -491,6 +528,7 @@ function doLogout(message) {
   if (message) loginError(message);
 }
 function showLogin() {
+  hideBoot();
   document.getElementById("loginView").hidden = false;
   document.getElementById("setupView").hidden = true;
   document.getElementById("appView").hidden = true;
@@ -540,6 +578,7 @@ function erpHandleAcceptOrderIntent(orderNumber) {
   });
 }
 function showWholesaleSetup() {
+  hideBoot();
   document.getElementById("loginView").hidden = true;
   document.getElementById("appView").hidden = true;
   document.getElementById("setupView").hidden = false;
@@ -578,6 +617,7 @@ async function doWholesaleSetup(event) {
   }
 }
 function enterApp() {
+  hideBoot();
   var s = erpSession();
   document.getElementById("loginView").hidden = true;
   document.getElementById("setupView").hidden = true;
@@ -619,6 +659,7 @@ function wsStatusLabel(s) {
     ready: "Ready", shipped: "Shipped", picked_up: "Picked up", cancelled: "Cancelled"}[s] || s;
 }
 function renderWholesaleRoute() {
+  hideBoot();
   var h = location.hash || "#/";
   document.getElementById("loginView").hidden = true;
   document.getElementById("setupView").hidden = true;
@@ -1211,6 +1252,7 @@ function currentRoute() {
   if (h.indexOf("#/orders") === 0) return "orders";
   if (h.indexOf("#/edi") === 0) return "edi";
   if (h.indexOf("#/reports") === 0) return "reports";
+  if (h.indexOf("#/marketing") === 0) return "marketing";
   if (h.indexOf("#/accounting") === 0) return "accounting";
   if (h.indexOf("#/settings") === 0) return "settings";
   if (h.indexOf("#/staff-perms") === 0) return "staff-perms";
@@ -1229,6 +1271,7 @@ function renderRoute() {
   if (erpSession().role === "wholesale") { renderWholesaleRoute(); return; }
   var openModals = document.querySelectorAll(".erp-modal-overlay");
   openModals.forEach(function (m) { m.parentNode.removeChild(m); });
+  hideBoot();
   document.getElementById("loginView").hidden = true;
   document.getElementById("appView").hidden = false;
   var r = currentRoute();
@@ -1239,6 +1282,10 @@ function renderRoute() {
     var dr = a.getAttribute("data-route");
     if (dr === "reports" || dr === "settings" || dr === "accounting" || dr === "staff-perms") {
       a.style.display = erpIsAdmin() ? "" : "none";
+    }
+    else if (dr === "marketing") {
+      // Marketing & Service: staff see it when they hold any marketing read perm.
+      a.style.display = (mktHas("instagram.read") || mktHas("newsletter.read") || mktHas("support.read")) ? "" : "none";
     }
   });
   if (r === "inventory") {
@@ -1286,6 +1333,10 @@ function renderRoute() {
     document.title = "Reports \u00b7 Pop-A-Licious ERP";
     if (!erpIsAdmin()) { location.hash = "#/"; return; }
     loadErpReportsDetail();
+  } else if (r === "marketing") {
+    document.title = "Marketing & Service \u00b7 Pop-A-Licious ERP";
+    if (!(mktHas("instagram.read") || mktHas("newsletter.read") || mktHas("support.read"))) { location.hash = "#/"; return; }
+    loadErpMarketingDetail();
   } else if (r === "settings") {
     document.title = "Settings \u00b7 Pop-A-Licious ERP";
     if (!erpIsAdmin()) { location.hash = "#/"; return; }
@@ -1411,7 +1462,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
         var erpState = {
           items: [], locations: [], stock: [], vendors: [], pos: [],
           alerts: [], selectedItemId: null, selectedPOId: null,
-          stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: ""
+          stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: "", mktIg: null, mktNews: null, mktTickets: null, mktView: "instagram", mktSelectedTicketId: null, mktTicketDetail: null
         };
         function erpQty(q) {
           var n = Number(q);
@@ -11398,6 +11449,556 @@ function renderErpOrderQbSection(body, o, orderId, refresh) {
 }
 
 /* ---------------- Settings (QuickBooks) ---------------- */
+/* ---------------- Marketing & Service (one-stop Phase 3) ---------------- */
+// Instagram schedule + insights, newsletter issues, support inbox.
+// Frontend gating is display-only; the backend enforces every permission.
+// Nothing here publishes, sends, or replies on its own — approve/send/
+// publish-now are admin-only and the backend enforces that too.
+var MKT_REFUND_POLICY = "Orders are guaranteed to arrive in perfect condition. A dissatisfied customer must contact Customer Service within 30 days of receipt with a detailed description and photo(s). The remedy is reshipment or replacement/exchange with an equal-or-greater-value item within 5 days. Refunds are not offered — replacement or exchange only.";
+// Printfix has no erpCan (that helper exists only in the permissions
+// build); the marketing section checks the session's stored perms
+// directly, with the same admin-grants-all rule.
+function mktHas(perm) {
+  if (erpIsAdmin()) return true;
+  var perms = erpSession().perms || [];
+  return perms.indexOf(perm) !== -1;
+}
+function mktCanIgRead() { return mktHas("instagram.read"); }
+function mktCanIgWrite() { return mktHas("instagram.write"); }
+function mktCanNewsRead() { return mktHas("newsletter.read"); }
+function mktCanNewsWrite() { return mktHas("newsletter.write"); }
+function mktCanSupRead() { return mktHas("support.read"); }
+function mktCanSupWrite() { return mktHas("support.write"); }
+function mktDate(iso) {
+  if (!iso) return "—";
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso);
+  return d.toLocaleString("en-US", { timeZone: "America/Los_Angeles", month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }) + " PT";
+}
+function mktBtn(label, onClick, disabled) {
+  var b = document.createElement("button");
+  b.type = "button";
+  b.textContent = label;
+  if (disabled) b.disabled = true;
+  b.addEventListener("click", onClick);
+  return b;
+}
+function mktNote(text) {
+  var p = document.createElement("p");
+  p.className = "admin-orders-empty";
+  p.textContent = text;
+  return p;
+}
+function mktMetricRow(label, value) {
+  var row = document.createElement("div");
+  var b = document.createElement("b");
+  b.textContent = label + ": ";
+  row.appendChild(b);
+  row.appendChild(document.createTextNode(value === null || value === undefined || value === "" ? "unavailable" : String(value)));
+  return row;
+}
+
+async function loadErpMarketingDetail() {
+  setAdminDetailStatus("Loading marketing & service…");
+  try {
+    var results = await Promise.all([
+      mktCanIgRead() ? erpGet("/api/erp/marketing/instagram/dashboard").catch(function () { return null; }) : Promise.resolve(null),
+      mktCanNewsRead() ? erpGet("/api/erp/marketing/newsletters").catch(function () { return null; }) : Promise.resolve(null),
+      mktCanSupRead() ? erpGet("/api/erp/marketing/support/tickets").catch(function () { return null; }) : Promise.resolve(null)
+    ]);
+    erpState.mktIg = results[0];
+    erpState.mktNews = results[1];
+    erpState.mktTickets = results[2];
+    renderErpMarketingDetail();
+    setAdminDetailStatus("");
+  } catch (error) {
+    setAdminDetailStatus(error instanceof TypeError ? "We couldn't connect to load marketing." : error.message, true);
+  }
+}
+
+function renderErpMarketingDetail() {
+  var els = adminDetailEls();
+  els.body.replaceChildren();
+  els.body.appendChild(erpSectionTitle("Marketing & Service"));
+  var sections = [];
+  if (mktCanIgRead()) sections.push(["instagram", "Instagram"]);
+  if (mktCanNewsRead()) sections.push(["newsletter", "Newsletter"]);
+  if (mktCanSupRead()) sections.push(["support", "Support inbox"]);
+  if (!erpState.mktView || sections.every(function (s) { return s[0] !== erpState.mktView; })) {
+    erpState.mktView = sections.length ? sections[0][0] : "instagram";
+  }
+  var tabs = document.createElement("div");
+  tabs.className = "erp-toolbar";
+  sections.forEach(function (s) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = s[1];
+    if (erpState.mktView === s[0]) b.disabled = true;
+    b.addEventListener("click", function () { erpState.mktView = s[0]; erpState.mktSelectedTicketId = null; erpState.mktTicketDetail = null; renderErpMarketingDetail(); });
+    tabs.appendChild(b);
+  });
+  els.body.appendChild(tabs);
+  if (erpState.mktView === "instagram" && mktCanIgRead()) renderMktInstagram(els.body);
+  else if (erpState.mktView === "newsletter" && mktCanNewsRead()) renderMktNewsletter(els.body);
+  else if (erpState.mktView === "support" && mktCanSupRead()) renderMktSupport(els.body);
+}
+
+function mktIgPostLine(p, showActions) {
+  var wrap = document.createElement("div");
+  wrap.className = "erp-form";
+  var h = document.createElement("h3");
+  h.textContent = (p.kind || "post") + " — " + mktDate(p.publish_at) + (p.promo_date ? " (" + p.promo_date + ")" : "");
+  h.style.flex = "1 1 100%";
+  wrap.appendChild(h);
+  var cap = document.createElement("p");
+  cap.textContent = p.caption || "(no caption yet)";
+  wrap.appendChild(cap);
+  var meta = document.createElement("p");
+  meta.className = "admin-orders-empty";
+  var files = (p.media && p.media.files) || [];
+  meta.textContent = "Status: " + p.status + " · Media: " + (files.length ? files.join(", ") : "none") + (p.ig_url ? " · " + p.ig_url : "") + (p.failure_note ? " · " + p.failure_note : "");
+  wrap.appendChild(meta);
+  if (showActions) {
+    var row = document.createElement("div");
+    row.className = "erp-toolbar";
+    if (p.status === "draft" && mktCanIgWrite()) {
+      row.appendChild(mktBtn("Approve", function () {
+        if (!erpIsAdmin()) { setAdminDetailStatus("Only Matt or DJ can approve a post.", true); return; }
+        erpPost("/api/erp/marketing/instagram/posts/" + p.id + "/approve", {}).then(loadErpMarketingDetail).catch(function (e) { setAdminDetailStatus(e.message, true); });
+      }, !erpIsAdmin()));
+    }
+    if (p.status === "approved" && mktCanIgWrite()) {
+      row.appendChild(mktBtn("Schedule", function () {
+        erpPost("/api/erp/marketing/instagram/posts/" + p.id + "/schedule", {}).then(loadErpMarketingDetail).catch(function (e) { setAdminDetailStatus(e.message, true); });
+      }));
+      row.appendChild(mktBtn("Publish now", function () {
+        if (!erpIsAdmin()) { setAdminDetailStatus("Only Matt or DJ can publish now.", true); return; }
+        erpPost("/api/erp/marketing/instagram/posts/" + p.id + "/publish-now", {}).then(loadErpMarketingDetail).catch(function (e) { setAdminDetailStatus(e.message, true); });
+      }, !erpIsAdmin()));
+    }
+    if (p.status === "published" && mktCanIgWrite()) {
+      row.appendChild(mktBtn("Check live post", function () {
+        erpPost("/api/erp/marketing/instagram/posts/" + p.id + "/check", {}).then(loadErpMarketingDetail).catch(function (e) { setAdminDetailStatus(e.message, true); });
+      }));
+      row.appendChild(mktBtn("Archive", function () {
+        if (!window.confirm("Archive this post on Instagram?")) return;
+        erpPost("/api/erp/marketing/instagram/posts/" + p.id + "/archive", { approved: true }).then(loadErpMarketingDetail).catch(function (e) { setAdminDetailStatus(e.message, true); });
+      }));
+    }
+    wrap.appendChild(row);
+  }
+  return wrap;
+}
+
+function renderMktInstagram(body) {
+  var d = erpState.mktIg;
+  if (!d) { body.appendChild(mktNote("Instagram data is unavailable right now.")); return; }
+  if ((d.needs_attention || []).length) {
+    var att = document.createElement("div");
+    att.className = "erp-form";
+    var ah = document.createElement("h3");
+    ah.textContent = "Needs attention";
+    att.appendChild(ah);
+    d.needs_attention.forEach(function (a) {
+      var p = document.createElement("p");
+      p.textContent = a.kind + ": " + a.note;
+      att.appendChild(p);
+    });
+    body.appendChild(att);
+  }
+  var up = d.upcoming || [];
+  var uh = document.createElement("h3");
+  uh.textContent = "Upcoming schedule";
+  body.appendChild(uh);
+  if (!up.length) body.appendChild(mktNote("Nothing scheduled yet."));
+  up.slice(0, 4).forEach(function (p) {
+    var tag = document.createElement("p");
+    tag.textContent = "Next up";
+    tag.style.fontWeight = "700";
+    body.appendChild(tag);
+    body.appendChild(mktIgPostLine(p, false));
+  });
+  up.slice(4).forEach(function (p) { body.appendChild(mktIgPostLine(p, false)); });
+  var dh = document.createElement("h3");
+  dh.textContent = "Drafts";
+  body.appendChild(dh);
+  (d.drafts || []).forEach(function (p) { body.appendChild(mktIgPostLine(p, true)); });
+  if (!(d.drafts || []).length) body.appendChild(mktNote("No drafts."));
+  var ph = document.createElement("h3");
+  ph.textContent = "Published posts";
+  body.appendChild(ph);
+  (d.published || []).forEach(function (p) {
+    var card = mktIgPostLine(p, true);
+    if (p.insights) {
+      var ins = document.createElement("div");
+      ["Views", "Accounts reached", "Likes", "Comments", "Saves", "Shares"].forEach(function (k) {
+        if (p.insights[k] !== undefined) ins.appendChild(mktMetricRow(k, p.insights[k]));
+      });
+      var cap = document.createElement("p");
+      cap.className = "admin-orders-empty";
+      cap.textContent = "Lifetime insights" + (p.insights_captured_at ? ", captured " + mktDate(p.insights_captured_at) : "") + ".";
+      ins.appendChild(cap);
+      card.appendChild(ins);
+    } else {
+      card.appendChild(mktNote("No insights snapshot yet for this post."));
+    }
+    body.appendChild(card);
+  });
+  if (!(d.published || []).length) body.appendChild(mktNote("Nothing published through the ERP yet."));
+  var sh = document.createElement("h3");
+  sh.textContent = "Account snapshot";
+  body.appendChild(sh);
+  var snap = d.snapshot;
+  if (snap && snap.metrics) {
+    var sw = document.createElement("div");
+    ["Accounts reached", "Views", "Accounts engaged", "Content interactions", "Profile visits", "Followers", "Number of Posts"].forEach(function (k) {
+      if (snap.metrics[k] !== undefined) sw.appendChild(mktMetricRow(k, snap.metrics[k]));
+    });
+    var sc = document.createElement("p");
+    sc.className = "admin-orders-empty";
+    sc.textContent = "Window: last 28 days. Captured " + mktDate(snap.captured_at) + ". Follower change and engagement rate are not returned by Instagram and are never derived.";
+    sw.appendChild(sc);
+    body.appendChild(sw);
+  } else {
+    body.appendChild(mktNote("No account snapshot yet — the daily sync has not run."));
+  }
+  if (mktCanIgWrite()) {
+    var form = document.createElement("div");
+    form.className = "erp-form";
+    var fh = document.createElement("h3");
+    fh.textContent = "New scheduled post";
+    form.appendChild(fh);
+    form.appendChild(mktNote("Drafts are inert until approved. Only Matt or DJ can approve or publish now. Times are Pacific."));
+    var kindSel = document.createElement("select");
+    ["post", "reel", "carousel", "story"].forEach(function (k) {
+      var o = document.createElement("option");
+      o.value = k; o.textContent = k;
+      kindSel.appendChild(o);
+    });
+    form.appendChild(erpField("Kind", kindSel));
+    var capIn = document.createElement("textarea");
+    capIn.placeholder = "Exact approved caption (max 2200 characters)";
+    form.appendChild(erpField("Caption", capIn));
+    var mediaIn = document.createElement("input");
+    mediaIn.type = "text";
+    mediaIn.placeholder = "cheddar.jpg (comma-separated, real bag photos under ~/workspace)";
+    form.appendChild(erpField("Media files", mediaIn));
+    var pubIn = document.createElement("input");
+    pubIn.type = "datetime-local";
+    form.appendChild(erpField("Publish at (PT)", pubIn));
+    var promoIn = document.createElement("input");
+    promoIn.type = "text";
+    promoIn.placeholder = "2026-11-14";
+    form.appendChild(erpField("Promo date (optional)", promoIn));
+    var st = document.createElement("p");
+    st.style.color = "var(--muted)";
+    st.style.flex = "1 1 100%";
+    form.appendChild(st);
+    var btn = mktBtn("Create draft", function () {
+      btn.disabled = true;
+      st.textContent = "Creating…";
+      var files = mediaIn.value.split(",").map(function (s) { return s.trim(); }).filter(function (s) { return s; });
+      erpPost("/api/erp/marketing/instagram/posts", {
+        kind: kindSel.value, caption: capIn.value,
+        media: { files: files, covers: [] },
+        publish_at: pubIn.value || null, promo_date: promoIn.value || null
+      }).then(loadErpMarketingDetail).catch(function (e) { st.textContent = e.message; btn.disabled = false; });
+    });
+    form.appendChild(btn);
+    body.appendChild(form);
+  }
+}
+
+function renderMktNewsletter(body) {
+  var d = erpState.mktNews;
+  if (!d) { body.appendChild(mktNote("Newsletter data is unavailable right now.")); return; }
+  var issues = d.issues || [];
+  var current = issues.length ? issues[0] : null;
+  var ch = document.createElement("h3");
+  ch.textContent = "Current issue";
+  body.appendChild(ch);
+  if (current) {
+    var card = document.createElement("div");
+    card.className = "erp-form";
+    var h = document.createElement("h3");
+    h.textContent = current.issue_month + " — " + (current.theme || "");
+    card.appendChild(h);
+    card.appendChild(mktMetricRow("Subject", current.subject || "(no subject yet)"));
+    card.appendChild(mktMetricRow("Status", current.status));
+    if (current.approved_by) card.appendChild(mktMetricRow("Approved by", current.approved_by + " · " + mktDate(current.approved_at)));
+    if (current.sent_at) card.appendChild(mktMetricRow("Sent", mktDate(current.sent_at) + " · " + (current.recipient_count === null || current.recipient_count === undefined ? "?" : current.recipient_count) + " recipients"));
+    var pv = document.createElement("p");
+    pv.textContent = current.body_html || "(no draft body yet)";
+    card.appendChild(pv);
+    var row = document.createElement("div");
+    row.className = "erp-toolbar";
+    if (current.status === "draft" && mktCanNewsWrite()) {
+      row.appendChild(mktBtn("Approve", function () {
+        if (!erpIsAdmin()) { setAdminDetailStatus("Only Matt or DJ can approve an issue.", true); return; }
+        erpPost("/api/erp/marketing/newsletters/" + current.id + "/approve", {}).then(loadErpMarketingDetail).catch(function (e) { setAdminDetailStatus(e.message, true); });
+      }, !erpIsAdmin()));
+    }
+    if (current.status === "approved" && mktCanNewsWrite()) {
+      row.appendChild(mktBtn("Send now", function () {
+        if (!erpIsAdmin()) { setAdminDetailStatus("Only Matt or DJ can send an issue.", true); return; }
+        if (!window.confirm("Send the " + current.issue_month + " newsletter to the full audience?")) return;
+        erpPost("/api/erp/marketing/newsletters/" + current.id + "/send", {}).then(loadErpMarketingDetail).catch(function (e) { setAdminDetailStatus(e.message, true); });
+      }, !erpIsAdmin()));
+    }
+    card.appendChild(row);
+    body.appendChild(card);
+  } else {
+    body.appendChild(mktNote("No issue yet — the next draft is created on the 25th."));
+  }
+  body.appendChild(mktMetricRow("Active subscribers", d.subscriber_count));
+  var ph = document.createElement("h3");
+  ph.textContent = "Past issues";
+  body.appendChild(ph);
+  if (!issues.length && !(d.campaigns || []).length) body.appendChild(mktNote("Nothing sent yet."));
+  body.appendChild(erpReportTable(["Month / campaign", "Subject", "Recipients", "Sent"], issues.filter(function (i) { return i.status === "sent"; }).map(function (i) {
+    return [i.issue_month, i.subject || "", (i.recipient_count === null || i.recipient_count === undefined) ? "—" : String(i.recipient_count), mktDate(i.sent_at)];
+  }).concat((d.campaigns || []).map(function (c) {
+    return [c.name || "", c.subject || "", String(c.recipient_count || 0), mktDate(c.sent_at)];
+  }))));
+  if (mktCanNewsWrite()) {
+    var form = document.createElement("div");
+    form.className = "erp-form";
+    var fh = document.createElement("h3");
+    fh.textContent = "New issue";
+    form.appendChild(fh);
+    var moIn = document.createElement("input");
+    moIn.type = "text";
+    moIn.placeholder = "2026-12";
+    form.appendChild(erpField("Issue month (YYYY-MM)", moIn));
+    var thIn = document.createElement("input");
+    thIn.type = "text";
+    thIn.placeholder = "Merry Pop";
+    form.appendChild(erpField("Theme", thIn));
+    var suIn = document.createElement("input");
+    suIn.type = "text";
+    form.appendChild(erpField("Subject", suIn));
+    var boIn = document.createElement("textarea");
+    boIn.placeholder = "Newsletter HTML body";
+    form.appendChild(erpField("Body", boIn));
+    var st = document.createElement("p");
+    st.style.color = "var(--muted)";
+    st.style.flex = "1 1 100%";
+    form.appendChild(st);
+    var btn = mktBtn("Create draft issue", function () {
+      btn.disabled = true;
+      st.textContent = "Creating…";
+      erpPost("/api/erp/marketing/newsletters", {
+        issue_month: moIn.value, theme: thIn.value, subject: suIn.value, body_html: boIn.value
+      }).then(loadErpMarketingDetail).catch(function (e) { st.textContent = e.message; btn.disabled = false; });
+    });
+    form.appendChild(btn);
+    body.appendChild(form);
+  }
+}
+
+function mktTicketLine(t) {
+  var wrap = document.createElement("div");
+  wrap.className = "erp-form";
+  var h = document.createElement("h3");
+  h.textContent = t.subject + " — " + (t.customer_email || "");
+  h.style.flex = "1 1 100%";
+  wrap.appendChild(h);
+  var meta = document.createElement("p");
+  meta.className = "admin-orders-empty";
+  meta.textContent = "Status: " + t.status + " · " + mktDate(t.created_at) + (t.order ? " · Order " + (t.order.number || "") : "");
+  wrap.appendChild(meta);
+  var btn = mktBtn("Open ticket", function () {
+    erpState.mktSelectedTicketId = t.id;
+    loadMktTicketDetail(t.id);
+  });
+  wrap.appendChild(btn);
+  return wrap;
+}
+
+async function loadMktTicketDetail(id) {
+  setAdminDetailStatus("Loading ticket…");
+  try {
+    var data = await erpGet("/api/erp/marketing/support/tickets/" + id);
+    erpState.mktTicketDetail = data.ticket;
+    renderErpMarketingDetail();
+    setAdminDetailStatus("");
+  } catch (error) {
+    setAdminDetailStatus(error instanceof TypeError ? "We couldn't connect to load the ticket." : error.message, true);
+  }
+}
+
+function renderMktSupport(body) {
+  var d = erpState.mktTickets;
+  var det = erpState.mktTicketDetail;
+  if (det) {
+    var back = mktBtn("← All tickets", function () { erpState.mktSelectedTicketId = null; erpState.mktTicketDetail = null; renderErpMarketingDetail(); });
+    body.appendChild(back);
+    var h = document.createElement("h3");
+    h.textContent = det.subject + " — " + (det.customer_email || "");
+    body.appendChild(h);
+    var msg = document.createElement("div");
+    msg.className = "erp-form";
+    var mh = document.createElement("h3");
+    mh.textContent = "Complaint";
+    msg.appendChild(mh);
+    var mb = document.createElement("p");
+    mb.textContent = det.body || "";
+    msg.appendChild(mb);
+    var mm = document.createElement("p");
+    mm.className = "admin-orders-empty";
+    mm.textContent = "From: " + (det.customer_name || "") + " <" + (det.customer_email || "") + "> · Status: " + det.status + " · " + mktDate(det.created_at);
+    msg.appendChild(mm);
+    body.appendChild(msg);
+    if (det.order) {
+      var ob = document.createElement("div");
+      ob.className = "erp-form";
+      var oh = document.createElement("h3");
+      oh.textContent = "Linked order " + (det.order.number || "");
+      ob.appendChild(oh);
+      ob.appendChild(mktMetricRow("Customer", (det.order.customer_name || "") + " <" + (det.order.email || "") + ">"));
+      ob.appendChild(mktMetricRow("Items", det.order.items_summary || ""));
+      ob.appendChild(mktMetricRow("Total", erpMoney(det.order.total_cents || 0)));
+      ob.appendChild(mktMetricRow("Status", det.order.status || ""));
+      if (det.order.tracking_number) ob.appendChild(mktMetricRow("Tracking", det.order.tracking_number));
+      body.appendChild(ob);
+    } else {
+      body.appendChild(mktNote("No order linked to this ticket." + ((det.orders_by_email || []).length ? " " + det.orders_by_email.length + " order(s) share this email — link one below." : "")));
+      (det.orders_by_email || []).forEach(function (o) {
+        var row = document.createElement("div");
+        row.className = "erp-toolbar";
+        var s = document.createElement("span");
+        s.textContent = (o.number || "") + " · " + (o.items_summary || "") + " · " + erpMoney(o.total_cents || 0);
+        row.appendChild(s);
+        if (mktCanSupWrite()) row.appendChild(mktBtn("Link this order", function () {
+          erpPost("/api/erp/marketing/support/tickets/" + det.id + "/link-order", { order_source: o.source, order_id: o.id }).then(function () { loadMktTicketDetail(det.id); }).catch(function (e) { setAdminDetailStatus(e.message, true); });
+        }));
+        body.appendChild(row);
+      });
+    }
+    var pol = document.createElement("div");
+    pol.className = "erp-form";
+    var ph = document.createElement("h3");
+    ph.textContent = "Refund policy";
+    pol.appendChild(ph);
+    var pp = document.createElement("p");
+    pp.textContent = det.refund_policy || MKT_REFUND_POLICY;
+    pol.appendChild(pp);
+    body.appendChild(pol);
+    var rh = document.createElement("h3");
+    rh.textContent = "Replies & notes";
+    body.appendChild(rh);
+    (det.replies || []).forEach(function (r) {
+      var rb = document.createElement("div");
+      rb.className = "erp-form";
+      var rt = document.createElement("p");
+      rt.textContent = (r.is_internal_note ? "Internal note" : "Reply draft") + " — " + (r.author || "") + " · " + mktDate(r.created_at) + (r.sent_via ? " · sent via " + r.sent_via : " · not sent (draft)");
+      rb.appendChild(rt);
+      var rx = document.createElement("p");
+      rx.textContent = r.body || "";
+      rb.appendChild(rx);
+      body.appendChild(rb);
+    });
+    if (mktCanSupWrite()) {
+      var stRow = document.createElement("div");
+      stRow.className = "erp-toolbar";
+      var stSel = document.createElement("select");
+      ["open", "in-progress", "waiting", "resolved", "closed"].forEach(function (s) {
+        var o = document.createElement("option");
+        o.value = s; o.textContent = s;
+        if (det.status === s) o.selected = true;
+        stSel.appendChild(o);
+      });
+      stRow.appendChild(stSel);
+      stRow.appendChild(mktBtn("Change status", function () {
+        erpPost("/api/erp/marketing/support/tickets/" + det.id + "/status", { status: stSel.value }).then(function () { loadMktTicketDetail(det.id); }).catch(function (e) { setAdminDetailStatus(e.message, true); });
+      }));
+      body.appendChild(stRow);
+      var form = document.createElement("div");
+      form.className = "erp-form";
+      var fh = document.createElement("h3");
+      fh.textContent = "Reply draft";
+      form.appendChild(fh);
+      form.appendChild(mktNote("Replies are drafts only in v1 — nothing is sent from the ERP. Copy the draft into the mailbox and send it there."));
+      var ta = document.createElement("textarea");
+      ta.placeholder = "Reply to the customer…";
+      form.appendChild(erpField("Reply", ta));
+      var fst = document.createElement("p");
+      fst.style.color = "var(--muted)";
+      fst.style.flex = "1 1 100%";
+      form.appendChild(fst);
+      form.appendChild(mktBtn("Save reply draft", function () {
+        erpPost("/api/erp/marketing/support/tickets/" + det.id + "/replies", { body: ta.value, is_internal_note: false }).then(function () { loadMktTicketDetail(det.id); }).catch(function (e) { fst.textContent = e.message; });
+      }));
+      var na = document.createElement("textarea");
+      na.placeholder = "Internal note (never sent)…";
+      form.appendChild(erpField("Internal note", na));
+      var nst = document.createElement("p");
+      nst.style.color = "var(--muted)";
+      nst.style.flex = "1 1 100%";
+      form.appendChild(nst);
+      form.appendChild(mktBtn("Save internal note", function () {
+        erpPost("/api/erp/marketing/support/tickets/" + det.id + "/replies", { body: na.value, is_internal_note: true }).then(function () { loadMktTicketDetail(det.id); }).catch(function (e) { nst.textContent = e.message; });
+      }));
+      body.appendChild(form);
+    }
+    return;
+  }
+  var tickets = (d && d.tickets) || [];
+  var lh = document.createElement("h3");
+  lh.textContent = "Tickets";
+  body.appendChild(lh);
+  if (!tickets.length) body.appendChild(mktNote("No tickets yet."));
+  tickets.forEach(function (t) { body.appendChild(mktTicketLine(t)); });
+  if (mktCanSupWrite()) {
+    var form = document.createElement("div");
+    form.className = "erp-form";
+    var fh = document.createElement("h3");
+    fh.textContent = "New ticket";
+    form.appendChild(fh);
+    form.appendChild(mktNote("Tickets are created by hand from an email read in the mailbox. Link the order by email or order number."));
+    var emIn = document.createElement("input");
+    emIn.type = "email";
+    emIn.placeholder = "customer@example.com";
+    form.appendChild(erpField("Customer email", emIn));
+    var nmIn = document.createElement("input");
+    nmIn.type = "text";
+    form.appendChild(erpField("Customer name (optional)", nmIn));
+    var suIn = document.createElement("input");
+    suIn.type = "text";
+    form.appendChild(erpField("Subject", suIn));
+    var boIn = document.createElement("textarea");
+    boIn.placeholder = "Paste the complaint…";
+    form.appendChild(erpField("Body", boIn));
+    var osIn = document.createElement("select");
+    ["", "stripe", "paypal", "wholesale"].forEach(function (s) {
+      var o = document.createElement("option");
+      o.value = s; o.textContent = s || "(no order link)";
+      osIn.appendChild(o);
+    });
+    form.appendChild(erpField("Order source (optional)", osIn));
+    var oiIn = document.createElement("input");
+    oiIn.type = "text";
+    oiIn.placeholder = "Order id";
+    form.appendChild(erpField("Order id (optional)", oiIn));
+    var st = document.createElement("p");
+    st.style.color = "var(--muted)";
+    st.style.flex = "1 1 100%";
+    form.appendChild(st);
+    var btn = mktBtn("Create ticket", function () {
+      btn.disabled = true;
+      st.textContent = "Creating…";
+      erpPost("/api/erp/marketing/support/tickets", {
+        customer_email: emIn.value, customer_name: nmIn.value,
+        subject: suIn.value, body: boIn.value,
+        order_source: osIn.value || null,
+        order_id: oiIn.value ? Number(oiIn.value) : null
+      }).then(loadErpMarketingDetail).catch(function (e) { st.textContent = e.message; btn.disabled = false; });
+    });
+    form.appendChild(btn);
+    body.appendChild(form);
+  }
+}
+
 /* ---------- Staff & permissions (admin only) ---------- */
 var ERP_PERM_GROUPS = [
   ["Inventory", [["inventory.read", "View inventory"], ["inventory.adjust", "Adjust stock + counts"], ["inventory.transfer", "Transfer stock"], ["inventory.receive", "Receive goods"]]],
@@ -11407,7 +12008,8 @@ var ERP_PERM_GROUPS = [
   ["Wholesale accounts", [["accounts.read", "View wholesale accounts"], ["accounts.write", "Manage wholesale accounts"]]],
   ["EDI", [["edi.read", "View EDI documents"], ["edi.write", "Manage EDI"]]],
   ["Reports", [["reports.read", "View reports"]]],
-  ["Accounting", [["accounting.read", "View accounting"], ["accounting.write", "Manage accounting"], ["tax.read", "View sales tax"], ["tax.write", "Manage sales tax"], ["payroll.read", "View payroll"], ["payroll.write", "Manage payroll"]]]
+  ["Accounting", [["accounting.read", "View accounting"], ["accounting.write", "Manage accounting"], ["tax.read", "View sales tax"], ["tax.write", "Manage sales tax"], ["payroll.read", "View payroll"], ["payroll.write", "Manage payroll"]]],
+  ["Marketing & Service", [["instagram.read", "View Instagram schedule + insights"], ["instagram.write", "Manage Instagram posts"], ["newsletter.read", "View newsletter issues"], ["newsletter.write", "Manage + send newsletters"], ["support.read", "View support inbox"], ["support.write", "Manage support tickets"]]]
 ];
 async function loadErpStaffPermsDetail() {
   setAdminDetailStatus("Loading staff permissions…");
