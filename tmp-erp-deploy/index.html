@@ -45,6 +45,10 @@ button { font-family: inherit; }
 .app-user { margin-left: auto; display: flex; align-items: center; gap: 12px; font-size: 14px; }
 .app-user button { border: 2px solid var(--paper); background: transparent; color: var(--paper);
   padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 13px; }
+#viewStorefrontLink, #viewStorefrontLink:visited { color: var(--paper); }
+#viewStorefrontLink:hover { text-decoration: underline; }
+.mkt-thumbs { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 8px; }
+.mkt-thumb { width: 160px; height: 160px; object-fit: cover; border: 2px solid var(--ink); background: var(--surface); }
 .app-main { max-width: 1120px; margin: 0 auto; padding: 20px 20px 60px; }
 .app-main h2 { margin: 6px 0 4px; font-size: 26px; }
 .app-status { min-height: 22px; margin: 0 0 14px; color: var(--muted); }
@@ -1462,7 +1466,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
         var erpState = {
           items: [], locations: [], stock: [], vendors: [], pos: [],
           alerts: [], selectedItemId: null, selectedPOId: null,
-          stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: "", mktIg: null, mktNews: null, mktTickets: null, mktView: "instagram", mktSelectedTicketId: null, mktTicketDetail: null
+          stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: "", acctAudit: [], acctAuditFilters: {action: "", actor: "", from: "", to: ""}, acctAuditOffset: 0, acctAuditLoaded: false, acctBackup: null, acctBackupLoaded: false, mktIg: null, mktNews: null, mktTickets: null, mktView: "instagram", mktSelectedTicketId: null, mktTicketDetail: null
         };
         function erpQty(q) {
           var n = Number(q);
@@ -3449,6 +3453,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           tabs.className = "erp-toolbar";
           var acctTabs = [["accounts", "Chart of accounts"], ["journal", "Journal"], ["trial", "Trial balance"], ["invoices", "Invoices"], ["bills", "Bills"], ["aging", "Aging"], ["banking", "Banking"]];
           if (erpAcctCanRead()) acctTabs.push(["reports", "Reports"]);
+          if (erpAcctCanRead()) acctTabs.push(["audit", "Audit log"]);
           if (erpTaxCanRead()) acctTabs.push(["tax", "Sales Tax"]);
           if (erpPayrollCanRead()) acctTabs.push(["payroll", "Payroll"]);
           acctTabs.forEach(function (t) {
@@ -3591,6 +3596,15 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               noAccess.textContent = "Admin access required.";
               els.body.appendChild(noAccess);
             }
+          } else if (erpState.acctView === "audit") {
+            if (erpAcctCanRead()) {
+              if (!erpState.acctAuditLoaded) erpAcctLoadAudit();
+              els.body.appendChild(erpAcctAuditSection());
+            } else {
+              var noAccess = document.createElement("p");
+              noAccess.textContent = "Admin access required.";
+              els.body.appendChild(noAccess);
+            }
           } else {
             var aToolbar = document.createElement("div");
             aToolbar.className = "erp-toolbar";
@@ -3604,8 +3618,212 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             if (erpAcctCanWrite()) aToolbar.appendChild(addAcctBtn);
             els.body.appendChild(aToolbar);
             if (erpState.showAddAcct && erpAcctCanWrite()) els.body.appendChild(erpAcctAddAccountForm());
+            if (erpAcctCanRead()) {
+              if (!erpState.acctBackupLoaded) erpAcctLoadBackupStatus();
+              els.body.appendChild(erpAcctBackupSection());
+            }
             els.body.appendChild(erpAcctAccountsTable());
           }
+        }
+        var ERP_ACCT_AUDIT_ACTIONS = ["account.create", "account.deactivate", "journal.post", "journal.reverse", "invoice.create", "invoice.pay", "invoice.void", "bill.create", "bill.pay", "bill.void", "bank.create", "bank.sync", "bank.auto_match", "bank.match", "bank.unmatch", "bank.close", "tax.rate.add", "tax.filing.create", "tax.remit", "tax.file", "payroll.employee.create", "payroll.employee.update", "payroll.employee.deactivate", "payroll.run.create", "payroll.run.approve", "payroll.run.pay", "payroll.tax.file", "migration.import", "period.lock", "period.unlock", "backup.export", "backup.restore"];
+        async function erpAcctLoadAudit() {
+          var f = erpState.acctAuditFilters;
+          var q = "/api/erp/accounting/audit?limit=100&offset=" + erpState.acctAuditOffset;
+          if (f.action) q += "&action=" + encodeURIComponent(f.action);
+          if (f.actor) q += "&actor=" + encodeURIComponent(f.actor);
+          if (f.from) q += "&from=" + encodeURIComponent(f.from);
+          if (f.to) q += "&to=" + encodeURIComponent(f.to);
+          try {
+            var data = await erpGet(q);
+            erpState.acctAudit = data.audit || [];
+          } catch (error) {
+            erpState.acctAudit = [];
+          }
+          erpState.acctAuditLoaded = true;
+          renderErpAccountingDetail();
+        }
+        function erpAcctAuditSection() {
+          var wrap = document.createElement("div");
+          var title = document.createElement("h3");
+          title.textContent = "Audit log";
+          wrap.appendChild(title);
+          var note = document.createElement("p");
+          note.textContent = "Every accounting write, newest first. Read-only: audit rows cannot be edited or deleted.";
+          wrap.appendChild(note);
+          var form = document.createElement("div");
+          form.className = "erp-toolbar";
+          var actionSel = document.createElement("select");
+          var allOpt = document.createElement("option");
+          allOpt.value = "";
+          allOpt.textContent = "All actions";
+          actionSel.appendChild(allOpt);
+          ERP_ACCT_AUDIT_ACTIONS.forEach(function (a) {
+            var o = document.createElement("option");
+            o.value = a;
+            o.textContent = a;
+            actionSel.appendChild(o);
+          });
+          actionSel.value = erpState.acctAuditFilters.action;
+          form.appendChild(actionSel);
+          var actorIn = document.createElement("input");
+          actorIn.type = "text";
+          actorIn.placeholder = "Actor (email)";
+          actorIn.value = erpState.acctAuditFilters.actor;
+          form.appendChild(actorIn);
+          var fromIn = document.createElement("input");
+          fromIn.type = "date";
+          fromIn.value = erpState.acctAuditFilters.from;
+          form.appendChild(fromIn);
+          var toIn = document.createElement("input");
+          toIn.type = "date";
+          toIn.value = erpState.acctAuditFilters.to;
+          form.appendChild(toIn);
+          var applyBtn = document.createElement("button");
+          applyBtn.type = "button";
+          applyBtn.textContent = "Apply filters";
+          applyBtn.addEventListener("click", function () {
+            erpState.acctAuditFilters = {action: actionSel.value, actor: actorIn.value.trim(), from: fromIn.value, to: toIn.value};
+            erpState.acctAuditOffset = 0;
+            erpState.acctAuditLoaded = false;
+            erpAcctLoadAudit();
+          });
+          form.appendChild(applyBtn);
+          var clearBtn = document.createElement("button");
+          clearBtn.type = "button";
+          clearBtn.textContent = "Clear filters";
+          clearBtn.addEventListener("click", function () {
+            erpState.acctAuditFilters = {action: "", actor: "", from: "", to: ""};
+            erpState.acctAuditOffset = 0;
+            erpState.acctAuditLoaded = false;
+            erpAcctLoadAudit();
+          });
+          form.appendChild(clearBtn);
+          wrap.appendChild(form);
+          if (!erpState.acctAuditLoaded) {
+            var loading = document.createElement("p");
+            loading.textContent = "Loading audit log\u2026";
+            wrap.appendChild(loading);
+            return wrap;
+          }
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          var head = document.createElement("tr");
+          ["Time", "Actor", "Action", "Target", "Detail"].forEach(function (h) {
+            var th = document.createElement("th");
+            th.textContent = h;
+            head.appendChild(th);
+          });
+          table.appendChild(head);
+          if (!erpState.acctAudit.length) {
+            var empty = document.createElement("tr");
+            var etd = document.createElement("td");
+            etd.colSpan = 5;
+            etd.textContent = "No audit rows match these filters.";
+            empty.appendChild(etd);
+            table.appendChild(empty);
+          }
+          erpState.acctAudit.forEach(function (row) {
+            var tr = document.createElement("tr");
+            var time = document.createElement("td");
+            time.textContent = row.created_at || "";
+            tr.appendChild(time);
+            var actor = document.createElement("td");
+            actor.textContent = row.actor || "";
+            tr.appendChild(actor);
+            var act = document.createElement("td");
+            act.textContent = row.action || "";
+            tr.appendChild(act);
+            var tgt = document.createElement("td");
+            tgt.textContent = (row.target_type || "") + " #" + row.target_id;
+            tr.appendChild(tgt);
+            var det = document.createElement("td");
+            det.textContent = row.detail || "";
+            tr.appendChild(det);
+            table.appendChild(tr);
+          });
+          wrap.appendChild(table);
+          var pager = document.createElement("div");
+          pager.className = "erp-toolbar";
+          var prevBtn = document.createElement("button");
+          prevBtn.type = "button";
+          prevBtn.textContent = "Previous page";
+          prevBtn.disabled = erpState.acctAuditOffset === 0;
+          prevBtn.addEventListener("click", function () {
+            erpState.acctAuditOffset = Math.max(0, erpState.acctAuditOffset - 100);
+            erpState.acctAuditLoaded = false;
+            erpAcctLoadAudit();
+          });
+          pager.appendChild(prevBtn);
+          var nextBtn = document.createElement("button");
+          nextBtn.type = "button";
+          nextBtn.textContent = "Next page";
+          nextBtn.disabled = erpState.acctAudit.length < 100;
+          nextBtn.addEventListener("click", function () {
+            erpState.acctAuditOffset += 100;
+            erpState.acctAuditLoaded = false;
+            erpAcctLoadAudit();
+          });
+          pager.appendChild(nextBtn);
+          wrap.appendChild(pager);
+          return wrap;
+        }
+        async function erpAcctLoadBackupStatus() {
+          try {
+            var data = await erpGet("/api/erp/accounting/backup/status");
+            erpState.acctBackup = (data && typeof data === "object") ? data : {error: true};
+          } catch (error) {
+            erpState.acctBackup = {error: true};
+          }
+          erpState.acctBackupLoaded = true;
+          renderErpAccountingDetail();
+        }
+        function erpAcctBackupSection() {
+          var wrap = document.createElement("div");
+          var title = document.createElement("h3");
+          title.textContent = "Backup status";
+          wrap.appendChild(title);
+          var note = document.createElement("p");
+          note.textContent = "Nightly accounting backup: a snapshot of the 20 accounting tables, stored on this VM and in Google Drive, verified weekly. Backup files are not downloadable from the ERP.";
+          wrap.appendChild(note);
+          if (!erpState.acctBackupLoaded) {
+            var loading = document.createElement("p");
+            loading.textContent = "Loading backup status\u2026";
+            wrap.appendChild(loading);
+            return wrap;
+          }
+          var s = erpState.acctBackup;
+          if (!s || s.error) {
+            var err = document.createElement("p");
+            err.textContent = "Backup status could not be loaded.";
+            wrap.appendChild(err);
+            return wrap;
+          }
+          if (!s.has_backup) {
+            var none = document.createElement("p");
+            none.textContent = "No backup yet \u2014 the nightly job has not run";
+            wrap.appendChild(none);
+            return wrap;
+          }
+          var lines = [
+            "Last backup (UTC): " + (s.last_backup_utc || ""),
+            "Manifest: " + (s.manifest_id || ""),
+            "Backed up: " + (s.tables || 0) + " tables, "
+              + (s.rows_backed_up || 0) + " rows",
+            "Oldest backup kept (UTC): " + (s.oldest_backup_utc || ""),
+            s.latest_drill_result
+              ? "Latest drill: " + s.latest_drill_result
+                + (s.latest_drill_at ? " (" + s.latest_drill_at + ")" : "")
+              : "Latest drill: not recorded yet \u2014 the weekly drill result is recorded in the backup index on the VM."
+          ];
+          if (s.latest_restore_utc) {
+            lines.push("Latest restore (UTC): " + s.latest_restore_utc);
+          }
+          lines.forEach(function (text) {
+            var p = document.createElement("p");
+            p.textContent = text;
+            wrap.appendChild(p);
+          });
+          return wrap;
         }
         function erpAcctAccountsTable() {
           var table = document.createElement("table");
@@ -11553,6 +11771,20 @@ function mktIgPostLine(p, showActions) {
   var cap = document.createElement("p");
   cap.textContent = p.caption || "(no caption yet)";
   wrap.appendChild(cap);
+  var mediaFiles = (p.media && p.media.files) || [];
+  if (mediaFiles.length) {
+    var thumbs = document.createElement("div");
+    thumbs.className = "mkt-thumbs";
+    mediaFiles.forEach(function (f) {
+      var im = document.createElement("img");
+      im.className = "mkt-thumb";
+      im.setAttribute("src", "/" + f);
+      im.setAttribute("alt", f);
+      im.onerror = function () { im.style.display = "none"; };
+      thumbs.appendChild(im);
+    });
+    wrap.appendChild(thumbs);
+  }
   var meta = document.createElement("p");
   meta.className = "admin-orders-empty";
   var files = (p.media && p.media.files) || [];
@@ -12258,7 +12490,7 @@ function renderErpSettingsDetail() {
   dh.style.color = "#c92e29";
   danger.appendChild(dh);
   var dp = document.createElement("p");
-  dp.textContent = "Permanently delete ALL ERP data — locations, items, stock, lots, vendors, purchase orders, counts, recipes, batches, wholesale accounts, orders, fulfillment, EDI and QuickBooks links — and start over empty. This cannot be undone. Your admin/staff logins are NOT affected.";
+  dp.textContent = "Permanently delete ALL ERP data — locations, items, stock, lots, vendors, purchase orders, counts, recipes, batches, wholesale accounts, orders, fulfillment, EDI and QuickBooks links — and start over empty. This cannot be undone. Your admin/staff logins are NOT affected. Accounting data is KEPT by a reset: the journal, invoices, bills, payroll, tax filings, and the audit log are never deleted by a reset, and accounting can only be removed by the restore procedure — or not at all.";
   danger.appendChild(dp);
   var wipeBtn = document.createElement("button");
   wipeBtn.type = "button";
@@ -12270,7 +12502,7 @@ function renderErpSettingsDetail() {
   wipeBtn.addEventListener("click", function () {
     if (!wipeArmed) {
       wipeArmed = true;
-      wipeBtn.textContent = "Tap again to confirm — this erases everything";
+      wipeBtn.textContent = "Tap again to confirm — this erases all non-accounting ERP data";
       wipeReset = setTimeout(function () {
         wipeArmed = false;
         wipeBtn.textContent = "Delete all ERP data";
