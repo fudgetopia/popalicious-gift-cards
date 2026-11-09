@@ -10748,6 +10748,44 @@ def erp_create_vendor():
     return jsonify(vendor=dict(row)), 201
 
 
+@app.put("/api/erp/vendors/<int:vendor_id>")
+def erp_update_vendor(vendor_id):
+    actor, err = _erp_check_perm("purchasing.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    vendor = conn.execute(
+        "SELECT * FROM erp_vendors WHERE id = ?", (vendor_id,)).fetchone()
+    if not vendor:
+        conn.close()
+        return jsonify(error="vendor not found"), 404
+    fields = {}
+    for key in ("name", "contact_name", "email", "phone", "payment_terms",
+                "notes"):
+        if key in data:
+            fields[key] = (data.get(key) or "").strip()
+    if "lead_time_days" in data:
+        try:
+            lead_time = int(data.get("lead_time_days") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="lead_time_days must be a number"), 400
+        fields["lead_time_days"] = max(lead_time, 0)
+    if "name" in fields and not fields["name"]:
+        conn.close()
+        return jsonify(error="name is required"), 400
+    if fields:
+        sets = ", ".join("%s = ?" % k for k in fields)
+        conn.execute("UPDATE erp_vendors SET %s WHERE id = ?" % sets,
+                     tuple(fields.values()) + (vendor_id,))
+        conn.commit()
+    row = conn.execute("SELECT * FROM erp_vendors WHERE id = ?",
+                       (vendor_id,)).fetchone()
+    conn.close()
+    return jsonify(vendor=dict(row))
+
+
 @app.post("/api/erp/vendors/<int:vendor_id>/deactivate")
 def erp_deactivate_vendor(vendor_id):
     actor, err = _erp_check_perm("purchasing.write")
