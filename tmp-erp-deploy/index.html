@@ -6867,6 +6867,13 @@ function erpNewAccountForm() {
   activeInput.type = "checkbox";
   activeInput.checked = true;
   form.appendChild(erpField("Active", activeInput));
+  var staffManagedInput = document.createElement("input");
+  staffManagedInput.type = "checkbox";
+  form.appendChild(erpField("We create this customer's orders", staffManagedInput));
+  var staffManagedHint = document.createElement("p");
+  staffManagedHint.className = "erp-form-status";
+  staffManagedHint.textContent = "Staff-managed: the customer doesn't need to verify a portal account. Employees create their orders and send invoices.";
+  form.appendChild(staffManagedHint);
   var submit = document.createElement("button");
   submit.type = "submit";
   submit.textContent = "Create account";
@@ -6890,6 +6897,7 @@ function erpNewAccountForm() {
       notes: form.notes.value.trim(),
       active: activeInput.checked,
       pricing_mode: (form.querySelector('input[name="pricing_mode"]:checked') || {}).value || "bag",
+      staff_managed: staffManagedInput.checked,
       location_name: form.location_name.value.trim(),
       street: form.street.value.trim(),
       city: form.city.value.trim(),
@@ -6997,6 +7005,7 @@ function renderErpAccountDetail(body) {
          ? "  (cases: " + erpMoney(a.savory_price_cents * 12) + " · " + erpMoney(a.sweet_price_cents * 12) + ")" : ""),
      "Default PO: " + (a.default_po || "—"),
      "Portal: " + (a.account_status || "active"),
+     "Ordering: " + (a.staff_managed ? "We create their orders" : "Customer orders in the portal"),
      "Terms: " + (a.payment_terms || "—"),
      "Orders: " + orders.length
     ].forEach(function (t) {
@@ -7013,23 +7022,31 @@ function renderErpAccountDetail(body) {
     if (erpIsAdmin()) {
       var etool = document.createElement("div");
       etool.className = "erp-toolbar";
-      // Phase 5: invite the customer to the ordering portal.
-      var inviteBtn = document.createElement("button");
-      inviteBtn.type = "button";
-      inviteBtn.textContent = "Invite to portal";
-      inviteBtn.addEventListener("click", function () {
-        inviteBtn.disabled = true;
-        setAdminDetailStatus("Sending invitation…");
-        erpPost("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id)) + "/invite?reveal=1", {
-          portal_url: location.origin + location.pathname
-        }).then(function (res) {
-          setAdminDetailStatus("Invitation sent to " + res.email + "." +
-            (res.invite_link ? " Invite link (copy to customer): " + res.invite_link : ""));
-        }).catch(function (error) {
-          setAdminDetailStatus(error.message, true);
-        }).finally(function () { inviteBtn.disabled = false; });
-      });
-      etool.appendChild(inviteBtn);
+      // Phase 5: invite the customer to the ordering portal — skipped for
+      // staff-managed accounts: we create their orders, so the customer
+      // never needs to verify a portal account.
+      if (!a.staff_managed) {
+        var inviteBtn = document.createElement("button");
+        inviteBtn.type = "button";
+        inviteBtn.textContent = "Invite to portal";
+        inviteBtn.addEventListener("click", function () {
+          inviteBtn.disabled = true;
+          setAdminDetailStatus("Sending invitation…");
+          erpPost("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id)) + "/invite?reveal=1", {
+            portal_url: location.origin + location.pathname
+          }).then(function (res) {
+            setAdminDetailStatus("Invitation sent to " + res.email + "." +
+              (res.invite_link ? " Invite link (copy to customer): " + res.invite_link : ""));
+          }).catch(function (error) {
+            setAdminDetailStatus(error.message, true);
+          }).finally(function () { inviteBtn.disabled = false; });
+        });
+        etool.appendChild(inviteBtn);
+      } else {
+        var smNote = document.createElement("span");
+        smNote.textContent = "Staff-managed — we create their orders; no portal invite needed.";
+        etool.appendChild(smNote);
+      }
       // Edit sits next to Deactivate so the two account actions are together.
       var editBtn = document.createElement("button");
       editBtn.type = "button";
@@ -7276,6 +7293,14 @@ function erpEditAccountForm(a) {
   activeInput.type = "checkbox";
   activeInput.checked = !!a.active;
   form.appendChild(erpField("Active", activeInput));
+  var staffManagedEditInput = document.createElement("input");
+  staffManagedEditInput.type = "checkbox";
+  staffManagedEditInput.checked = !!a.staff_managed;
+  form.appendChild(erpField("We create this customer's orders", staffManagedEditInput));
+  var staffManagedEditHint = document.createElement("p");
+  staffManagedEditHint.className = "erp-form-status";
+  staffManagedEditHint.textContent = "Staff-managed: the customer doesn't need to verify a portal account. Employees create their orders and send invoices.";
+  form.appendChild(staffManagedEditHint);
   var submit = document.createElement("button");
   submit.type = "submit";
   submit.textContent = "Save account";
@@ -7298,7 +7323,8 @@ function erpEditAccountForm(a) {
       default_po: poInput.value.trim(),
       notes: notesInput.value.trim(),
       active: activeInput.checked,
-      pricing_mode: (form.querySelector('input[name="pricing_mode"]:checked') || {}).value || "bag"
+      pricing_mode: (form.querySelector('input[name="pricing_mode"]:checked') || {}).value || "bag",
+      staff_managed: staffManagedEditInput.checked
     };
     var priceFields = [["savory_price", "savory_price_cents", savoryEditInput.value.trim()],
       ["sweet_price", "sweet_price_cents", sweetEditInput.value.trim()]];
