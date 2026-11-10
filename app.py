@@ -12380,8 +12380,172 @@ def erp_low_stock():
                 "reorder_qty": float(r["reorder_qty"]),
                 "preferred_vendor_id": r["preferred_vendor_id"],
             })
+    today_s = datetime.now(timezone.utc).date().isoformat()
+    expiry_alerts = [d for d in _erp_lot_rows(conn, today_s)
+                     if d["band"] in ("expired", "expiring_30",
+                                      "expiring_60", "expiring_90")]
     conn.close()
-    return jsonify(alerts=alerts, count=len(alerts))
+    return jsonify(alerts=alerts, count=len(alerts),
+                   expiry_alerts=expiry_alerts,
+                   expiry_alert_count=len(expiry_alerts))
+
+
+@app.get("/api/erp/lots")
+def erp_list_lots():
+    """Lot list with remaining qty (from the ledger), expiry band and days
+    to expiry. Only lots with stock remaining are listed."""
+    actor, err = _erp_check_perm("inventory.read")
+    if err:
+        return err
+    conn = db()
+    today_s = datetime.now(timezone.utc).date().isoformat()
+    lots = _erp_lot_rows(conn, today_s)
+    conn.close()
+    return jsonify(lots=lots, count=len(lots))
+
+
+@app.get("/api/erp/shrinkage")
+def erp_shrinkage():
+    """Shrinkage/waste summary: adjustment movements grouped by reason and
+    by location, plus a per-item top list. Query params: from, to
+    (YYYY-MM-DD, inclusive), location_id, reason. Cost uses the unit cost
+    recorded on each adjustment (the item's avg cost at the time)."""
+    actor, err = _erp_check_perm("inventory.read")
+    if err:
+        return err
+    date_from = (request.args.get("from") or "").strip()
+    date_to = (request.args.get("to") or "").strip()
+    for label, v in (("from", date_from), ("to", date_to)):
+        if v and not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+            return jsonify(error="%s must be YYYY-MM-DD" % label), 400
+    reason = (request.args.get("reason") or "").strip()
+    if reason and reason not in ERP_ADJUST_REASONS:
+        return jsonify(error="reason must be one of: "
+                       + ", ".join(ERP_ADJUST_REASONS)), 400
+    location_id = request.args.get("location_id")
+    try:
+        location_id = int(location_id) if location_id else None
+    except (TypeError, ValueError):
+        return jsonify(error="location_id must be an integer"), 400
+    conn = db()
+    clauses = ["l.movement_type = 'adjustment'", "l.ref_type = 'reason'"]
+    params = []
+    if date_from:
+        clauses.append("substr(l.created_at, 1, 10) >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("substr(l.created_at, 1, 10) <= ?")
+        params.append(date_to)
+    if location_id:
+        clauses.append("l.location_id = ?")
+        params.append(location_id)
+    if reason:
+        clauses.append("l.ref_id = ?")
+        params.append(reason)
+    where = " WHERE " + " AND ".join(clauses)
+    agg = ("COUNT(*) AS lines,"
+           " COALESCE(SUM(l.qty_change), 0) AS qty,"
+           " COALESCE(SUM(l.qty_change * l.unit_cost_cents), 0) AS cost_cents,"
+           " COALESCE(SUM(CASE WHEN l.qty_change < 0 THEN l.qty_change"
+           "  ELSE 0 END), 0) AS shrink_qty,"
+           " COALESCE(SUM(CASE WHEN l.qty_change < 0"
+           "  THEN -l.qty_change * l.unit_cost_cents ELSE 0 END), 0)"
+           " AS shrink_cost_cents")
+    by_reason = conn.execute(
+        "SELECT l.ref_id AS reason, " + agg
+        + " FROM erp_stock_ledger l" + where
+        + " GROUP BY l.ref_id ORDER BY shrink_cost_cents DESC",
+        params).fetchall()
+    by_location = conn.execute(
+        "SELECT l.location_id, loc.code AS location_code, " + agg
+        + " FROM erp_stock_ledger l"
+        " LEFT JOIN erp_locations loc ON loc.id = l.location_id" + where
+        + " GROUP BY l.location_id ORDER BY shrink_cost_cents DESC",
+        params).fetchall()
+    by_item = conn.execute(
+        "SELECT l.item_id, i.sku, i.name AS item_name, i.unit, " + agg
+        + " FROM erp_stock_ledger l"
+        " JOIN erp_items i ON i.id = l.item_id" + where
+        + " GROUP BY l.item_id ORDER BY shrink_cost_cents DESC LIMIT 10",
+        params).fetchall()
+    total = conn.execute(
+        "SELECT " + agg + " FROM erp_stock_ledger l" + where,
+        params).fetchone()
+    conn.close()
+
+    def _row(r):
+        return {"lines": int(r["lines"]), "qty": float(r["qty"]),
+                "cost_cents": int(r["cost_cents"]),
+                "shrink_qty": float(r["shrink_qty"]),
+                "shrink_cost_cents": int(r["shrink_cost_cents"])}
+    out = {
+        "from": date_from or None, "to": date_to or None,
+        "by_reason": [dict({"reason": r["reason"]}, **_row(r))
+                      for r in by_reason],
+        "by_location": [dict({"location_id": r["location_id"],
+                              "location_code": r["location_code"]}, **_row(r))
+                        for r in by_location],
+        "by_item": [dict({"item_id": r["item_id"], "sku": r["sku"],
+                          "item_name": r["item_name"], "unit": r["unit"]},
+                         **_row(r)) for r in by_item],
+        "total": _row(total),
+    }
+    return jsonify(out)
+
+
+@app.get("/api/erp/replenishment/suggestions")
+def erp_replenishment_suggestions():
+    """Suggested replenishment: below-par items grouped by preferred vendor.
+    suggested_qty is the par-level reorder qty when set, else the shortfall
+    to the reorder point (at least 1). can_order is true for popcorn only —
+    POs carry popcorn only, so anything else is listed with no PO action."""
+    actor, err = _erp_check_perm("inventory.read")
+    if err:
+        return err
+    conn = db()
+    rules = conn.execute(
+        "SELECT r.*, i.sku, i.name AS item_name, i.type AS item_type, i.unit,"
+        " i.avg_cost_cents, l.code AS location_code,"
+        " v.name AS vendor_name FROM erp_reorder_rules r"
+        " JOIN erp_items i ON i.id = r.item_id AND i.active = 1"
+        " JOIN erp_locations l ON l.id = r.location_id AND l.active = 1"
+        " LEFT JOIN erp_vendors v ON v.id = r.preferred_vendor_id"
+        " ORDER BY i.name").fetchall()
+    groups = {}
+    order = []
+    for r in rules:
+        on_hand = _erp_on_hand(conn, r["item_id"], r["location_id"])
+        if on_hand > float(r["reorder_point"]):
+            continue
+        vid = int(r["preferred_vendor_id"] or 0)
+        if vid not in groups:
+            groups[vid] = {"vendor_id": vid,
+                           "vendor_name": r["vendor_name"],
+                           "items": []}
+            order.append(vid)
+        rq = float(r["reorder_qty"] or 0)
+        suggested = rq if rq > 0 else max(float(r["reorder_point"]) - on_hand, 1)
+        groups[vid]["items"].append({
+            "item_id": r["item_id"], "sku": r["sku"],
+            "item_name": r["item_name"], "type": r["item_type"],
+            "unit": r["unit"], "location_id": r["location_id"],
+            "location_code": r["location_code"], "on_hand": on_hand,
+            "reorder_point": float(r["reorder_point"]), "reorder_qty": rq,
+            "suggested_qty": suggested,
+            "unit_cost_cents": int(r["avg_cost_cents"] or 0),
+            "can_order": (r["item_type"] or "") == "popcorn",
+        })
+    out = []
+    for vid in order:
+        g = groups[vid]
+        g["can_create_po"] = vid != 0 and any(i["can_order"] for i in g["items"])
+        out.append(g)
+    # Unassigned group (no preferred vendor) sorts last.
+    out.sort(key=lambda g: (g["vendor_id"] == 0,
+                            (g["vendor_name"] or "").lower()))
+    conn.close()
+    return jsonify(groups=out,
+                   count=sum(len(g["items"]) for g in out))
 
 
 @app.post("/api/erp/seed")
@@ -12745,17 +12909,74 @@ def _erp_get_batch(conn, batch_id):
                         (batch_id,)).fetchone()
 
 
-def _erp_lot_balances(conn, item_id, location_id):
-    """FIFO-ordered lot balances for an item at a location, from the ledger.
+def _erp_expiry_band(expiry_date, today_s):
+    """Expiry band for a 'YYYY-MM-DD' expiry vs today's 'YYYY-MM-DD'.
 
-    Returns [(lot_code, on_hand, first_seen), ...], oldest first.
-    Stock without a lot code is not listed here (handled as remainder).
+    Returns (band, days_to_expiry). Bands: expired, expiring_30,
+    expiring_60, expiring_90, ok, none (no expiry date / unparseable)."""
+    if not expiry_date:
+        return "none", None
+    try:
+        d = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+        t = datetime.strptime(today_s, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return "none", None
+    days = (d - t).days
+    if days < 0:
+        return "expired", days
+    if days <= 30:
+        return "expiring_30", days
+    if days <= 60:
+        return "expiring_60", days
+    if days <= 90:
+        return "expiring_90", days
+    return "ok", days
+
+
+def _erp_lot_rows(conn, today_s):
+    """Every lot with stock remaining: erp_lots joined to the ledger for
+    the live qty, with expiry band + days to expiry. Sorted earliest
+    expiry first (undated last)."""
+    rows = conn.execute(
+        "SELECT lo.*, i.sku, i.name AS item_name, i.unit, i.type AS item_type,"
+        " loc.code AS location_code,"
+        " COALESCE((SELECT SUM(qty_change) FROM erp_stock_ledger"
+        "  WHERE lot_code = lo.lot_code AND location_id = lo.location_id), 0)"
+        " AS qty_remaining"
+        " FROM erp_lots lo"
+        " JOIN erp_items i ON i.id = lo.item_id"
+        " LEFT JOIN erp_locations loc ON loc.id = lo.location_id"
+        " ORDER BY (lo.expiry_date = ''), lo.expiry_date, i.name").fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["qty_remaining"] = float(d["qty_remaining"] or 0)
+        band, days = _erp_expiry_band(d["expiry_date"], today_s)
+        d["band"] = band
+        d["days_to_expiry"] = days
+        if d["qty_remaining"] > 1e-9:
+            out.append(d)
+    return out
+
+
+def _erp_lot_balances(conn, item_id, location_id):
+    """FEFO-ordered lot balances for an item at a location, from the ledger.
+
+    Returns [(lot_code, on_hand, first_seen), ...], earliest expiry first.
+    Lots with an expiry date come before lots without one; ties break by
+    first receipt (oldest first). Stock without a lot code is not listed
+    here (handled as remainder).
     """
     rows = conn.execute(
-        "SELECT lot_code, COALESCE(SUM(qty_change), 0) AS q,"
-        " MIN(created_at) AS first_seen FROM erp_stock_ledger"
-        " WHERE item_id = ? AND location_id = ? AND lot_code != ''"
-        " GROUP BY lot_code HAVING q > 1e-9 ORDER BY first_seen",
+        "SELECT l.lot_code, COALESCE(SUM(l.qty_change), 0) AS q,"
+        " MIN(l.created_at) AS first_seen,"
+        " COALESCE(MIN(e.expiry_date), '') AS expiry_date"
+        " FROM erp_stock_ledger l"
+        " LEFT JOIN erp_lots e ON e.lot_code = l.lot_code"
+        "  AND e.location_id = l.location_id"
+        " WHERE l.item_id = ? AND l.location_id = ? AND l.lot_code != ''"
+        " GROUP BY l.lot_code HAVING q > 1e-9"
+        " ORDER BY (expiry_date = ''), expiry_date, first_seen",
         (item_id, location_id)).fetchall()
     return [(r["lot_code"], float(r["q"]), r["first_seen"]) for r in rows]
 
@@ -13366,7 +13587,7 @@ def erp_batch_start(batch_id):
 
 @app.post("/api/erp/batches/<int:batch_id>/complete")
 def erp_batch_complete(batch_id):
-    """Complete a batch: consume ingredients (FIFO lots) via production_out
+    """Complete a batch: consume ingredients (FEFO lots) via production_out
     movements, snapshot costs, stamp lot code + 6-month expiry. All-or-nothing."""
     actor, err = _erp_check_perm("batches.write")
     if err:
@@ -13417,7 +13638,7 @@ def erp_batch_complete(batch_id):
                            % (l["sku"], _erp_fmt_qty(on_hand), l["unit"],
                               _erp_fmt_qty(need), l["unit"])), 400
         plan.append((l, need))
-    # Consume FIFO lots, post movements, snapshot costs.
+    # Consume FEFO lots, post movements, snapshot costs.
     total_cost = 0
     today = datetime.now(timezone.utc).date()
     today_s = today.isoformat()
