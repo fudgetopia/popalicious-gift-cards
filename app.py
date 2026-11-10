@@ -1170,6 +1170,34 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS erp_faire_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            faire_order_id TEXT UNIQUE NOT NULL,
+            wholesale_order_id INTEGER NOT NULL DEFAULT 0,
+            display_id TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT '',
+            needs_review INTEGER NOT NULL DEFAULT 0,
+            last_seen_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_faire_sync (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            last_updated_at_min TEXT NOT NULL DEFAULT '',
+            last_run_at TEXT NOT NULL DEFAULT '',
+            last_summary TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE TABLE IF NOT EXISTS erp_faire_import_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            faire_order_id TEXT NOT NULL DEFAULT '',
+            display_id TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL DEFAULT '',
+            matched_lines TEXT NOT NULL DEFAULT '[]',
+            unmatched_lines TEXT NOT NULL DEFAULT '[]',
+            qb_status TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS erp_qb_oauth (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             access_token TEXT NOT NULL DEFAULT '',
@@ -1316,7 +1344,9 @@ def init_db():
     for col, ddl in (("po_number", "TEXT NOT NULL DEFAULT ''"),
                      ("address_id", "INTEGER NOT NULL DEFAULT 0"),
                      ("pricing_mode", "TEXT NOT NULL DEFAULT 'bag'"),
-                     ("placed_by_user_id", "INTEGER NOT NULL DEFAULT 0")):
+                     ("placed_by_user_id", "INTEGER NOT NULL DEFAULT 0"),
+                     ("via_faire", "INTEGER NOT NULL DEFAULT 0"),
+                     ("faire_order_id", "TEXT NOT NULL DEFAULT ''")):
         if col not in wocols:
             conn.execute("ALTER TABLE erp_wholesale_orders ADD COLUMN %s %s" % (col, ddl))
     wacols2 = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_addresses)").fetchall()]
@@ -18604,6 +18634,542 @@ _QB_AUTH_URL = "https://appcenter.intuit.com/connect/oauth2"
 _QB_TOKEN_URL = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
 _QB_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
 
+# ---------------- ERP: Faire auto-import (poll + auto-push to QuickBooks) ----------------
+# Faire's External API v2 is polling-only (no webhooks): the sync pulls
+# GET /orders?updated_at_min=...&sort_by=UPDATED_AT with cursor pagination
+# and maps new orders into wholesale orders. Auth is OAuth 2.0: POST
+# /authenticate with the app credentials; every call then sends both
+# X-FAIRE-APP-CREDENTIALS (Base64 "applicationId:applicationSecret") and
+# X-FAIRE-OAUTH-ACCESS-TOKEN. Credentials come from the environment
+# (FAIRE_APP_ID / FAIRE_APP_SECRET) — never stored, re-authenticated on
+# every sync run. A 429 stops the poll immediately; the watermark is only
+# advanced on a complete run, so the next run re-pulls from the same point
+# (duplicate protection comes from the faire_order_id UNIQUE link).
+
+_FAIRE_BASE_URL = "https://www.faire.com/external-api/v2"
+_FAIRE_TEST_DOUBLE = None
+
+# States that import as wholesale orders. PRE_TRANSIT / IN_TRANSIT still
+# need ERP fulfillment tracking; BACKORDERED imports flagged for review.
+_FAIRE_IMPORTABLE_STATES = ("NEW", "PROCESSING", "PRE_TRANSIT", "IN_TRANSIT",
+                            "BACKORDERED")
+# States never imported (logged as skipped). DELIVERED orders are already
+# fulfilled; PENDING_RETAILER_CONFIRMATION is not yet a real order.
+_FAIRE_SKIP_STATES = ("CANCELED", "PENDING_RETAILER_CONFIRMATION", "DELIVERED")
+
+
+def _faire_request(method, path, params=None, json_body=None, access_token=None):
+    """One Faire API call. Returns (status_code, parsed_json_dict).
+    With _FAIRE_TEST_DOUBLE set, the double answers instead of the network:
+    double(method, path, params, json_body) -> (status, dict)."""
+    if _FAIRE_TEST_DOUBLE is not None:
+        return _FAIRE_TEST_DOUBLE(method, path, params or {}, json_body)
+    app_id = os.environ.get("FAIRE_APP_ID", "").strip()
+    app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
+    creds = base64.b64encode(("%s:%s" % (app_id, app_secret)).encode("utf-8")).decode("ascii")
+    headers = {"X-FAIRE-APP-CREDENTIALS": creds}
+    if access_token:
+        headers["X-FAIRE-OAUTH-ACCESS-TOKEN"] = access_token
+    url = _FAIRE_BASE_URL + path
+    try:
+        if method == "GET":
+            resp = requests.get(url, params=params or {}, headers=headers, timeout=30)
+        else:
+            resp = requests.post(url, json=json_body or {}, headers=headers, timeout=30)
+    except Exception as e:
+        return 0, {"error": str(e)}
+    try:
+        data = resp.json()
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return resp.status_code, data
+
+
+def _faire_authenticate():
+    """POST /authenticate with the app credentials. Returns (token, error).
+    The token is used for this sync run only — never stored."""
+    app_id = os.environ.get("FAIRE_APP_ID", "").strip()
+    app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
+    if not app_id or not app_secret:
+        return None, "Faire not configured (FAIRE_APP_ID / FAIRE_APP_SECRET missing)"
+    status, data = _faire_request(
+        "POST", "/authenticate",
+        json_body={"applicationId": app_id, "applicationSecret": app_secret})
+    if status == 0:
+        return None, "Faire authenticate failed: %s" % (data.get("error") or "network error")
+    if status != 200:
+        return None, "Faire authenticate failed (HTTP %s)" % status
+    token = (data.get("accessToken") or data.get("access_token")
+             or data.get("token") or "")
+    if not token:
+        return None, "Faire authenticate returned no access token"
+    return token, None
+
+
+def _faire_norm_name(s):
+    """Normalize a flavor/product name for matching: ASCII, upper, single spaces."""
+    ascii_s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii")
+    norm = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", ascii_s.upper())).strip()
+    # Same alias the label matching uses: Cookies N' Creme is Cookie and Cream.
+    if norm in ("COOKIES N CREME", "COOKIES AND CREAM"):
+        return "COOKIE AND CREAM"
+    return norm
+
+
+def _faire_money_cents(price):
+    """ExternalMoneyV2 {amount_minor, currency} -> integer cents."""
+    if isinstance(price, dict):
+        try:
+            return int(price.get("amount_minor") or 0)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+def _faire_match_flavor(conn, sku, product_name, variant_name):
+    """Match a Faire line to a Pop-A-Licious flavor name. Returns the flavor
+    name or None. Never invents a flavor. Order: exact SKU against POP-*
+    item SKUs, exact normalized name, then longest normalized-substring
+    (so 'Cheddar Jalapeño' beats 'Cheddar' for a Cheddar Jalapeño line)."""
+    sku_norm = (sku or "").strip().upper()
+    if sku_norm:
+        row = conn.execute(
+            "SELECT name FROM erp_items WHERE type = 'popcorn' AND UPPER(sku) = ?",
+            (sku_norm,)).fetchone()
+        if row:
+            name = row["name"] or ""
+            if name.endswith(" Popcorn"):
+                return name[:-len(" Popcorn")]
+            return name
+        for fr in conn.execute("SELECT flavor_name FROM erp_flavor_categories").fetchall():
+            if _faire_norm_name(fr["flavor_name"]) == _faire_norm_name(sku_norm):
+                return fr["flavor_name"]
+    candidates = []
+    for text in (product_name, variant_name):
+        n = _faire_norm_name(text)
+        if not n:
+            continue
+        for fr in conn.execute("SELECT flavor_name FROM erp_flavor_categories").fetchall():
+            fn = _faire_norm_name(fr["flavor_name"])
+            if n == fn:
+                return fr["flavor_name"]
+            if fn and fn in n:
+                candidates.append((len(fn), fr["flavor_name"]))
+    if candidates:
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+    return None
+
+
+def _faire_format_address(addr):
+    """Join a Faire retailer address dict into one address string."""
+    if not isinstance(addr, dict):
+        return ""
+    parts = []
+    for key in ("address1", "address2", "street", "street1", "street2"):
+        if addr.get(key):
+            parts.append(str(addr[key]).strip())
+    cityline = ", ".join(str(p) for p in (addr.get("city"), addr.get("state"),
+                                          addr.get("postal_code") or addr.get("zip")) if p)
+    if cityline:
+        parts.append(cityline)
+    if addr.get("country"):
+        parts.append(str(addr["country"]).strip())
+    return ", ".join(p for p in parts if p)
+
+
+def _faire_payment_terms(raw):
+    """NET_30 / NET_60 -> 'Net 30' / 'Net 60'; anything else passes through."""
+    raw = (raw or "").strip()
+    if raw.upper().startswith("NET_"):
+        return "Net " + raw[4:]
+    return raw
+
+
+def _faire_match_or_create_account(conn, retailer, customer, payment_terms, actor):
+    """Match a Faire retailer to a wholesale account by name (case-insensitive);
+    create it with the $4/$4 defaults when new. Returns (account_row, created)."""
+    name = ((retailer or {}).get("name") or "").strip()
+    if not name:
+        return None, False
+    acct = conn.execute(
+        "SELECT * FROM erp_wholesale_accounts WHERE LOWER(name) = LOWER(?)",
+        (name,)).fetchone()
+    if acct:
+        return acct, False
+    contact = " ".join(p for p in (((customer or {}).get("first_name") or ""),
+                                    ((customer or {}).get("last_name") or "")) if p).strip()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
+        " price_per_bag_cents, savory_price_cents, sweet_price_cents, payment_terms,"
+        " notes, active, staff_managed, created_by, created_at)"
+        " VALUES (?, ?, '', '', ?, 400, 400, 400, ?, ?, 1, 0, ?, ?)",
+        (name, contact, _faire_format_address((retailer or {}).get("address") or {}),
+         _faire_payment_terms(payment_terms),
+         "Created by Faire auto-import", actor, now))
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (cur.lastrowid,)).fetchone()
+    return acct, True
+
+
+def _faire_log(conn, faire_order_id, display_id, state, outcome, matched,
+               unmatched, qb_status, notes):
+    """One import-log row (the Order hub Faire section reads these)."""
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_faire_import_log (faire_order_id, display_id, state, outcome,"
+        " matched_lines, unmatched_lines, qb_status, notes, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (faire_order_id, display_id, state, outcome,
+         json.dumps(matched or []), json.dumps(unmatched or []),
+         qb_status or "", notes or "", now))
+    return cur.lastrowid
+
+
+def _faire_import_order(conn, order, actor):
+    """Import one Faire order. Returns a result dict for the summary/log.
+    Never raises for a bad order — problems are recorded, not fatal."""
+    faire_id = str(order.get("id") or "")
+    display_id = str(order.get("display_id") or faire_id)
+    state = str(order.get("state") or "").upper()
+    now = datetime.now(timezone.utc).isoformat()
+    existing = None
+    if faire_id:
+        existing = conn.execute(
+            "SELECT * FROM erp_faire_orders WHERE faire_order_id = ?",
+            (faire_id,)).fetchone()
+    if existing:
+        # Already imported: track the Faire state, never touch the ERP order.
+        changed = (existing["state"] or "") != state
+        conn.execute("UPDATE erp_faire_orders SET state = ?, last_seen_at = ? WHERE id = ?",
+                     (state, now, existing["id"]))
+        note = ""
+        if changed and state == "CANCELED":
+            note = "Faire state changed to CANCELED — ERP order left as-is for review"
+            conn.execute("UPDATE erp_faire_orders SET needs_review = 1 WHERE id = ?",
+                         (existing["id"],))
+        _faire_log(conn, faire_id, display_id, state,
+                   "state_updated" if changed else "already_seen",
+                   [], [], "", note)
+        return {"outcome": "state_updated" if changed else "already_seen",
+                "faire_order_id": faire_id, "display_id": display_id,
+                "state": state, "order_id": existing["wholesale_order_id"],
+                "needs_review": bool(changed and state == "CANCELED"), "note": note}
+    if state in _FAIRE_SKIP_STATES:
+        _faire_log(conn, faire_id, display_id, state, "skipped", [], [], "",
+                   "state %s is not imported" % state)
+        return {"outcome": "skipped", "faire_order_id": faire_id,
+                "display_id": display_id, "state": state}
+    if state not in _FAIRE_IMPORTABLE_STATES:
+        _faire_log(conn, faire_id, display_id, state, "skipped", [], [], "",
+                   "unknown state %s" % (state or "?"))
+        return {"outcome": "skipped", "faire_order_id": faire_id,
+                "display_id": display_id, "state": state}
+    retailer = order.get("retailer") or {}
+    acct, created = _faire_match_or_create_account(
+        conn, retailer, order.get("customer") or {},
+        order.get("payment_terms") or "", actor)
+    if not acct:
+        _faire_log(conn, faire_id, display_id, state, "error", [], [], "",
+                   "retailer has no name")
+        return {"outcome": "error", "faire_order_id": faire_id,
+                "display_id": display_id, "state": state,
+                "error": "retailer has no name"}
+    matched, unmatched = [], []
+    for it in order.get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        if it.get("excluded"):
+            continue
+        if str(it.get("state") or "").upper() == "CANCELED":
+            continue
+        try:
+            qty = float(it.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            continue
+        flavor = _faire_match_flavor(conn, it.get("sku"), it.get("product_name"),
+                                     it.get("variant_name"))
+        if not flavor:
+            unmatched.append({"sku": it.get("sku") or "",
+                              "product_name": it.get("product_name") or "",
+                              "variant_name": it.get("variant_name") or "",
+                              "qty": qty})
+            continue
+        unit, _cat = _wholesale_flavor_price(conn, acct, flavor, qty)
+        matched.append({"flavor_name": flavor, "qty_bags": qty,
+                        "unit_price_cents": unit,
+                        "line_total_cents": int(round(qty * unit)),
+                        "faire_price_cents": _faire_money_cents(it.get("price"))})
+    if not matched:
+        _faire_log(conn, faire_id, display_id, state, "no_matched_lines",
+                   [], unmatched, "", "no lines matched a flavor")
+        return {"outcome": "no_matched_lines", "faire_order_id": faire_id,
+                "display_id": display_id, "state": state,
+                "unmatched": unmatched, "needs_review": True}
+    notes = ["Faire %s" % display_id]
+    needs_review = False
+    if unmatched:
+        needs_review = True
+        notes.append("unmatched lines skipped: %s" % ", ".join(
+            (u.get("sku") or u.get("product_name") or "?") for u in unmatched))
+    if state == "BACKORDERED":
+        needs_review = True
+        notes.append("Faire state BACKORDERED — check stock before fulfilling")
+    total = sum(li["line_total_cents"] for li in matched)
+    refusal = _erp_wholesale_check_credit(conn, acct, total)
+    if refusal:
+        # Unlike manual entry (which refuses), the import keeps the order and
+        # flags it — a Faire order must never vanish silently on credit.
+        needs_review = True
+        notes.append("credit check: %s" % refusal)
+    if not acct["active"]:
+        needs_review = True
+        notes.append("account is inactive — review before fulfilling")
+    order_number = _erp_next_wholesale_number(conn)
+    created_at = str(order.get("created_at") or "")
+    order_date = created_at[:10] if len(created_at) >= 10 else ""
+    ship_date = str(order.get("expected_ship_date") or "")
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_orders (order_number, account_id, status, order_date,"
+        " due_date, notes, via_faire, faire_order_id, created_by, created_at)"
+        " VALUES (?, ?, 'new', ?, ?, ?, 1, ?, ?, ?)",
+        (order_number, acct["id"], order_date,
+         ship_date[:10] if len(ship_date) >= 10 else "",
+         "; ".join(notes), faire_id, actor, now))
+    order_id = cur.lastrowid
+    for li in matched:
+        conn.execute(
+            "INSERT INTO erp_wholesale_order_lines (order_id, flavor_name, qty_bags,"
+            " unit_price_cents, line_total_cents) VALUES (?, ?, ?, ?, ?)",
+            (order_id, li["flavor_name"], li["qty_bags"],
+             li["unit_price_cents"], li["line_total_cents"]))
+    _erp_set_fulfillment(conn, "wholesale", order_id, "new", actor,
+                         "created from Faire %s" % display_id)
+    conn.execute(
+        "INSERT INTO erp_faire_orders (faire_order_id, wholesale_order_id, display_id,"
+        " state, needs_review, last_seen_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (faire_id, order_id, display_id, state, 1 if needs_review else 0, now, now))
+    _faire_log(conn, faire_id, display_id, state, "imported", matched, unmatched,
+               "", "; ".join(notes))
+    return {"outcome": "imported", "faire_order_id": faire_id,
+            "display_id": display_id, "state": state, "order_id": order_id,
+            "order_number": order_number, "matched": matched,
+            "unmatched": unmatched, "needs_review": needs_review,
+            "account_created": created}
+
+
+def _faire_push_unpushed(conn, actor, summary):
+    """Attempt the QuickBooks push for Faire orders not yet pushed.
+    Returns (pushed, skipped). Never raises — a failed push is recorded
+    in the summary and the order stays pushable manually later."""
+    pushed = 0
+    skipped = 0
+    rows = conn.execute(
+        "SELECT fo.faire_order_id, fo.display_id, fo.state, fo.wholesale_order_id"
+        " FROM erp_faire_orders fo WHERE fo.wholesale_order_id > 0"
+        " ORDER BY fo.id").fetchall()
+    for r in rows:
+        if _qb_pushed(conn, "wholesale_order", r["wholesale_order_id"], "invoice"):
+            continue
+        status, payload = _qb_push_wholesale_invoice(
+            conn, r["wholesale_order_id"], actor)
+        if status == 201:
+            pushed += 1
+            qb_status = "pushed"
+        elif status == 409:
+            pushed += 1
+            qb_status = "pushed"
+        elif status == 400 and payload.get("error") in (
+                "QuickBooks not connected",
+                "configure the QuickBooks wholesale item first"):
+            skipped += 1
+            qb_status = "skipped"
+        else:
+            summary["errors"].append(
+                "%s: QuickBooks push failed (%s)"
+                % (r["display_id"], payload.get("error") or status))
+            qb_status = "error"
+        conn.execute(
+            "UPDATE erp_faire_import_log SET qb_status = ? WHERE id = ("
+            "SELECT MAX(id) FROM erp_faire_import_log WHERE faire_order_id = ?)",
+            (qb_status, r["faire_order_id"]))
+    return pushed, skipped
+
+
+@app.post("/api/erp/faire/sync")
+def erp_faire_sync():
+    """Poll Faire for new/updated orders and import them as wholesale orders.
+    Cron-secret gated (X-Cron-Secret) or an admin session with orders.write.
+    After import, auto-pushes new and previously-unpushed Faire orders to
+    QuickBooks through the same push the manual endpoint uses."""
+    secret = CRON_SECRET
+    header = request.headers.get("X-Cron-Secret")
+    if header is not None:
+        if not secret:
+            return jsonify(error="cron not configured"), 503
+        if header != secret:
+            return jsonify(error="forbidden"), 403
+        actor = "cron"
+    else:
+        actor, err = _erp_check_perm("orders.write")
+        if err:
+            return err
+    token, auth_err = _faire_authenticate()
+    if auth_err:
+        return jsonify(error=auth_err), 503
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_faire_sync WHERE id = 1").fetchone()
+    watermark = (row["last_updated_at_min"] if row and row["last_updated_at_min"] else "")
+    run_start = datetime.now(timezone.utc)
+    if not watermark:
+        watermark = (run_start - timedelta(days=7)).isoformat()
+    summary = {"imported": 0, "skipped": 0, "already_seen": 0, "qb_pushed": 0,
+               "qb_skipped": 0, "errors": [], "stopped_on_429": False,
+               "orders": []}
+    cursor = None
+    max_seen = None
+    stopped = False
+    while True:
+        params = {"updated_at_min": watermark, "sort_by": "UPDATED_AT", "limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        status, data = _faire_request("GET", "/orders", params=params,
+                                      access_token=token)
+        if status == 429:
+            summary["stopped_on_429"] = True
+            summary["errors"].append(
+                "Faire rate limited (429) — stopping, will resume next run")
+            stopped = True
+            break
+        if status == 0:
+            summary["errors"].append(
+                "Faire request failed: %s" % (data.get("error") or "network error"))
+            stopped = True
+            break
+        if status != 200:
+            summary["errors"].append(
+                "Faire orders request failed (HTTP %s)" % status)
+            stopped = True
+            break
+        for o in data.get("orders") or []:
+            if not isinstance(o, dict) or not o.get("id"):
+                continue
+            upd = str(o.get("updated_at") or "")
+            if upd and (max_seen is None or upd > max_seen):
+                max_seen = upd
+            try:
+                res = _faire_import_order(conn, o, actor)
+            except Exception as e:
+                res = {"outcome": "error",
+                       "faire_order_id": str(o.get("id") or ""),
+                       "display_id": str(o.get("display_id") or ""),
+                       "state": str(o.get("state") or ""), "error": str(e)}
+                _faire_log(conn, res["faire_order_id"], res["display_id"],
+                           res["state"], "error", [], [], "",
+                           "import failed: %s" % str(e))
+            summary["orders"].append({
+                "faire_order_id": res.get("faire_order_id", ""),
+                "display_id": res.get("display_id", ""),
+                "state": res.get("state", ""),
+                "outcome": res.get("outcome", ""),
+                "order_id": res.get("order_id"),
+                "order_number": res.get("order_number", ""),
+                "needs_review": bool(res.get("needs_review"))})
+            if res["outcome"] == "imported":
+                summary["imported"] += 1
+            elif res["outcome"] in ("already_seen", "state_updated"):
+                summary["already_seen"] += 1
+            elif res["outcome"] in ("skipped", "no_matched_lines"):
+                summary["skipped"] += 1
+            else:
+                summary["errors"].append(
+                    "%s: %s" % (res.get("display_id") or res.get("faire_order_id"),
+                                res.get("error") or res.get("outcome")))
+        cursor = data.get("cursor") or None
+        if not cursor:
+            break
+    new_watermark = watermark
+    if not stopped:
+        if max_seen:
+            try:
+                dt = datetime.fromisoformat(max_seen.replace("Z", "+00:00"))
+                new_watermark = (dt - timedelta(seconds=1)).isoformat()
+            except (TypeError, ValueError):
+                new_watermark = max_seen
+        else:
+            new_watermark = run_start.isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO erp_faire_sync (id, last_updated_at_min,"
+        " last_run_at, last_summary) VALUES (1, ?, ?, ?)",
+        (new_watermark, run_start.isoformat(), json.dumps(summary)))
+    conn.commit()
+    # Auto-push to QuickBooks: new imports + previously-imported unpushed orders.
+    pushed, skipped = _faire_push_unpushed(conn, actor, summary)
+    summary["qb_pushed"] = pushed
+    summary["qb_skipped"] = skipped
+    conn.execute("UPDATE erp_faire_sync SET last_summary = ? WHERE id = 1",
+                 (json.dumps(summary),))
+    conn.commit()
+    conn.close()
+    return jsonify(summary)
+
+
+@app.get("/api/erp/faire/status")
+def erp_faire_status():
+    """Faire sync state for the Order hub section: last run, counts, config."""
+    actor, err = _erp_check_perm("orders.read")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_faire_sync WHERE id = 1").fetchone()
+    imported = conn.execute("SELECT COUNT(*) FROM erp_faire_orders").fetchone()[0]
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM erp_faire_orders WHERE needs_review = 1").fetchone()[0]
+    last = {}
+    if row and row["last_summary"]:
+        try:
+            last = json.loads(row["last_summary"])
+        except (TypeError, ValueError):
+            last = {}
+    conn.close()
+    return jsonify({
+        "configured": bool(os.environ.get("FAIRE_APP_ID")
+                           and os.environ.get("FAIRE_APP_SECRET")),
+        "last_run_at": row["last_run_at"] if row else "",
+        "last_updated_at_min": row["last_updated_at_min"] if row else "",
+        "last_summary": last,
+        "orders_imported": imported,
+        "pending_review": pending,
+    })
+
+
+@app.get("/api/erp/faire/import-log")
+def erp_faire_import_log():
+    """Recent Faire import-log rows, newest first (limit 50)."""
+    actor, err = _erp_check_perm("orders.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_faire_import_log ORDER BY id DESC LIMIT 50").fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        for key in ("matched_lines", "unmatched_lines"):
+            try:
+                d[key] = json.loads(d[key] or "[]")
+            except (TypeError, ValueError):
+                d[key] = []
+        out.append(d)
+    conn.close()
+    return jsonify(log=out)
+
+
 # Test hook: tests assign backend._QBO_TEST_DOUBLE to a fake implementing
 # find_customer / create_customer / create_invoice / create_sales_receipt.
 # The suite must NEVER make live Intuit calls.
@@ -19087,30 +19653,23 @@ def erp_qb_invoice_preview(order_id):
     return jsonify(preview)
 
 
-@app.post("/api/erp/wholesale-orders/<int:order_id>/quickbooks-push")
-def erp_qb_invoice_push(order_id):
-    """Creates the QuickBooks invoice. Idempotent: second push -> 409."""
-    actor, err = _erp_check_perm("qb.manage")
-    if err:
-        return err
-    conn = db()
+def _qb_push_wholesale_invoice(conn, order_id, actor):
+    """Push one wholesale order to QuickBooks as an invoice.
+    Returns (http_status, payload_dict). Shared by the manual endpoint
+    below and the Faire auto-import; the endpoint's behavior is unchanged.
+    The caller owns the connection (this commits only the link rows)."""
     order, account, lines = _qb_load_wholesale_order(conn, order_id)
     if not order:
-        conn.close()
-        return jsonify(error="order not found"), 404
+        return 404, {"error": "order not found"}
     if _qb_pushed(conn, "wholesale_order", order_id, "invoice"):
-        conn.close()
-        return jsonify(error="already pushed to QuickBooks"), 409
+        return 409, {"error": "already pushed to QuickBooks"}
     if not _qb_connected(conn):
-        conn.close()
-        return jsonify(error="QuickBooks not connected"), 400
+        return 400, {"error": "QuickBooks not connected"}
     if not lines:
-        conn.close()
-        return jsonify(error="order has no lines"), 400
+        return 400, {"error": "order has no lines"}
     item_id = _qb_config(conn, "wholesale_item_id")
     if not item_id:
-        conn.close()
-        return jsonify(error="configure the QuickBooks wholesale item first"), 400
+        return 400, {"error": "configure the QuickBooks wholesale item first"}
     try:
         def do_push(client):
             customer = client.find_customer(account["name"])
@@ -19126,8 +19685,7 @@ def erp_qb_invoice_push(order_id):
             return customer, invoice
         customer, invoice = _qb_call_with_refresh(conn, do_push)
     except _QBOError as e:
-        conn.close()
-        return jsonify(error=str(e)), e.status
+        return e.status, {"error": str(e)}
     now = datetime.now(timezone.utc).isoformat()
     try:
         conn.execute(
@@ -19143,10 +19701,20 @@ def erp_qb_invoice_push(order_id):
         conn.commit()
     except sqlite3.IntegrityError:
         conn.rollback()
-        conn.close()
-        return jsonify(error="already pushed to QuickBooks"), 409
+        return 409, {"error": "already pushed to QuickBooks"}
+    return 201, {"ok": True, "qb_invoice_id": str(invoice["Id"])}
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/quickbooks-push")
+def erp_qb_invoice_push(order_id):
+    """Creates the QuickBooks invoice. Idempotent: second push -> 409."""
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    status, payload = _qb_push_wholesale_invoice(conn, order_id, actor)
     conn.close()
-    return jsonify({"ok": True, "qb_invoice_id": str(invoice["Id"])}), 201
+    return jsonify(payload), status
 
 
 def _qb_receipt_payload(summary, item_id):
