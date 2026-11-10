@@ -1063,6 +1063,36 @@ def init_db():
             line_total_cents INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_erp_wholesale_lines ON erp_wholesale_order_lines (order_id);
+        CREATE TABLE IF NOT EXISTS erp_wholesale_price_tiers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            category TEXT NOT NULL,
+            min_bags INTEGER NOT NULL,
+            price_per_bag_cents INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_wholesale_tiers
+            ON erp_wholesale_price_tiers (account_id, category, min_bags);
+        CREATE TABLE IF NOT EXISTS erp_wholesale_returns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            order_id INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'requested',
+            credit_cents INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_wholesale_return_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            return_id INTEGER NOT NULL,
+            order_line_id INTEGER NOT NULL,
+            flavor_name TEXT NOT NULL DEFAULT '',
+            qty_bags REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_wholesale_returns
+            ON erp_wholesale_returns (order_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_wholesale_return_lines
+            ON erp_wholesale_return_lines (return_id);
         CREATE TABLE IF NOT EXISTS erp_order_fulfillment (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             order_source TEXT NOT NULL,
@@ -1273,6 +1303,25 @@ def init_db():
                      ("contact_phone", "TEXT NOT NULL DEFAULT ''")):
         if col not in wacols2:
             conn.execute("ALTER TABLE erp_wholesale_addresses ADD COLUMN %s %s" % (col, ddl))
+    # Order hub 5-pack migrations (Nov 2026): tier pricing, credit limits,
+    # case prices on accounts; pick/ship quantities on order lines; Shippo
+    # label fields on wholesale orders.
+    wacols3 = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_accounts)").fetchall()]
+    for col, ddl in (("credit_limit_cents", "INTEGER"),
+                     ("credit_hold", "INTEGER NOT NULL DEFAULT 0"),
+                     ("savory_case_price_cents", "INTEGER"),
+                     ("sweet_case_price_cents", "INTEGER")):
+        if col not in wacols3:
+            conn.execute("ALTER TABLE erp_wholesale_accounts ADD COLUMN %s %s" % (col, ddl))
+    wolcols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_order_lines)").fetchall()]
+    for col, ddl in (("qty_picked", "REAL NOT NULL DEFAULT 0"),
+                     ("qty_shipped", "REAL NOT NULL DEFAULT 0")):
+        if col not in wolcols:
+            conn.execute("ALTER TABLE erp_wholesale_order_lines ADD COLUMN %s %s" % (col, ddl))
+    wocol2 = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_orders)").fetchall()]
+    for col in ("shippo_label_url", "shippo_tracking_number", "shippo_label_created_at"):
+        if col not in wocol2:
+            conn.execute("ALTER TABLE erp_wholesale_orders ADD COLUMN %s TEXT NOT NULL DEFAULT ''" % col)
     # Backfill one delivery location per account that still only has the legacy
     # free-text address and no structured locations yet.
     for _a in conn.execute("SELECT id, address FROM erp_wholesale_accounts").fetchall():
@@ -6571,7 +6620,18 @@ def _mkt_order_detail(conn, source, order_id):
         order["account"] = dict(acct) if acct else None
         order["notes"] = w["notes"]
         order["order_date"] = w["order_date"]
-        order["tracking_number"] = ""
+        addr_id = w["address_id"] if "address_id" in w.keys() else 0
+        ship_addr = None
+        if addr_id:
+            arow = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                                (addr_id,)).fetchone()
+            if arow:
+                ship_addr = dict(arow)
+        order["ship_address"] = ship_addr
+        order["shippo_label_url"] = w["shippo_label_url"] if "shippo_label_url" in w.keys() else ""
+        order["shippo_tracking_number"] = w["shippo_tracking_number"] if "shippo_tracking_number" in w.keys() else ""
+        order["shippo_label_created_at"] = w["shippo_label_created_at"] if "shippo_label_created_at" in w.keys() else ""
+        order["tracking_number"] = order["shippo_tracking_number"]
         order["shipping_address"] = acct["address"] if acct else ""
         qb_link = _qb_pushed(conn, "wholesale_order", order_id, "invoice")
         order["qb_invoice_id"] = qb_link["qb_id"] if qb_link else None
@@ -14146,7 +14206,7 @@ def erp_batch_trace(batch_id):
 # ---------------- ERP Phase 3: Order hub + wholesale CRM ----------------
 
 _ERP_FULFILLMENT_STATUSES = ("new", "submitted", "accepted", "in_production", "ready", "shipped",
-                             "picked_up", "cancelled")
+                             "picked_up", "cancelled", "partially_shipped")
 _ERP_ORDER_SOURCES = ("stripe", "paypal", "wholesale")
 
 
@@ -14259,6 +14319,14 @@ def _erp_wholesale_account_dict(conn, a):
     d["order_count"] = n
     # Staff-managed accounts: we create their orders; no portal invite needed.
     d["staff_managed"] = bool(a["staff_managed"]) if "staff_managed" in a.keys() else False
+    d["credit_hold"] = bool(a["credit_hold"]) if "credit_hold" in a.keys() else False
+    d["tiers"] = [dict(t) for t in conn.execute(
+        "SELECT * FROM erp_wholesale_price_tiers WHERE account_id = ?"
+        " ORDER BY category, min_bags", (a["id"],)).fetchall()]
+    d["open_balance_cents"] = _erp_wholesale_open_balance_cents(conn, a["id"])
+    limit = a["credit_limit_cents"] if "credit_limit_cents" in a.keys() else None
+    d["remaining_credit_cents"] = (None if limit is None
+                                   else max(int(limit) - d["open_balance_cents"], 0))
     return d
 
 
@@ -14392,7 +14460,18 @@ def erp_order_detail(source, order_id):
         order["account"] = dict(acct) if acct else None
         order["notes"] = w["notes"]
         order["order_date"] = w["order_date"]
-        order["tracking_number"] = ""
+        addr_id = w["address_id"] if "address_id" in w.keys() else 0
+        ship_addr = None
+        if addr_id:
+            arow = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                                (addr_id,)).fetchone()
+            if arow:
+                ship_addr = dict(arow)
+        order["ship_address"] = ship_addr
+        order["shippo_label_url"] = w["shippo_label_url"] if "shippo_label_url" in w.keys() else ""
+        order["shippo_tracking_number"] = w["shippo_tracking_number"] if "shippo_tracking_number" in w.keys() else ""
+        order["shippo_label_created_at"] = w["shippo_label_created_at"] if "shippo_label_created_at" in w.keys() else ""
+        order["tracking_number"] = order["shippo_tracking_number"]
         order["shipping_address"] = acct["address"] if acct else ""
         qb_link = _qb_pushed(conn, "wholesale_order", order_id, "invoice")
         order["qb_invoice_id"] = qb_link["qb_id"] if qb_link else None
@@ -14442,6 +14521,9 @@ def erp_order_set_status(source, order_id):
     if err_msg:
         conn.close()
         return jsonify(error=err_msg), 400
+    if source == "wholesale" and status in ("shipped", "picked_up"):
+        conn.execute("UPDATE erp_wholesale_order_lines SET qty_shipped = qty_bags"
+                     " WHERE order_id = ?", (order_id,))
     if source == "wholesale" and status == "in_production":
         # Phase 5: entering production generates the per-flavor checklist.
         _erp_ensure_production_lines(conn, order_id)
@@ -14541,14 +14623,33 @@ def erp_create_wholesale_account():
         return jsonify(error="savory_price_cents and sweet_price_cents must be numbers"), 400
     if savory <= 0 or sweet <= 0:
         return jsonify(error="category prices must be greater than zero"), 400
+    credit_limit = None
+    if data.get("credit_limit_cents") is not None:
+        try:
+            credit_limit = int(data.get("credit_limit_cents"))
+        except (TypeError, ValueError):
+            return jsonify(error="credit_limit_cents must be a number"), 400
+        if credit_limit < 0:
+            return jsonify(error="credit_limit_cents cannot be negative"), 400
+    case_prices = {}
+    for key in ("savory_case_price_cents", "sweet_case_price_cents"):
+        if data.get(key) is not None:
+            try:
+                cp = int(data.get(key))
+            except (TypeError, ValueError):
+                return jsonify(error="%s must be a number" % key), 400
+            if cp <= 0:
+                return jsonify(error="%s must be greater than zero" % key), 400
+            case_prices[key] = cp
     conn = db()
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
         " price_per_bag_cents, payment_terms, notes, active, created_by, created_at,"
         " contact_person, savory_price_cents, sweet_price_cents, default_po,"
-        " pricing_mode, staff_managed, account_status)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+        " pricing_mode, staff_managed, account_status, credit_limit_cents,"
+        " credit_hold, savory_case_price_cents, sweet_case_price_cents)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
         (name, (data.get("contact_name") or "").strip(),
          (data.get("email") or "").strip(), (data.get("phone") or "").strip(),
          (data.get("address") or "").strip(), price,
@@ -14556,7 +14657,10 @@ def erp_create_wholesale_account():
          (data.get("notes") or "").strip(), actor, now,
          (data.get("contact_person") or "").strip(), savory, sweet,
          (data.get("default_po") or "").strip(), pricing_mode,
-         1 if data.get("staff_managed") else 0))
+         1 if data.get("staff_managed") else 0, credit_limit,
+         1 if data.get("credit_hold") else 0,
+         case_prices.get("savory_case_price_cents"),
+         case_prices.get("sweet_case_price_cents")))
     account_id = cur.lastrowid
     # Main delivery location: the customer manages further addresses themselves
     # in the portal; the admin sees the profile read-only.
@@ -14652,6 +14756,35 @@ def erp_update_wholesale_account(account_id):
         fields["active"] = 1 if data.get("active") else 0
     if "staff_managed" in data:
         fields["staff_managed"] = 1 if data.get("staff_managed") else 0
+    if "credit_limit_cents" in data:
+        if data.get("credit_limit_cents") is None:
+            fields["credit_limit_cents"] = None
+        else:
+            try:
+                cl = int(data.get("credit_limit_cents"))
+            except (TypeError, ValueError):
+                conn.close()
+                return jsonify(error="credit_limit_cents must be a number"), 400
+            if cl < 0:
+                conn.close()
+                return jsonify(error="credit_limit_cents cannot be negative"), 400
+            fields["credit_limit_cents"] = cl
+    if "credit_hold" in data:
+        fields["credit_hold"] = 1 if data.get("credit_hold") else 0
+    for key in ("savory_case_price_cents", "sweet_case_price_cents"):
+        if key in data:
+            if data.get(key) is None:
+                fields[key] = None
+            else:
+                try:
+                    cp = int(data.get(key))
+                except (TypeError, ValueError):
+                    conn.close()
+                    return jsonify(error="%s must be a number" % key), 400
+                if cp <= 0:
+                    conn.close()
+                    return jsonify(error="%s must be greater than zero" % key), 400
+                fields[key] = cp
     if "name" in fields and not fields["name"]:
         conn.close()
         return jsonify(error="name is required"), 400
@@ -14665,6 +14798,80 @@ def erp_update_wholesale_account(account_id):
     out = _erp_wholesale_account_dict(conn, acct)
     conn.close()
     return jsonify(account=out)
+
+
+@app.get("/api/erp/wholesale-accounts/<int:account_id>/tiers")
+def erp_list_wholesale_tiers(account_id):
+    actor, err = _erp_check_perm("accounts.read")
+    if err:
+        return err
+    conn = db()
+    if not conn.execute("SELECT 1 FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone():
+        conn.close()
+        return jsonify(error="account not found"), 404
+    tiers = [dict(t) for t in conn.execute(
+        "SELECT * FROM erp_wholesale_price_tiers WHERE account_id = ?"
+        " ORDER BY category, min_bags", (account_id,)).fetchall()]
+    conn.close()
+    return jsonify(tiers=tiers)
+
+
+@app.post("/api/erp/wholesale-accounts/<int:account_id>/tiers")
+def erp_add_wholesale_tier(account_id):
+    actor, err = _erp_check_perm("accounts.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    category = (data.get("category") or "").strip().lower()
+    if category not in ("savory", "sweet"):
+        return jsonify(error="category must be 'savory' or 'sweet'"), 400
+    try:
+        min_bags = int(data.get("min_bags") or 0)
+        price = int(data.get("price_per_bag_cents") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="min_bags and price_per_bag_cents must be numbers"), 400
+    if min_bags < 1:
+        return jsonify(error="min_bags must be at least 1"), 400
+    if price <= 0:
+        return jsonify(error="price_per_bag_cents must be greater than zero"), 400
+    conn = db()
+    if not conn.execute("SELECT 1 FROM erp_wholesale_accounts WHERE id = ?",
+                        (account_id,)).fetchone():
+        conn.close()
+        return jsonify(error="account not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO erp_wholesale_price_tiers (account_id, category, min_bags,"
+        " price_per_bag_cents, created_at) VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(account_id, category, min_bags) DO UPDATE SET"
+        " price_per_bag_cents = excluded.price_per_bag_cents",
+        (account_id, category, min_bags, price, now))
+    conn.commit()
+    tier = conn.execute(
+        "SELECT * FROM erp_wholesale_price_tiers WHERE account_id = ?"
+        " AND category = ? AND min_bags = ?",
+        (account_id, category, min_bags)).fetchone()
+    conn.close()
+    return jsonify(tier=dict(tier)), 201
+
+
+@app.delete("/api/erp/wholesale-accounts/<int:account_id>/tiers/<int:tier_id>")
+def erp_delete_wholesale_tier(account_id, tier_id):
+    actor, err = _erp_check_perm("accounts.write")
+    if err:
+        return err
+    conn = db()
+    tier = conn.execute(
+        "SELECT * FROM erp_wholesale_price_tiers WHERE id = ? AND account_id = ?",
+        (tier_id, account_id)).fetchone()
+    if not tier:
+        conn.close()
+        return jsonify(error="tier not found"), 404
+    conn.execute("DELETE FROM erp_wholesale_price_tiers WHERE id = ?", (tier_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(deleted=tier_id)
 
 
 @app.post("/api/erp/wholesale-accounts/import")
@@ -14831,17 +15038,25 @@ def erp_create_wholesale_order():
         if qty <= 0:
             conn.close()
             return jsonify(error="line %d: qty_bags must be greater than zero" % i), 400
-        try:
-            unit = int((li or {}).get("unit_price_cents") or acct["price_per_bag_cents"])
-        except (TypeError, ValueError):
-            conn.close()
-            return jsonify(error="line %d: unit_price_cents must be a number" % i), 400
+        if (li or {}).get("unit_price_cents"):
+            try:
+                unit = int((li or {}).get("unit_price_cents"))
+            except (TypeError, ValueError):
+                conn.close()
+                return jsonify(error="line %d: unit_price_cents must be a number" % i), 400
+        else:
+            unit, _cat = _wholesale_flavor_price(conn, acct, flavor, qty)
         if unit <= 0:
             conn.close()
             return jsonify(error="line %d: unit_price_cents must be greater than zero" % i), 400
         lines.append({"flavor_name": flavor, "qty_bags": qty,
                       "unit_price_cents": unit,
                       "line_total_cents": int(round(qty * unit))})
+    refusal = _erp_wholesale_check_credit(
+        conn, acct, sum(li["line_total_cents"] for li in lines))
+    if refusal:
+        conn.close()
+        return jsonify(error=refusal), 400
     now = datetime.now(timezone.utc).isoformat()
     order_number = _erp_next_wholesale_number(conn)
     cur = conn.execute(
@@ -14891,7 +15106,18 @@ def erp_get_wholesale_order(order_id):
     order["account"] = dict(acct) if acct else None
     order["notes"] = w["notes"]
     order["order_date"] = w["order_date"]
-    order["tracking_number"] = ""
+    addr_id = w["address_id"] if "address_id" in w.keys() else 0
+    ship_addr = None
+    if addr_id:
+        arow = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                            (addr_id,)).fetchone()
+        if arow:
+            ship_addr = dict(arow)
+    order["ship_address"] = ship_addr
+    order["shippo_label_url"] = w["shippo_label_url"] if "shippo_label_url" in w.keys() else ""
+    order["shippo_tracking_number"] = w["shippo_tracking_number"] if "shippo_tracking_number" in w.keys() else ""
+    order["shippo_label_created_at"] = w["shippo_label_created_at"] if "shippo_label_created_at" in w.keys() else ""
+    order["tracking_number"] = order["shippo_tracking_number"]
     order["shipping_address"] = acct["address"] if acct else ""
     order["email"] = acct["email"] if acct else ""
     fulf = _erp_fulfillment_dict(conn, "wholesale", order_id)
@@ -14921,12 +15147,74 @@ def _wholesale_account_prices(acct):
             "sweet": int(acct["sweet_price_cents"] or 400)}
 
 
-def _wholesale_flavor_price(conn, acct, flavor_name):
+def _erp_wholesale_tier_price(conn, account_id, category, qty_bags):
+    """Best tier price for an account+category+qty, or None. The tier
+    with the highest min_bags <= qty wins."""
+    row = conn.execute(
+        "SELECT price_per_bag_cents FROM erp_wholesale_price_tiers"
+        " WHERE account_id = ? AND category = ? AND min_bags <= ?"
+        " ORDER BY min_bags DESC LIMIT 1",
+        (account_id, category, qty_bags)).fetchone()
+    return int(row["price_per_bag_cents"]) if row else None
+
+
+def _erp_wholesale_resolved_bag_price(conn, acct, category, qty_bags):
+    """Per-bag price for a wholesale line: best tier first, then the
+    case price (case mode with an explicit case price set, per bag =
+    case/12 rounded), then the flat category price."""
+    if qty_bags is not None:
+        tier = _erp_wholesale_tier_price(conn, acct["id"], category, qty_bags)
+        if tier is not None:
+            return tier
+    if (acct["pricing_mode"] or "bag") == "case":
+        case = (acct["savory_case_price_cents"] if category == "savory"
+                else acct["sweet_case_price_cents"]) if "savory_case_price_cents" in acct.keys() else None
+        if case:
+            return int(round(int(case) / 12))
+    prices = _wholesale_account_prices(acct)
+    return prices["savory"] if category == "savory" else prices["sweet"]
+
+
+_ERP_WHOLESALE_OPEN_STATUSES = ("new", "submitted", "accepted", "in_production",
+                                "ready", "partially_shipped")
+
+
+def _erp_wholesale_open_balance_cents(conn, account_id):
+    """Open balance: line totals of orders still open (not shipped,
+    picked up, or cancelled). There is no payment tracking in the ERP,
+    so a shipped order no longer counts against credit."""
+    rows = conn.execute(
+        "SELECT l.line_total_cents FROM erp_wholesale_order_lines l"
+        " JOIN erp_wholesale_orders o ON o.id = l.order_id"
+        " WHERE o.account_id = ? AND o.status IN (%s)"
+        % ",".join("?" * len(_ERP_WHOLESALE_OPEN_STATUSES)),
+        (account_id,) + _ERP_WHOLESALE_OPEN_STATUSES).fetchall()
+    return sum(int(r["line_total_cents"] or 0) for r in rows)
+
+
+def _erp_wholesale_check_credit(conn, acct, new_total_cents):
+    """Refusal reason when a new order would breach credit, else None."""
+    if acct["credit_hold"] if "credit_hold" in acct.keys() else False:
+        return ("this account is on credit hold \u2014 new orders are blocked "
+                "until the hold is cleared")
+    limit = acct["credit_limit_cents"] if "credit_limit_cents" in acct.keys() else None
+    if limit is None:
+        return None
+    open_cents = _erp_wholesale_open_balance_cents(conn, acct["id"])
+    if open_cents + int(new_total_cents) > int(limit):
+        dollars = lambda c: "$%s" % format(c / 100, ",.2f")
+        return ("this order would exceed the account's credit limit "
+                "(limit %s, open balance %s, remaining %s)"
+                % (dollars(limit), dollars(open_cents),
+                   dollars(max(int(limit) - open_cents, 0))))
+    return None
+
+
+def _wholesale_flavor_price(conn, acct, flavor_name, qty_bags=None):
     cat = conn.execute("SELECT category FROM erp_flavor_categories WHERE flavor_name = ?",
                        (flavor_name,)).fetchone()
     category = (cat["category"] if cat else "sweet")
-    prices = _wholesale_account_prices(acct)
-    return prices["savory"] if category == "savory" else prices["sweet"], category
+    return _erp_wholesale_resolved_bag_price(conn, acct, category, qty_bags), category
 
 
 def _send_wholesale_invite_email(to_email, business_name, link):
@@ -15217,7 +15505,7 @@ def wholesale_create_order():
         if qty <= 0:
             conn.close()
             return jsonify(error="line %d: qty_bags must be greater than zero" % i), 400
-        unit, _cat = _wholesale_flavor_price(conn, acct, flavor)
+        unit, _cat = _wholesale_flavor_price(conn, acct, flavor, qty)
         if not conn.execute("SELECT 1 FROM erp_flavor_categories WHERE flavor_name = ?",
                             (flavor,)).fetchone():
             conn.close()
@@ -15238,6 +15526,11 @@ def wholesale_create_order():
     elif len(addrs) > 1:
         conn.close()
         return jsonify(error="please choose a delivery location"), 400
+    refusal = _erp_wholesale_check_credit(
+        conn, acct, sum(li["line_total_cents"] for li in lines))
+    if refusal:
+        conn.close()
+        return jsonify(error=refusal), 400
     po_number = (data.get("po_number") or "").strip() or (acct["default_po"] or "")
     now = datetime.now(timezone.utc).isoformat()
     order_number = _erp_next_wholesale_number(conn)
@@ -15653,6 +15946,306 @@ def erp_wholesale_production_done(order_id, line_id):
     d, t = _erp_production_progress(conn, order_id)
     conn.close()
     return jsonify(ok=True, done=d, total=t)
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/pick")
+def erp_wholesale_order_pick(order_id):
+    actor, err = _erp_check_perm("orders.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    if w["status"] in ("shipped", "picked_up", "cancelled"):
+        conn.close()
+        return jsonify(error="cannot pick a %s order" % w["status"]), 400
+    lines_in = data.get("lines") or []
+    if not lines_in:
+        conn.close()
+        return jsonify(error="at least one line is required"), 400
+    lines = {l["id"]: l for l in conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ?", (order_id,)).fetchall()}
+    for i, entry in enumerate(lines_in, 1):
+        try:
+            line_id = int((entry or {}).get("line_id") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="line %d: line_id must be a number" % i), 400
+        line = lines.get(line_id)
+        if not line:
+            conn.close()
+            return jsonify(error="line %d: unknown line" % i), 400
+        try:
+            picked = float((entry or {}).get("qty_picked") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="line %d: qty_picked must be a number" % i), 400
+        if picked < 0 or picked > float(line["qty_bags"]):
+            conn.close()
+            return jsonify(error="line %d: qty_picked must be between 0 and %s"
+                           % (i, _erp_fmt_qty(line["qty_bags"]))), 400
+        conn.execute("UPDATE erp_wholesale_order_lines SET qty_picked = ? WHERE id = ?",
+                     (picked, line_id))
+    conn.commit()
+    out = [dict(l) for l in conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
+        (order_id,)).fetchall()]
+    conn.close()
+    return jsonify(lines=out)
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/ship")
+def erp_wholesale_order_ship(order_id):
+    actor, err = _erp_check_perm("orders.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    if w["status"] not in ("ready", "partially_shipped"):
+        conn.close()
+        return jsonify(error="only ready orders can ship (status: %s)" % w["status"]), 400
+    lines_in = data.get("lines") or []
+    if not lines_in:
+        conn.close()
+        return jsonify(error="at least one line is required"), 400
+    lines = {l["id"]: l for l in conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ?", (order_id,)).fetchall()}
+    for i, entry in enumerate(lines_in, 1):
+        try:
+            line_id = int((entry or {}).get("line_id") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="line %d: line_id must be a number" % i), 400
+        line = lines.get(line_id)
+        if not line:
+            conn.close()
+            return jsonify(error="line %d: unknown line" % i), 400
+        try:
+            qty = float((entry or {}).get("qty") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="line %d: qty must be a number" % i), 400
+        if qty <= 0:
+            conn.close()
+            return jsonify(error="line %d: qty must be greater than zero" % i), 400
+        remaining = float(line["qty_bags"]) - float(line["qty_shipped"] or 0)
+        if qty > remaining:
+            conn.close()
+            return jsonify(error="line %d: cannot ship more than the %s remaining"
+                           % (i, _erp_fmt_qty(remaining))), 400
+        conn.execute("UPDATE erp_wholesale_order_lines SET qty_shipped = qty_shipped + ?"
+                     " WHERE id = ?", (qty, line_id))
+    after = conn.execute(
+        "SELECT qty_bags, qty_shipped FROM erp_wholesale_order_lines WHERE order_id = ?",
+        (order_id,)).fetchall()
+    all_shipped = all(float(l["qty_shipped"] or 0) >= float(l["qty_bags"]) for l in after)
+    new_status = "shipped" if all_shipped else "partially_shipped"
+    err_msg = _erp_set_fulfillment(conn, "wholesale", order_id, new_status,
+                                   actor, "shipped via Order hub")
+    if err_msg:
+        conn.rollback()
+        conn.close()
+        return jsonify(error=err_msg), 400
+    conn.commit()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    out = _erp_wholesale_order_brief(conn, w)
+    out["lines"] = [dict(l) for l in conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
+        (order_id,)).fetchall()]
+    conn.close()
+    return jsonify(order=out)
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/shipping-label")
+def erp_wholesale_order_shipping_label(order_id):
+    actor, err = _erp_check_perm("orders.write")
+    if err:
+        return err
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    if w["shippo_label_url"] if "shippo_label_url" in w.keys() else "":
+        conn.close()
+        return jsonify(error="shipping label already exists for this order"), 400
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (w["account_id"],)).fetchone()
+    addr_id = w["address_id"] if "address_id" in w.keys() else 0
+    addr = None
+    if addr_id:
+        addr = conn.execute("SELECT * FROM erp_wholesale_addresses WHERE id = ?",
+                            (addr_id,)).fetchone()
+    if not addr or not (addr["zip"] or "").strip():
+        conn.close()
+        return jsonify(error="no shippable address on file for this order"), 400
+    lines = conn.execute(
+        "SELECT qty_bags, qty_shipped FROM erp_wholesale_order_lines WHERE order_id = ?",
+        (order_id,)).fetchall()
+    shipped = sum(float(l["qty_shipped"] or 0) for l in lines)
+    total_qty = int(shipped) if shipped > 0 else int(sum(float(l["qty_bags"]) for l in lines))
+    if total_qty <= 0:
+        conn.close()
+        return jsonify(error="nothing to ship on this order"), 400
+    address_to = _shippo_address_to(
+        name=acct["name"] if acct else "", street1=addr["street"],
+        city=addr["city"], state=addr["state"], zip_code=addr["zip"], country="US")
+    label_url, tracking = _create_shippo_label(address_to, total_qty,
+                                               order_ref=w["order_number"])
+    if not label_url:
+        conn.close()
+        return jsonify(error="Shippo couldn't create a label \u2014 nothing was stored"), 502
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_wholesale_orders SET shippo_label_url = ?, shippo_tracking_number = ?,"
+        " shippo_label_created_at = ? WHERE id = ?",
+        (label_url, tracking or "", now, order_id))
+    conn.commit()
+    conn.close()
+    return jsonify(label_url=label_url, tracking_number=tracking or "", created_at=now)
+
+
+def _erp_wholesale_return_dict(conn, return_id):
+    r = conn.execute("SELECT * FROM erp_wholesale_returns WHERE id = ?",
+                     (return_id,)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    d["lines"] = [dict(l) for l in conn.execute(
+        "SELECT * FROM erp_wholesale_return_lines WHERE return_id = ? ORDER BY id",
+        (return_id,)).fetchall()]
+    return d
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/returns")
+def erp_wholesale_order_create_return(order_id):
+    actor, err = _erp_check_perm("orders.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    reason = (data.get("reason") or "").strip()
+    lines_in = data.get("lines") or []
+    if not lines_in:
+        conn.close()
+        return jsonify(error="at least one return line is required"), 400
+    lines = {l["id"]: l for l in conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ?", (order_id,)).fetchall()}
+    clean = []
+    for i, entry in enumerate(lines_in, 1):
+        try:
+            line_id = int((entry or {}).get("order_line_id") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="line %d: order_line_id must be a number" % i), 400
+        line = lines.get(line_id)
+        if not line:
+            conn.close()
+            return jsonify(error="line %d: unknown order line" % i), 400
+        try:
+            qty = float((entry or {}).get("qty") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="line %d: qty must be a number" % i), 400
+        if qty <= 0:
+            conn.close()
+            return jsonify(error="line %d: qty must be greater than zero" % i), 400
+        already = conn.execute(
+            "SELECT COALESCE(SUM(qty_bags), 0) AS q FROM erp_wholesale_return_lines"
+            " WHERE order_line_id = ?", (line_id,)).fetchone()["q"]
+        if float(already or 0) + qty > float(line["qty_bags"]):
+            conn.close()
+            return jsonify(error="line %d: cannot return more than the %s ordered"
+                           % (i, _erp_fmt_qty(line["qty_bags"]))), 400
+        clean.append((line_id, line["flavor_name"], qty))
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_wholesale_returns (order_id, reason, status, credit_cents,"
+        " created_by, created_at) VALUES (?, ?, 'requested', 0, ?, ?)",
+        (order_id, reason, actor, now))
+    rid = cur.lastrowid
+    for line_id, flavor, qty in clean:
+        conn.execute(
+            "INSERT INTO erp_wholesale_return_lines (return_id, order_line_id,"
+            " flavor_name, qty_bags) VALUES (?, ?, ?, ?)",
+            (rid, line_id, flavor, qty))
+    conn.commit()
+    ret = _erp_wholesale_return_dict(conn, rid)
+    conn.close()
+    return jsonify(wholesale_return=ret), 201
+
+
+@app.get("/api/erp/wholesale-orders/<int:order_id>/returns")
+def erp_wholesale_order_list_returns(order_id):
+    actor, err = _erp_check_perm("orders.read")
+    if err:
+        return err
+    conn = db()
+    if not conn.execute("SELECT 1 FROM erp_wholesale_orders WHERE id = ?",
+                        (order_id,)).fetchone():
+        conn.close()
+        return jsonify(error="order not found"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_wholesale_returns WHERE order_id = ? ORDER BY id",
+        (order_id,)).fetchall()
+    out = [_erp_wholesale_return_dict(conn, r["id"]) for r in rows]
+    conn.close()
+    return jsonify(returns=out)
+
+
+_ERP_WHOLESALE_RETURN_NEXT = {"requested": ("received", "credited"),
+                              "received": ("credited",),
+                              "credited": ()}
+
+
+@app.post("/api/erp/wholesale-returns/<int:return_id>/status")
+def erp_wholesale_return_set_status(return_id):
+    actor, err = _erp_check_perm("orders.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    status = (data.get("status") or "").strip()
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_wholesale_returns WHERE id = ?",
+                     (return_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="return not found"), 404
+    if status not in _ERP_WHOLESALE_RETURN_NEXT.get(r["status"], ()):
+        conn.close()
+        return jsonify(error="cannot move a %s return to %s" % (r["status"], status or "''")), 400
+    credit = int(r["credit_cents"] or 0)
+    if "credit_cents" in data:
+        try:
+            credit = int(data.get("credit_cents") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="credit_cents must be a number"), 400
+        if credit < 0:
+            conn.close()
+            return jsonify(error="credit_cents cannot be negative"), 400
+    conn.execute("UPDATE erp_wholesale_returns SET status = ?, credit_cents = ? WHERE id = ?",
+                 (status, credit, return_id))
+    conn.commit()
+    out = _erp_wholesale_return_dict(conn, return_id)
+    conn.close()
+    return jsonify(wholesale_return=out)
 
 
 @app.get("/api/erp/wholesale-accounts/<int:account_id>/addresses")
