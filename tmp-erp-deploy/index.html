@@ -9682,6 +9682,7 @@ erpState.faireStatus = null;
 erpState.faireLog = [];
 erpState.faireSyncing = false;
 erpState.faireSyncMsg = "";
+erpState.faireConnectMsg = "";
 erpState.showNewAccount = false;
 erpState.showImportAccounts = false;
 erpState.showEditAccount = false;
@@ -10069,6 +10070,54 @@ function renderErpFaireSection(body) {
     meta.textContent = parts.join(" · ");
   }
   box.appendChild(meta);
+  var faireCanWrite = (typeof erpCan === "function" ? erpCan("orders.write") : erpIsAdmin());
+  if (st && st.oauth_connected) {
+    var connLine = document.createElement("p");
+    connLine.textContent = "Connected to Faire"
+      + (st.oauth_connected_at ? " (since " + erpFmtDate(st.oauth_connected_at) + ")" : "")
+      + " — orders are polled with the connected OAuth token.";
+    box.appendChild(connLine);
+    if (faireCanWrite) {
+      var discBtn = document.createElement("button");
+      discBtn.type = "button";
+      discBtn.id = "faireDisconnectBtn";
+      discBtn.textContent = "Disconnect";
+      discBtn.addEventListener("click", function () {
+        erpState.faireConnectMsg = "";
+        erpPost("/api/erp/faire/disconnect", {}).then(function () {
+          erpState.faireConnectMsg = "Disconnected from Faire.";
+          loadErpFaireSection();
+        }).catch(function (error) {
+          erpState.faireConnectMsg = error.message;
+          renderErpOrdersDetail();
+        });
+      });
+      box.appendChild(discBtn);
+    }
+  } else if (st && faireCanWrite) {
+    var connBtn = document.createElement("button");
+    connBtn.type = "button";
+    connBtn.id = "faireConnectBtn";
+    connBtn.textContent = "Connect Faire";
+    connBtn.addEventListener("click", function () {
+      erpState.faireConnectMsg = "";
+      erpGet("/api/erp/faire/connect").then(function (res) {
+        if (res && res.authorize_url) window.open(res.authorize_url, "_blank");
+        else erpState.faireConnectMsg = "Could not start the Faire connection.";
+        renderErpOrdersDetail();
+      }).catch(function (error) {
+        erpState.faireConnectMsg = error.message;
+        renderErpOrdersDetail();
+      });
+    });
+    box.appendChild(connBtn);
+  }
+  if (erpState.faireConnectMsg) {
+    var cmsg = document.createElement("p");
+    cmsg.id = "faireConnectMsg";
+    cmsg.textContent = erpState.faireConnectMsg;
+    box.appendChild(cmsg);
+  }
   if ((typeof erpCan === "function" ? erpCan("orders.write") : erpIsAdmin())) {
     var syncBtn = document.createElement("button");
     syncBtn.type = "button";
