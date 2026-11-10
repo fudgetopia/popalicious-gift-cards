@@ -18643,9 +18643,12 @@ _QB_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
 # endpoint in Faire's docs, so no token exchange is ever called. Every
 # call sends X-FAIRE-APP-CREDENTIALS (Base64
 # "applicationId:applicationSecret" from FAIRE_APP_ID / FAIRE_APP_SECRET)
-# plus the token under BOTH X-FAIRE-OAUTH-ACCESS-TOKEN and
-# X-FAIRE-ACCESS-TOKEN: the Brand-Portal key is an API key, and Faire's
-# docs are ambiguous about which header carries it, so both are sent.
+# plus the token under ONLY X-FAIRE-ACCESS-TOKEN: the Brand-Portal key is
+# an API key, not a code-grant OAuth token. Header variants tried live:
+# OAuth header only -> 401; BOTH headers -> 401; API-key header only is
+# the last untested variant — Faire may validate the OAuth header first
+# and reject it when it holds an API key. If this still 401s, the
+# remaining path is the full OAuth authorization-code flow (not built).
 # A 429 stops the poll immediately; the
 # watermark is only
 # advanced on a complete run, so the next run re-pulls from the same point
@@ -18672,7 +18675,6 @@ def _faire_request(method, path, params=None, json_body=None, access_token=None)
     creds = base64.b64encode(("%s:%s" % (app_id, app_secret)).encode("utf-8")).decode("ascii")
     headers = {"X-FAIRE-APP-CREDENTIALS": creds}
     if access_token:
-        headers["X-FAIRE-OAUTH-ACCESS-TOKEN"] = access_token
         headers["X-FAIRE-ACCESS-TOKEN"] = access_token
     if _FAIRE_TEST_DOUBLE is not None:
         return _FAIRE_TEST_DOUBLE(method, path, params or {}, json_body, headers)
