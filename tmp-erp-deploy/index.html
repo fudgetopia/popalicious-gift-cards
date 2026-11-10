@@ -9702,9 +9702,399 @@ erpState.ediPostDoc = null;
 function erpOrderStatusLabel(s) {
   var labels = {new: "New", submitted: "Submitted", accepted: "Accepted",
     in_production: "In production", ready: "Ready",
-    shipped: "Shipped", picked_up: "Picked up", cancelled: "Cancelled"};
+    shipped: "Shipped", picked_up: "Picked up", cancelled: "Cancelled",
+    partially_shipped: "Partially shipped"};
   return labels[s] || s;
 }
+/* ---------- Order hub 5-pack: packing slip ---------- */
+function erpWholesalePackingSlipHtml(o) {
+  var esc = function (s) {
+    return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  };
+  var rows = "";
+  var totalQty = 0;
+  (o.lines || []).forEach(function (l) {
+    var ordered = Number(l.qty_bags) || 0;
+    var shipped = Number(l.qty_shipped) || 0;
+    totalQty += ordered;
+    rows += "<tr><td>" + esc(l.flavor_name) + "</td><td>" + erpQty(ordered) +
+      "</td><td>" + erpQty(shipped) + "</td><td>" + erpQty(ordered - shipped) + "</td></tr>";
+  });
+  var shipTo = "";
+  if (o.ship_address) {
+    var sa = o.ship_address;
+    shipTo = esc(sa.name || o.account_name || "") + "<br>" + esc(sa.street || "") +
+      "<br>" + esc(sa.city || "") + ", " + esc(sa.state || "") + " " + esc(sa.zip || "");
+  } else if (o.shipping_address) {
+    shipTo = esc(o.shipping_address).replace(/\n/g, "<br>");
+  } else {
+    shipTo = esc(o.account_name || "—");
+  }
+  return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Packing slip " +
+    esc(o.number) + "</title><style>body{font-family:Arial,sans-serif;margin:24px;}" +
+    "table{border-collapse:collapse;width:100%;}th,td{border:1px solid #999;padding:6px;text-align:left;}" +
+    "th{background:#eee;}</style></head><body>" +
+    "<h1>Packing slip " + esc(o.number) + "</h1>" +
+    "<p><strong>Ship to:</strong><br>" + shipTo + "</p>" +
+    "<p><strong>Order date:</strong> " + esc((o.created_at || "").slice(0, 10)) +
+    "<br><strong>Status:</strong> " + esc(erpOrderStatusLabel(o.status)) + "</p>" +
+    "<table><thead><tr><th>Flavor</th><th>Ordered</th><th>Shipped</th><th>Backordered</th></tr></thead>" +
+    "<tbody>" + rows + "</tbody></table>" +
+    "<p><strong>Total bags:</strong> " + erpQty(totalQty) + "</p>" +
+    (o.shippo_tracking_number ? "<p><strong>Tracking:</strong> " + esc(o.shippo_tracking_number) + "</p>" : "") +
+    "<p>Pop-A-Licious · 6290 McLeod Dr, Suite 120, Las Vegas, NV 89120</p>" +
+    "</body></html>";
+}
+function erpShowPrintWholesalePackingSlip(o) {
+  var view = document.getElementById("erpPrintView");
+  if (!view) {
+    view = document.createElement("div");
+    view.id = "erpPrintView";
+    document.body.appendChild(view);
+  }
+  var doc = erpWholesalePackingSlipHtml(o);
+  var styleHtml = "";
+  var s0 = doc.indexOf("<style>");
+  var s1 = doc.indexOf("</style>");
+  if (s0 >= 0 && s1 > s0) styleHtml = doc.slice(s0, s1 + 8);
+  var b0 = doc.indexOf("<body>") + 6;
+  var b1 = doc.lastIndexOf("</body>");
+  var bodyHtml = (b0 >= 6 && b1 > b0) ? doc.slice(b0, b1) : "";
+  view.innerHTML = "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
+    "<button type=\"button\" id=\"erpPrintBack\">Back to order</button></div>" +
+    styleHtml + bodyHtml;
+  document.body.classList.add("erp-printing");
+  window.scrollTo(0, 0);
+  document.getElementById("erpPrintGo").addEventListener("click", function () {
+    window.print();
+  });
+  document.getElementById("erpPrintBack").addEventListener("click", erpHidePrintLabel);
+}
+
+/* ---------- Order hub 5-pack: pick / pack / ship / label ---------- */
+function erpRenderOrderHubPack(body, o, id, source, onRefresh) {
+  if (!o.lines || !o.lines.length) return;
+  var canWrite = (typeof erpCan === "function" ? erpCan("orders.write") : erpIsAdmin());
+  var h = document.createElement("h3");
+  h.textContent = "Pick & pack";
+  body.appendChild(h);
+  var wrap = document.createElement("div");
+  wrap.className = "admin-orders-wrap";
+  var table = document.createElement("table");
+  table.className = "admin-orders-table";
+  var thead = document.createElement("thead");
+  var hr = document.createElement("tr");
+  ["Flavor", "Ordered", "Picked", "Remaining", "Shipped", "Backordered"].forEach(function (c) {
+    var th = document.createElement("th");
+    th.textContent = c;
+    hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  var tbody = document.createElement("tbody");
+  var pickInputs = {};
+  var shipInputs = {};
+  o.lines.forEach(function (l) {
+    var ordered = Number(l.qty_bags) || 0;
+    var picked = Number(l.qty_picked) || 0;
+    var shipped = Number(l.qty_shipped) || 0;
+    var tr = document.createElement("tr");
+    tr.appendChild(erpCell("Flavor", l.flavor_name));
+    tr.appendChild(erpCell("Ordered", erpQty(ordered)));
+    var pickTd = document.createElement("td");
+    if (canWrite && ["shipped", "picked_up", "cancelled"].indexOf(o.status) === -1) {
+      var pi = document.createElement("input");
+      pi.type = "number"; pi.min = "0"; pi.step = "any"; pi.value = String(picked);
+      pi.style.width = "70px";
+      pickInputs[l.id] = pi;
+      pickTd.appendChild(pi);
+    } else {
+      pickTd.textContent = erpQty(picked);
+    }
+    tr.appendChild(pickTd);
+    tr.appendChild(erpCell("Remaining", erpQty(ordered - picked)));
+    var shipTd = document.createElement("td");
+    if (canWrite && (o.status === "ready" || o.status === "partially_shipped")) {
+      var si = document.createElement("input");
+      si.type = "number"; si.min = "0"; si.step = "any";
+      si.value = String(Math.max(ordered - shipped, 0));
+      si.style.width = "70px";
+      shipInputs[l.id] = si;
+      shipTd.appendChild(si);
+    } else {
+      shipTd.textContent = erpQty(shipped);
+    }
+    tr.appendChild(shipTd);
+    tr.appendChild(erpCell("Backordered", erpQty(ordered - shipped)));
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  body.appendChild(wrap);
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  var slipBtn = document.createElement("button");
+  slipBtn.type = "button";
+  slipBtn.textContent = "Packing slip";
+  slipBtn.addEventListener("click", function () { erpShowPrintWholesalePackingSlip(o); });
+  bar.appendChild(slipBtn);
+  if (canWrite) {
+    if (["shipped", "picked_up", "cancelled"].indexOf(o.status) === -1) {
+      var pickBtn = document.createElement("button");
+      pickBtn.type = "button";
+      pickBtn.textContent = "Save picked quantities";
+    pickBtn.addEventListener("click", function () {
+      var lines = [];
+      Object.keys(pickInputs).forEach(function (lid) {
+        lines.push({line_id: Number(lid), qty_picked: Number(pickInputs[lid].value) || 0});
+      });
+      if (!lines.length) return;
+      pickBtn.disabled = true;
+      setAdminDetailStatus("Saving picked quantities…");
+      erpPost("/api/erp/wholesale-orders/" + encodeURIComponent(String(id)) + "/pick", {lines: lines}).then(function () {
+        setAdminDetailStatus("Picked quantities saved.");
+        onRefresh();
+      }).catch(function (error) {
+        pickBtn.disabled = false;
+        setAdminDetailStatus(error.message, true);
+      });
+    });
+    bar.appendChild(pickBtn);
+    }
+    if (o.status === "ready" || o.status === "partially_shipped") {
+      var shipBtn = document.createElement("button");
+      shipBtn.type = "button";
+      shipBtn.textContent = "Ship partial";
+      shipBtn.addEventListener("click", function () {
+        var lines = [];
+        Object.keys(shipInputs).forEach(function (lid) {
+          var q = Number(shipInputs[lid].value) || 0;
+          if (q > 0) lines.push({line_id: Number(lid), qty: q});
+        });
+        if (!lines.length) { setAdminDetailStatus("Enter a quantity to ship.", true); return; }
+        shipBtn.disabled = true;
+        setAdminDetailStatus("Shipping…");
+        erpPost("/api/erp/wholesale-orders/" + encodeURIComponent(String(id)) + "/ship", {lines: lines}).then(function () {
+          setAdminDetailStatus("Shipment recorded.");
+          onRefresh();
+        }).catch(function (error) {
+          shipBtn.disabled = false;
+          setAdminDetailStatus(error.message, true);
+        });
+      });
+      bar.appendChild(shipBtn);
+    }
+    if (o.shippo_label_url) {
+      var lab = document.createElement("span");
+      lab.textContent = "Shipping label: " + o.shippo_label_url +
+        (o.shippo_tracking_number ? " · Tracking: " + o.shippo_tracking_number : "");
+      bar.appendChild(lab);
+    } else {
+      var labelBtn = document.createElement("button");
+      labelBtn.type = "button";
+      labelBtn.textContent = "Create shipping label";
+      labelBtn.addEventListener("click", function () {
+        labelBtn.disabled = true;
+        setAdminDetailStatus("Creating shipping label…");
+        erpPost("/api/erp/wholesale-orders/" + encodeURIComponent(String(id)) + "/shipping-label", {}).then(function (res) {
+          setAdminDetailStatus("Label created" + (res.tracking_number ? " — tracking " + res.tracking_number : "") + ".");
+          onRefresh();
+        }).catch(function (error) {
+          labelBtn.disabled = false;
+          setAdminDetailStatus(error.message, true);
+        });
+      });
+      bar.appendChild(labelBtn);
+    }
+  }
+  body.appendChild(bar);
+}
+
+/* ---------- Order hub 5-pack: returns / RMA ---------- */
+function erpRenderWholesaleReturns(body, o, id, onRefresh) {
+  var h = document.createElement("h3");
+  h.textContent = "Returns";
+  body.appendChild(h);
+  var wrap = document.createElement("div");
+  wrap.id = "erpWholesaleReturns";
+  body.appendChild(wrap);
+  erpGet("/api/erp/wholesale-orders/" + encodeURIComponent(String(id)) + "/returns").then(function (res) {
+    var returns = res.returns || [];
+    wrap.replaceChildren();
+    if (!returns.length) {
+      var none = document.createElement("p");
+      none.textContent = "No returns yet.";
+      wrap.appendChild(none);
+    }
+    returns.forEach(function (r) {
+      var p = document.createElement("p");
+      var linesText = (r.lines || []).map(function (l) {
+        return l.flavor_name + " × " + erpQty(l.qty_bags);
+      }).join(", ");
+      p.textContent = "Return #" + r.id + " — " + r.status +
+        (r.reason ? " — " + r.reason : "") + " — " + linesText +
+        (r.credit_cents ? " — credit " + erpMoney(r.credit_cents) : "");
+      wrap.appendChild(p);
+      if ((typeof erpCan === "function" ? erpCan("orders.write") : erpIsAdmin()) && r.status !== "credited") {
+        var row = document.createElement("div");
+        row.className = "erp-toolbar";
+        var creditInput = document.createElement("input");
+        creditInput.type = "number"; creditInput.min = "0"; creditInput.step = "0.01";
+        creditInput.placeholder = "Credit $";
+        creditInput.style.width = "90px";
+        row.appendChild(erpField("Credit $", creditInput));
+        var next = r.status === "requested" ? ["received", "credited"] : ["credited"];
+        next.forEach(function (st) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.textContent = "Mark " + st;
+          b.addEventListener("click", function () {
+            var payload = {status: st};
+            if (creditInput.value.trim()) {
+              var cents = erpDollarsToCents(creditInput.value.trim());
+              if (cents === null) { setAdminDetailStatus("Credit must be a number.", true); return; }
+              payload.credit_cents = cents;
+            }
+            b.disabled = true;
+            erpPost("/api/erp/wholesale-returns/" + encodeURIComponent(String(r.id)) + "/status", payload).then(function () {
+              onRefresh();
+            }).catch(function (error) {
+              b.disabled = false;
+              setAdminDetailStatus(error.message, true);
+            });
+          });
+          row.appendChild(b);
+        });
+        wrap.appendChild(row);
+      }
+    });
+    if ((typeof erpCan === "function" ? erpCan("orders.write") : erpIsAdmin()) && o.lines && o.lines.length &&
+        ["cancelled"].indexOf(o.status) === -1) {
+      var form = document.createElement("form");
+      form.className = "erp-form";
+      var title = document.createElement("strong");
+      title.textContent = "File return";
+      title.style.width = "100%";
+      form.appendChild(title);
+      var reasonInput = erpTextInput("reason", "Reason for return");
+      form.appendChild(erpField("Reason", reasonInput));
+      var qtyInputs = {};
+      o.lines.forEach(function (l) {
+        var qi = document.createElement("input");
+        qi.type = "number"; qi.min = "0"; qi.step = "any"; qi.value = "0";
+        qi.style.width = "70px";
+        qtyInputs[l.id] = qi;
+        form.appendChild(erpField(l.flavor_name + " qty to return", qi));
+      });
+      var submit = document.createElement("button");
+      submit.type = "submit";
+      submit.textContent = "File return";
+      form.appendChild(submit);
+      var status = document.createElement("p");
+      status.className = "erp-form-status";
+      form.appendChild(status);
+      form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        var lines = [];
+        Object.keys(qtyInputs).forEach(function (lid) {
+          var q = Number(qtyInputs[lid].value) || 0;
+          if (q > 0) lines.push({order_line_id: Number(lid), qty: q});
+        });
+        if (!lines.length) { status.textContent = "Enter a quantity to return."; return; }
+        submit.disabled = true;
+        status.textContent = "Filing return…";
+        erpPost("/api/erp/wholesale-orders/" + encodeURIComponent(String(id)) + "/returns",
+          {reason: reasonInput.value.trim(), lines: lines}).then(function () {
+            onRefresh();
+          }).catch(function (error) {
+            submit.disabled = false;
+            status.textContent = error.message;
+          });
+      });
+      wrap.appendChild(form);
+    }
+  }).catch(function (error) {
+    wrap.replaceChildren();
+    var p = document.createElement("p");
+    p.textContent = error.message;
+    wrap.appendChild(p);
+  });
+}
+
+/* ---------- Order hub 5-pack: volume-tier editor ---------- */
+function erpRenderAccountTiers(container, a, onRefresh) {
+  var h = document.createElement("h3");
+  h.textContent = "Volume pricing tiers";
+  container.appendChild(h);
+  var tiers = a.tiers || [];
+  if (!tiers.length) {
+    var none = document.createElement("p");
+    none.textContent = "No volume tiers yet — the flat savory / sweet price applies at any quantity.";
+    container.appendChild(none);
+  }
+  tiers.forEach(function (t) {
+    var p = document.createElement("p");
+    p.textContent = t.category + " · " + t.min_bags + "+ bags: " + erpMoney(t.price_per_bag_cents) + "/bag";
+    if ((typeof erpCan === "function" ? erpCan("accounts.write") : erpIsAdmin())) {
+      var rm = document.createElement("button");
+      rm.type = "button";
+      rm.textContent = "Remove tier";
+      rm.addEventListener("click", function () {
+        rm.disabled = true;
+        erpDelete("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id)) + "/tiers/" + encodeURIComponent(String(t.id))).then(function () {
+          onRefresh();
+        }).catch(function (error) {
+          rm.disabled = false;
+          setAdminDetailStatus(error.message, true);
+        });
+      });
+      p.appendChild(document.createTextNode(" "));
+      p.appendChild(rm);
+    }
+    container.appendChild(p);
+  });
+  if ((typeof erpCan === "function" ? erpCan("accounts.write") : erpIsAdmin())) {
+    var form = document.createElement("form");
+    form.className = "erp-form";
+    var catSel = document.createElement("select");
+    ["savory", "sweet"].forEach(function (c) {
+      var o = document.createElement("option");
+      o.value = c; o.textContent = c;
+      catSel.appendChild(o);
+    });
+    form.appendChild(erpField("Category", catSel));
+    var minInput = erpTextInput("min_bags", "24");
+    form.appendChild(erpField("Min bags", minInput));
+    var priceInput = erpTextInput("tier_price", "3.50");
+    form.appendChild(erpField("Price/bag ($)", priceInput));
+    var submit = document.createElement("button");
+    submit.type = "submit";
+    submit.textContent = "Add tier";
+    form.appendChild(submit);
+    var status = document.createElement("p");
+    status.className = "erp-form-status";
+    form.appendChild(status);
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var cents = erpDollarsToCents(priceInput.value.trim());
+      if (cents === null || cents <= 0) { status.textContent = "Price must be a number greater than zero."; return; }
+      var minBags = parseInt(minInput.value.trim(), 10);
+      if (!minBags || minBags < 1) { status.textContent = "Min bags must be at least 1."; return; }
+      submit.disabled = true;
+      status.textContent = "Adding tier…";
+      erpPost("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id)) + "/tiers",
+        {category: catSel.value, min_bags: minBags, price_per_bag_cents: cents}).then(function () {
+          onRefresh();
+        }).catch(function (error) {
+          submit.disabled = false;
+          status.textContent = error.message;
+        });
+    });
+    container.appendChild(form);
+  }
+}
+
 function erpChip(status, label) {
   var chip = document.createElement("span");
   chip.className = "erp-chip";
@@ -10015,6 +10405,11 @@ function renderErpOrderDetail(body) {
       ts.textContent = "Tracking: " + o.tracking_number;
       meta.appendChild(ts);
     }
+    if (o.shippo_label_url) {
+      var ls = document.createElement("span");
+      ls.textContent = "Shipping label: " + o.shippo_label_url;
+      meta.appendChild(ls);
+    }
     body.appendChild(meta);
 
     // customer / account block
@@ -10069,7 +10464,9 @@ function renderErpOrderDetail(body) {
       ltable.className = "admin-orders-table";
       var lthead = document.createElement("thead");
       var lhr = document.createElement("tr");
-      ["Flavor", "Bags", "Unit price", "Line total"].forEach(function (c) {
+      (source === "wholesale"
+        ? ["Flavor", "Bags", "Unit price", "Line total", "Picked", "Shipped", "Backordered"]
+        : ["Flavor", "Bags", "Unit price", "Line total"]).forEach(function (c) {
         var th = document.createElement("th");
         th.textContent = c;
         lhr.appendChild(th);
@@ -10083,6 +10480,14 @@ function renderErpOrderDetail(body) {
         tr.appendChild(erpCell("Bags", l.qty_bags));
         tr.appendChild(erpCell("Unit price", erpMoney(l.unit_price_cents)));
         tr.appendChild(erpCell("Line total", erpMoney(l.line_total_cents)));
+        if (source === "wholesale") {
+          var ordered = Number(l.qty_bags) || 0;
+          var picked = Number(l.qty_picked) || 0;
+          var shipped = Number(l.qty_shipped) || 0;
+          tr.appendChild(erpCell("Picked", erpQty(picked)));
+          tr.appendChild(erpCell("Shipped", erpQty(shipped)));
+          tr.appendChild(erpCell("Backordered", erpQty(ordered - shipped)));
+        }
         ltbody.appendChild(tr);
       });
       ltable.appendChild(ltbody);
@@ -10163,6 +10568,12 @@ function renderErpOrderDetail(body) {
           });
       });
       body.appendChild(addProdForm);
+    }
+
+    // Order hub 5-pack: pick/pack, shipping label, partial shipment, returns.
+    if (source === "wholesale") {
+      erpRenderOrderHubPack(body, o, id, source, function () { renderErpOrderDetail(body); });
+      erpRenderWholesaleReturns(body, o, id, function () { renderErpOrderDetail(body); });
     }
 
     // fulfillment
@@ -11029,6 +11440,15 @@ function erpNewAccountForm() {
   var sweetPriceInput = erpTextInput("sweet_price", "4.00");
   form.appendChild(erpField("Savory price/bag ($)", savoryPriceInput));
   form.appendChild(erpField("Sweet price/bag ($)", sweetPriceInput));
+  var savoryCaseInput = erpTextInput("savory_case_price", "");
+  var sweetCaseInput = erpTextInput("sweet_case_price", "");
+  form.appendChild(erpField("Savory case price ($, 12 bags — blank = 12 × bag price)", savoryCaseInput));
+  form.appendChild(erpField("Sweet case price ($, 12 bags — blank = 12 × bag price)", sweetCaseInput));
+  var creditLimitInput = erpTextInput("credit_limit", "");
+  form.appendChild(erpField("Credit limit ($ — blank = no limit)", creditLimitInput));
+  var creditHoldInput = document.createElement("input");
+  creditHoldInput.type = "checkbox";
+  form.appendChild(erpField("Credit hold (block new orders)", creditHoldInput));
   // Pricing mode toggle: per bag, or per case (12 bags) with auto case-price math.
   var modeField = document.createElement("label");
   modeField.textContent = "Price by ";
@@ -11050,11 +11470,15 @@ function erpNewAccountForm() {
     var sv = erpDollarsToCents(savoryPriceInput.value.trim());
     var sw = erpDollarsToCents(sweetPriceInput.value.trim());
     if (sv === null || sw === null) { caseHint.textContent = ""; return; }
-    caseHint.textContent = "Case price (12 bags): savory " + erpMoney(sv * 12) +
-      " · sweet " + erpMoney(sw * 12);
+    var svc = erpDollarsToCents(savoryCaseInput.value.trim());
+    var swc = erpDollarsToCents(sweetCaseInput.value.trim());
+    caseHint.textContent = "Case price (12 bags): savory " + erpMoney(svc ? svc : sv * 12) +
+      " · sweet " + erpMoney(swc ? swc : sw * 12);
   };
   savoryPriceInput.addEventListener("input", paintCaseHint);
   sweetPriceInput.addEventListener("input", paintCaseHint);
+  savoryCaseInput.addEventListener("input", paintCaseHint);
+  sweetCaseInput.addEventListener("input", paintCaseHint);
   paintCaseHint();
   var locTitle = document.createElement("p");
   locTitle.style.fontWeight = "800";
@@ -11107,6 +11531,7 @@ function erpNewAccountForm() {
       active: activeInput.checked,
       pricing_mode: (form.querySelector('input[name="pricing_mode"]:checked') || {}).value || "bag",
       staff_managed: staffManagedInput.checked,
+      credit_hold: creditHoldInput.checked,
       location_name: form.location_name.value.trim(),
       street: form.street.value.trim(),
       city: form.city.value.trim(),
@@ -11117,7 +11542,8 @@ function erpNewAccountForm() {
       location_phone: form.location_phone.value.trim()
     };
     var priceFields = [["price_per_bag", "price_per_bag_cents"],
-      ["savory_price", "savory_price_cents"], ["sweet_price", "sweet_price_cents"]];
+      ["savory_price", "savory_price_cents"], ["sweet_price", "sweet_price_cents"],
+      ["savory_case_price", "savory_case_price_cents"], ["sweet_case_price", "sweet_case_price_cents"]];
     for (var pi = 0; pi < priceFields.length; pi++) {
       var raw = form[priceFields[pi][0]].value.trim();
       if (raw) {
@@ -11128,6 +11554,12 @@ function erpNewAccountForm() {
         }
         payload[priceFields[pi][1]] = c;
       }
+    }
+    var clRaw = creditLimitInput.value.trim();
+    if (clRaw) {
+      var clCents = erpDollarsToCents(clRaw);
+      if (clCents === null) { status.textContent = "Credit limit must be a number."; return; }
+      payload.credit_limit_cents = clCents;
     }
     submit.disabled = true;
     status.textContent = "Creating account…";
@@ -11216,13 +11648,20 @@ function renderErpAccountDetail(body) {
      "Portal: " + (a.account_status || "active"),
      "Ordering: " + (a.staff_managed ? "We create their orders" : "Customer orders in the portal"),
      "Terms: " + (a.payment_terms || "—"),
-     "Orders: " + orders.length
+     "Orders: " + orders.length,
+     "Credit limit: " + (a.credit_limit_cents === null || a.credit_limit_cents === undefined ? "No limit" : erpMoney(a.credit_limit_cents)),
+     "Credit hold: " + (a.credit_hold ? "ON — new orders blocked" : "Off"),
+     "Open balance: " + erpMoney(a.open_balance_cents || 0),
+     "Remaining credit: " + (a.remaining_credit_cents === null || a.remaining_credit_cents === undefined ? "—" : erpMoney(a.remaining_credit_cents))
     ].forEach(function (t) {
       var s = document.createElement("span");
       s.textContent = t;
       meta.appendChild(s);
     });
     body.appendChild(meta);
+    var tierSection = document.createElement("div");
+    erpRenderAccountTiers(tierSection, a, function () { renderErpAccountDetail(body); });
+    body.appendChild(tierSection);
     if (a.notes) {
       var notes = document.createElement("p");
       notes.textContent = a.notes;
@@ -11461,6 +11900,19 @@ function erpEditAccountForm(a) {
   var sweetEditInput = erpTextInput("sweet_price", "4.00");
   if (a.sweet_price_cents) sweetEditInput.value = (Number(a.sweet_price_cents) / 100).toFixed(2);
   form.appendChild(erpField("Sweet price/bag ($)", sweetEditInput));
+  var savoryCaseEditInput = erpTextInput("savory_case_price", "");
+  if (a.savory_case_price_cents) savoryCaseEditInput.value = (Number(a.savory_case_price_cents) / 100).toFixed(2);
+  form.appendChild(erpField("Savory case price ($, 12 bags — blank = 12 × bag price)", savoryCaseEditInput));
+  var sweetCaseEditInput = erpTextInput("sweet_case_price", "");
+  if (a.sweet_case_price_cents) sweetCaseEditInput.value = (Number(a.sweet_case_price_cents) / 100).toFixed(2);
+  form.appendChild(erpField("Sweet case price ($, 12 bags — blank = 12 × bag price)", sweetCaseEditInput));
+  var creditLimitEditInput = erpTextInput("credit_limit", "");
+  if (a.credit_limit_cents !== null && a.credit_limit_cents !== undefined) creditLimitEditInput.value = (Number(a.credit_limit_cents) / 100).toFixed(2);
+  form.appendChild(erpField("Credit limit ($ — blank = no limit)", creditLimitEditInput));
+  var creditHoldEditInput = document.createElement("input");
+  creditHoldEditInput.type = "checkbox";
+  creditHoldEditInput.checked = !!a.credit_hold;
+  form.appendChild(erpField("Credit hold (block new orders)", creditHoldEditInput));
   var modeEditField = document.createElement("label");
   modeEditField.textContent = "Price by ";
   var modeEditBag = document.createElement("input");
@@ -11483,11 +11935,15 @@ function erpEditAccountForm(a) {
     var sv = erpDollarsToCents(savoryEditInput.value.trim());
     var sw = erpDollarsToCents(sweetEditInput.value.trim());
     if (sv === null || sw === null) { caseEditHint.textContent = ""; return; }
-    caseEditHint.textContent = "Case price (12 bags): savory " + erpMoney(sv * 12) +
-      " · sweet " + erpMoney(sw * 12);
+    var svc = erpDollarsToCents(savoryCaseEditInput.value.trim());
+    var swc = erpDollarsToCents(sweetCaseEditInput.value.trim());
+    caseEditHint.textContent = "Case price (12 bags): savory " + erpMoney(svc ? svc : sv * 12) +
+      " · sweet " + erpMoney(swc ? swc : sw * 12);
   };
   savoryEditInput.addEventListener("input", paintCaseEditHint);
   sweetEditInput.addEventListener("input", paintCaseEditHint);
+  savoryCaseEditInput.addEventListener("input", paintCaseEditHint);
+  sweetCaseEditInput.addEventListener("input", paintCaseEditHint);
   paintCaseEditHint();
   var poInput = erpTextInput("default_po", "");
   poInput.value = a.default_po || "";
@@ -11533,10 +11989,13 @@ function erpEditAccountForm(a) {
       notes: notesInput.value.trim(),
       active: activeInput.checked,
       pricing_mode: (form.querySelector('input[name="pricing_mode"]:checked') || {}).value || "bag",
-      staff_managed: staffManagedEditInput.checked
+      staff_managed: staffManagedEditInput.checked,
+      credit_hold: creditHoldEditInput.checked
     };
     var priceFields = [["savory_price", "savory_price_cents", savoryEditInput.value.trim()],
-      ["sweet_price", "sweet_price_cents", sweetEditInput.value.trim()]];
+      ["sweet_price", "sweet_price_cents", sweetEditInput.value.trim()],
+      ["savory_case_price", "savory_case_price_cents", savoryCaseEditInput.value.trim()],
+      ["sweet_case_price", "sweet_case_price_cents", sweetCaseEditInput.value.trim()]];
     for (var pi = 0; pi < priceFields.length; pi++) {
       if (priceFields[pi][2]) {
         var cents = erpDollarsToCents(priceFields[pi][2]);
@@ -11546,6 +12005,16 @@ function erpEditAccountForm(a) {
         }
         payload[priceFields[pi][1]] = cents;
       }
+    }
+    if (!savoryCaseEditInput.value.trim()) payload.savory_case_price_cents = null;
+    if (!sweetCaseEditInput.value.trim()) payload.sweet_case_price_cents = null;
+    var clEditRaw = creditLimitEditInput.value.trim();
+    if (clEditRaw) {
+      var clEditCents = erpDollarsToCents(clEditRaw);
+      if (clEditCents === null) { status.textContent = "Credit limit must be a number."; return; }
+      payload.credit_limit_cents = clEditCents;
+    } else {
+      payload.credit_limit_cents = null;
     }
     submit.disabled = true;
     status.textContent = "Saving…";
