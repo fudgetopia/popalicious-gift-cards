@@ -104,6 +104,14 @@ button { font-family: inherit; }
       .admin-orders-empty { margin: 0; padding: 24px; color: var(--muted); }
       .admin-stat-card--clickable { cursor: pointer; }
       .admin-stat-card--clickable:hover, .admin-stat-card--clickable:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
+      .dash-panel { border: 2px solid var(--ink); background: var(--surface); padding: 16px 20px; margin-top: 12px; }
+      .dash-chart { display: flex; align-items: flex-end; gap: 3px; height: 180px; border-bottom: 2px solid var(--ink); padding-top: 10px; }
+      .dash-chart-group { flex: 1; display: flex; align-items: flex-end; gap: 2px; height: 100%; min-width: 0; }
+      .dash-chart-bar { flex: 1; min-width: 0; }
+      .dash-chart-bar--rev { background: var(--teal); }
+      .dash-chart-bar--ord { background: var(--yellow); }
+      .dash-chart-labels { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 6px; }
+      .dash-chart-note { color: var(--muted); font-size: 13px; margin: 8px 0 0; }
       .admin-orders-table tbody tr.admin-order-row--clickable { cursor: pointer; }
       .admin-orders-table tbody tr.admin-order-row--clickable:hover { background: color-mix(in srgb, var(--teal) 12%, var(--surface)); }
       .admin-detail-status { min-height: 22px; margin: 0 0 14px; color: var(--muted); }
@@ -1383,11 +1391,12 @@ async function renderHome() {
   var grid = document.createElement("div");
   grid.className = "admin-stat-grid";
   body.appendChild(grid);
-  var invVal = null, openPOs = null, note = "";
+  var dashData = null, invVal = null, openPOs = null, note = "";
   try {
     var resp = await authFetch("/api/admin/dashboard");
     var data = await resp.json().catch(function () { return {}; });
     if (resp.ok) {
+      dashData = data;
       invVal = data.inventory_value_cents;
       openPOs = data.open_purchase_orders;
     } else if (resp.status === 403) {
@@ -1399,26 +1408,224 @@ async function renderHome() {
     note = "We couldn't connect to load the dashboard.";
   }
   function card(label, value, hash) {
-    var a = document.createElement("a");
-    a.className = "admin-stat-card admin-stat-card--clickable";
-    a.href = hash;
-    a.style.textDecoration = "none";
-    a.style.color = "inherit";
+    var el = hash ? document.createElement("a") : document.createElement("div");
+    el.className = "admin-stat-card" + (hash ? " admin-stat-card--clickable" : "");
+    if (hash) {
+      el.href = hash;
+      el.style.textDecoration = "none";
+      el.style.color = "inherit";
+    }
     var lab = document.createElement("div");
     lab.className = "admin-stat-label";
     lab.textContent = label;
     var val = document.createElement("div");
     val.className = "admin-stat-value";
     val.textContent = value;
-    a.appendChild(lab);
-    a.appendChild(val);
-    return a;
+    el.appendChild(lab);
+    el.appendChild(val);
+    return el;
   }
   grid.appendChild(card("Inventory value",
     invVal === null || invVal === undefined ? "\u2014" : money(invVal / 100), "#/inventory"));
   grid.appendChild(card("Open purchase orders",
     openPOs === null || openPOs === undefined ? "\u2014" : String(openPOs), "#/purchasing"));
+  if (dashData) {
+    var kpi = document.createElement("div");
+    kpi.className = "admin-stat-grid";
+    kpi.style.marginTop = "12px";
+    body.appendChild(kpi);
+    kpi.appendChild(card("Revenue today", money((dashData.revenue_today_cents || 0) / 100), "#/reports"));
+    kpi.appendChild(card("Orders today", String(dashData.orders_today || 0), "#/reports"));
+    kpi.appendChild(card("All-time revenue", money((dashData.revenue_cents || 0) / 100), "#/reports"));
+    kpi.appendChild(card("Gift-card liability", money((dashData.gift_cards_outstanding_cents || 0) / 100), null));
+    await renderDashAttention(body, dashData);
+    renderDashRecentOrders(body, dashData);
+    await renderDashTrend(body);
+  }
   setAdminDetailStatus(note, !!note && invVal === null);
+}
+function dashSectionTitle(body, text) {
+  var h = document.createElement("h3");
+  h.className = "erp-section-title";
+  h.textContent = text;
+  body.appendChild(h);
+  return h;
+}
+async function renderDashAttention(body, data) {
+  dashSectionTitle(body, "Needs attention");
+  var box = document.createElement("div");
+  box.className = "erp-alert-box";
+  body.appendChild(box);
+  var list = document.createElement("ul");
+  box.appendChild(list);
+  var count = 0;
+  function addLine(text, hash) {
+    var li = document.createElement("li");
+    var a = document.createElement("a");
+    a.href = hash;
+    a.textContent = text;
+    li.appendChild(a);
+    list.appendChild(li);
+    count++;
+  }
+  if ((data.open_purchase_orders || 0) > 0) {
+    addLine(data.open_purchase_orders + (data.open_purchase_orders === 1 ? " open purchase order" : " open purchase orders"), "#/purchasing");
+  }
+  if (erpIsAdmin() || (typeof erpCan === "function" && erpCan("inventory.read"))) {
+    try {
+      var resp = await authFetch("/api/erp/alerts/low-stock");
+      var low = await resp.json().catch(function () { return {}; });
+      if (resp.ok && low && Array.isArray(low.alerts)) {
+        low.alerts.forEach(function (a) {
+          addLine(a.item_name + " (" + a.sku + ") \u2014 " + a.location_code + ": on hand " + a.on_hand + ", reorder at " + a.reorder_point, "#/inventory");
+        });
+      }
+    } catch (e) { /* low-stock unavailable; the widget still shows the PO lines */ }
+  }
+  if (count === 0) {
+    var p = document.createElement("p");
+    p.textContent = "Nothing needs attention right now.";
+    box.appendChild(p);
+  }
+}
+function renderDashRecentOrders(body, data) {
+  var rows = data.recent_orders || [];
+  if (!rows.length) return;
+  dashSectionTitle(body, "Recent orders");
+  var table = document.createElement("table");
+  table.className = "admin-orders-table";
+  var thead = document.createElement("thead");
+  var hr = document.createElement("tr");
+  ["Customer", "Items", "Total", "Created"].forEach(function (c) {
+    var th = document.createElement("th");
+    th.textContent = c;
+    hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+  table.appendChild(thead);
+  var tbody = document.createElement("tbody");
+  rows.forEach(function (o) {
+    var tr = document.createElement("tr");
+    tr.style.cursor = "pointer";
+    tr.addEventListener("click", function () {
+      erpState.selectedOrderSource = "stripe";
+      erpState.selectedOrderId = o.id;
+      erpState.orderReturnView = "queue";
+      renderErpOrdersDetail();
+    });
+    var cust = document.createElement("td");
+    cust.textContent = o.email || "\u2014";
+    var items = document.createElement("td");
+    items.textContent = o.items || "\u2014";
+    var total = document.createElement("td");
+    total.textContent = money((o.total_cents || 0) / 100);
+    var created = document.createElement("td");
+    created.textContent = String(o.created_at || "").slice(0, 10);
+    tr.appendChild(cust);
+    tr.appendChild(items);
+    tr.appendChild(total);
+    tr.appendChild(created);
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  body.appendChild(table);
+}
+async function renderDashTrend(body) {
+  dashSectionTitle(body, "Sales trend");
+  var wrap = document.createElement("div");
+  wrap.className = "dash-panel";
+  body.appendChild(wrap);
+  var toggles = document.createElement("div");
+  toggles.className = "erp-subtabs";
+  wrap.appendChild(toggles);
+  var chartBox = document.createElement("div");
+  wrap.appendChild(chartBox);
+  function setActive(group) {
+    Array.prototype.forEach.call(toggles.children, function (b) {
+      if (b.getAttribute("data-group") === group) b.classList.add("active");
+      else b.classList.remove("active");
+    });
+  }
+  function draw(series) {
+    chartBox.replaceChildren();
+    var byPeriod = {};
+    (series.sales || []).forEach(function (p) {
+      byPeriod[p.period] = { revenue: p.value || 0, orders: 0 };
+    });
+    (series.orders || []).forEach(function (p) {
+      if (!byPeriod[p.period]) byPeriod[p.period] = { revenue: 0, orders: 0 };
+      byPeriod[p.period].orders = p.value || 0;
+    });
+    var periods = Object.keys(byPeriod).sort().slice(-30);
+    if (!periods.length) {
+      var none = document.createElement("p");
+      none.textContent = "No sales in this period yet.";
+      chartBox.appendChild(none);
+      return;
+    }
+    var maxRev = 0, maxOrd = 0;
+    periods.forEach(function (p) {
+      if (byPeriod[p].revenue > maxRev) maxRev = byPeriod[p].revenue;
+      if (byPeriod[p].orders > maxOrd) maxOrd = byPeriod[p].orders;
+    });
+    var chart = document.createElement("div");
+    chart.className = "dash-chart";
+    periods.forEach(function (p) {
+      var g = document.createElement("div");
+      g.className = "dash-chart-group";
+      var rev = document.createElement("div");
+      rev.className = "dash-chart-bar dash-chart-bar--rev";
+      rev.style.height = (maxRev ? Math.max(2, Math.round(byPeriod[p].revenue / maxRev * 100)) : 0) + "%";
+      rev.title = p + ": revenue " + money(byPeriod[p].revenue / 100) + ", " + byPeriod[p].orders + " orders";
+      var ord = document.createElement("div");
+      ord.className = "dash-chart-bar dash-chart-bar--ord";
+      ord.style.height = (maxOrd ? Math.max(2, Math.round(byPeriod[p].orders / maxOrd * 100)) : 0) + "%";
+      ord.title = rev.title;
+      g.appendChild(rev);
+      g.appendChild(ord);
+      chart.appendChild(g);
+    });
+    chartBox.appendChild(chart);
+    var labels = document.createElement("div");
+    labels.className = "dash-chart-labels";
+    var first = document.createElement("span");
+    first.textContent = periods[0];
+    var peak = document.createElement("span");
+    peak.textContent = "Peak revenue " + money(maxRev / 100);
+    var last = document.createElement("span");
+    last.textContent = periods[periods.length - 1];
+    labels.appendChild(first);
+    labels.appendChild(peak);
+    labels.appendChild(last);
+    chartBox.appendChild(labels);
+    var note = document.createElement("p");
+    note.className = "dash-chart-note";
+    note.textContent = "Teal bars: revenue. Yellow bars: orders. Each series is scaled to its own peak.";
+    chartBox.appendChild(note);
+  }
+  async function load(group) {
+    setActive(group);
+    try {
+      var resp = await authFetch("/api/admin/analytics?group=" + encodeURIComponent(group));
+      var series = await resp.json().catch(function () { return {}; });
+      if (!resp.ok) throw new Error("unavailable");
+      draw(series);
+    } catch (e) {
+      chartBox.replaceChildren();
+      var err = document.createElement("p");
+      err.textContent = "Sales trend unavailable.";
+      chartBox.appendChild(err);
+    }
+  }
+  [["day", "Daily"], ["month", "Monthly"], ["year", "Yearly"]].forEach(function (g) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = g[1];
+    b.setAttribute("data-group", g[0]);
+    b.addEventListener("click", function () { load(g[0]); });
+    toggles.appendChild(b);
+  });
+  await load("day");
 }
 window.addEventListener("hashchange", renderRoute);
 
