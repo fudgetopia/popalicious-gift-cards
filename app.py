@@ -489,6 +489,17 @@ def init_db():
             conn.execute("ALTER TABLE erp_recipes ADD COLUMN serving_grams REAL")
         if "servings_per_bag" not in rcols:
             conn.execute("ALTER TABLE erp_recipes ADD COLUMN servings_per_bag INTEGER")
+    # Migration: emailed_at on purchase orders (Purchasing 5-pack, Nov 2026).
+    poexists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_purchase_orders'"
+    ).fetchone()
+    if poexists:
+        pocols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(erp_purchase_orders)").fetchall()]
+        if "emailed_at" not in pocols:
+            conn.execute(
+                "ALTER TABLE erp_purchase_orders"
+                " ADD COLUMN emailed_at TEXT NOT NULL DEFAULT ''")
     # Migration: per-staff ERP permissions (Nov 2026). Existing staff keep
     # exactly the access they had; new staff start with no grants.
     _erp_seed_staff_perms(conn)
@@ -916,7 +927,8 @@ def init_db():
             tax_cents INTEGER NOT NULL DEFAULT 0,
             notes TEXT NOT NULL DEFAULT '',
             created_by TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            emailed_at TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS erp_po_lines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -10683,6 +10695,10 @@ def _erp_po_summary(conn, po):
     d["line_count"] = lines["n"]
     d["total_ordered_cents"] = int(lines["ordered"] or 0)
     d["total_received_cents"] = int(lines["received"] or 0)
+    today = datetime.now(timezone.utc).date().isoformat()
+    d["is_overdue"] = bool(
+        (po["status"] in ("sent", "partial"))
+        and (po["expected_date"] or "") and (po["expected_date"] or "") < today)
     return d
 
 
@@ -12284,6 +12300,369 @@ def erp_po_status(po_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True, po_id=po_id, status=new_status)
+
+
+def _erp_po_last_receipt_date(conn, po_number):
+    """Date (YYYY-MM-DD) of the last purchase_receipt ledger row for a PO."""
+    row = conn.execute(
+        "SELECT MAX(substr(created_at, 1, 10)) AS d FROM erp_stock_ledger"
+        " WHERE movement_type = 'purchase_receipt' AND ref_id = ?",
+        (po_number,)).fetchone()
+    return row["d"] if row and row["d"] else None
+
+
+def _erp_vendor_performance(conn, vendor_id):
+    """On-time %, fill rate, avg lead time, overdue POs for one vendor.
+
+    On-time and lead time cover completed POs (received/closed) that have an
+    expected date and a receipt row; fill rate covers every ordered PO
+    (sent/partial/received/closed) — drafts and cancelled POs are excluded.
+    """
+    pos = conn.execute(
+        "SELECT * FROM erp_purchase_orders WHERE vendor_id = ? ORDER BY id",
+        (vendor_id,)).fetchall()
+    today = datetime.now(timezone.utc).date().isoformat()
+    completed = [p for p in pos if p["status"] in ("received", "closed")]
+    open_pos = [p for p in pos if p["status"] in ("draft", "sent", "partial")]
+    on_time = 0
+    on_time_denom = 0
+    lead_days = []
+    for p in completed:
+        if not (p["expected_date"] or ""):
+            continue
+        last = _erp_po_last_receipt_date(conn, p["po_number"])
+        if not last:
+            continue
+        on_time_denom += 1
+        if last <= p["expected_date"]:
+            on_time += 1
+        try:
+            lead_days.append(
+                (datetime.strptime(last, "%Y-%m-%d").date()
+                 - datetime.strptime((p["order_date"] or "")[:10],
+                                    "%Y-%m-%d").date()).days)
+        except (ValueError, TypeError):
+            pass
+    ordered = 0.0
+    received = 0.0
+    for p in pos:
+        if p["status"] in ("draft", "cancelled"):
+            continue
+        for l in conn.execute(
+                "SELECT qty_ordered, qty_received FROM erp_po_lines WHERE po_id = ?",
+                (p["id"],)).fetchall():
+            ordered += float(l["qty_ordered"] or 0)
+            received += float(l["qty_received"] or 0)
+    overdue = []
+    for p in pos:
+        if (p["status"] in ("sent", "partial") and (p["expected_date"] or "")
+                and p["expected_date"] < today):
+            try:
+                days = (datetime.strptime(today, "%Y-%m-%d").date()
+                        - datetime.strptime(p["expected_date"],
+                                            "%Y-%m-%d").date()).days
+            except ValueError:
+                days = 0
+            overdue.append({"po_id": p["id"], "po_number": p["po_number"],
+                            "status": p["status"],
+                            "expected_date": p["expected_date"],
+                            "days_overdue": days})
+    return {
+        "po_count": len(pos),
+        "open_count": len(open_pos),
+        "completed_count": len(completed),
+        "on_time_pct": (round(100.0 * on_time / on_time_denom, 1)
+                        if on_time_denom else None),
+        "on_time_count": on_time,
+        "on_time_denominator": on_time_denom,
+        "fill_rate_pct": (round(100.0 * received / ordered, 1)
+                          if ordered > 0 else None),
+        "avg_lead_days": (round(sum(lead_days) / len(lead_days), 1)
+                          if lead_days else None),
+        "overdue": overdue,
+    }
+
+
+def _erp_po_email_html(po, vendor, lines):
+    """Plain HTML body for a PO email: the PO is the order."""
+    import html as _html
+    dollars = lambda c: "$%s" % format((c or 0) / 100, ",.2f")
+    rows = ""
+    lines_total = 0
+    for l in lines:
+        lt = int(round(float(l["qty_ordered"]) * int(l["unit_cost_cents"])))
+        lines_total += lt
+        rows += ("<tr><td>%s &mdash; %s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                 % (_html.escape(l["sku"] or ""),
+                    _html.escape(l["item_name"] or ""),
+                    _erp_fmt_qty(l["qty_ordered"]),
+                    dollars(l["unit_cost_cents"]), dollars(lt)))
+    freight = int(po["freight_cents"] or 0)
+    tax = int(po["tax_cents"] or 0)
+    grand = lines_total + freight + tax
+    notes = ""
+    if (po["notes"] or "").strip():
+        notes = "<p><strong>Notes:</strong> %s</p>" % _html.escape(po["notes"])
+    return """\
+<html><body style="font-family: Arial, sans-serif; line-height: 1.6;">
+<p>Hi %s,</p>
+<p>Please supply the following order from Pop-A-Licious:</p>
+<p><strong>Purchase order %s</strong><br>
+Order date: %s<br>
+Expected delivery: %s</p>
+<table border="1" cellpadding="6" cellspacing="0">
+<tr><th>Item</th><th>Qty</th><th>Unit cost</th><th>Line total</th></tr>
+%s
+</table>
+<p>Goods: %s<br>Freight: %s<br>Tax: %s<br><strong>Total: %s</strong></p>
+%s
+<p>Please confirm receipt of this order and the expected delivery date.</p>
+<p>Thanks,<br>Pop-A-Licious</p>
+</body></html>""" % (
+        _html.escape(vendor["contact_name"] or vendor["name"] or "there"),
+        _html.escape(po["po_number"]),
+        (po["order_date"] or "")[:10],
+        _html.escape(po["expected_date"] or "—"),
+        rows,
+        dollars(lines_total), dollars(freight), dollars(tax), dollars(grand),
+        notes)
+
+
+@app.put("/api/erp/purchase-orders/<int:po_id>")
+def erp_update_po(po_id):
+    actor, err = _erp_check_perm("purchasing.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    po = conn.execute(
+        "SELECT * FROM erp_purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    if not po:
+        conn.close()
+        return jsonify(error="purchase order not found"), 404
+    if po["status"] != "draft":
+        conn.close()
+        return jsonify(
+            error="only draft purchase orders can be edited (status: %s)"
+                  % po["status"]), 400
+    vendor_id = po["vendor_id"]
+    if "vendor_id" in data:
+        try:
+            vendor_id = int(data.get("vendor_id") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="vendor_id must be a number"), 400
+        vendor = conn.execute(
+            "SELECT * FROM erp_vendors WHERE id = ?", (vendor_id,)).fetchone()
+        if not vendor or not vendor["active"]:
+            conn.close()
+            return jsonify(error="valid vendor_id is required"), 400
+    try:
+        freight = int(data.get("freight_cents", po["freight_cents"]) or 0)
+        tax = int(data.get("tax_cents", po["tax_cents"]) or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="freight_cents and tax_cents must be whole cents"), 400
+    if freight < 0 or tax < 0:
+        conn.close()
+        return jsonify(error="freight_cents and tax_cents cannot be negative"), 400
+    expected = (data.get("expected_date", po["expected_date"]) or "").strip()
+    notes = (data.get("notes", po["notes"]) or "").strip()
+    clean = None
+    if "lines" in data:
+        raw_lines = data.get("lines") or []
+        if not raw_lines:
+            conn.close()
+            return jsonify(error="at least one line is required"), 400
+        already = conn.execute(
+            "SELECT COALESCE(SUM(qty_received), 0) AS r"
+            " FROM erp_po_lines WHERE po_id = ?", (po_id,)).fetchone()["r"]
+        if float(already or 0) > 0:
+            conn.close()
+            return jsonify(
+                error="cannot edit lines after receiving has started"), 400
+        clean = []
+        for entry in raw_lines:
+            item = _erp_get_item(conn, (entry or {}).get("item_id"))
+            if not item or not item["active"]:
+                conn.close()
+                return jsonify(error="every line needs a valid item_id"), 400
+            if (item["type"] or "") != "popcorn":
+                conn.close()
+                return jsonify(
+                    error="only popcorn can be added to a purchase order"), 400
+            try:
+                qty = float(entry.get("qty_ordered") or 0)
+            except (TypeError, ValueError):
+                qty = 0
+            try:
+                cost = int(entry.get("unit_cost_cents") or 0)
+            except (TypeError, ValueError):
+                cost = 0
+            if qty <= 0:
+                conn.close()
+                return jsonify(
+                    error="qty_ordered must be greater than zero"), 400
+            if cost < 0:
+                conn.close()
+                return jsonify(
+                    error="unit_cost_cents cannot be negative"), 400
+            clean.append((item["id"], qty, cost))
+    conn.execute(
+        "UPDATE erp_purchase_orders SET vendor_id = ?, expected_date = ?,"
+        " freight_cents = ?, tax_cents = ?, notes = ? WHERE id = ?",
+        (vendor_id, expected, freight, tax, notes, po_id))
+    if clean is not None:
+        conn.execute("DELETE FROM erp_po_lines WHERE po_id = ?", (po_id,))
+        for item_id, qty, cost in clean:
+            conn.execute(
+                "INSERT INTO erp_po_lines (po_id, item_id, qty_ordered,"
+                " qty_received, unit_cost_cents) VALUES (?, ?, ?, 0, ?)",
+                (po_id, item_id, qty, cost))
+    conn.commit()
+    po = conn.execute(
+        "SELECT * FROM erp_purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    vendor = conn.execute(
+        "SELECT * FROM erp_vendors WHERE id = ?", (po["vendor_id"],)).fetchone()
+    lines = conn.execute(
+        "SELECT l.*, i.sku, i.name AS item_name, i.type AS item_type,"
+        " i.unit AS item_unit"
+        " FROM erp_po_lines l JOIN erp_items i ON i.id = l.item_id"
+        " WHERE l.po_id = ? ORDER BY l.id", (po_id,)).fetchall()
+    summary = _erp_po_summary(conn, po)
+    conn.close()
+    return jsonify(purchase_order=summary, vendor=dict(vendor) if vendor else None,
+                   lines=[dict(l) for l in lines])
+
+
+@app.post("/api/erp/purchase-orders/<int:po_id>/email")
+def erp_email_po(po_id):
+    actor, err = _erp_check_perm("purchasing.write")
+    if err:
+        return err
+    conn = db()
+    po = conn.execute(
+        "SELECT * FROM erp_purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    if not po:
+        conn.close()
+        return jsonify(error="purchase order not found"), 404
+    if po["status"] == "cancelled":
+        conn.close()
+        return jsonify(error="cancelled purchase orders cannot be emailed"), 400
+    vendor = conn.execute(
+        "SELECT * FROM erp_vendors WHERE id = ?", (po["vendor_id"],)).fetchone()
+    if not vendor or not (vendor["email"] or "").strip():
+        conn.close()
+        return jsonify(error="this vendor has no email on file \u2014 add one to send the PO"), 400
+    lines = conn.execute(
+        "SELECT l.*, i.sku, i.name AS item_name, i.type AS item_type,"
+        " i.unit AS item_unit"
+        " FROM erp_po_lines l JOIN erp_items i ON i.id = l.item_id"
+        " WHERE l.po_id = ? ORDER BY l.id", (po_id,)).fetchall()
+    body = _erp_po_email_html(po, vendor, lines)
+    try:
+        send_email((vendor["email"] or "").strip(),
+                   "Purchase order %s from Pop-A-Licious" % po["po_number"],
+                   body)
+    except Exception as exc:
+        conn.close()
+        return jsonify(error="couldn't send the email: %s" % exc), 502
+    now = datetime.now(timezone.utc).isoformat()
+    new_status = "sent" if po["status"] == "draft" else po["status"]
+    conn.execute(
+        "UPDATE erp_purchase_orders SET emailed_at = ?, status = ? WHERE id = ?",
+        (now, new_status, po_id))
+    conn.commit()
+    po = conn.execute(
+        "SELECT * FROM erp_purchase_orders WHERE id = ?", (po_id,)).fetchone()
+    summary = _erp_po_summary(conn, po)
+    conn.close()
+    return jsonify(purchase_order=summary,
+                   emailed_to=(vendor["email"] or "").strip(), emailed_at=now)
+
+
+@app.get("/api/erp/purchase-orders/overdue")
+def erp_overdue_pos():
+    actor, err = _erp_check_perm("purchasing.read")
+    if err:
+        return err
+    today = datetime.now(timezone.utc).date().isoformat()
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_purchase_orders"
+        " WHERE status IN ('sent', 'partial') AND expected_date != ''"
+        " AND expected_date < ? ORDER BY expected_date",
+        (today,)).fetchall()
+    out = []
+    for po in rows:
+        d = _erp_po_summary(conn, po)
+        try:
+            days = (datetime.strptime(today, "%Y-%m-%d").date()
+                    - datetime.strptime(po["expected_date"],
+                                        "%Y-%m-%d").date()).days
+        except ValueError:
+            days = 0
+        d["days_overdue"] = days
+        out.append(d)
+    conn.close()
+    return jsonify(today=today, count=len(out), overdue=out)
+
+
+@app.get("/api/erp/vendors/<int:vendor_id>/performance")
+def erp_vendor_performance(vendor_id):
+    actor, err = _erp_check_perm("purchasing.read")
+    if err:
+        return err
+    conn = db()
+    vendor = conn.execute(
+        "SELECT * FROM erp_vendors WHERE id = ?", (vendor_id,)).fetchone()
+    if not vendor:
+        conn.close()
+        return jsonify(error="vendor not found"), 404
+    result = _erp_vendor_performance(conn, vendor_id)
+    conn.close()
+    return jsonify(vendor=dict(vendor), performance=result)
+
+
+@app.get("/api/erp/vendors/<int:vendor_id>/price-history")
+def erp_vendor_price_history(vendor_id):
+    actor, err = _erp_check_perm("purchasing.read")
+    if err:
+        return err
+    conn = db()
+    vendor = conn.execute(
+        "SELECT * FROM erp_vendors WHERE id = ?", (vendor_id,)).fetchone()
+    if not vendor:
+        conn.close()
+        return jsonify(error="vendor not found"), 404
+    rows = conn.execute(
+        "SELECT l.unit_cost_cents, p.po_number, p.order_date, i.id AS item_id,"
+        " i.sku, i.name AS item_name FROM erp_po_lines l"
+        " JOIN erp_purchase_orders p ON p.id = l.po_id"
+        " JOIN erp_items i ON i.id = l.item_id"
+        " WHERE p.vendor_id = ?"
+        " AND p.status IN ('sent', 'partial', 'received', 'closed')"
+        " ORDER BY i.name, p.order_date, p.id",
+        (vendor_id,)).fetchall()
+    items = []
+    by_item = {}
+    for r in rows:
+        entry = by_item.get(r["item_id"])
+        if entry is None:
+            entry = {"item_id": r["item_id"], "sku": r["sku"],
+                     "item_name": r["item_name"], "entries": []}
+            by_item[r["item_id"]] = entry
+            items.append(entry)
+        prev = (entry["entries"][-1]["unit_cost_cents"]
+                if entry["entries"] else None)
+        entry["entries"].append({
+            "po_number": r["po_number"],
+            "order_date": (r["order_date"] or "")[:10],
+            "unit_cost_cents": int(r["unit_cost_cents"]),
+            "changed": prev is not None and int(r["unit_cost_cents"]) != prev,
+            "prev_unit_cost_cents": prev})
+    conn.close()
+    return jsonify(vendor=dict(vendor), items=items)
 
 
 @app.get("/api/erp/reorder-rules")
@@ -17070,6 +17449,79 @@ def erp_qb_status():
         "realm_id": (tok["realm_id"] if tok else "") or "",
         "company_name": (tok["company_name"] if tok else "") or "",
     })
+
+
+# ---------- report: spend by vendor ----------
+
+@app.get("/api/erp/reports/spend-by-vendor")
+def erp_report_spend_by_vendor():
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    df, dt = _erp_report_dates(request.args)
+    if df is None:
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    fmt = (request.args.get("format") or "json").strip().lower()
+    where, params = _erp_date_where(df, dt, "p.order_date")
+    # Ordered POs only: drafts are planned spend, cancelled POs are not spend.
+    status_filter = "p.status IN ('sent', 'partial', 'received', 'closed')"
+    conn = db()
+    line_rows = conn.execute(
+        "SELECT p.vendor_id, COALESCE(SUM(l.qty_ordered * l.unit_cost_cents), 0)"
+        " AS lines_total, COALESCE(SUM(l.qty_ordered), 0) AS bags"
+        " FROM erp_po_lines l JOIN erp_purchase_orders p ON p.id = l.po_id"
+        + (" WHERE " + status_filter + " AND " + where if where else
+           " WHERE " + status_filter)
+        + " GROUP BY p.vendor_id",
+        params).fetchall()
+    po_rows = conn.execute(
+        "SELECT vendor_id, COUNT(*) AS po_count,"
+        " COALESCE(SUM(freight_cents), 0) AS freight,"
+        " COALESCE(SUM(tax_cents), 0) AS tax"
+        " FROM erp_purchase_orders p"
+        + (" WHERE " + status_filter + " AND " + where if where else
+           " WHERE " + status_filter)
+        + " GROUP BY vendor_id",
+        params).fetchall()
+    by_vendor = {}
+    for r in line_rows:
+        by_vendor[r["vendor_id"]] = {
+            "lines_total_cents": int(r["lines_total"] or 0),
+            "bags": float(r["bags"] or 0)}
+    for r in po_rows:
+        d = by_vendor.setdefault(r["vendor_id"], {
+            "lines_total_cents": 0, "bags": 0.0})
+        d["po_count"] = int(r["po_count"] or 0)
+        d["freight_cents"] = int(r["freight"] or 0)
+        d["tax_cents"] = int(r["tax"] or 0)
+    vendors = []
+    total_cents = 0
+    total_pos = 0
+    for vid in sorted(by_vendor):
+        v = conn.execute(
+            "SELECT name FROM erp_vendors WHERE id = ?", (vid,)).fetchone()
+        d = by_vendor[vid]
+        t = (d["lines_total_cents"] + d.get("freight_cents", 0)
+             + d.get("tax_cents", 0))
+        total_cents += t
+        total_pos += d.get("po_count", 0)
+        vendors.append({
+            "vendor_id": vid, "vendor_name": v["name"] if v else "",
+            "po_count": d.get("po_count", 0), "bags": d["bags"],
+            "lines_total_cents": d["lines_total_cents"],
+            "freight_cents": d.get("freight_cents", 0),
+            "tax_cents": d.get("tax_cents", 0), "total_cents": t})
+    conn.close()
+    if fmt == "csv":
+        return _erp_csv_response(
+            "erp-spend-by-vendor-%s-%s.csv" % (df or "all", dt or "all"),
+            ["vendor", "purchase_orders", "bags", "lines_total_cents",
+             "freight_cents", "tax_cents", "total_cents"],
+            [[v["vendor_name"], v["po_count"], v["bags"],
+              v["lines_total_cents"], v["freight_cents"], v["tax_cents"],
+              v["total_cents"]] for v in vendors])
+    return jsonify({"from": df, "to": dt, "vendors": vendors,
+                    "total_cents": total_cents, "po_count": total_pos})
 
 
 @app.get("/api/erp/quickbooks/connect")
