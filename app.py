@@ -17534,9 +17534,15 @@ def erp_report_sales():
     wholesale = {"order_count": 0, "total_cents": 0, "flavors": []}
     csv_rows = []
     if channel in ("all", "online"):
+        # A captured PayPal order is copied into orders by the capture
+        # (stripe_session_id 'paypal:<id>'), so the orders side must exclude
+        # paypal-sourced rows or this UNION ALL counts the order twice.
+        orders_where = "stripe_session_id NOT LIKE 'paypal:%'"
+        if where:
+            orders_where += " AND " + where
         q = ("SELECT id, 'stripe' AS src, email, customer_name, items_summary,"
              " amount_total_cents, total_qty, created_at FROM orders"
-             + (" WHERE " + where if where else "")
+             " WHERE " + orders_where
              + " UNION ALL SELECT id, 'paypal' AS src, email, '' AS customer_name,"
              " items_summary, amount_total_cents, total_qty, created_at"
              " FROM paypal_orders WHERE status = 'captured'"
@@ -17746,7 +17752,11 @@ def _erp_build_summary(conn, period_start, period_end):
     Wholesale is excluded: it reaches QuickBooks as invoices (no double count)."""
     total_cents = 0
     order_count = 0
-    for tbl, extra in (("orders", ""), ("paypal_orders", "AND status = 'captured'")):
+    # A captured PayPal order is copied into orders by the capture
+    # (stripe_session_id 'paypal:<id>'). The paypal_orders side counts it
+    # once already, so the orders side excludes paypal-sourced rows.
+    for tbl, extra in (("orders", "AND stripe_session_id NOT LIKE 'paypal:%'"),
+                       ("paypal_orders", "AND status = 'captured'")):
         r = conn.execute(
             "SELECT COALESCE(SUM(amount_total_cents), 0) AS t, COUNT(*) AS c"
             " FROM %s WHERE substr(created_at, 1, 10) >= ?"
