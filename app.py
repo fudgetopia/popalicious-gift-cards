@@ -7514,6 +7514,14 @@ def admin_dashboard():
     revenue_today = conn.execute(
         "SELECT COALESCE(SUM(amount_total_cents), 0) AS s FROM orders"
         " WHERE substr(created_at, 1, 10) = date('now')").fetchone()["s"]
+    # PayPal checkouts start as paypal_orders rows with status 'created' and
+    # only reach the orders table on capture (the capture endpoint copies
+    # them there once). Uncaptured checkouts are not revenue yet — they are
+    # awaiting payment. Do NOT add paypal_orders to the sums: a captured
+    # PayPal order already sits in orders, so that would double-count it.
+    awaiting = conn.execute(
+        "SELECT COUNT(*) AS c, COALESCE(SUM(amount_total_cents), 0) AS s"
+        " FROM paypal_orders WHERE status != 'captured'").fetchone()
     gift_cards_sold = conn.execute(
         "SELECT COUNT(*) AS c FROM gift_cards").fetchone()["c"]
     gift_cards_outstanding = conn.execute(
@@ -7540,6 +7548,8 @@ def admin_dashboard():
     return jsonify(
         revenue_cents=revenue, total_orders=total_orders,
         orders_today=orders_today, revenue_today_cents=revenue_today,
+        awaiting_payment_count=int(awaiting["c"] or 0),
+        awaiting_payment_cents=int(awaiting["s"] or 0),
         gift_cards_sold=gift_cards_sold,
         gift_cards_outstanding_cents=gift_cards_outstanding,
         loyalty_members=members, kernels_issued=kernels_issued,
