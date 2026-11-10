@@ -723,6 +723,13 @@ def init_db():
             approved_at TEXT,
             published_at TEXT
         );
+        CREATE TABLE IF NOT EXISTS erp_login_codes (
+            code_hash TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
+        );
         CREATE TABLE IF NOT EXISTS erp_mkt_ig_insights (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scope TEXT NOT NULL,
@@ -4099,6 +4106,50 @@ def auth_me():
     return jsonify(id=row["id"], name=row["name"], email=row["email"],
                    is_admin=row["email"].lower() in ADMIN_EMAILS)
 
+@app.post("/api/auth/erp-handoff")
+def auth_erp_handoff():
+    """Redeem a one-time ERP login code for the admin's session token.
+
+    Public: the code itself is the credential. Single-use, 60-second life.
+    Unknown, already-used, and expired codes all fail with 401.
+    """
+    err = _require_auth_ready()
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    code = (data.get("code") or "").strip()
+    if not code:
+        return jsonify(error="code required"), 401
+    digest = hashlib.sha256(code.encode()).hexdigest()
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_login_codes WHERE code_hash = ?", (digest,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="invalid code"), 401
+    try:
+        created = datetime.fromisoformat(row["created_at"])
+    except ValueError:
+        created = None
+    if created is not None and created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    if created is None or (datetime.now(timezone.utc) - created).total_seconds() > HANDOFF_TTL_SECONDS:
+        conn.close()
+        return jsonify(error="code expired"), 401
+    cur = conn.execute(
+        "UPDATE erp_login_codes SET used = 1 WHERE code_hash = ? AND used = 0",
+        (digest,))
+    if cur.rowcount != 1:
+        conn.close()
+        return jsonify(error="invalid code"), 401
+    conn.commit()
+    user = _auth_user_from_token(row["token"])
+    conn.close()
+    if not user:
+        return jsonify(error="invalid code"), 401
+    return jsonify(token=row["token"], email=user["email"], name=user["name"])
+
+
 @app.get("/api/auth/google/start")
 def google_start():
     err = _require_auth_ready()
@@ -5987,6 +6038,42 @@ def erp_session_info():
     if role == "wholesale":
         return jsonify(role="wholesale", perms=[])
     return jsonify(error="login required"), 401
+
+# ---------------- Storefront login handoff (Nov 2026) ----------------
+# The storefront signs the admin in only through the shared pal_session
+# cookie, which is third-party from pop-a-licious.com — browsers that block
+# third-party cookies show the admin logged out after clicking "View
+# storefront" in the ERP. The ERP mints a short-lived single-use code; the
+# storefront redeems it for the admin's session token. Only the SHA-256 hash
+# of a code is stored, never the code itself. The redeemed token is the
+# minter's own session token: the cookie token and the Bearer <redacted> are the
+# same _issue_auth_token value, and it is what /api/auth/me accepts.
+HANDOFF_TTL_SECONDS = 60
+
+
+@app.post("/api/erp/auth/handoff")
+def erp_auth_handoff():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.lower().startswith("bearer ") else ""
+    token = token or _session_token_from_request()
+    user = _auth_user_from_token(token)
+    if not user:
+        return jsonify(error="login required"), 401
+    code = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        "INSERT INTO erp_login_codes (code_hash, token, email, created_at, used)"
+        " VALUES (?, ?, ?, ?, 0)",
+        (hashlib.sha256(code.encode()).hexdigest(), token,
+         user["email"], now))
+    conn.commit()
+    conn.close()
+    return jsonify(code=code)
+
 
 # ---------------- Marketing emails (promos + merch drops) ----------------
 # Audience = deduplicated: active+verified users + order emails (Stripe +
