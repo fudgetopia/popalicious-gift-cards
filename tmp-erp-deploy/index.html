@@ -1690,7 +1690,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
 /* ================= ERP Phase 1: Inventory + Purchasing (lifted from site build) ================= */
         var erpState = {
           items: [], locations: [], stock: [], vendors: [], pos: [],
-          alerts: [], selectedItemId: null, selectedPOId: null,
+          alerts: [], expiryAlerts: [], reorderRules: [],
+          showLots: false, showShrinkage: false, showReplenishment: false,
+          selectedItemId: null, selectedPOId: null,
           stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: "", acctAudit: [], acctAuditFilters: {action: "", actor: "", from: "", to: ""}, acctAuditOffset: 0, acctAuditLoaded: false, acctBackup: null, acctBackupLoaded: false, mktIg: null, mktNews: null, mktTickets: null, mktView: "instagram", mktSelectedTicketId: null, mktTicketDetail: null
         };
         function erpQty(q) {
@@ -1825,12 +1827,17 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               erpGet("/api/erp/items"),
               erpGet("/api/erp/locations"),
               erpGet("/api/erp/stock"),
-              erpGet("/api/erp/alerts/low-stock")
+              erpGet("/api/erp/alerts/low-stock"),
+              erpGet("/api/erp/vendors").catch(function () { return {vendors: []}; }),
+              erpGet("/api/erp/reorder-rules").catch(function () { return {reorder_rules: []}; })
             ]);
             erpState.items = results[0].items || [];
             erpState.locations = results[1].locations || [];
             erpState.stock = results[2].stock || [];
             erpState.alerts = results[3].alerts || [];
+            erpState.expiryAlerts = results[3].expiry_alerts || [];
+            erpState.vendors = results[4].vendors || [];
+            erpState.reorderRules = results[5].reorder_rules || [];
             renderErpInventoryDetail();
             setAdminDetailStatus(erpState.items.length + (erpState.items.length === 1 ? " item tracked." : " items tracked."));
           } catch (error) {
@@ -1854,6 +1861,23 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               ul.appendChild(li);
             });
             box.appendChild(ul);
+            if (erpState.expiryAlerts.length) {
+              var exHeading = document.createElement("strong");
+              exHeading.textContent = "Expiring soon (" + erpState.expiryAlerts.length + ")";
+              box.appendChild(exHeading);
+              var exUl = document.createElement("ul");
+              erpState.expiryAlerts.forEach(function (a) {
+                var li = document.createElement("li");
+                var days = (a.days_to_expiry === null || a.days_to_expiry === undefined)
+                  ? "" : (a.days_to_expiry < 0
+                    ? " — expired " + Math.abs(a.days_to_expiry) + " days ago"
+                    : " — " + a.days_to_expiry + " days left");
+                li.textContent = a.sku + " — " + a.item_name + " @ " + a.location_code +
+                  ": lot " + a.lot_code + " expires " + (a.expiry_date || "—") + days;
+                exUl.appendChild(li);
+              });
+              box.appendChild(exUl);
+            }
             els.body.appendChild(box);
           } else {
             var quiet = document.createElement("p");
@@ -1904,10 +1928,24 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             renderErpInventoryDetail();
           });
           toolbar.appendChild(countBtn);
+          [["showLots", "Lots & expiry"], ["showShrinkage", "Shrinkage"],
+           ["showReplenishment", "Replenishment"]].forEach(function (pair) {
+            var b = document.createElement("button");
+            b.type = "button";
+            b.textContent = erpState[pair[0]] ? "Hide " + pair[1] : pair[1];
+            b.addEventListener("click", function () {
+              erpState[pair[0]] = !erpState[pair[0]];
+              renderErpInventoryDetail();
+            });
+            toolbar.appendChild(b);
+          });
           els.body.appendChild(toolbar);
           if (erpState.showAddItem) els.body.appendChild(erpAddItemForm());
           if (erpState.showLocations) els.body.appendChild(erpLocationsPanel());
           if (erpState.showCounts) els.body.appendChild(erpCountPanel());
+          if (erpState.showLots) els.body.appendChild(erpLotPanel());
+          if (erpState.showShrinkage) els.body.appendChild(erpShrinkagePanel());
+          if (erpState.showReplenishment) els.body.appendChild(erpReplenishmentPanel());
           var tableWrap = document.createElement("div");
           tableWrap.className = "admin-orders-wrap";
           els.body.appendChild(tableWrap);
@@ -2660,6 +2698,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
                 table.appendChild(thead);
                 var tbody = document.createElement("tbody");
                 var inputs = {};
+                var rowsByItem = {};
                 (c.lines || []).forEach(function (l) {
                   var tr = document.createElement("tr");
                   var td1 = document.createElement("td");
@@ -2693,10 +2732,32 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
                   tr.appendChild(td5);
                   tbody.appendChild(tr);
                   inputs[l.item_id] = inp;
+                  rowsByItem[l.item_id] = tr;
                 });
                 table.appendChild(tbody);
                 tw.appendChild(table);
                 wrap.appendChild(tw);
+                if (!done) {
+                  wrap.appendChild(erpScanBox(function (code, scanStatus) {
+                    var found = erpResolveScanCode(code);
+                    if (!found) {
+                      scanStatus.textContent = "No item matches '" + code + "'.";
+                      return;
+                    }
+                    var inp = inputs[found.item.id];
+                    if (!inp) {
+                      scanStatus.textContent = found.item.sku + " — " + found.item.name + " isn't on this count sheet.";
+                      return;
+                    }
+                    Object.keys(rowsByItem).forEach(function (k) {
+                      rowsByItem[k].style.background = "";
+                    });
+                    rowsByItem[found.item.id].style.background = "#fef3c7";
+                    if (inp.focus) inp.focus();
+                    if (inp.select) inp.select();
+                    scanStatus.textContent = "Found " + found.item.sku + " — " + found.item.name + " (via " + found.via + ").";
+                  }));
+                }
                 var sheetStatus = document.createElement("p");
                 sheetStatus.className = "erp-form-status";
                 wrap.appendChild(sheetStatus);
@@ -2921,6 +2982,460 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             });
           });
           return form;
+        }
+        // ---------- scan resolution ----------
+        // Normalize a scanned code: a GS1 Digital Link QR carries the GTIN
+        // after /01/ (GTIN-14 = "00" + UPC-A); a bare scan is digits as-is.
+        function erpNormalizeScanCode(code) {
+          var s = String(code || "").trim();
+          var m = s.match(/\/01\/(\d{12,14})/);
+          if (m) s = m[1];
+          s = s.replace(/\D/g, "");
+          if (s.length === 14 && s.slice(0, 2) === "00") s = s.slice(2);
+          return s;
+        }
+        // Resolve a scanned code to an item: exact SKU first, then the
+        // flavor UPC from the label map (erpMatchFlavorCode). Returns
+        // {item, via} or null. No code is ever invented.
+        function erpResolveScanCode(code) {
+          var items = erpState.items || [];
+          var raw = String(code || "").trim();
+          if (!raw) return null;
+          var lower = raw.toLowerCase();
+          for (var i = 0; i < items.length; i++) {
+            if (String(items[i].sku || "").toLowerCase() === lower) {
+              return {item: items[i], via: "sku"};
+            }
+          }
+          var digits = erpNormalizeScanCode(raw);
+          if (digits.length === 12) {
+            for (var j = 0; j < items.length; j++) {
+              var fc = null;
+              try { fc = erpMatchFlavorCode(items[j].name); } catch (e) { fc = null; }
+              if (fc && fc.upc === digits) return {item: items[j], via: "upc"};
+            }
+          }
+          return null;
+        }
+        // A scan-mode input: a USB keyboard-wedge scanner types the code
+        // + Enter; camera scan uses the native Barcode Detection API where
+        // the browser supports it, with a plain fallback message elsewhere.
+        function erpScanBox(onScan) {
+          var wrap = document.createElement("div");
+          wrap.className = "erp-scan-box";
+          var input = document.createElement("input");
+          input.type = "text";
+          input.placeholder = "Scan barcode or type SKU, then Enter";
+          input.setAttribute("aria-label", "Scan barcode or SKU");
+          input.autocomplete = "off";
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          function handle(code) {
+            var v = (code || "").trim();
+            if (!v) return;
+            onScan(v, status);
+            input.value = "";
+          }
+          input.addEventListener("keydown", function (ev) {
+            if (ev.key === "Enter") { ev.preventDefault(); handle(input.value); }
+          });
+          wrap.appendChild(input);
+          if (typeof window !== "undefined" && window.BarcodeDetector) {
+            var camBtn = document.createElement("button");
+            camBtn.type = "button";
+            camBtn.textContent = "Scan with camera";
+            camBtn.addEventListener("click", function () {
+              erpCameraScan(handle, status, camBtn);
+            });
+            wrap.appendChild(camBtn);
+          } else {
+            var note = document.createElement("span");
+            note.className = "admin-orders-empty";
+            note.textContent = "Camera scan isn't available in this browser — a USB scanner works in this box.";
+            wrap.appendChild(note);
+          }
+          wrap.appendChild(status);
+          return wrap;
+        }
+        function erpCameraScan(onCode, status, btn) {
+          if (typeof navigator === "undefined" || !navigator.mediaDevices ||
+              !navigator.mediaDevices.getUserMedia) {
+            status.textContent = "Camera isn't available in this browser.";
+            return;
+          }
+          btn.disabled = true;
+          status.textContent = "Opening camera — point it at a barcode…";
+          var video = document.createElement("video");
+          video.style.width = "100%";
+          video.setAttribute("playsinline", "");
+          btn.parentNode.appendChild(video);
+          var stopped = false;
+          var timer = null;
+          function stop(stream) {
+            stopped = true;
+            if (timer) clearInterval(timer);
+            if (stream) stream.getTracks().forEach(function (t) { t.stop(); });
+            if (video.parentNode) video.parentNode.removeChild(video);
+            btn.disabled = false;
+          }
+          navigator.mediaDevices.getUserMedia({video: {facingMode: "environment"}})
+            .then(function (stream) {
+              video.srcObject = stream;
+              return video.play().then(function () { return stream; });
+            }).then(function (stream) {
+              var detector = new BarcodeDetector({formats: ["qr_code", "ean_13", "ean_8", "upc_a", "upc_e", "code_128"]});
+              timer = setInterval(function () {
+                if (stopped) return;
+                detector.detect(video).then(function (codes) {
+                  if (codes && codes.length) {
+                    stop(stream);
+                    status.textContent = "Scanned: " + codes[0].rawValue;
+                    onCode(codes[0].rawValue);
+                  }
+                }).catch(function () { /* keep scanning */ });
+              }, 400);
+              setTimeout(function () {
+                if (!stopped) {
+                  stop(stream);
+                  status.textContent = "Camera scan timed out — try again or type the code.";
+                }
+              }, 60000);
+            }).catch(function () {
+              stop(null);
+              status.textContent = "Couldn't open the camera — check permission, or type the code.";
+            });
+        }
+        // ---------- lots & expiry ----------
+        function erpLotBandChip(band) {
+          var map = {
+            expired: ["cancelled", "Expired"],
+            expiring_30: ["partial", "\u2264 30 days"],
+            expiring_60: ["sent", "\u2264 60 days"],
+            expiring_90: ["Planned", "\u2264 90 days"],
+            ok: ["received", "OK"]
+          };
+          var m = map[band];
+          if (!m) {
+            var s = document.createElement("span");
+            s.textContent = "—";
+            return s;
+          }
+          return erpChip(m[0], m[1]);
+        }
+        function erpLotPanel() {
+          var panel = document.createElement("div");
+          panel.className = "erp-form";
+          panel.style.display = "block";
+          var h = document.createElement("h3");
+          h.textContent = "Lots & expiry";
+          panel.appendChild(h);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          status.textContent = "Loading lots…";
+          panel.appendChild(status);
+          var filterLabel = document.createElement("label");
+          filterLabel.textContent = "Show ";
+          var filterSel = document.createElement("select");
+          [["", "All lots"], ["expired", "Expired"], ["expiring_30", "Expiring in 30 days"],
+           ["expiring_60", "Expiring in 60 days"], ["expiring_90", "Expiring in 90 days"],
+           ["ok", "OK (> 90 days)"], ["none", "No expiry date"]].forEach(function (o) {
+            var opt = document.createElement("option");
+            opt.value = o[0];
+            opt.textContent = o[1];
+            filterSel.appendChild(opt);
+          });
+          filterLabel.appendChild(filterSel);
+          panel.appendChild(filterLabel);
+          var wrap = document.createElement("div");
+          wrap.className = "admin-orders-wrap";
+          panel.appendChild(wrap);
+          var lots = [];
+          function render() {
+            wrap.replaceChildren();
+            var shown = lots.filter(function (l) {
+              return !filterSel.value || l.band === filterSel.value;
+            });
+            if (!shown.length) {
+              var p = document.createElement("p");
+              p.textContent = lots.length ? "No lots in this band." : "No lots with stock on hand.";
+              wrap.appendChild(p);
+              return;
+            }
+            var table = document.createElement("table");
+            table.className = "admin-orders-table";
+            var thead = document.createElement("thead");
+            var hr = document.createElement("tr");
+            ["Item", "Lot", "Location", "Received", "Expiry", "Days left", "Qty", "Status"].forEach(function (t) {
+              var th = document.createElement("th");
+              th.textContent = t;
+              hr.appendChild(th);
+            });
+            thead.appendChild(hr);
+            table.appendChild(thead);
+            var tbody = document.createElement("tbody");
+            shown.forEach(function (l) {
+              var tr = document.createElement("tr");
+              tr.appendChild(erpCell("Item", l.sku + " — " + l.item_name));
+              tr.appendChild(erpCell("Lot", l.lot_code));
+              tr.appendChild(erpCell("Location", l.location_code || "—"));
+              tr.appendChild(erpCell("Received", l.received_date || "—"));
+              tr.appendChild(erpCell("Expiry", l.expiry_date || "—"));
+              tr.appendChild(erpCell("Days left", (l.days_to_expiry === null || l.days_to_expiry === undefined) ? "—" : String(l.days_to_expiry)));
+              tr.appendChild(erpCell("Qty", erpQty(l.qty_remaining) + " " + (l.unit || "")));
+              var td = document.createElement("td");
+              td.appendChild(erpLotBandChip(l.band));
+              tr.appendChild(td);
+              tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            wrap.appendChild(table);
+          }
+          filterSel.addEventListener("change", render);
+          erpGet("/api/erp/lots").then(function (res) {
+            lots = res.lots || [];
+            status.textContent = lots.length + (lots.length === 1 ? " lot with stock." : " lots with stock.");
+            render();
+          }).catch(function (error) { status.textContent = error.message; });
+          return panel;
+        }
+        // ---------- shrinkage / waste ----------
+        function erpShrinkagePanel() {
+          var panel = document.createElement("div");
+          panel.className = "erp-form";
+          panel.style.display = "block";
+          var h = document.createElement("h3");
+          h.textContent = "Shrinkage & waste";
+          panel.appendChild(h);
+          var today = new Date().toISOString().slice(0, 10);
+          function daysAgo(n) {
+            return new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+          }
+          var presetLabel = document.createElement("label");
+          presetLabel.textContent = "Period ";
+          var presetSel = document.createElement("select");
+          [["90", "Last 90 days"], ["30", "Last 30 days"], ["year", "This year"], ["all", "All time"]].forEach(function (o) {
+            var opt = document.createElement("option");
+            opt.value = o[0];
+            opt.textContent = o[1];
+            presetSel.appendChild(opt);
+          });
+          presetLabel.appendChild(presetSel);
+          panel.appendChild(presetLabel);
+          var fromLabel = document.createElement("label");
+          fromLabel.textContent = "From ";
+          var fromInput = document.createElement("input");
+          fromInput.type = "date";
+          fromLabel.appendChild(fromInput);
+          panel.appendChild(fromLabel);
+          var toLabel = document.createElement("label");
+          toLabel.textContent = "To ";
+          var toInput = document.createElement("input");
+          toInput.type = "date";
+          toInput.value = today;
+          toLabel.appendChild(toInput);
+          panel.appendChild(toLabel);
+          var loadBtn = document.createElement("button");
+          loadBtn.type = "button";
+          loadBtn.textContent = "Load";
+          panel.appendChild(loadBtn);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          panel.appendChild(status);
+          var wrap = document.createElement("div");
+          wrap.className = "admin-orders-wrap";
+          panel.appendChild(wrap);
+          function applyPreset() {
+            var y = today.slice(0, 4);
+            if (presetSel.value === "30") { fromInput.value = daysAgo(29); toInput.value = today; }
+            else if (presetSel.value === "year") { fromInput.value = y + "-01-01"; toInput.value = today; }
+            else if (presetSel.value === "all") { fromInput.value = ""; toInput.value = ""; }
+            else { fromInput.value = daysAgo(89); toInput.value = today; }
+          }
+          function reasonLabel(r) {
+            return {count_correction: "Count correction", damage: "Damage",
+                    spoilage: "Spoilage", sample: "Sample",
+                    wholesale_shipment: "Wholesale shipment"}[r] || r;
+          }
+          function shrinkTable(title, rows, firstCol, firstKey) {
+            var hh = document.createElement("h3");
+            hh.textContent = title;
+            wrap.appendChild(hh);
+            if (!rows.length) {
+              var p = document.createElement("p");
+              p.textContent = "No adjustments in this period.";
+              wrap.appendChild(p);
+              return;
+            }
+            var table = document.createElement("table");
+            table.className = "admin-orders-table";
+            var thead = document.createElement("thead");
+            var hr = document.createElement("tr");
+            [firstCol, "Lines", "Net qty", "Net cost", "Shrink qty", "Shrink cost"].forEach(function (t) {
+              var th = document.createElement("th");
+              th.textContent = t;
+              hr.appendChild(th);
+            });
+            thead.appendChild(hr);
+            table.appendChild(thead);
+            var tbody = document.createElement("tbody");
+            rows.forEach(function (r) {
+              var tr = document.createElement("tr");
+              tr.appendChild(erpCell(firstCol, firstKey === "reason" ? reasonLabel(r.reason) : (r[firstKey] || "—")));
+              tr.appendChild(erpCell("Lines", String(r.lines)));
+              tr.appendChild(erpCell("Net qty", erpQty(r.qty)));
+              tr.appendChild(erpCell("Net cost", erpMoney(r.cost_cents)));
+              tr.appendChild(erpCell("Shrink qty", erpQty(r.shrink_qty)));
+              tr.appendChild(erpCell("Shrink cost", erpMoney(r.shrink_cost_cents)));
+              tbody.appendChild(tr);
+            });
+            table.appendChild(tbody);
+            wrap.appendChild(table);
+          }
+          function load() {
+            status.textContent = "Loading…";
+            var qs = [];
+            if (fromInput.value) qs.push("from=" + encodeURIComponent(fromInput.value));
+            if (toInput.value) qs.push("to=" + encodeURIComponent(toInput.value));
+            erpGet("/api/erp/shrinkage" + (qs.length ? "?" + qs.join("&") : "")).then(function (res) {
+              var t = res.total || {};
+              status.textContent = (t.lines || 0) + " adjustment(s) · net " +
+                erpQty(t.qty) + " · shrink " + erpQty(t.shrink_qty) +
+                " (" + erpMoney(t.shrink_cost_cents) + ").";
+              wrap.replaceChildren();
+              shrinkTable("By reason", res.by_reason || [], "Reason", "reason");
+              shrinkTable("By location", res.by_location || [], "Location", "location_code");
+              var it = document.createElement("h3");
+              it.textContent = "Top items by shrink cost";
+              wrap.appendChild(it);
+              var items = (res.by_item || []).filter(function (r) { return r.shrink_cost_cents > 0; });
+              if (!items.length) {
+                var p = document.createElement("p");
+                p.textContent = "No shrinkage in this period.";
+                wrap.appendChild(p);
+              } else {
+                shrinkTable("Top items", items, "Item", "sku");
+              }
+            }).catch(function (error) { status.textContent = error.message; });
+          }
+          presetSel.addEventListener("change", function () { applyPreset(); load(); });
+          loadBtn.addEventListener("click", load);
+          applyPreset();
+          load();
+          return panel;
+        }
+        // ---------- suggested replenishment ----------
+        function erpReplenishmentPanel() {
+          var panel = document.createElement("div");
+          panel.className = "erp-form";
+          panel.style.display = "block";
+          var h = document.createElement("h3");
+          h.textContent = "Suggested replenishment";
+          panel.appendChild(h);
+          var note = document.createElement("p");
+          note.className = "admin-orders-empty";
+          note.textContent = "Below-par items, grouped by preferred vendor. Purchase orders carry popcorn only — anything else stays as an alert.";
+          panel.appendChild(note);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          status.textContent = "Loading suggestions…";
+          panel.appendChild(status);
+          var wrap = document.createElement("div");
+          wrap.className = "admin-orders-wrap";
+          panel.appendChild(wrap);
+          var canPO = (typeof erpCan === "function") ? erpCan("purchasing.write") : erpIsAdmin();
+          function refresh(keepStatus) {
+            erpGet("/api/erp/replenishment/suggestions").then(function (res) {
+              var groups = res.groups || [];
+              if (!keepStatus) {
+                status.textContent = groups.length
+                  ? (res.count + " item(s) below par in " + groups.length + " group(s).")
+                  : "Nothing below par right now.";
+              }
+              wrap.replaceChildren();
+              groups.forEach(function (g) {
+                var gh = document.createElement("h3");
+                gh.textContent = g.vendor_name || "No preferred vendor";
+                wrap.appendChild(gh);
+                var table = document.createElement("table");
+                table.className = "admin-orders-table";
+                var thead = document.createElement("thead");
+                var hr = document.createElement("tr");
+                ["Item", "Location", "On hand", "Reorder at", "Suggested qty", "Unit cost"].forEach(function (t) {
+                  var th = document.createElement("th");
+                  th.textContent = t;
+                  hr.appendChild(th);
+                });
+                thead.appendChild(hr);
+                table.appendChild(thead);
+                var tbody = document.createElement("tbody");
+                var qtyInputs = {};
+                g.items.forEach(function (it) {
+                  var tr = document.createElement("tr");
+                  tr.appendChild(erpCell("Item", it.sku + " — " + it.item_name + (it.can_order ? "" : " (no PO — popcorn only)")));
+                  tr.appendChild(erpCell("Location", it.location_code));
+                  tr.appendChild(erpCell("On hand", erpQty(it.on_hand) + " " + (it.unit || "")));
+                  tr.appendChild(erpCell("Reorder at", erpQty(it.reorder_point)));
+                  var qtd = document.createElement("td");
+                  if (it.can_order) {
+                    var qi = document.createElement("input");
+                    qi.type = "number";
+                    qi.min = "0";
+                    qi.step = "any";
+                    qi.style.width = "90px";
+                    qi.value = it.suggested_qty;
+                    qi.setAttribute("aria-label", "Order qty for " + it.sku);
+                    qtd.appendChild(qi);
+                    qtyInputs[it.item_id] = qi;
+                  } else {
+                    qtd.textContent = erpQty(it.suggested_qty);
+                  }
+                  tr.appendChild(qtd);
+                  tr.appendChild(erpCell("Unit cost", erpMoney(it.unit_cost_cents)));
+                  tbody.appendChild(tr);
+                });
+                table.appendChild(tbody);
+                wrap.appendChild(table);
+                if (g.can_create_po && canPO) {
+                  var poBtn = document.createElement("button");
+                  poBtn.type = "button";
+                  poBtn.textContent = "Create draft PO";
+                  poBtn.addEventListener("click", function () {
+                    var lines = [];
+                    g.items.forEach(function (it) {
+                      if (!it.can_order) return;
+                      var q = Number(qtyInputs[it.item_id] ? qtyInputs[it.item_id].value : it.suggested_qty);
+                      if (isFinite(q) && q > 0) {
+                        lines.push({item_id: it.item_id, qty_ordered: q, unit_cost_cents: it.unit_cost_cents});
+                      }
+                    });
+                    if (!lines.length) {
+                      status.textContent = "Nothing to order in this group — set a quantity above zero.";
+                      return;
+                    }
+                    poBtn.disabled = true;
+                    status.textContent = "Creating draft PO…";
+                    erpPost("/api/erp/purchase-orders", {
+                      vendor_id: g.vendor_id, lines: lines
+                    }).then(function (res) {
+                      status.textContent = "Draft " + res.purchase_order.po_number + " created.";
+                      refresh(true);
+                    }).catch(function (error) {
+                      poBtn.disabled = false;
+                      status.textContent = error.message;
+                    });
+                  });
+                  wrap.appendChild(poBtn);
+                } else if (!g.vendor_id) {
+                  var vn = document.createElement("p");
+                  vn.className = "admin-orders-empty";
+                  vn.textContent = "Set a preferred vendor on the par level to order these.";
+                  wrap.appendChild(vn);
+                }
+              });
+            }).catch(function (error) { status.textContent = error.message; });
+          }
+          refresh();
+          return panel;
         }
         function renderErpStockTable(wrap) {
           wrap.replaceChildren();
@@ -3530,6 +4045,38 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           qtyInput.min = "0";
           qtyLabel.appendChild(qtyInput);
           form.appendChild(qtyLabel);
+          var vendorLabel = document.createElement("label");
+          vendorLabel.textContent = "Preferred vendor ";
+          var vendorSel = document.createElement("select");
+          var noneOpt = document.createElement("option");
+          noneOpt.value = "";
+          noneOpt.textContent = "No preferred vendor";
+          vendorSel.appendChild(noneOpt);
+          (erpState.vendors || []).filter(function (v) { return v.active; }).forEach(function (v) {
+            var opt = document.createElement("option");
+            opt.value = String(v.id);
+            opt.textContent = v.name;
+            vendorSel.appendChild(opt);
+          });
+          vendorLabel.appendChild(vendorSel);
+          form.appendChild(vendorLabel);
+          function prefillRule() {
+            var rule = null;
+            (erpState.reorderRules || []).forEach(function (r) {
+              if (r.item_id === item.id && Number(r.location_id) === Number(locSel.value)) rule = r;
+            });
+            if (rule) {
+              pointInput.value = rule.reorder_point;
+              qtyInput.value = rule.reorder_qty || "";
+              vendorSel.value = rule.preferred_vendor_id ? String(rule.preferred_vendor_id) : "";
+            } else {
+              pointInput.value = "";
+              qtyInput.value = "";
+              vendorSel.value = "";
+            }
+          }
+          locSel.addEventListener("change", prefillRule);
+          prefillRule();
           var submit = document.createElement("button");
           submit.type = "submit";
           submit.textContent = "Save par level";
@@ -3545,7 +4092,8 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               item_id: item.id,
               location_id: Number(locSel.value),
               reorder_point: Number(pointInput.value),
-              reorder_qty: Number(qtyInput.value) || 0
+              reorder_qty: Number(qtyInput.value) || 0,
+              preferred_vendor_id: Number(vendorSel.value) || 0
             }).then(function () {
               status.textContent = "Par level saved.";
             }).catch(function (error) {
@@ -6955,6 +7503,23 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           expLabel.appendChild(expInput);
           form.appendChild(expLabel);
           var qtyInputs = [];
+          form.appendChild(erpScanBox(function (code, scanStatus) {
+            var found = erpResolveScanCode(code);
+            if (!found) {
+              scanStatus.textContent = "No item matches '" + code + "'.";
+              return;
+            }
+            var target = null;
+            qtyInputs.forEach(function (q) {
+              if (String(q.sku).toLowerCase() === String(found.item.sku).toLowerCase()) target = q;
+            });
+            if (!target) {
+              scanStatus.textContent = found.item.sku + " isn't on this PO.";
+              return;
+            }
+            if (target.input.focus) target.input.focus();
+            scanStatus.textContent = "Found " + found.item.sku + " — enter the received quantity.";
+          }));
           open.forEach(function (l) {
             var remaining = Number(l.qty_ordered) - Number(l.qty_received);
             var rowLabel = document.createElement("label");
@@ -6968,7 +7533,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             qtyInput.setAttribute("aria-label", "Quantity received for " + l.sku);
             rowLabel.appendChild(qtyInput);
             form.appendChild(rowLabel);
-            qtyInputs.push({line_id: l.id, input: qtyInput, max: remaining});
+            qtyInputs.push({line_id: l.id, sku: l.sku, input: qtyInput, max: remaining});
           });
           var submit = document.createElement("button");
           submit.type = "submit";
