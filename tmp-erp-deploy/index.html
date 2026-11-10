@@ -13354,12 +13354,17 @@ function erpReportFilterBar(onApply, showChannel) {
   return bar;
 }
 
-function erpCsvButton(label, pathFn) {
+function erpCsvButton(label, pathFn, extra) {
   var b = document.createElement("button");
   b.type = "button";
   b.textContent = label;
   b.addEventListener("click", function () {
-    var q = erpReportQuery("format=csv");
+    // pathFn returns a BASE path only; the query string (from/to + extra +
+    // format=csv) is appended exactly once here. Previously every call site
+    // built its own query string and this appended a second one, so the
+    // server saw format="csv?format=csv" and returned JSON, not CSV.
+    var ex = (typeof extra === "function" ? extra() : (extra || ""));
+    var q = erpReportQuery((ex ? ex + "&" : "") + "format=csv");
     erpDownloadCsv(pathFn() + q, label.toLowerCase().replace(/[^a-z0-9]+/g, "-") + ".csv");
   });
   return b;
@@ -13381,7 +13386,9 @@ function renderErpReportsDetail() {
   tabs.className = "erp-subtabs";
   [["sales", "Sales"], ["valuation", "Inventory valuation"],
    ["margin", "Production margin"], ["wholesale", "Wholesale performance"],
-   ["spend", "Spend by vendor"],
+   ["spend", "Spend by vendor"], ["customers", "Customers"],
+   ["profitability", "Channel profitability"], ["programs", "Programs"],
+   ["forecast", "Forecast"],
    ["summaries", "Sales summaries"]].forEach(function (t) {
     var b = document.createElement("button");
     b.type = "button";
@@ -13401,6 +13408,10 @@ function renderErpReportsDetail() {
   else if (v === "margin") renderErpMarginReport(els.body);
   else if (v === "wholesale") renderErpWholesalePerfReport(els.body);
   else if (v === "spend") renderErpSpendReport(els.body);
+  else if (v === "customers") renderErpCustomersReport(els.body);
+  else if (v === "profitability") renderErpProfitabilityReport(els.body);
+  else if (v === "programs") renderErpProgramsReport(els.body);
+  else if (v === "forecast") renderErpForecastReport(els.body);
   else renderErpSummariesView(els.body);
 }
 
@@ -13411,8 +13422,9 @@ function renderErpSalesReport(body) {
   var bar = document.createElement("div");
   bar.className = "erp-toolbar";
   bar.appendChild(erpCsvButton("Export CSV", function () {
-    return "/api/erp/reports/sales" + erpReportQuery(
-      "channel=" + encodeURIComponent(erpState.reportFilters.channel || "all") + "&format=csv");
+    return "/api/erp/reports/sales";
+  }, function () {
+    return "channel=" + encodeURIComponent(erpState.reportFilters.channel || "all");
   }));
   body.appendChild(bar);
   out.textContent = "Loading…";
@@ -13424,6 +13436,25 @@ function renderErpSalesReport(body) {
       " across " + res.order_count + " orders" +
       (res.from || res.to ? " (" + (res.from || "…") + " to " + (res.to || "…") + ")" : "");
     out.appendChild(sum);
+    if (res.breakdown) {
+      var bkd = res.breakdown;
+      var bh = document.createElement("h3");
+      bh.textContent = "Breakdown";
+      out.appendChild(bh);
+      out.appendChild(erpReportTable(["", "Amount / count", "Note"], [
+        ["Gift-card discounts", erpMoney(bkd.discounts.gift_card_cents), ""],
+        ["Promo-code orders", bkd.discounts.promo_code_orders, bkd.discounts.note],
+        ["Reward-code orders", bkd.discounts.reward_code_orders, ""],
+        ["Wholesale credits", erpMoney(bkd.refunds.wholesale_credits_cents), ""],
+        ["Retail refunds", erpMoney(bkd.refunds.retail_refunds_cents), bkd.refunds.note],
+        ["Wholesale shipping (label cost)",
+         bkd.shipping.wholesale_label_cost_cents === null ? null
+           : erpMoney(bkd.shipping.wholesale_label_cost_cents), ""],
+        ["Online shipping cost", null, bkd.shipping.note],
+        ["Shipping collected", null, "Not stored on orders."],
+        ["Tax collected", null, bkd.tax.note]
+      ]));
+    }
     if (res.channel !== "wholesale") {
       var h3 = document.createElement("h3");
       h3.textContent = "Online — " + erpMoney(res.online.total_cents) + " (" + res.online.order_count + " orders)";
@@ -13444,7 +13475,7 @@ function renderErpSalesReport(body) {
 function renderErpValuationReport(body) {
   var bar = document.createElement("div");
   bar.className = "erp-toolbar";
-  bar.appendChild(erpCsvButton("Export CSV", function () { return "/api/erp/reports/inventory-valuation?format=csv"; }));
+  bar.appendChild(erpCsvButton("Export CSV", function () { return "/api/erp/reports/inventory-valuation"; }));
   body.appendChild(bar);
   var out = document.createElement("div");
   out.textContent = "Loading…";
@@ -13469,7 +13500,7 @@ function renderErpMarginReport(body) {
   var bar = document.createElement("div");
   bar.className = "erp-toolbar";
   bar.appendChild(erpCsvButton("Export CSV", function () {
-    return "/api/erp/reports/production-margin" + erpReportQuery("format=csv");
+    return "/api/erp/reports/production-margin";
   }));
   body.appendChild(bar);
   var out = document.createElement("div");
@@ -13496,7 +13527,7 @@ function renderErpMarginReport(body) {
 function renderErpWholesalePerfReport(body) {
   var bar = document.createElement("div");
   bar.className = "erp-toolbar";
-  bar.appendChild(erpCsvButton("Export CSV", function () { return "/api/erp/reports/wholesale-performance?format=csv"; }));
+  bar.appendChild(erpCsvButton("Export CSV", function () { return "/api/erp/reports/wholesale-performance"; }));
   body.appendChild(bar);
   var out = document.createElement("div");
   out.textContent = "Loading…";
@@ -13520,7 +13551,7 @@ function renderErpSpendReport(body) {
   var bar = document.createElement("div");
   bar.className = "erp-toolbar";
   bar.appendChild(erpCsvButton("Export CSV", function () {
-    return "/api/erp/reports/spend-by-vendor" + erpReportQuery("format=csv");
+    return "/api/erp/reports/spend-by-vendor";
   }));
   body.appendChild(bar);
   var out = document.createElement("div");
@@ -13538,6 +13569,199 @@ function renderErpSpendReport(body) {
       res.vendors.map(function (v) {
         return [v.vendor_name, v.po_count, v.bags, erpMoney(v.lines_total_cents),
                 erpMoney(v.freight_cents), erpMoney(v.tax_cents), erpMoney(v.total_cents)];
+      })));
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+function erpReportsReadAllowed() {
+  return (typeof erpCan === "function" ? erpCan("reports.read") : erpIsAdmin());
+}
+
+function renderErpCustomersReport(body) {
+  if (!erpReportsReadAllowed()) {
+    var denied = document.createElement("p");
+    denied.textContent = "You don't have permission to view reports.";
+    body.appendChild(denied);
+    return;
+  }
+  body.appendChild(erpReportFilterBar(function () { renderErpReportsDetail(); }, false));
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  bar.appendChild(erpCsvButton("Export CSV", function () {
+    return "/api/erp/reports/customers";
+  }));
+  body.appendChild(bar);
+  var search = erpTextInput("q", "Search customer or account");
+  search.style.width = "260px";
+  body.appendChild(erpField("Search", search));
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  var rows = [];
+  function paint() {
+    var q = (search.value || "").trim().toLowerCase();
+    var shown = rows.filter(function (c) {
+      return !q || (c.display + " " + c.email + " " + c.account_name)
+        .toLowerCase().indexOf(q) !== -1;
+    });
+    out.replaceChildren();
+    var s = rows._summary;
+    var sum = document.createElement("p");
+    sum.innerHTML = "<strong>Customers:</strong> " + s.total_customers +
+      " · <strong>Repeat:</strong> " + s.repeat_customers +
+      " (" + s.repeat_rate_pct + "%) · <strong>Avg lifetime value:</strong> " +
+      erpMoney(s.avg_lifetime_value_cents);
+    out.appendChild(sum);
+    out.appendChild(erpReportTable(
+      ["Customer", "Email", "Account", "Orders", "Bags", "Spent", "First", "Last", "Repeat"],
+      shown.map(function (c) {
+        return [c.display, c.email, c.account_name, c.order_count, c.total_bags,
+                erpMoney(c.total_spent_cents),
+                c.first_order_at ? erpFmtDate(c.first_order_at) : "—",
+                c.last_order_at ? erpFmtDate(c.last_order_at) : "—",
+                c.repeat ? "yes" : "no"];
+      })));
+  }
+  search.addEventListener("input", paint);
+  erpGet("/api/erp/reports/customers" + erpReportQuery()).then(function (res) {
+    rows = res.customers || [];
+    rows._summary = res.summary;
+    paint();
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+function renderErpProfitabilityReport(body) {
+  if (!erpReportsReadAllowed()) {
+    var denied = document.createElement("p");
+    denied.textContent = "You don't have permission to view reports.";
+    body.appendChild(denied);
+    return;
+  }
+  body.appendChild(erpReportFilterBar(function () { renderErpReportsDetail(); }, false));
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  bar.appendChild(erpCsvButton("Export CSV", function () {
+    return "/api/erp/reports/channel-profitability";
+  }));
+  body.appendChild(bar);
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  erpGet("/api/erp/reports/channel-profitability" + erpReportQuery()).then(function (res) {
+    out.replaceChildren();
+    var cost = document.createElement("p");
+    cost.style.color = "var(--muted)";
+    cost.textContent = res.blended_cost_per_bag_cents === null
+      ? "No completed batches yet, so cost of goods cannot be computed."
+      : "Blended production cost: " + erpMoney(res.blended_cost_per_bag_cents) +
+        " / bag across " + res.cost_basis.completed_batches + " completed batches.";
+    out.appendChild(cost);
+    out.appendChild(erpReportTable(
+      ["Channel", "Revenue", "Bags", "Cost of goods", "Shipping", "Fees", "Net", "Net %"],
+      res.channels.map(function (c) {
+        return [c.channel, erpMoney(c.revenue_cents), c.bags,
+                c.cogs_cents === null ? null : erpMoney(c.cogs_cents),
+                c.shipping_cost_cents === null ? null : erpMoney(c.shipping_cost_cents),
+                null,
+                c.net_cents === null ? null : erpMoney(c.net_cents),
+                c.net_margin_pct === null ? null : c.net_margin_pct + "%"];
+      })));
+    (res.notes || []).forEach(function (n) {
+      var p = document.createElement("p");
+      p.style.color = "var(--muted)";
+      p.textContent = n;
+      out.appendChild(p);
+    });
+    var excl = document.createElement("p");
+    excl.style.color = "var(--muted)";
+    excl.textContent = "Net excludes: " +
+      res.channels.map(function (c) { return c.channel + ": " + c.net_excludes.join(", "); }).join("; ") + ".";
+    out.appendChild(excl);
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+function renderErpProgramsReport(body) {
+  if (!erpReportsReadAllowed()) {
+    var denied = document.createElement("p");
+    denied.textContent = "You don't have permission to view reports.";
+    body.appendChild(denied);
+    return;
+  }
+  body.appendChild(erpReportFilterBar(function () { renderErpReportsDetail(); }, false));
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  bar.appendChild(erpCsvButton("Export CSV", function () {
+    return "/api/erp/reports/programs";
+  }));
+  body.appendChild(bar);
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  erpGet("/api/erp/reports/programs" + erpReportQuery()).then(function (res) {
+    out.replaceChildren();
+    var g = res.gift_cards;
+    var h1 = document.createElement("h3");
+    h1.textContent = "Gift cards";
+    out.appendChild(h1);
+    out.appendChild(erpReportTable(["", "Count", "Amount"], [
+      ["Issued", g.issued_count, erpMoney(g.issued_cents)],
+      ["Redeemed", g.redeemed_count, erpMoney(g.redeemed_cents)],
+      ["Outstanding liability", g.active_count, erpMoney(g.outstanding_cents)]
+    ]));
+    var s = res.subscriptions;
+    var h2 = document.createElement("h3");
+    h2.textContent = "Subscriptions";
+    out.appendChild(h2);
+    out.appendChild(erpReportTable(["", "Count", "Amount"], [
+      ["Active", s.active, ""],
+      ["Paused", s.paused, ""],
+      ["Cancelled", s.cancelled, ""],
+      ["Renewals charged", s.renewals_charged_count, erpMoney(s.renewals_charged_cents)]
+    ]));
+    var h3 = document.createElement("h3");
+    h3.textContent = "Fundraisers";
+    out.appendChild(h3);
+    out.appendChild(erpReportTable(
+      ["Fundraiser", "Goal", "Orders", "Raised", "Donations", "Round-ups", "Progress"],
+      (res.fundraisers || []).map(function (f) {
+        return [f.org_name + " (" + f.code + ")", erpMoney(f.goal_cents),
+                f.orders, erpMoney(f.raised_cents), erpMoney(f.donation_cents),
+                erpMoney(f.roundup_cents),
+                f.progress_pct === null ? null : f.progress_pct + "%"];
+      })));
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+function renderErpForecastReport(body) {
+  if (!erpReportsReadAllowed()) {
+    var denied = document.createElement("p");
+    denied.textContent = "You don't have permission to view reports.";
+    body.appendChild(denied);
+    return;
+  }
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  bar.appendChild(erpCsvButton("Export CSV", function () {
+    return "/api/erp/reports/forecast";
+  }));
+  body.appendChild(bar);
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  erpGet("/api/erp/reports/forecast").then(function (res) {
+    out.replaceChildren();
+    var note = document.createElement("p");
+    note.style.color = "var(--muted)";
+    note.textContent = res.note + " Window: " + res.window_start + " to " + res.window_end + ".";
+    out.appendChild(note);
+    var headers = ["Flavor", "Category"].concat(
+      res.buckets.map(function (bk) { return bk.start; }),
+      ["Total 8w", "Velocity /wk", "Projection 4w", "Recent sales"]);
+    out.appendChild(erpReportTable(headers,
+      res.flavors.map(function (f) {
+        return [f.flavor, f.category].concat(f.weekly_bags,
+          [f.total_bags_8w, f.velocity_4w, f.projection_4w,
+           f.has_recent_sales ? "yes" : "no recent sales"]);
       })));
   }).catch(function (error) { out.textContent = error.message; });
 }
