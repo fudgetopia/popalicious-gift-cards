@@ -1693,6 +1693,8 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           alerts: [], expiryAlerts: [], reorderRules: [],
           showLots: false, showShrinkage: false, showReplenishment: false,
           selectedItemId: null, selectedPOId: null,
+          overduePOs: [], perfVendorId: null, perfData: null,
+          priceVendorId: null, priceData: null, editPOId: null,
           stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: "", acctAudit: [], acctAuditFilters: {action: "", actor: "", from: "", to: ""}, acctAuditOffset: 0, acctAuditLoaded: false, acctBackup: null, acctBackupLoaded: false, mktIg: null, mktNews: null, mktTickets: null, mktView: "instagram", mktSelectedTicketId: null, mktTicketDetail: null
         };
         function erpQty(q) {
@@ -4111,10 +4113,12 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               erpGet("/api/erp/vendors"),
               erpGet("/api/erp/purchase-orders"),
               erpGet("/api/erp/items"),
-              erpGet("/api/erp/locations")
+              erpGet("/api/erp/locations"),
+              erpGet("/api/erp/purchase-orders/overdue")
             ]);
             erpState.vendors = results[0].vendors || [];
             erpState.pos = results[1].purchase_orders || [];
+            erpState.overduePOs = results[4].overdue || [];
             erpState.items = results[2].items || [];
             erpState.locations = results[3].locations || [];
             renderErpPurchasingDetail();
@@ -4149,6 +4153,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             erpState.vendors.forEach(function (vv) { if (vv.id === erpState.editVendorId) ev = vv; });
             if (ev) els.body.appendChild(erpEditVendorForm(ev));
           }
+          if ((erpState.overduePOs || []).length) els.body.appendChild(erpOverduePanel());
+          if (erpState.perfVendorId && erpState.perfData) els.body.appendChild(erpVendorPerformancePanel(erpState.perfData));
+          if (erpState.priceVendorId && erpState.priceData) els.body.appendChild(erpVendorPricePanel(erpState.priceData));
           els.body.appendChild(erpSectionTitle("Purchase orders"));
           var poToolbar = document.createElement("div");
           poToolbar.className = "erp-toolbar";
@@ -7054,7 +7061,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           var inputs = {};
           [["name", "Vendor name", true], ["contact_name", "Contact", false],
            ["email", "Email", false], ["phone", "Phone", false],
-           ["payment_terms", "Payment terms", false]].forEach(function (f) {
+           ["payment_terms", "Payment terms", false],
+           ["lead_time_days", "Lead time (days)", false],
+           ["notes", "Notes", false]].forEach(function (f) {
             var label = document.createElement("label");
             label.textContent = f[1] + " ";
             var input = document.createElement("input");
@@ -7093,7 +7102,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           var inputs = {};
           [["name", "Vendor name", true, v.name], ["contact_name", "Contact", false, v.contact_name],
            ["email", "Email", false, v.email], ["phone", "Phone", false, v.phone],
-           ["payment_terms", "Payment terms", false, v.payment_terms]].forEach(function (f) {
+           ["payment_terms", "Payment terms", false, v.payment_terms],
+           ["lead_time_days", "Lead time (days)", false, v.lead_time_days],
+           ["notes", "Notes", false, v.notes]].forEach(function (f) {
             var label = document.createElement("label");
             label.textContent = f[1] + " ";
             var input = document.createElement("input");
@@ -7139,7 +7150,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           }
           var table = document.createElement("table");
           table.className = "admin-orders-table";
-          table.innerHTML = "<thead><tr><th>Vendor</th><th>Contact</th><th>Email</th><th>Phone</th><th>Terms</th><th>Action</th></tr></thead>";
+          table.innerHTML = "<thead><tr><th>Vendor</th><th>Contact</th><th>Email</th><th>Phone</th><th>Terms</th><th>Lead time</th><th>Action</th></tr></thead>";
           var body = document.createElement("tbody");
           erpState.vendors.forEach(function (v) {
             var tr = document.createElement("tr");
@@ -7148,8 +7159,43 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             tr.appendChild(erpCell("Email", v.email));
             tr.appendChild(erpCell("Phone", v.phone));
             tr.appendChild(erpCell("Terms", v.payment_terms));
+            tr.appendChild(erpCell("Lead time", v.lead_time_days ? v.lead_time_days + " days" : "—"));
             var actionCell = document.createElement("td");
             actionCell.setAttribute("data-label", "Action");
+            var perfBtn = document.createElement("button");
+            perfBtn.type = "button";
+            perfBtn.textContent = erpState.perfVendorId === v.id ? "Hide performance" : "Performance";
+            perfBtn.addEventListener("click", function () {
+              if (erpState.perfVendorId === v.id) {
+                erpState.perfVendorId = null;
+                erpState.perfData = null;
+                renderErpPurchasingDetail();
+                return;
+              }
+              erpGet("/api/erp/vendors/" + encodeURIComponent(String(v.id)) + "/performance").then(function (res) {
+                erpState.perfVendorId = v.id;
+                erpState.perfData = res;
+                renderErpPurchasingDetail();
+              }).catch(function (error) { setAdminDetailStatus(error.message, true); });
+            });
+            if ((typeof erpCan === "function" ? erpCan("purchasing.read") : erpIsAdmin())) actionCell.appendChild(perfBtn);
+            var priceBtn = document.createElement("button");
+            priceBtn.type = "button";
+            priceBtn.textContent = erpState.priceVendorId === v.id ? "Hide prices" : "Prices";
+            priceBtn.addEventListener("click", function () {
+              if (erpState.priceVendorId === v.id) {
+                erpState.priceVendorId = null;
+                erpState.priceData = null;
+                renderErpPurchasingDetail();
+                return;
+              }
+              erpGet("/api/erp/vendors/" + encodeURIComponent(String(v.id)) + "/price-history").then(function (res) {
+                erpState.priceVendorId = v.id;
+                erpState.priceData = res;
+                renderErpPurchasingDetail();
+              }).catch(function (error) { setAdminDetailStatus(error.message, true); });
+            });
+            if ((typeof erpCan === "function" ? erpCan("purchasing.read") : erpIsAdmin())) actionCell.appendChild(priceBtn);
             var editBtn = document.createElement("button");
             editBtn.type = "button";
             editBtn.textContent = erpState.editVendorId === v.id ? "Cancel" : "Edit";
@@ -7410,12 +7456,21 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           meta.textContent = (data.vendor ? data.vendor.name : "—") +
             " · ordered " + (po.order_date || "").slice(0, 10) +
             (po.expected_date ? " · expected " + po.expected_date : "") +
-            (po.freight_cents ? " · freight " + erpMoney(po.freight_cents) : "");
+            (po.freight_cents ? " · freight " + erpMoney(po.freight_cents) : "") +
+            (po.emailed_at ? " · emailed " + (po.emailed_at || "").slice(0, 10) : "");
           head.appendChild(meta);
           var statusLine = document.createElement("p");
           statusLine.appendChild(erpStatusChip(po.status));
+          if (po.is_overdue) {
+            var od = document.createElement("strong");
+            od.textContent = " Overdue — expected " + (po.expected_date || "");
+            statusLine.appendChild(od);
+          }
           head.appendChild(statusLine);
           body.appendChild(head);
+          if (erpState.editPOId === po.id && po.status === "draft") {
+            body.appendChild(erpEditPOForm(po, data.lines || []));
+          }
           var wrap = document.createElement("div");
           wrap.className = "admin-orders-wrap";
           var table = document.createElement("table");
@@ -7440,7 +7495,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           });
           table.appendChild(tb);
           wrap.appendChild(table);
-          body.appendChild(wrap);
+          if (erpState.editPOId !== po.id) body.appendChild(wrap);
           var actions = document.createElement("div");
           actions.className = "erp-toolbar";
           function statusButton(label, toStatus, confirmText) {
@@ -7467,7 +7522,56 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           } else if (po.status === "received") {
             statusButton("Close PO", "closed");
           }
-          if (actions.children.length) body.appendChild(actions);
+          if (po.status === "draft" && (typeof erpCan === "function" ? erpCan("purchasing.write") : erpIsAdmin())) {
+            var editPOBtn = document.createElement("button");
+            editPOBtn.type = "button";
+            editPOBtn.textContent = "Edit PO";
+            editPOBtn.addEventListener("click", function () {
+              erpState.editPOId = po.id;
+              renderErpPurchasingDetail();
+            });
+            actions.appendChild(editPOBtn);
+          }
+          if (po.status !== "cancelled" && (typeof erpCan === "function" ? erpCan("purchasing.write") : erpIsAdmin())
+              && data.vendor && (data.vendor.email || "")) {
+            var emailPOBtn = document.createElement("button");
+            emailPOBtn.type = "button";
+            emailPOBtn.textContent = po.emailed_at ? "Email PO again" : "Email PO";
+            emailPOBtn.addEventListener("click", function () {
+              emailPOBtn.disabled = true;
+              setAdminDetailStatus("Emailing PO…");
+              erpPost("/api/erp/purchase-orders/" + encodeURIComponent(String(po.id)) + "/email", {})
+                .then(function (res) {
+                  setAdminDetailStatus("Emailed to " + res.emailed_to + ".");
+                  return loadErpPurchasingDetail();
+                })
+                .catch(function (error) {
+                  emailPOBtn.disabled = false;
+                  setAdminDetailStatus(error.message, true);
+                });
+            });
+            actions.appendChild(emailPOBtn);
+          }
+          if (actions.children.length && erpState.editPOId !== po.id) body.appendChild(actions);
+          if (po.status !== "cancelled" && (typeof erpCan === "function" ? erpCan("purchasing.write") : erpIsAdmin())
+              && !(data.vendor && (data.vendor.email || ""))) {
+            var noEmail = document.createElement("p");
+            noEmail.className = "admin-orders-empty";
+            noEmail.textContent = "No email on file for this vendor — add one to email the PO.";
+            body.appendChild(noEmail);
+          }
+          if ((typeof erpCan === "function" ? erpCan("purchasing.read") : erpIsAdmin()) && erpState.editPOId !== po.id) {
+            var printPOBtn = document.createElement("button");
+            printPOBtn.type = "button";
+            printPOBtn.textContent = "Print PO";
+            printPOBtn.addEventListener("click", function () {
+              erpShowPrintPO(po, data.vendor, data.lines || []);
+            });
+            var printWrap = document.createElement("div");
+            printWrap.className = "erp-toolbar";
+            printWrap.appendChild(printPOBtn);
+            body.appendChild(printWrap);
+          }
           if (po.status === "sent" || po.status === "partial") {
             body.appendChild(erpSectionTitle("Receive goods"));
             body.appendChild(erpReceiveForm(po, data.lines || []));
@@ -7579,6 +7683,312 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           return form;
         }
 
+
+        /* ---------------- Purchasing 5-pack: overdue, performance, prices ---------------- */
+        function erpOverduePanel() {
+          var wrap = document.createElement("div");
+          var title = document.createElement("h3");
+          title.textContent = "Overdue purchase orders (" + erpState.overduePOs.length + ")";
+          wrap.appendChild(title);
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          table.innerHTML = "<thead><tr><th>PO</th><th>Vendor</th><th>Expected</th><th>Days overdue</th></tr></thead>";
+          var tb = document.createElement("tbody");
+          erpState.overduePOs.forEach(function (po) {
+            var tr = document.createElement("tr");
+            tr.className = "admin-order-row--clickable";
+            tr.appendChild(erpCell("PO", po.po_number));
+            tr.appendChild(erpCell("Vendor", po.vendor_name || "—"));
+            tr.appendChild(erpCell("Expected", po.expected_date || "—"));
+            tr.appendChild(erpCell("Days overdue", String(po.days_overdue)));
+            tr.setAttribute("tabindex", "0");
+            tr.setAttribute("title", "View purchase order");
+            var open = function () {
+              erpState.selectedPOId = po.id;
+              renderErpPurchasingDetail();
+            };
+            tr.addEventListener("click", open);
+            tr.addEventListener("keydown", function (event) {
+              if (event.key === "Enter" || event.key === " ") { event.preventDefault(); open(); }
+            });
+            tb.appendChild(tr);
+          });
+          table.appendChild(tb);
+          wrap.appendChild(table);
+          return wrap;
+        }
+        function erpVendorPerformancePanel(res) {
+          var wrap = document.createElement("div");
+          var p = res.performance || {};
+          var title = document.createElement("h3");
+          title.textContent = "Vendor performance — " + (res.vendor ? res.vendor.name : "");
+          wrap.appendChild(title);
+          var sum = document.createElement("p");
+          sum.textContent = p.po_count + " purchase orders (" + p.open_count + " open, " +
+            p.completed_count + " completed) · On-time " +
+            (p.on_time_pct === null ? "—" : p.on_time_pct + "% (" + p.on_time_count + " of " + p.on_time_denominator + ")") +
+            " · Fill rate " + (p.fill_rate_pct === null ? "—" : p.fill_rate_pct + "%") +
+            " · Avg lead time " + (p.avg_lead_days === null ? "—" : p.avg_lead_days + " days");
+          wrap.appendChild(sum);
+          if ((p.overdue || []).length) {
+            var od = document.createElement("p");
+            od.textContent = "Overdue: " + p.overdue.map(function (o) {
+              return o.po_number + " (expected " + o.expected_date + ", " + o.days_overdue + " days)";
+            }).join("; ");
+            wrap.appendChild(od);
+          } else {
+            var none = document.createElement("p");
+            none.className = "admin-orders-empty";
+            none.textContent = "No overdue purchase orders for this vendor.";
+            wrap.appendChild(none);
+          }
+          return wrap;
+        }
+        function erpVendorPricePanel(res) {
+          var wrap = document.createElement("div");
+          var title = document.createElement("h3");
+          title.textContent = "Price history — " + (res.vendor ? res.vendor.name : "");
+          wrap.appendChild(title);
+          if (!(res.items || []).length) {
+            var empty = document.createElement("p");
+            empty.className = "admin-orders-empty";
+            empty.textContent = "No priced orders for this vendor yet.";
+            wrap.appendChild(empty);
+            return wrap;
+          }
+          res.items.forEach(function (it) {
+            var h = document.createElement("h4");
+            h.textContent = it.sku + " — " + it.item_name;
+            wrap.appendChild(h);
+            wrap.appendChild(erpReportTable(["PO", "Order date", "Unit cost", "Change"],
+              it.entries.map(function (e) {
+                return [e.po_number, e.order_date, erpMoney(e.unit_cost_cents),
+                        e.changed ? "Changed — was " + erpMoney(e.prev_unit_cost_cents) : "—"];
+              })));
+          });
+          return wrap;
+        }
+        /* Printable PO: pure HTML builder (harness-testable) + the in-page
+           print view, same pattern as the label print view. */
+        function erpPOPrintHtml(po, vendor, lines) {
+          var esc = function (s) {
+            return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+              .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+          };
+          var dollars = function (c) { return erpMoney(c); };
+          var rows = "";
+          var linesTotal = 0;
+          (lines || []).forEach(function (l) {
+            var lt = Math.round(Number(l.qty_ordered) * Number(l.unit_cost_cents));
+            linesTotal += lt;
+            rows += "<tr><td>" + esc(l.sku) + " &mdash; " + esc(l.item_name) + "</td><td>" +
+              erpQty(l.qty_ordered) + "</td><td>" + dollars(l.unit_cost_cents) + "</td><td>" +
+              dollars(lt) + "</td></tr>";
+          });
+          var freight = Number(po.freight_cents) || 0;
+          var tax = Number(po.tax_cents) || 0;
+          var grand = linesTotal + freight + tax;
+          return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Purchase order " +
+            esc(po.po_number) + "</title><style>body{font-family:Arial,sans-serif;margin:24px;}" +
+            "table{border-collapse:collapse;width:100%;}th,td{border:1px solid #999;padding:6px;text-align:left;}" +
+            "th{background:#eee;}</style></head><body>" +
+            "<h1>Purchase order " + esc(po.po_number) + "</h1>" +
+            "<p><strong>Vendor:</strong> " + esc(vendor ? vendor.name : "—") + "<br>" +
+            (vendor && vendor.contact_name ? "<strong>Contact:</strong> " + esc(vendor.contact_name) + "<br>" : "") +
+            (vendor && vendor.email ? "<strong>Email:</strong> " + esc(vendor.email) + "<br>" : "") +
+            (vendor && vendor.phone ? "<strong>Phone:</strong> " + esc(vendor.phone) + "<br>" : "") +
+            "<strong>Order date:</strong> " + esc((po.order_date || "").slice(0, 10)) + "<br>" +
+            "<strong>Expected delivery:</strong> " + esc(po.expected_date || "—") + "</p>" +
+            "<table><thead><tr><th>Item</th><th>Qty</th><th>Unit cost</th><th>Line total</th></tr></thead>" +
+            "<tbody>" + rows + "</tbody></table>" +
+            "<p>Goods: " + dollars(linesTotal) + "<br>Freight: " + dollars(freight) +
+            "<br>Tax: " + dollars(tax) + "<br><strong>Total: " + dollars(grand) + "</strong></p>" +
+            (po.notes ? "<p><strong>Notes:</strong> " + esc(po.notes) + "</p>" : "") +
+            "<p>Pop-A-Licious · 6290 McLeod Dr, Suite 120, Las Vegas, NV 89120</p>" +
+            "</body></html>";
+        }
+        function erpShowPrintPO(po, vendor, lines) {
+          var view = document.getElementById("erpPrintView");
+          if (!view) {
+            view = document.createElement("div");
+            view.id = "erpPrintView";
+            document.body.appendChild(view);
+          }
+          var doc = erpPOPrintHtml(po, vendor, lines);
+          var styleHtml = "";
+          var s0 = doc.indexOf("<style>");
+          var s1 = doc.indexOf("</style>");
+          if (s0 >= 0 && s1 > s0) styleHtml = doc.slice(s0, s1 + 8);
+          var b0 = doc.indexOf("<body>") + 6;
+          var b1 = doc.lastIndexOf("</body>");
+          var bodyHtml = (b0 >= 6 && b1 > b0) ? doc.slice(b0, b1) : "";
+          view.innerHTML = "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
+            "<button type=\"button\" id=\"erpPrintBack\">Back to purchase order</button></div>" +
+            styleHtml + bodyHtml;
+          document.body.classList.add("erp-printing");
+          window.scrollTo(0, 0);
+          document.getElementById("erpPrintGo").addEventListener("click", function () {
+            window.print();
+          });
+          document.getElementById("erpPrintBack").addEventListener("click", erpHidePrintLabel);
+        }
+        function erpEditPOForm(po, lines) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var vendorLabel = document.createElement("label");
+          vendorLabel.textContent = "Vendor ";
+          var vendorSel = document.createElement("select");
+          erpState.vendors.forEach(function (v) {
+            var o = document.createElement("option");
+            o.value = v.id;
+            o.textContent = v.name;
+            if (String(v.id) === String(po.vendor_id)) o.selected = true;
+            vendorSel.appendChild(o);
+          });
+          vendorLabel.appendChild(vendorSel);
+          form.appendChild(vendorLabel);
+          var dateLabel = document.createElement("label");
+          dateLabel.textContent = "Expected date ";
+          var dateInput = document.createElement("input");
+          dateInput.type = "date";
+          dateInput.value = po.expected_date || "";
+          dateLabel.appendChild(dateInput);
+          form.appendChild(dateLabel);
+          var freightLabel = document.createElement("label");
+          freightLabel.textContent = "Freight $ ";
+          var freightInput = document.createElement("input");
+          freightInput.type = "number";
+          freightInput.step = "0.01";
+          freightInput.min = "0";
+          freightInput.value = ((Number(po.freight_cents) || 0) / 100).toFixed(2);
+          freightLabel.appendChild(freightInput);
+          form.appendChild(freightLabel);
+          var taxLabel = document.createElement("label");
+          taxLabel.textContent = "Tax $ ";
+          var taxInput = document.createElement("input");
+          taxInput.type = "number";
+          taxInput.step = "0.01";
+          taxInput.min = "0";
+          taxInput.value = ((Number(po.tax_cents) || 0) / 100).toFixed(2);
+          taxLabel.appendChild(taxInput);
+          form.appendChild(taxLabel);
+          var linesTitle = document.createElement("strong");
+          linesTitle.textContent = "Lines";
+          form.appendChild(linesTitle);
+          var linesWrap = document.createElement("div");
+          linesWrap.className = "erp-po-lines";
+          form.appendChild(linesWrap);
+          var lineRows = [];
+          function addEditLineRow(prefill) {
+            var row = document.createElement("div");
+            row.className = "erp-po-line";
+            var itemSel = document.createElement("select");
+            var popcornItems = erpState.items.filter(function (it) { return it.type === "popcorn"; });
+            popcornItems.forEach(function (it) {
+              var o = document.createElement("option");
+              o.value = it.id;
+              o.textContent = it.sku + " — " + it.name;
+              if (prefill && String(it.id) === String(prefill.item_id)) o.selected = true;
+              itemSel.appendChild(o);
+            });
+            row.appendChild(itemSel);
+            var qtyInput = document.createElement("input");
+            qtyInput.type = "number";
+            qtyInput.step = "any";
+            qtyInput.min = "0";
+            qtyInput.required = true;
+            qtyInput.placeholder = "Qty";
+            qtyInput.setAttribute("aria-label", "Quantity ordered");
+            if (prefill) qtyInput.value = prefill.qty_ordered;
+            row.appendChild(qtyInput);
+            var costInput = document.createElement("input");
+            costInput.type = "number";
+            costInput.step = "0.01";
+            costInput.min = "0";
+            costInput.required = true;
+            costInput.placeholder = "Unit cost $";
+            costInput.setAttribute("aria-label", "Unit cost in dollars");
+            if (prefill) costInput.value = ((Number(prefill.unit_cost_cents) || 0) / 100).toFixed(2);
+            row.appendChild(costInput);
+            var remove = document.createElement("button");
+            remove.type = "button";
+            remove.textContent = "Remove";
+            remove.addEventListener("click", function () {
+              linesWrap.removeChild(row);
+              lineRows.splice(lineRows.indexOf(entry), 1);
+            });
+            row.appendChild(remove);
+            var entry = {row: row, itemSel: itemSel, qtyInput: qtyInput, costInput: costInput};
+            lineRows.push(entry);
+            linesWrap.appendChild(row);
+          }
+          (lines || []).forEach(function (l) { addEditLineRow(l); });
+          if (!lineRows.length) addEditLineRow(null);
+          var addLineBtn = document.createElement("button");
+          addLineBtn.type = "button";
+          addLineBtn.textContent = "Add line";
+          addLineBtn.addEventListener("click", function () { addEditLineRow(null); });
+          form.appendChild(addLineBtn);
+          var notesLabel = document.createElement("label");
+          notesLabel.textContent = "Notes ";
+          var notesInput = document.createElement("input");
+          notesInput.placeholder = "optional";
+          notesInput.value = po.notes || "";
+          notesLabel.appendChild(notesInput);
+          form.appendChild(notesLabel);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Save changes";
+          form.appendChild(submit);
+          var cancel = document.createElement("button");
+          cancel.type = "button";
+          cancel.textContent = "Cancel";
+          cancel.addEventListener("click", function () {
+            erpState.editPOId = null;
+            renderErpPurchasingDetail();
+          });
+          form.appendChild(cancel);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            if (!lineRows.length) {
+              status.textContent = "Add at least one line.";
+              return;
+            }
+            var newLines = [];
+            for (var i = 0; i < lineRows.length; i++) {
+              var lr = lineRows[i];
+              var qty = Number(lr.qtyInput.value);
+              var cost = erpDollarsToCents(lr.costInput.value);
+              if (!isFinite(qty) || qty <= 0 || cost === null) {
+                status.textContent = "Every line needs a quantity and a unit cost.";
+                return;
+              }
+              newLines.push({item_id: Number(lr.itemSel.value), qty_ordered: qty, unit_cost_cents: cost});
+            }
+            var freight = erpDollarsToCents(freightInput.value || "0");
+            var tax = erpDollarsToCents(taxInput.value || "0");
+            submit.disabled = true;
+            status.textContent = "Saving…";
+            erpPut("/api/erp/purchase-orders/" + encodeURIComponent(String(po.id)), {
+              vendor_id: Number(vendorSel.value),
+              expected_date: dateInput.value,
+              freight_cents: freight === null ? 0 : freight,
+              tax_cents: tax === null ? 0 : tax,
+              notes: notesInput.value.trim(),
+              lines: newLines
+            }).then(function () {
+              erpState.editPOId = null;
+              return loadErpPurchasingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
 
 /* ================= ERP Phase 2: Production ================= */
 erpState.recipes = [];
@@ -12139,6 +12549,7 @@ function renderErpReportsDetail() {
   tabs.className = "erp-subtabs";
   [["sales", "Sales"], ["valuation", "Inventory valuation"],
    ["margin", "Production margin"], ["wholesale", "Wholesale performance"],
+   ["spend", "Spend by vendor"],
    ["summaries", "Sales summaries"]].forEach(function (t) {
     var b = document.createElement("button");
     b.type = "button";
@@ -12157,6 +12568,7 @@ function renderErpReportsDetail() {
   else if (v === "valuation") renderErpValuationReport(els.body);
   else if (v === "margin") renderErpMarginReport(els.body);
   else if (v === "wholesale") renderErpWholesalePerfReport(els.body);
+  else if (v === "spend") renderErpSpendReport(els.body);
   else renderErpSummariesView(els.body);
 }
 
@@ -12267,6 +12679,33 @@ function renderErpWholesalePerfReport(body) {
       res.accounts.map(function (a) {
         return [a.name, a.order_count, erpMoney(a.revenue_cents),
                 erpMoney(a.avg_order_cents), a.last_order_at ? erpFmtDate(a.last_order_at) : "—"];
+      })));
+  }).catch(function (error) { out.textContent = error.message; });
+}
+
+function renderErpSpendReport(body) {
+  body.appendChild(erpReportFilterBar(function () { renderErpReportsDetail(); }, false));
+  var bar = document.createElement("div");
+  bar.className = "erp-toolbar";
+  bar.appendChild(erpCsvButton("Export CSV", function () {
+    return "/api/erp/reports/spend-by-vendor" + erpReportQuery("format=csv");
+  }));
+  body.appendChild(bar);
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  erpGet("/api/erp/reports/spend-by-vendor" + erpReportQuery()).then(function (res) {
+    out.replaceChildren();
+    var sum = document.createElement("p");
+    sum.innerHTML = "<strong>Total spend:</strong> " + erpMoney(res.total_cents) +
+      " across " + res.po_count + " purchase orders" +
+      (res.from || res.to ? " (" + (res.from || "…") + " to " + (res.to || "…") + ")" : "");
+    out.appendChild(sum);
+    out.appendChild(erpReportTable(
+      ["Vendor", "POs", "Bags", "Goods", "Freight", "Tax", "Total"],
+      res.vendors.map(function (v) {
+        return [v.vendor_name, v.po_count, v.bags, erpMoney(v.lines_total_cents),
+                erpMoney(v.freight_cents), erpMoney(v.tax_cents), erpMoney(v.total_cents)];
       })));
   }).catch(function (error) { out.textContent = error.message; });
 }
