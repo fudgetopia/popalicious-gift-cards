@@ -18641,9 +18641,12 @@ _QB_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
 # generated in the Faire Brand Portal (Settings, Integrations) and read
 # from the environment as FAIRE_ACCESS_TOKEN — there is no /authenticate
 # endpoint in Faire's docs, so no token exchange is ever called. Every
-# call sends both X-FAIRE-APP-CREDENTIALS (Base64
+# call sends X-FAIRE-APP-CREDENTIALS (Base64
 # "applicationId:applicationSecret" from FAIRE_APP_ID / FAIRE_APP_SECRET)
-# and X-FAIRE-OAUTH-ACCESS-TOKEN. A 429 stops the poll immediately; the
+# plus the token under BOTH X-FAIRE-OAUTH-ACCESS-TOKEN and
+# X-FAIRE-ACCESS-TOKEN: the Brand-Portal key is an API key, and Faire's
+# docs are ambiguous about which header carries it, so both are sent.
+# A 429 stops the poll immediately; the
 # watermark is only
 # advanced on a complete run, so the next run re-pulls from the same point
 # (duplicate protection comes from the faire_order_id UNIQUE link).
@@ -18663,15 +18666,16 @@ _FAIRE_SKIP_STATES = ("CANCELED", "PENDING_RETAILER_CONFIRMATION", "DELIVERED")
 def _faire_request(method, path, params=None, json_body=None, access_token=None):
     """One Faire API call. Returns (status_code, parsed_json_dict).
     With _FAIRE_TEST_DOUBLE set, the double answers instead of the network:
-    double(method, path, params, json_body) -> (status, dict)."""
-    if _FAIRE_TEST_DOUBLE is not None:
-        return _FAIRE_TEST_DOUBLE(method, path, params or {}, json_body)
+    double(method, path, params, json_body, headers) -> (status, dict)."""
     app_id = os.environ.get("FAIRE_APP_ID", "").strip()
     app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
     creds = base64.b64encode(("%s:%s" % (app_id, app_secret)).encode("utf-8")).decode("ascii")
     headers = {"X-FAIRE-APP-CREDENTIALS": creds}
     if access_token:
         headers["X-FAIRE-OAUTH-ACCESS-TOKEN"] = access_token
+        headers["X-FAIRE-ACCESS-TOKEN"] = access_token
+    if _FAIRE_TEST_DOUBLE is not None:
+        return _FAIRE_TEST_DOUBLE(method, path, params or {}, json_body, headers)
     url = _FAIRE_BASE_URL + path
     try:
         if method == "GET":
