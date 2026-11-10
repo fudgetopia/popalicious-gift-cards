@@ -18308,6 +18308,111 @@ def _erp_csv_response(filename, header, rows):
     return resp
 
 
+def _erp_flavor_key(name):
+    """Grouping key for a flavor name: strip a trailing ' Popcorn', trim,
+    lowercase. 'Caramel Popcorn' and 'caramel' group together."""
+    n = (name or "").strip()
+    if n.lower().endswith(" popcorn"):
+        n = n[: -len(" Popcorn")].strip()
+    return n.lower()
+
+
+def _erp_flavor_display(name):
+    """Display name for a flavor: strip a trailing ' Popcorn', keep casing."""
+    n = (name or "").strip()
+    if n.lower().endswith(" popcorn"):
+        n = n[: -len(" Popcorn")].strip()
+    return n
+
+
+def _erp_online_sales_rows(conn, df, dt):
+    """Online sales rows for a period, de-duplicated exactly like the Sales
+    report: orders excluding paypal-sourced copies UNION ALL captured
+    paypal_orders. Each row carries src, email, items_summary,
+    amount_total_cents, total_qty, created_at, gift_card_discount_cents,
+    promo_code, reward_code."""
+    where, params = _erp_date_where(df, dt)
+    orders_where = "stripe_session_id NOT LIKE 'paypal:%'"
+    if where:
+        orders_where += " AND " + where
+    q = ("SELECT id, 'stripe' AS src, email, items_summary, amount_total_cents,"
+         " total_qty, created_at, gift_card_discount_cents, promo_code, reward_code"
+         " FROM orders WHERE " + orders_where
+         + " UNION ALL SELECT id, 'paypal' AS src, email, items_summary,"
+         " amount_total_cents, total_qty, created_at, gift_card_discount_cents,"
+         " promo_code, reward_code FROM paypal_orders WHERE status = 'captured'"
+         + (" AND " + where if where else ""))
+    return conn.execute(q, params + params).fetchall()
+
+
+def _erp_blended_cost_per_bag(conn):
+    """Blended production cost per bag across ALL completed batches
+    (all-time basis): total_cost_cents / actual_qty_bags.
+    Returns (cents_per_bag or None, batch_count, bags_produced,
+    total_cost_cents)."""
+    r = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(actual_qty_bags), 0) AS bags,"
+        " COALESCE(SUM(total_cost_cents), 0) AS cost"
+        " FROM erp_production_batches"
+        " WHERE status = 'completed' AND actual_qty_bags > 0").fetchone()
+    bags = float(r["bags"] or 0)
+    if bags <= 0:
+        return None, int(r["n"] or 0), 0, int(r["cost"] or 0)
+    return (int(r["cost"] or 0) / bags), int(r["n"] or 0), bags, int(r["cost"] or 0)
+
+
+def _erp_sales_breakdown(conn, df, dt, channel, online_rows):
+    """Discount / refund / shipping / tax breakdown for the Sales report.
+    Every figure comes from data the backend actually stores; anything not
+    stored is None with a note explaining why — never estimated."""
+    b = {
+        "discounts": {
+            "gift_card_cents": 0, "promo_code_orders": 0, "reward_code_orders": 0,
+            "note": ("Only gift-card discounts are stored in cents on orders. "
+                     "Promo-code and reward-code discount amounts are not tracked "
+                     "anywhere — only the count of orders that used one.")},
+        "refunds": {
+            "wholesale_credits_cents": 0, "wholesale_returns_credited": 0,
+            "retail_refunds_cents": 0,
+            "note": ("Refunds are not offered — replacement or exchange only — "
+                     "so retail refunds are always $0 and no retail refund "
+                     "records exist.")},
+        "shipping": {
+            "wholesale_label_cost_cents": None, "online_label_cost_cents": None,
+            "collected_cents": None,
+            "note": ("Wholesale shipping cost is the Shippo label rate stored "
+                     "when the label is created. Online label rates are "
+                     "discarded after label creation and shipping collected is "
+                     "not stored on orders, so both are not tracked.")},
+        "tax": {
+            "collected_cents": None,
+            "note": ("Sales tax collected is not stored on orders; Nevada tax "
+                     "is computed in Accounting (Phase 1, not yet deployed).")},
+    }
+    if channel in ("all", "online") and online_rows is not None:
+        for r in online_rows:
+            b["discounts"]["gift_card_cents"] += int(r["gift_card_discount_cents"] or 0)
+            if (r["promo_code"] or "").strip():
+                b["discounts"]["promo_code_orders"] += 1
+            if (r["reward_code"] or "").strip():
+                b["discounts"]["reward_code_orders"] += 1
+    if channel in ("all", "wholesale"):
+        w, p = _erp_date_where(df, dt, "r.created_at")
+        row = conn.execute(
+            "SELECT COALESCE(SUM(credit_cents), 0) AS c, COUNT(*) AS n"
+            " FROM erp_wholesale_returns r WHERE r.status = 'credited'"
+            + (" AND " + w if w else ""), p).fetchone()
+        b["refunds"]["wholesale_credits_cents"] = int(row["c"] or 0)
+        b["refunds"]["wholesale_returns_credited"] = int(row["n"] or 0)
+        w2, p2 = _erp_date_where(df, dt, "shippo_label_created_at")
+        row = conn.execute(
+            "SELECT COALESCE(SUM(shipping_cents), 0) AS c"
+            " FROM erp_wholesale_orders WHERE shippo_label_url != ''"
+            + (" AND " + w2 if w2 else ""), p2).fetchone()
+        b["shipping"]["wholesale_label_cost_cents"] = int(row["c"] or 0)
+    return b
+
+
 # ---------- report: sales by flavor/channel ----------
 
 @app.get("/api/erp/reports/sales")
@@ -18327,22 +18432,14 @@ def erp_report_sales():
     online = {"order_count": 0, "total_cents": 0, "flavors": []}
     wholesale = {"order_count": 0, "total_cents": 0, "flavors": []}
     csv_rows = []
+    online_rows = None
     if channel in ("all", "online"):
         # A captured PayPal order is copied into orders by the capture
         # (stripe_session_id 'paypal:<id>'), so the orders side must exclude
         # paypal-sourced rows or this UNION ALL counts the order twice.
-        orders_where = "stripe_session_id NOT LIKE 'paypal:%'"
-        if where:
-            orders_where += " AND " + where
-        q = ("SELECT id, 'stripe' AS src, email, customer_name, items_summary,"
-             " amount_total_cents, total_qty, created_at FROM orders"
-             " WHERE " + orders_where
-             + " UNION ALL SELECT id, 'paypal' AS src, email, '' AS customer_name,"
-             " items_summary, amount_total_cents, total_qty, created_at"
-             " FROM paypal_orders WHERE status = 'captured'"
-             + (" AND " + where if where else ""))
-        p = params + params
-        rows = conn.execute(q, p).fetchall()
+        # _erp_online_sales_rows applies exactly that rule.
+        rows = _erp_online_sales_rows(conn, df, dt)
+        online_rows = rows
         flavors = {}
         for r in rows:
             online["order_count"] += 1
@@ -18383,8 +18480,25 @@ def erp_report_sales():
                                 "", r["bags"] or 0, r["total_cents"] or 0])
         wholesale["flavors"] = [{"flavor": k, "bags": v["bags"], "total_cents": v["total_cents"]}
                                 for k, v in sorted(flavors.items(), key=lambda kv: -kv[1]["bags"])]
+    breakdown = _erp_sales_breakdown(conn, df, dt, channel, online_rows)
     conn.close()
     if fmt == "csv":
+        for _label, _val in [
+                ("discounts: gift cards", breakdown["discounts"]["gift_card_cents"]),
+                ("discounts: promo-code orders (count)",
+                 breakdown["discounts"]["promo_code_orders"]),
+                ("discounts: reward-code orders (count)",
+                 breakdown["discounts"]["reward_code_orders"]),
+                ("refunds: wholesale credits",
+                 breakdown["refunds"]["wholesale_credits_cents"]),
+                ("refunds: retail", breakdown["refunds"]["retail_refunds_cents"]),
+                ("shipping: wholesale label cost",
+                 breakdown["shipping"]["wholesale_label_cost_cents"]),
+                ("shipping: online label cost",
+                 breakdown["shipping"]["online_label_cost_cents"]),
+                ("tax collected", breakdown["tax"]["collected_cents"])]:
+            csv_rows.append(["breakdown", "", _label, "", "", _label, 0,
+                             "" if _val is None else _val])
         return _erp_csv_response(
             "erp-sales-%s-%s.csv" % (df or "all", dt or "all"),
             ["channel", "source", "order_ref", "date", "customer",
@@ -18395,7 +18509,404 @@ def erp_report_sales():
         "online": online, "wholesale": wholesale,
         "order_count": online["order_count"] + wholesale["order_count"],
         "total_cents": online["total_cents"] + wholesale["total_cents"],
+        "breakdown": breakdown,
     })
+
+
+# ---------- report: customers / retention ----------
+
+@app.get("/api/erp/reports/customers")
+def erp_report_customers():
+    """One row per customer: retail keyed by normalized lowercase email
+    (orders + captured paypal_orders, uncaptured PayPal excluded), wholesale
+    keyed by account email — or by account when it has no email. Repeat =
+    2+ orders. Not a CRM: a simple customer list with repeat rate + LTV."""
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    df, dt = _erp_report_dates(request.args)
+    if df is None:
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    customers = {}
+
+    def _add(key, display, email, account_name, order_dt, bags, spent):
+        c = customers.get(key)
+        if c is None:
+            c = {"key": key, "display": display, "email": email or "",
+                 "account_name": account_name or "", "order_count": 0,
+                 "total_bags": 0, "total_spent_cents": 0,
+                 "first_order_at": None, "last_order_at": None}
+            customers[key] = c
+        c["order_count"] += 1
+        c["total_bags"] += bags
+        c["total_spent_cents"] += spent
+        d = (order_dt or "")[:10]
+        if d:
+            if not c["first_order_at"] or d < c["first_order_at"]:
+                c["first_order_at"] = d
+            if not c["last_order_at"] or d > c["last_order_at"]:
+                c["last_order_at"] = d
+
+    for r in _erp_online_sales_rows(conn, df, dt):
+        email = (r["email"] or "").strip().lower()
+        if email:
+            _add("email:" + email, email, email, "", r["created_at"],
+                 float(r["total_qty"] or 0), int(r["amount_total_cents"] or 0))
+        else:
+            _add("email:", "(no email)", "", "", r["created_at"],
+                 float(r["total_qty"] or 0), int(r["amount_total_cents"] or 0))
+    where, params = _erp_date_where(df, dt, "o.created_at")
+    q = ("SELECT o.id, o.created_at, a.id AS account_id, a.name AS account_name,"
+         " a.email AS account_email, COALESCE(SUM(l.qty_bags), 0) AS bags,"
+         " COALESCE(SUM(l.line_total_cents), 0) AS spent"
+         " FROM erp_wholesale_orders o"
+         " JOIN erp_wholesale_accounts a ON a.id = o.account_id"
+         " LEFT JOIN erp_wholesale_order_lines l ON l.order_id = o.id"
+         + (" WHERE " + where if where else "")
+         + " GROUP BY o.id ORDER BY o.id")
+    for r in conn.execute(q, params).fetchall():
+        email = (r["account_email"] or "").strip().lower()
+        if email:
+            _add("email:" + email, email, email, r["account_name"], r["created_at"],
+                 float(r["bags"] or 0), int(r["spent"] or 0))
+        else:
+            _add("account:%d" % r["account_id"], r["account_name"], "",
+                 r["account_name"], r["created_at"],
+                 float(r["bags"] or 0), int(r["spent"] or 0))
+    conn.close()
+    rows = sorted(customers.values(), key=lambda c: -c["total_spent_cents"])
+    for c in rows:
+        c["repeat"] = c["order_count"] >= 2
+    total = len(rows)
+    repeat = sum(1 for c in rows if c["repeat"])
+    total_spent = sum(c["total_spent_cents"] for c in rows)
+    summary = {
+        "total_customers": total,
+        "repeat_customers": repeat,
+        "repeat_rate_pct": round(repeat / total * 100, 1) if total else 0.0,
+        "avg_lifetime_value_cents": int(round(total_spent / total)) if total else 0,
+        "total_spent_cents": total_spent,
+    }
+    if fmt == "csv":
+        return _erp_csv_response(
+            "erp-customers-%s-%s.csv" % (df or "all", dt or "all"),
+            ["customer", "email", "account", "orders", "bags", "total_spent_cents",
+             "first_order", "last_order", "repeat"],
+            [[c["display"], c["email"], c["account_name"], c["order_count"],
+              c["total_bags"], c["total_spent_cents"],
+              c["first_order_at"] or "", c["last_order_at"] or "",
+              "yes" if c["repeat"] else "no"] for c in rows])
+    return jsonify({"from": df, "to": dt, "summary": summary, "customers": rows})
+
+
+# ---------- report: channel profitability ----------
+
+@app.get("/api/erp/reports/channel-profitability")
+def erp_report_channel_profitability():
+    """Per-channel revenue, cost of goods, shipping cost, payment fees, net.
+    COGS uses the blended production cost per bag across all completed
+    batches (all-time basis). Payment fees are not stored anywhere, so they
+    are null with a footnote — never estimated from a published rate.
+    Online shipping cost is not tracked either (retail label rates are
+    discarded after label creation); wholesale shipping cost is the Shippo
+    label rate stored when the label is created. Net is revenue minus the
+    costs that are actually tracked; net_excludes lists what it leaves out.
+    The Faire row appears only when Faire orders exist in the period;
+    wholesale here is non-Faire wholesale (the Sales report groups Faire
+    under wholesale)."""
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    df, dt = _erp_report_dates(request.args)
+    if df is None:
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    blended, n_batches, prod_bags, prod_cost = _erp_blended_cost_per_bag(conn)
+    online_rows = _erp_online_sales_rows(conn, df, dt)
+    online_rev = sum(int(r["amount_total_cents"] or 0) for r in online_rows)
+    online_bags = sum(float(r["total_qty"] or 0) for r in online_rows)
+    where, params = _erp_date_where(df, dt, "o.created_at")
+    wrows = conn.execute(
+        "SELECT o.id, o.via_faire, COALESCE(SUM(l.qty_bags), 0) AS bags,"
+        " COALESCE(SUM(l.line_total_cents), 0) AS rev"
+        " FROM erp_wholesale_orders o"
+        " LEFT JOIN erp_wholesale_order_lines l ON l.order_id = o.id"
+        + (" WHERE " + where if where else "")
+        + " GROUP BY o.id", params).fetchall()
+    ws_rev = ws_bags = f_rev = f_bags = 0
+    for r in wrows:
+        if int(r["via_faire"] or 0):
+            f_rev += int(r["rev"] or 0)
+            f_bags += float(r["bags"] or 0)
+        else:
+            ws_rev += int(r["rev"] or 0)
+            ws_bags += float(r["bags"] or 0)
+    w2, p2 = _erp_date_where(df, dt, "shippo_label_created_at")
+
+    def _ship_cost(faire):
+        row = conn.execute(
+            "SELECT COALESCE(SUM(shipping_cents), 0) AS c"
+            " FROM erp_wholesale_orders WHERE shippo_label_url != ''"
+            " AND via_faire = ?" + (" AND " + w2 if w2 else ""),
+            [1 if faire else 0] + p2).fetchone()
+        return int(row["c"] or 0)
+
+    ws_ship = _ship_cost(False)
+    f_ship = _ship_cost(True)
+    conn.close()
+
+    def _chan(name, rev, bags, ship):
+        cogs = round(bags * blended, 2) if blended is not None else None
+        net = None
+        if cogs is not None:
+            net = round(rev - cogs - (ship or 0), 2)
+        excl = ["payment fees (not tracked)"]
+        if ship is None:
+            excl.append("shipping cost (not tracked)")
+        return {"channel": name, "revenue_cents": rev, "bags": bags,
+                "cogs_cents": cogs, "shipping_cost_cents": ship,
+                "fees_cents": None, "net_cents": net,
+                "net_margin_pct": round(net / rev * 100, 1)
+                if (net is not None and rev) else None,
+                "net_excludes": excl}
+
+    channels = [_chan("online", online_rev, online_bags, None),
+                _chan("wholesale", ws_rev, ws_bags, ws_ship)]
+    if f_rev or f_bags:
+        channels.append(_chan("faire", f_rev, f_bags, f_ship))
+    notes = [
+        "Cost of goods uses the blended production cost per bag across all "
+        "completed batches (all-time basis); no per-flavor cost is assumed.",
+        "Payment processing fees are not stored anywhere, so net profit "
+        "excludes them.",
+        "Online shipping cost is not tracked: Shippo label rates for retail "
+        "orders are discarded after label creation.",
+    ]
+    if fmt == "csv":
+        return _erp_csv_response(
+            "erp-channel-profitability-%s-%s.csv" % (df or "all", dt or "all"),
+            ["channel", "revenue_cents", "bags", "cogs_cents",
+             "shipping_cost_cents", "fees_cents", "net_cents", "net_margin_pct"],
+            [[c["channel"], c["revenue_cents"], c["bags"],
+              "" if c["cogs_cents"] is None else c["cogs_cents"],
+              "" if c["shipping_cost_cents"] is None else c["shipping_cost_cents"],
+              "", "" if c["net_cents"] is None else c["net_cents"],
+              "" if c["net_margin_pct"] is None else c["net_margin_pct"]]
+             for c in channels])
+    return jsonify({
+        "from": df, "to": dt,
+        "blended_cost_per_bag_cents":
+            round(blended, 2) if blended is not None else None,
+        "cost_basis": {"completed_batches": n_batches,
+                       "bags_produced": prod_bags,
+                       "total_cost_cents": prod_cost},
+        "channels": channels, "notes": notes,
+    })
+
+
+# ---------- report: programs (gift cards / subscriptions / fundraisers) ----------
+
+@app.get("/api/erp/reports/programs")
+def erp_report_programs():
+    """Gift-card, subscription, and fundraiser totals, each from the tables
+    that actually exist in this codebase. Demo rows (is_demo=1) are excluded
+    everywhere. Gift-card liability is the live sum of active card balances.
+    Fundraiser totals count paid orders only."""
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    df, dt = _erp_report_dates(request.args)
+    if df is None:
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    w, p = _erp_date_where(df, dt)
+    gc_issued = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(amount_cents), 0) AS amt"
+        " FROM gift_cards WHERE is_demo = 0"
+        + (" AND " + w if w else ""), p).fetchone()
+    w2, p2 = _erp_date_where(df, dt, "red.created_at")
+    gc_red = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(red.amount_cents), 0) AS amt"
+        " FROM redemptions red JOIN gift_cards g ON g.code = red.code"
+        " WHERE g.is_demo = 0" + (" AND " + w2 if w2 else ""), p2).fetchone()
+    gc_out = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(balance_cents), 0) AS amt"
+        " FROM gift_cards WHERE is_demo = 0 AND active = 1").fetchone()
+    gift_cards = {
+        "issued_count": int(gc_issued["n"] or 0),
+        "issued_cents": int(gc_issued["amt"] or 0),
+        "redeemed_count": int(gc_red["n"] or 0),
+        "redeemed_cents": int(gc_red["amt"] or 0),
+        "active_count": int(gc_out["n"] or 0),
+        "outstanding_cents": int(gc_out["amt"] or 0),
+    }
+    subs = {r["status"]: int(r["n"] or 0) for r in conn.execute(
+        "SELECT status, COUNT(*) AS n FROM subscriptions"
+        " WHERE is_demo = 0 GROUP BY status").fetchall()}
+    w3, p3 = _erp_date_where(df, dt, "charged_at")
+    ren = conn.execute(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(amount_cents), 0) AS amt"
+        " FROM subscription_renewals WHERE status = 'charged'"
+        + (" AND " + w3 if w3 else ""), p3).fetchone()
+    subscriptions = {
+        "active": subs.get("active", 0),
+        "paused": subs.get("paused", 0),
+        "cancelled": subs.get("cancelled", 0),
+        "total": sum(subs.values()),
+        "renewals_charged_count": int(ren["n"] or 0),
+        "renewals_charged_cents": int(ren["amt"] or 0),
+    }
+    fundraisers = []
+    for f in conn.execute(
+            "SELECT id, code, org_name, goal_cents, status, created_at"
+            " FROM fundraisers ORDER BY created_at").fetchall():
+        w4, p4 = _erp_date_where(df, dt, "created_at")
+        per = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(total_cents), 0) AS tot,"
+            " COALESCE(SUM(donation_cents), 0) AS don,"
+            " COALESCE(SUM(roundup_cents), 0) AS rnd"
+            " FROM fundraiser_orders WHERE fundraiser_id = ? AND status = 'paid'"
+            + (" AND " + w4 if w4 else ""),
+            [f["id"]] + p4).fetchone()
+        all_t = conn.execute(
+            "SELECT COALESCE(SUM(total_cents), 0) AS tot FROM fundraiser_orders"
+            " WHERE fundraiser_id = ? AND status = 'paid'", (f["id"],)).fetchone()
+        raised_all = int(all_t["tot"] or 0)
+        goal = int(f["goal_cents"] or 0)
+        fundraisers.append({
+            "id": f["id"], "code": f["code"], "org_name": f["org_name"],
+            "status": f["status"], "goal_cents": goal,
+            "orders": int(per["n"] or 0),
+            "raised_cents": int(per["tot"] or 0),
+            "donation_cents": int(per["don"] or 0),
+            "roundup_cents": int(per["rnd"] or 0),
+            "raised_all_time_cents": raised_all,
+            "progress_pct": round(raised_all / goal * 100, 1) if goal else None,
+        })
+    conn.close()
+    if fmt == "csv":
+        rows = [
+            ["gift_cards", "issued", gift_cards["issued_count"],
+             gift_cards["issued_cents"], "in period"],
+            ["gift_cards", "redeemed", gift_cards["redeemed_count"],
+             gift_cards["redeemed_cents"], "in period"],
+            ["gift_cards", "outstanding liability", gift_cards["active_count"],
+             gift_cards["outstanding_cents"], "live balance on active cards"],
+            ["subscriptions", "active", subscriptions["active"], "", "now"],
+            ["subscriptions", "cancelled", subscriptions["cancelled"], "", "now"],
+            ["subscriptions", "renewals charged",
+             subscriptions["renewals_charged_count"],
+             subscriptions["renewals_charged_cents"], "in period"],
+        ]
+        for f in fundraisers:
+            rows.append(["fundraisers", "%s (%s)" % (f["org_name"], f["code"]),
+                         f["orders"], f["raised_cents"],
+                         "in period; all-time %d, goal %d" % (
+                             f["raised_all_time_cents"], f["goal_cents"])])
+        return _erp_csv_response(
+            "erp-programs-%s-%s.csv" % (df or "all", dt or "all"),
+            ["section", "label", "count", "amount_cents", "note"], rows)
+    return jsonify({"from": df, "to": dt, "gift_cards": gift_cards,
+                    "subscriptions": subscriptions, "fundraisers": fundraisers})
+
+
+# ---------- report: demand forecast ----------
+
+@app.get("/api/erp/reports/forecast")
+def erp_report_forecast():
+    """Per-flavor demand forecast. Bags sold per week over the last 8 weeks
+    (online orders + captured PayPal + wholesale lines, same de-duplication
+    as the Sales report), 4-week average velocity, and a forward projection
+    for the next 4 weeks = velocity x 4. A simple average projection only:
+    no seasonality, no trend adjustment, no confidence figure. The canonical
+    flavor list comes from erp_flavor_categories, so flavors with no recent
+    sales still appear, flagged has_recent_sales=False. Names not in the
+    catalog (variety packs, merch) appear as their own rows."""
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    today = datetime.now(timezone.utc).date()
+    buckets = []
+    for i in range(7, -1, -1):
+        end = today - timedelta(days=7 * i)
+        start = end - timedelta(days=6)
+        buckets.append({"label": "%s to %s" % (start.isoformat(), end.isoformat()),
+                        "start": start.isoformat(), "end": end.isoformat()})
+    window_start = buckets[0]["start"]
+    window_end = buckets[-1]["end"]
+    sales = {}
+
+    def _add(name, qty, date_str):
+        key = _erp_flavor_key(name)
+        if not key:
+            return
+        try:
+            d = datetime.strptime((date_str or "")[:10], "%Y-%m-%d").date()
+        except ValueError:
+            return
+        delta = (today - d).days
+        if delta < 0 or delta > 55:
+            return
+        b = 7 - (delta // 7)
+        entry = sales.get(key)
+        if entry is None:
+            entry = {"display": _erp_flavor_display(name), "weekly": [0.0] * 8}
+            sales[key] = entry
+        entry["weekly"][b] += float(qty or 0)
+
+    for r in _erp_online_sales_rows(conn, window_start, window_end):
+        for qty, name in _erp_parse_summary_flavors(r["items_summary"]):
+            _add(name, qty, r["created_at"])
+    for r in conn.execute(
+            "SELECT o.created_at, l.flavor_name, l.qty_bags"
+            " FROM erp_wholesale_order_lines l"
+            " JOIN erp_wholesale_orders o ON o.id = l.order_id"
+            " WHERE substr(o.created_at, 1, 10) >= ?"
+            " AND substr(o.created_at, 1, 10) <= ?",
+            (window_start, window_end)).fetchall():
+        _add(r["flavor_name"], r["qty_bags"], r["created_at"])
+
+    def _row(flavor, category, weekly):
+        total = sum(weekly)
+        vel = sum(weekly[-4:]) / 4
+        return {"flavor": flavor, "category": category,
+                "weekly_bags": [round(x, 1) for x in weekly],
+                "total_bags_8w": round(total, 1),
+                "velocity_4w": round(vel, 2),
+                "projection_4w": round(vel * 4, 1),
+                "has_recent_sales": total > 0}
+
+    flavors = []
+    for row in conn.execute(
+            "SELECT flavor_name, category FROM erp_flavor_categories"
+            " ORDER BY flavor_name").fetchall():
+        key = _erp_flavor_key(row["flavor_name"])
+        entry = sales.pop(key, None)
+        flavors.append(_row(row["flavor_name"], row["category"],
+                            entry["weekly"] if entry else [0.0] * 8))
+    for key in sorted(sales):
+        entry = sales[key]
+        flavors.append(_row(entry["display"], "", entry["weekly"]))
+    conn.close()
+    note = ("Simple average projection: 4-week average weekly velocity x 4 "
+            "weeks. No seasonality or trend adjustment; flavors with no sales "
+            "in the last 8 weeks are flagged.")
+    if fmt == "csv":
+        header = ["flavor", "category"] +             ["week_%d_bags" % (i + 1) for i in range(8)] +             ["total_bags_8w", "velocity_4w", "projection_4w", "has_recent_sales"]
+        return _erp_csv_response(
+            "erp-forecast-%s.csv" % today.isoformat(), header,
+            [[f["flavor"], f["category"]] + f["weekly_bags"] +
+             [f["total_bags_8w"], f["velocity_4w"], f["projection_4w"],
+              "yes" if f["has_recent_sales"] else "no"] for f in flavors])
+    return jsonify({"generated_on": today.isoformat(),
+                    "window_start": window_start, "window_end": window_end,
+                    "buckets": buckets, "flavors": flavors, "note": note})
 
 
 # ---------- report: inventory valuation ----------
