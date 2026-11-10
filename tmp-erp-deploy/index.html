@@ -9686,6 +9686,7 @@ erpState.productionPostBatch = null;
 erpState.ediView = "documents";
 erpState.ediDocuments = [];
 erpState.ediPartners = [];
+erpState.ediAlerts = null;
 erpState.selectedEdiDocId = null;
 erpState.selectedEdiPartnerId = null;
 erpState.ediDocDirectionFilter = "";
@@ -10852,9 +10853,88 @@ function renderErpOrderDetail(body) {
           });
         });
         gen.appendChild(b810);
+        var b855 = document.createElement("button");
+        b855.type = "button";
+        b855.textContent = "Generate 855 (ack)";
+        b855.addEventListener("click", function () {
+          b855.disabled = true;
+          setAdminDetailStatus("Generating 855…");
+          erpPost("/api/erp/wholesale-orders/" + encodeURIComponent(String(id)) + "/edi-855", {}).then(function (res) {
+            b855.disabled = false;
+            showGenResult(res.document);
+            setAdminDetailStatus("");
+          }).catch(function (error) {
+            b855.disabled = false;
+            setAdminDetailStatus(error.message, true);
+          });
+        });
+        gen.appendChild(b855);
       }
       body.appendChild(gen);
       body.appendChild(genResult);
+    }
+    // pending EDI 860 changes for this order (never auto-applied)
+    if (source === "wholesale" && (typeof erpCan === "function" ? erpCan("edi.read") : erpIsAdmin())) {
+      var chBox = document.createElement("div");
+      chBox.className = "erp-alert-box";
+      var chTitle = document.createElement("strong");
+      chTitle.textContent = "Pending EDI order changes (860)";
+      chBox.appendChild(chTitle);
+      var chList = document.createElement("div");
+      chBox.appendChild(chList);
+      body.appendChild(chBox);
+      var loadEdiChanges = function () {
+        chList.textContent = "Loading…";
+        erpGet("/api/erp/edi-changes?order_id=" + encodeURIComponent(String(id)) + "&status=pending").then(function (res) {
+          chList.replaceChildren();
+          if (!res.changes || !res.changes.length) {
+            chList.textContent = "No pending changes.";
+            return;
+          }
+          res.changes.forEach(function (c) {
+            var item = document.createElement("div");
+            var t = document.createElement("p");
+            var lines = ((c.change && c.change.changes) || []).map(function (ln) {
+              return "line " + ln.line + " " + (ln.change_type || "") + " qty " + ln.qty +
+                (ln.unit_price_cents ? " @ $" + (ln.unit_price_cents / 100).toFixed(2) : "");
+            }).join("; ");
+            t.textContent = "Change #" + c.id + " — PO " + ((c.change && c.change.po_number) || "—") + ": " + (lines || "no lines");
+            item.appendChild(t);
+            if ((typeof erpCan === "function" ? erpCan("edi.write") : erpIsAdmin())) {
+              var acc = document.createElement("button");
+              acc.type = "button";
+              acc.textContent = "Accept";
+              acc.addEventListener("click", function () {
+                acc.disabled = true;
+                erpPost("/api/erp/edi-changes/" + encodeURIComponent(String(c.id)) + "/accept", {}).then(function () {
+                  loadEdiChanges();
+                }).catch(function (error) {
+                  acc.disabled = false;
+                  setAdminDetailStatus(error.message, true);
+                });
+              });
+              item.appendChild(acc);
+              var rej = document.createElement("button");
+              rej.type = "button";
+              rej.textContent = "Reject";
+              rej.addEventListener("click", function () {
+                rej.disabled = true;
+                erpPost("/api/erp/edi-changes/" + encodeURIComponent(String(c.id)) + "/reject", {}).then(function () {
+                  loadEdiChanges();
+                }).catch(function (error) {
+                  rej.disabled = false;
+                  setAdminDetailStatus(error.message, true);
+                });
+              });
+              item.appendChild(rej);
+            }
+            chList.appendChild(item);
+          });
+        }).catch(function (error) {
+          chList.textContent = error.message;
+        });
+      };
+      loadEdiChanges();
     }
     setAdminDetailStatus("Order " + o.number + ".");
   }).catch(function (error) {
@@ -12205,10 +12285,12 @@ async function loadErpEdiDetail() {
     var qs = q.length ? "?" + q.join("&") : "";
     var results = await Promise.all([
       erpGet("/api/erp/edi-documents" + qs),
-      erpGet("/api/erp/edi-partners")
+      erpGet("/api/erp/edi-partners"),
+      erpGet("/api/erp/edi/alerts").catch(function () { return null; })
     ]);
     erpState.ediDocuments = results[0].documents || [];
     erpState.ediPartners = results[1].partners || [];
+    erpState.ediAlerts = results[2];
     renderErpEdiDetail();
     setAdminDetailStatus("");
   } catch (error) {
@@ -12308,6 +12390,24 @@ function renderErpEdiDocuments(body) {
     toolbar.appendChild(upBtn);
   }
   body.appendChild(toolbar);
+  if (erpState.ediAlerts && erpState.ediAlerts.failed_count) {
+    var alertBox = document.createElement("div");
+    alertBox.className = "erp-alert-box";
+    var alertStrong = document.createElement("strong");
+    alertStrong.textContent = erpState.ediAlerts.failed_count +
+      (erpState.ediAlerts.failed_count === 1 ? " failed EDI document" : " failed EDI documents") +
+      " — ";
+    alertBox.appendChild(alertStrong);
+    var alertLink = document.createElement("button");
+    alertLink.type = "button";
+    alertLink.textContent = "View failed";
+    alertLink.addEventListener("click", function () {
+      erpState.ediDocStatusFilter = "failed";
+      loadErpEdiDetail();
+    });
+    alertBox.appendChild(alertLink);
+    body.appendChild(alertBox);
+  }
   if (erpState.showUploadEdi && erpIsAdmin()) body.appendChild(erpEdiUploadForm());
   if (erpState.ediUploadPreview) body.appendChild(erpEdiUploadPreview());
 
@@ -12562,6 +12662,17 @@ function renderErpEdiDocDetail(body) {
       meta.appendChild(s);
     });
     body.appendChild(meta);
+    if (d.doc_type === "856" && d.parsed && d.parsed.ssccs && d.parsed.ssccs.length) {
+      var ssccLine = document.createElement("p");
+      ssccLine.textContent = "SSCCs (" + d.parsed.ssccs.length + " carton" +
+        (d.parsed.ssccs.length === 1 ? "" : "s") + "): " + d.parsed.ssccs.join(", ");
+      body.appendChild(ssccLine);
+    }
+    if (d.error_text) {
+      var errLine = document.createElement("p");
+      errLine.textContent = "Send failed: " + d.error_text;
+      body.appendChild(errLine);
+    }
     if (d.order_source && d.order_id) {
       var ol = document.createElement("p");
       ol.textContent = "Linked order: ";
@@ -12592,6 +12703,32 @@ function renderErpEdiDocDetail(body) {
         });
       });
       toolbar.appendChild(retryBtn);
+      if (d.direction === "outbound" && d.status === "queued") {
+        var sendBtn = document.createElement("button");
+        sendBtn.type = "button";
+        sendBtn.textContent = "Send";
+        sendBtn.addEventListener("click", function () {
+          sendBtn.disabled = true;
+          setAdminDetailStatus("Sending…");
+          erpPost("/api/erp/edi-documents/" + encodeURIComponent(String(id)) + "/send", {}).then(function (res) {
+            if (res.download && res.content) {
+              var blob = new Blob([res.content], {type: "text/plain"});
+              var a = document.createElement("a");
+              a.href = URL.createObjectURL(blob);
+              a.download = res.filename || ("edi-" + d.doc_type + "-" + d.id + ".x12");
+              a.click();
+              setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+              setAdminDetailStatus("Document downloaded — it stays queued until it is sent by hand.");
+            } else {
+              renderErpEdiDocDetail(body);
+            }
+          }).catch(function (error) {
+            sendBtn.disabled = false;
+            setAdminDetailStatus(error.message, true);
+          });
+        });
+        toolbar.appendChild(sendBtn);
+      }
       body.appendChild(toolbar);
     }
     var rh = document.createElement("h3");
@@ -12649,7 +12786,7 @@ function renderErpEdiPartners(body) {
   table.className = "admin-orders-table";
   var thead = document.createElement("thead");
   var hr = document.createElement("tr");
-  ["Name", "Provider", "Transport", "Status", "Webhook key", "Created"].forEach(function (c) {
+  ["Name", "Provider", "Transport", "Test mode", "Status", "Webhook key", "Created"].forEach(function (c) {
     var th = document.createElement("th");
     th.textContent = c;
     hr.appendChild(th);
@@ -12672,6 +12809,7 @@ function renderErpEdiPartners(body) {
     tr.appendChild(nmTd);
     tr.appendChild(erpCell("Provider", p.provider));
     tr.appendChild(erpCell("Transport", erpTransportLabel(p.transport)));
+    tr.appendChild(erpCell("Test mode", p.test_mode ? "Test" : "—"));
     var stTd = document.createElement("td");
     stTd.appendChild(erpChip(p.active ? "received" : "cancelled", p.active ? "Active" : "Inactive"));
     tr.appendChild(stTd);
@@ -12703,11 +12841,20 @@ function erpNewEdiPartnerForm() {
   activeInput.type = "checkbox";
   activeInput.checked = true;
   form.appendChild(erpField("Active", activeInput));
+  var testModeInput = document.createElement("input");
+  testModeInput.type = "checkbox";
+  testModeInput.checked = false;
+  form.appendChild(erpField("Test mode", testModeInput));
   var configArea = document.createElement("textarea");
   configArea.rows = 4;
   configArea.style.width = "100%";
   configArea.placeholder = 'Optional config JSON, e.g. {"account_id": 3, "ship_to_map": {}}';
   form.appendChild(erpField("Config JSON", configArea));
+  var segmentMapArea = document.createElement("textarea");
+  segmentMapArea.rows = 3;
+  segmentMapArea.style.width = "100%";
+  segmentMapArea.placeholder = 'Optional segment-map JSON, e.g. {"isa_sender": "MYPARTNER", "sscc_company_prefix": "602581", "test_url": "https://…"}';
+  form.appendChild(erpField("Segment map JSON", segmentMapArea));
   var submit = document.createElement("button");
   submit.type = "submit";
   submit.textContent = "Create partner";
@@ -12724,7 +12871,8 @@ function erpNewEdiPartnerForm() {
       name: name,
       provider: form.provider.value.trim(),
       transport: transportSel.value,
-      active: activeInput.checked
+      active: activeInput.checked,
+      test_mode: testModeInput.checked
     };
     var cfgRaw = configArea.value.trim();
     if (cfgRaw) {
@@ -12732,6 +12880,16 @@ function erpNewEdiPartnerForm() {
         payload.config = JSON.parse(cfgRaw);
       } catch (e) {
         status.textContent = "Config must be valid JSON.";
+        return;
+      }
+    }
+    var mapRaw = segmentMapArea.value.trim();
+    if (mapRaw) {
+      try {
+        if (!payload.config) payload.config = {};
+        payload.config.segment_map = JSON.parse(mapRaw);
+      } catch (e) {
+        status.textContent = "Segment map must be valid JSON.";
         return;
       }
     }
@@ -12774,6 +12932,7 @@ function renderErpEdiPartnerDetail(body) {
     meta.className = "erp-detail-meta";
     ["Provider: " + (p.provider || "—"),
      "Transport: " + erpTransportLabel(p.transport),
+     "Test mode: " + (p.test_mode ? "On" : "Off"),
      "Webhook key: " + (p.has_webhook_key ? "Set" : "—"),
      "Created: " + erpFmtDate(p.created_at)
     ].forEach(function (t) {
@@ -12837,15 +12996,30 @@ function erpEditEdiPartnerForm(p) {
   activeInput.type = "checkbox";
   activeInput.checked = !!p.active;
   form.appendChild(erpField("Active", activeInput));
+  var testModeInput = document.createElement("input");
+  testModeInput.type = "checkbox";
+  testModeInput.checked = !!p.test_mode;
+  form.appendChild(erpField("Test mode", testModeInput));
   var configArea = document.createElement("textarea");
   configArea.rows = 4;
   configArea.style.width = "100%";
   try {
-    configArea.value = JSON.stringify(p.config || {}, null, 2);
+    var cfgNoMap = Object.assign({}, p.config || {});
+    delete cfgNoMap.segment_map;
+    configArea.value = JSON.stringify(cfgNoMap, null, 2);
   } catch (e) {
     configArea.value = "";
   }
   form.appendChild(erpField("Config JSON", configArea));
+  var segmentMapArea = document.createElement("textarea");
+  segmentMapArea.rows = 3;
+  segmentMapArea.style.width = "100%";
+  try {
+    segmentMapArea.value = JSON.stringify((p.config && p.config.segment_map) || {}, null, 2);
+  } catch (e) {
+    segmentMapArea.value = "";
+  }
+  form.appendChild(erpField("Segment map JSON", segmentMapArea));
   var rotateInput = document.createElement("input");
   rotateInput.type = "checkbox";
   form.appendChild(erpField("Rotate webhook key", rotateInput));
@@ -12865,7 +13039,8 @@ function erpEditEdiPartnerForm(p) {
       name: name,
       provider: providerInput.value.trim(),
       transport: transportSel.value,
-      active: activeInput.checked
+      active: activeInput.checked,
+      test_mode: testModeInput.checked
     };
     var cfgRaw = configArea.value.trim();
     if (cfgRaw) {
@@ -12875,6 +13050,21 @@ function erpEditEdiPartnerForm(p) {
         status.textContent = "Config must be valid JSON.";
         return;
       }
+    }
+    var mapRaw = segmentMapArea.value.trim();
+    if (mapRaw) {
+      try {
+        if (!payload.config) payload.config = {};
+        payload.config.segment_map = JSON.parse(mapRaw);
+      } catch (e) {
+        status.textContent = "Segment map must be valid JSON.";
+        return;
+      }
+    } else {
+      // An empty map clears the stored one (the PUT merges config keys,
+      // so an empty object — not a missing key — is what removes it).
+      if (!payload.config) payload.config = {};
+      payload.config.segment_map = {};
     }
     if (rotateInput.checked) payload.rotate_webhook_key = true;
     submit.disabled = true;
