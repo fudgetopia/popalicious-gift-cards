@@ -9678,6 +9678,10 @@ erpState.ordersStatusFilter = "";
 erpState.ordersSearch = "";
 erpState.ordersSearchTimer = null;
 erpState.showNewWholesaleOrder = false;
+erpState.faireStatus = null;
+erpState.faireLog = [];
+erpState.faireSyncing = false;
+erpState.faireSyncMsg = "";
 erpState.showNewAccount = false;
 erpState.showImportAccounts = false;
 erpState.showEditAccount = false;
@@ -10022,6 +10026,123 @@ function erpRenderWholesaleReturns(body, o, id, onRefresh) {
     p.textContent = error.message;
     wrap.appendChild(p);
   });
+}
+
+/* ---------- Faire auto-import ---------- */
+async function loadErpFaireSection() {
+  if (!(typeof erpCan === "function" ? erpCan("orders.read") : erpIsAdmin())) return;
+  try {
+    var results = await Promise.all([
+      erpGet("/api/erp/faire/status"),
+      erpGet("/api/erp/faire/import-log")
+    ]);
+    erpState.faireStatus = results[0];
+    erpState.faireLog = results[1].log || [];
+    if (erpState.ordersView === "wholesale") renderErpOrdersDetail();
+  } catch (error) {
+    // The section keeps the last good data (or the loading line) on failure.
+  }
+}
+function renderErpFaireSection(body) {
+  var box = document.createElement("div");
+  box.className = "erp-key-notice";
+  box.id = "faireSection";
+  var h3 = document.createElement("h3");
+  h3.textContent = "Faire auto-import";
+  box.appendChild(h3);
+  var st = erpState.faireStatus;
+  var meta = document.createElement("p");
+  if (!st) {
+    meta.textContent = "Loading Faire sync status…";
+  } else if (st.configured === false) {
+    meta.textContent = "Faire is not configured yet (FAIRE_APP_ID / FAIRE_APP_SECRET). Orders are not being polled.";
+  } else {
+    var parts = [];
+    parts.push("Last sync: " + (st.last_run_at ? erpFmtDate(st.last_run_at) : "never"));
+    parts.push("Orders imported: " + (st.orders_imported || 0));
+    parts.push("Pending review: " + (st.pending_review || 0));
+    if (st.last_summary && typeof st.last_summary.imported === "number") {
+      parts.push("Last run: imported " + st.last_summary.imported
+        + " · skipped " + (st.last_summary.skipped || 0)
+        + " · QuickBooks pushed " + (st.last_summary.qb_pushed || 0));
+    }
+    meta.textContent = parts.join(" · ");
+  }
+  box.appendChild(meta);
+  if ((typeof erpCan === "function" ? erpCan("orders.write") : erpIsAdmin())) {
+    var syncBtn = document.createElement("button");
+    syncBtn.type = "button";
+    syncBtn.id = "faireSyncNowBtn";
+    syncBtn.textContent = erpState.faireSyncing ? "Syncing…" : "Sync now";
+    syncBtn.disabled = !!erpState.faireSyncing;
+    syncBtn.addEventListener("click", function () {
+      erpState.faireSyncing = true;
+      erpState.faireSyncMsg = "";
+      renderErpOrdersDetail();
+      erpPost("/api/erp/faire/sync", {}).then(function (res) {
+        erpState.faireSyncing = false;
+        erpState.faireSyncMsg = "Imported " + (res.imported || 0)
+          + " · skipped " + (res.skipped || 0)
+          + " · already seen " + (res.already_seen || 0)
+          + " · QuickBooks pushed " + (res.qb_pushed || 0)
+          + " · QuickBooks skipped " + (res.qb_skipped || 0)
+          + ((res.errors && res.errors.length) ? " · " + res.errors.join("; ") : "");
+        loadErpFaireSection();
+        loadErpOrdersDetail();
+      }).catch(function (error) {
+        erpState.faireSyncing = false;
+        erpState.faireSyncMsg = error.message;
+        renderErpOrdersDetail();
+      });
+    });
+    box.appendChild(syncBtn);
+  }
+  if (erpState.faireSyncMsg) {
+    var msg = document.createElement("p");
+    msg.id = "faireSyncMsg";
+    msg.textContent = erpState.faireSyncMsg;
+    box.appendChild(msg);
+  }
+  if (erpState.faireLog.length) {
+    var table = document.createElement("table");
+    table.className = "admin-orders-table";
+    table.id = "faireImportLogTable";
+    var thead = document.createElement("thead");
+    var hr = document.createElement("tr");
+    ["Faire order", "State", "Outcome", "Matched", "Unmatched", "QuickBooks", "Notes"].forEach(function (c) {
+      var th = document.createElement("th");
+      th.textContent = c;
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    erpState.faireLog.forEach(function (e) {
+      var tr = document.createElement("tr");
+      tr.appendChild(erpCell("Faire order", e.display_id || e.faire_order_id || "—"));
+      tr.appendChild(erpCell("State", e.state || "—"));
+      tr.appendChild(erpCell("Outcome", e.outcome || "—"));
+      var matched = (e.matched_lines || []).map(function (l) {
+        return (l.flavor_name || "?") + " x" + (l.qty_bags === undefined ? "" : l.qty_bags);
+      }).join(", ");
+      tr.appendChild(erpCell("Matched", matched));
+      var unmatched = (e.unmatched_lines || []).map(function (l) {
+        return (l.sku || l.product_name || "?");
+      }).join(", ");
+      tr.appendChild(erpCell("Unmatched", unmatched));
+      tr.appendChild(erpCell("QuickBooks", e.qb_status || "—"));
+      tr.appendChild(erpCell("Notes", e.notes || "—"));
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    box.appendChild(table);
+  } else if (st) {
+    var none = document.createElement("p");
+    none.className = "admin-orders-empty";
+    none.textContent = "No Faire imports yet.";
+    box.appendChild(none);
+  }
+  body.appendChild(box);
 }
 
 /* ---------- Order hub 5-pack: volume-tier editor ---------- */
@@ -11200,6 +11321,8 @@ function erpShowLinkOrderModal(batch, onLinked) {
 
 /* ---------- wholesale orders sub-view ---------- */
 function renderErpWholesaleOrders(body) {
+  if ((typeof erpCan === "function" ? erpCan("orders.read") : erpIsAdmin()) && !erpState.faireStatus) loadErpFaireSection();
+  renderErpFaireSection(body);
   var toolbar = document.createElement("div");
   toolbar.className = "erp-toolbar";
   if (erpIsAdmin()) {
