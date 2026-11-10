@@ -35,7 +35,7 @@ from urllib.parse import urlencode
 
 import requests
 import stripe
-from flask import Flask, jsonify, redirect, request
+from flask import Flask, Response, jsonify, redirect, request
 from flask_cors import CORS
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -1197,6 +1197,14 @@ def init_db():
             qb_status TEXT NOT NULL DEFAULT '',
             notes TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_faire_oauth (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            access_token TEXT NOT NULL DEFAULT '',
+            token_type TEXT NOT NULL DEFAULT '',
+            scope TEXT NOT NULL DEFAULT '',
+            obtained_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
         );
         CREATE TABLE IF NOT EXISTS erp_qb_oauth (
             id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -18637,24 +18645,31 @@ _QB_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
 # ---------------- ERP: Faire auto-import (poll + auto-push to QuickBooks) ----------------
 # Faire's External API v2 is polling-only (no webhooks): the sync pulls
 # GET /orders?updated_at_min=...&sort_by=UPDATED_AT with cursor pagination
-# and maps new orders into wholesale orders. Auth: the access token is
-# generated in the Faire Brand Portal (Settings, Integrations) and read
-# from the environment as FAIRE_ACCESS_TOKEN — there is no /authenticate
-# endpoint in Faire's docs, so no token exchange is ever called. Every
-# call sends X-FAIRE-APP-CREDENTIALS (Base64
-# "applicationId:applicationSecret" from FAIRE_APP_ID / FAIRE_APP_SECRET)
-# plus the token under ONLY X-FAIRE-ACCESS-TOKEN: the Brand-Portal key is
-# an API key, not a code-grant OAuth token. Header variants tried live:
-# OAuth header only -> 401; BOTH headers -> 401; API-key header only is
-# the last untested variant — Faire may validate the OAuth header first
-# and reject it when it holds an API key. If this still 401s, the
-# remaining path is the full OAuth authorization-code flow (not built).
+# and maps new orders into wholesale orders. Auth: the OAuth
+# authorization-code flow — the admin clicks Connect Faire, approves the
+# app at faire.com/oauth2/authorize, and the callback exchanges the code
+# for an access token at the token endpoint; the token is stored in
+# erp_faire_oauth and sent as X-FAIRE-OAUTH-ACCESS-TOKEN. The
+# Brand-Portal API key (FAIRE_ACCESS_TOKEN env) is kept as a fallback and
+# is sent as X-FAIRE-ACCESS-TOKEN. Every call also sends
+# X-FAIRE-APP-CREDENTIALS (Base64 "applicationId:applicationSecret" from
+# FAIRE_APP_ID / FAIRE_APP_SECRET). There is no /authenticate endpoint in
+# Faire's docs. Header variants tried live with the Brand-Portal key:
+# OAuth header only -> 401; BOTH headers -> 401; API-key header only ->
+# 401 — the key itself never authenticated, hence the OAuth flow.
 # A 429 stops the poll immediately; the
 # watermark is only
 # advanced on a complete run, so the next run re-pulls from the same point
 # (duplicate protection comes from the faire_order_id UNIQUE link).
 
 _FAIRE_BASE_URL = "https://www.faire.com/external-api/v2"
+_FAIRE_TOKEN_URL = "https://www.faire.com/api/external-api-oauth2/token"
+_FAIRE_REVOKE_URL = "https://www.faire.com/api/external-api-oauth2/revoke"
+_FAIRE_AUTHORIZE_URL = "https://faire.com/oauth2/authorize"
+_FAIRE_CALLBACK_URL = ("https://popalicious-gift-cards-production.up.railway.app"
+                       "/api/erp/faire/callback")
+_FAIRE_FRONTEND_URL = "https://erp.pop-a-licious.com"
+_FAIRE_OAUTH_SCOPE = ("READ_ORDERS", "READ_PRODUCTS", "READ_BRAND", "READ_RETAILER")
 _FAIRE_TEST_DOUBLE = None
 
 # States that import as wholesale orders. PRE_TRANSIT / IN_TRANSIT still
@@ -18666,16 +18681,23 @@ _FAIRE_IMPORTABLE_STATES = ("NEW", "PROCESSING", "PRE_TRANSIT", "IN_TRANSIT",
 _FAIRE_SKIP_STATES = ("CANCELED", "PENDING_RETAILER_CONFIRMATION", "DELIVERED")
 
 
-def _faire_request(method, path, params=None, json_body=None, access_token=None):
+def _faire_request(method, path, params=None, json_body=None, access_token=None,
+                   is_oauth=False):
     """One Faire API call. Returns (status_code, parsed_json_dict).
     With _FAIRE_TEST_DOUBLE set, the double answers instead of the network:
-    double(method, path, params, json_body, headers) -> (status, dict)."""
+    double(method, path, params, json_body, headers) -> (status, dict).
+    The token header depends on where the token came from: a stored OAuth
+    token goes under X-FAIRE-OAUTH-ACCESS-TOKEN; the Brand-Portal key
+    (FAIRE_ACCESS_TOKEN env) goes under X-FAIRE-ACCESS-TOKEN."""
     app_id = os.environ.get("FAIRE_APP_ID", "").strip()
     app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
     creds = base64.b64encode(("%s:%s" % (app_id, app_secret)).encode("utf-8")).decode("ascii")
     headers = {"X-FAIRE-APP-CREDENTIALS": creds}
     if access_token:
-        headers["X-FAIRE-ACCESS-TOKEN"] = access_token
+        if is_oauth:
+            headers["X-FAIRE-OAUTH-ACCESS-TOKEN"] = access_token
+        else:
+            headers["X-FAIRE-ACCESS-TOKEN"] = access_token
     if _FAIRE_TEST_DOUBLE is not None:
         return _FAIRE_TEST_DOUBLE(method, path, params or {}, json_body, headers)
     url = _FAIRE_BASE_URL + path
@@ -18695,22 +18717,114 @@ def _faire_request(method, path, params=None, json_body=None, access_token=None)
     return resp.status_code, data
 
 
+def _faire_state_token(email):
+    s = URLSafeTimedSerializer(AUTH_SECRET, salt="popalicious-faire-oauth")
+    return s.dumps({"email": email})
+
+
+def _faire_state_email(state, max_age=600):
+    s = URLSafeTimedSerializer(AUTH_SECRET, salt="popalicious-faire-oauth")
+    try:
+        return s.loads(state, max_age=max_age).get("email")
+    except (BadSignature, SignatureExpired):
+        return None
+
+
+def _faire_oauth_row(conn):
+    return conn.execute("SELECT * FROM erp_faire_oauth WHERE id = 1").fetchone()
+
+
+def _faire_store_oauth_token(conn, access_token, token_type, scope):
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO erp_faire_oauth (id, access_token, token_type,"
+        " scope, obtained_at, updated_at) VALUES (1, ?, ?, ?, ?, ?)",
+        (access_token, token_type or "", scope or "", now, now))
+    conn.commit()
+
+
+def _faire_token_post(json_body):
+    """POST to the Faire OAuth token endpoint (not under the /v2 base).
+    With _FAIRE_TEST_DOUBLE set, the double answers instead of the
+    network: double("POST", "/oauth2/token", {}, body, {}) -> (status, dict).
+    The docs state no header requirement for this call, so none are sent."""
+    if _FAIRE_TEST_DOUBLE is not None:
+        return _FAIRE_TEST_DOUBLE("POST", "/oauth2/token", {}, json_body, {})
+    try:
+        resp = requests.post(_FAIRE_TOKEN_URL, json=json_body, timeout=30)
+    except Exception as e:
+        return 0, {"error": str(e)}
+    try:
+        data = resp.json()
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return resp.status_code, data
+
+
+def _faire_exchange_token(code):
+    """Exchange an OAuth authorization code for an access token.
+    Returns (data, error). Tries the docs' Request Parameters table
+    casing (camelCase) first, then retries once with the sample JSON
+    casing (snake_case) — the docs are inconsistent on field casing."""
+    app_id = os.environ.get("FAIRE_APP_ID", "").strip()
+    app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
+    scope = list(_FAIRE_OAUTH_SCOPE)
+    bodies = [
+        {"applicationId": app_id, "applicationSecret": app_secret,
+         "scope": scope, "grantType": "AUTHORIZATION_CODE",
+         "redirectUrl": _FAIRE_CALLBACK_URL, "authorizationCode": code},
+        {"application_token": app_id, "application_secret": app_secret,
+         "scope": scope, "grant_type": "AUTHORIZATION_CODE",
+         "redirect_url": _FAIRE_CALLBACK_URL, "authorization_code": code},
+    ]
+    for body in bodies:
+        status, data = _faire_token_post(body)
+        if status == 200 and data.get("access_token"):
+            return data, None
+    return None, "Faire token exchange failed"
+
+
+def _faire_revoke_token(token):
+    """Best-effort revoke of a stored OAuth token. Never raises."""
+    app_id = os.environ.get("FAIRE_APP_ID", "").strip()
+    app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
+    body = {"applicationToken": app_id, "applicationSecret": app_secret,
+            "accessTokenOAuth": token}
+    try:
+        if _FAIRE_TEST_DOUBLE is not None:
+            _FAIRE_TEST_DOUBLE("POST", "/oauth2/revoke", {}, body, {})
+            return
+        requests.post(_FAIRE_REVOKE_URL, json=body, timeout=15)
+    except Exception:
+        pass
+
+
 def _faire_authenticate():
-    """Return the Brand-Portal access token from the environment.
-    Returns (token, error). There is no /authenticate endpoint in Faire's
-    docs, so no token exchange is ever called: the token is generated in
-    the Faire Brand Portal (Settings, Integrations) and set as
-    FAIRE_ACCESS_TOKEN. The token is used for this sync run only."""
+    """Return the token for a Faire sync run.
+    Returns (token, error, is_oauth). Precedence: (1) a stored OAuth
+    token from the authorization-code flow; (2) the Brand-Portal access
+    token from FAIRE_ACCESS_TOKEN; (3) a 'not configured' error. An
+    OAuth token is sent as X-FAIRE-OAUTH-ACCESS-TOKEN; the Brand-Portal
+    key is sent as X-FAIRE-ACCESS-TOKEN."""
     app_id = os.environ.get("FAIRE_APP_ID", "").strip()
     app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
     if not app_id or not app_secret:
-        return None, "Faire not configured (FAIRE_APP_ID / FAIRE_APP_SECRET missing)"
+        return None, "Faire not configured (FAIRE_APP_ID / FAIRE_APP_SECRET missing)", False
+    conn = db()
+    try:
+        row = _faire_oauth_row(conn)
+    finally:
+        conn.close()
+    if row and (row["access_token"] or ""):
+        return row["access_token"], None, True
     token = os.environ.get("FAIRE_ACCESS_TOKEN", "").strip()
     if not token:
         return None, ("Faire access token not configured — generate one in the "
                       "Faire Brand Portal (Settings, Integrations) and set "
-                      "FAIRE_ACCESS_TOKEN")
-    return token, None
+                      "FAIRE_ACCESS_TOKEN"), False
+    return token, None, False
 
 
 def _faire_norm_name(s):
@@ -19024,7 +19138,7 @@ def erp_faire_sync():
         actor, err = _erp_check_perm("orders.write")
         if err:
             return err
-    token, auth_err = _faire_authenticate()
+    token, auth_err, is_oauth = _faire_authenticate()
     if auth_err:
         return jsonify(error=auth_err), 503
     conn = db()
@@ -19044,7 +19158,7 @@ def erp_faire_sync():
         if cursor:
             params["cursor"] = cursor
         status, data = _faire_request("GET", "/orders", params=params,
-                                      access_token=token)
+                                      access_token=token, is_oauth=is_oauth)
         if status == 429:
             summary["stopped_on_429"] = True
             summary["errors"].append(
@@ -19132,6 +19246,7 @@ def erp_faire_status():
         return err
     conn = db()
     row = conn.execute("SELECT * FROM erp_faire_sync WHERE id = 1").fetchone()
+    orow = _faire_oauth_row(conn)
     imported = conn.execute("SELECT COUNT(*) FROM erp_faire_orders").fetchone()[0]
     pending = conn.execute(
         "SELECT COUNT(*) FROM erp_faire_orders WHERE needs_review = 1").fetchone()[0]
@@ -19146,6 +19261,8 @@ def erp_faire_status():
         "configured": bool(os.environ.get("FAIRE_APP_ID")
                            and os.environ.get("FAIRE_APP_SECRET")
                            and os.environ.get("FAIRE_ACCESS_TOKEN")),
+        "oauth_connected": bool(orow and (orow["access_token"] or "")),
+        "oauth_connected_at": (orow["obtained_at"] if orow else "") or "",
         "last_run_at": row["last_run_at"] if row else "",
         "last_updated_at_min": row["last_updated_at_min"] if row else "",
         "last_summary": last,
@@ -19174,6 +19291,74 @@ def erp_faire_import_log():
         out.append(d)
     conn.close()
     return jsonify(log=out)
+
+
+@app.get("/api/erp/faire/connect")
+def erp_faire_connect():
+    """Start the Faire OAuth authorization-code flow: mint a signed,
+    time-limited state token and return the Faire authorize URL for the
+    admin's browser. Admin session with orders.write."""
+    actor, err = _erp_check_perm("orders.write")
+    if err:
+        return err
+    app_id = os.environ.get("FAIRE_APP_ID", "").strip()
+    app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
+    if not app_id or not app_secret:
+        return jsonify(error="Faire not configured (FAIRE_APP_ID / FAIRE_APP_SECRET missing)"), 503
+    params = {
+        "applicationId": app_id,
+        "scope": ",".join(_FAIRE_OAUTH_SCOPE),
+        "state": _faire_state_token(actor),
+        "redirectUrl": _FAIRE_CALLBACK_URL,
+    }
+    return jsonify({"authorize_url": _FAIRE_AUTHORIZE_URL + "?" + urlencode(params)})
+
+
+@app.get("/api/erp/faire/callback")
+def erp_faire_callback():
+    # Browser redirect from Faire; no ERP session. The signed `state`
+    # binds this callback to the admin who started the flow, and the
+    # authorization code expires within 10 minutes.
+    email = _faire_state_email(request.args.get("state") or "")
+    if not email:
+        return Response("Invalid or expired Faire authorization state",
+                        status=400, mimetype="text/plain")
+    code = request.args.get("code") or ""
+    if not code:
+        return Response("Missing Faire authorization code",
+                        status=400, mimetype="text/plain")
+    app_id = os.environ.get("FAIRE_APP_ID", "").strip()
+    app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
+    if not app_id or not app_secret:
+        return Response("Faire not configured (FAIRE_APP_ID / FAIRE_APP_SECRET missing)",
+                        status=502, mimetype="text/plain")
+    data, err = _faire_exchange_token(code)
+    if err or not data or not data.get("access_token"):
+        return Response("Faire token exchange failed",
+                        status=502, mimetype="text/plain")
+    conn = db()
+    _faire_store_oauth_token(conn, data.get("access_token", ""),
+                             data.get("token_type", ""),
+                             ",".join(_FAIRE_OAUTH_SCOPE))
+    conn.close()
+    return redirect(_FAIRE_FRONTEND_URL + "/#/orders")
+
+
+@app.post("/api/erp/faire/disconnect")
+def erp_faire_disconnect():
+    """Disconnect Faire OAuth: best-effort revoke, then delete the stored
+    token. Admin session with orders.write."""
+    actor, err = _erp_check_perm("orders.write")
+    if err:
+        return err
+    conn = db()
+    row = _faire_oauth_row(conn)
+    if row and (row["access_token"] or ""):
+        _faire_revoke_token(row["access_token"])
+    conn.execute("DELETE FROM erp_faire_oauth WHERE id = 1")
+    conn.commit()
+    conn.close()
+    return jsonify({"connected": False})
 
 
 # Test hook: tests assign backend._QBO_TEST_DOUBLE to a fake implementing
