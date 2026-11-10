@@ -1772,6 +1772,11 @@ def fulfill_order(session, meta):
         total_qty = int(meta.get("total_qty") or 0)
     except (TypeError, ValueError):
         total_qty = 0
+    if total_qty <= 0:
+        # Session metadata sometimes never carries total_qty (live order
+        # #1001 has total_qty 0 with a correct items_summary); derive it
+        # from the summary so the row is correct at the source.
+        total_qty = sum(q for q, _ in _erp_parse_summary_flavors(items_summary))
     ship = session.get("shipping_details") or {}
     ship_addr = ship.get("address") or {}
     label_url, tracking_number, _rate_cents = _create_shippo_label(
@@ -6678,6 +6683,19 @@ def _mkt_orders_by_email(conn, email):
         if o:
             out.append(o)
     return out
+
+
+def _erp_online_bags(r):
+    """Bag count for an online sales row: parse items_summary; fall back to
+    total_qty only when the summary parses to 0 (empty/unparseable). The
+    Stripe webhook stores total_qty from session metadata, which is 0 on
+    rows whose metadata never carried it (live order #1001) — items_summary
+    is correct there, and the by-flavor table + forecast already count from
+    the same parse."""
+    parsed = sum(q for q, _ in _erp_parse_summary_flavors(r["items_summary"]))
+    if parsed:
+        return parsed
+    return int(r["total_qty"] or 0)
 
 
 def _mkt_order_detail(conn, source, order_id):
@@ -18449,7 +18467,7 @@ def erp_report_sales():
             if fmt == "csv":
                 csv_rows.append(["online", r["src"], "%s-%d" % (r["src"], r["id"]),
                                 (r["created_at"] or "")[:10], r["email"] or "",
-                                r["items_summary"] or "", r["total_qty"] or 0,
+                                r["items_summary"] or "", _erp_online_bags(r),
                                 r["amount_total_cents"] or 0])
         online["flavors"] = [{"flavor": k, "bags": v}
                              for k, v in sorted(flavors.items(), key=lambda kv: -kv[1])]
@@ -18553,10 +18571,10 @@ def erp_report_customers():
         email = (r["email"] or "").strip().lower()
         if email:
             _add("email:" + email, email, email, "", r["created_at"],
-                 float(r["total_qty"] or 0), int(r["amount_total_cents"] or 0))
+                 float(_erp_online_bags(r)), int(r["amount_total_cents"] or 0))
         else:
             _add("email:", "(no email)", "", "", r["created_at"],
-                 float(r["total_qty"] or 0), int(r["amount_total_cents"] or 0))
+                 float(_erp_online_bags(r)), int(r["amount_total_cents"] or 0))
     where, params = _erp_date_where(df, dt, "o.created_at")
     q = ("SELECT o.id, o.created_at, a.id AS account_id, a.name AS account_name,"
          " a.email AS account_email, COALESCE(SUM(l.qty_bags), 0) AS bags,"
@@ -18627,7 +18645,7 @@ def erp_report_channel_profitability():
     blended, n_batches, prod_bags, prod_cost = _erp_blended_cost_per_bag(conn)
     online_rows = _erp_online_sales_rows(conn, df, dt)
     online_rev = sum(int(r["amount_total_cents"] or 0) for r in online_rows)
-    online_bags = sum(float(r["total_qty"] or 0) for r in online_rows)
+    online_bags = sum(float(_erp_online_bags(r)) for r in online_rows)
     where, params = _erp_date_where(df, dt, "o.created_at")
     wrows = conn.execute(
         "SELECT o.id, o.via_faire, COALESCE(SUM(l.qty_bags), 0) AS bags,"
