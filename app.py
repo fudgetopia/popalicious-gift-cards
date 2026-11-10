@@ -18637,12 +18637,14 @@ _QB_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
 # ---------------- ERP: Faire auto-import (poll + auto-push to QuickBooks) ----------------
 # Faire's External API v2 is polling-only (no webhooks): the sync pulls
 # GET /orders?updated_at_min=...&sort_by=UPDATED_AT with cursor pagination
-# and maps new orders into wholesale orders. Auth is OAuth 2.0: POST
-# /authenticate with the app credentials; every call then sends both
-# X-FAIRE-APP-CREDENTIALS (Base64 "applicationId:applicationSecret") and
-# X-FAIRE-OAUTH-ACCESS-TOKEN. Credentials come from the environment
-# (FAIRE_APP_ID / FAIRE_APP_SECRET) — never stored, re-authenticated on
-# every sync run. A 429 stops the poll immediately; the watermark is only
+# and maps new orders into wholesale orders. Auth: the access token is
+# generated in the Faire Brand Portal (Settings, Integrations) and read
+# from the environment as FAIRE_ACCESS_TOKEN — there is no /authenticate
+# endpoint in Faire's docs, so no token exchange is ever called. Every
+# call sends both X-FAIRE-APP-CREDENTIALS (Base64
+# "applicationId:applicationSecret" from FAIRE_APP_ID / FAIRE_APP_SECRET)
+# and X-FAIRE-OAUTH-ACCESS-TOKEN. A 429 stops the poll immediately; the
+# watermark is only
 # advanced on a complete run, so the next run re-pulls from the same point
 # (duplicate protection comes from the faire_order_id UNIQUE link).
 
@@ -18688,23 +18690,20 @@ def _faire_request(method, path, params=None, json_body=None, access_token=None)
 
 
 def _faire_authenticate():
-    """POST /authenticate with the app credentials. Returns (token, error).
-    The token is used for this sync run only — never stored."""
+    """Return the Brand-Portal access token from the environment.
+    Returns (token, error). There is no /authenticate endpoint in Faire's
+    docs, so no token exchange is ever called: the token is generated in
+    the Faire Brand Portal (Settings, Integrations) and set as
+    FAIRE_ACCESS_TOKEN. The token is used for this sync run only."""
     app_id = os.environ.get("FAIRE_APP_ID", "").strip()
     app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
     if not app_id or not app_secret:
         return None, "Faire not configured (FAIRE_APP_ID / FAIRE_APP_SECRET missing)"
-    status, data = _faire_request(
-        "POST", "/authenticate",
-        json_body={"applicationId": app_id, "applicationSecret": app_secret})
-    if status == 0:
-        return None, "Faire authenticate failed: %s" % (data.get("error") or "network error")
-    if status != 200:
-        return None, "Faire authenticate failed (HTTP %s)" % status
-    token = (data.get("accessToken") or data.get("access_token")
-             or data.get("token") or "")
+    token = os.environ.get("FAIRE_ACCESS_TOKEN", "").strip()
     if not token:
-        return None, "Faire authenticate returned no access token"
+        return None, ("Faire access token not configured — generate one in the "
+                      "Faire Brand Portal (Settings, Integrations) and set "
+                      "FAIRE_ACCESS_TOKEN")
     return token, None
 
 
@@ -19139,7 +19138,8 @@ def erp_faire_status():
     conn.close()
     return jsonify({
         "configured": bool(os.environ.get("FAIRE_APP_ID")
-                           and os.environ.get("FAIRE_APP_SECRET")),
+                           and os.environ.get("FAIRE_APP_SECRET")
+                           and os.environ.get("FAIRE_ACCESS_TOKEN")),
         "last_run_at": row["last_run_at"] if row else "",
         "last_updated_at_min": row["last_updated_at_min"] if row else "",
         "last_summary": last,
