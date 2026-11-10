@@ -19,8 +19,10 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import string
+import subprocess
 import unicodedata
 import hmac
 import hashlib
@@ -1052,6 +1054,7 @@ def init_db():
             via_edi INTEGER NOT NULL DEFAULT 0,
             edi_document_id INTEGER NOT NULL DEFAULT 0,
             created_by TEXT NOT NULL DEFAULT '',
+            shipping_cents INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS erp_wholesale_order_lines (
@@ -1132,6 +1135,7 @@ def init_db():
             config_json TEXT NOT NULL DEFAULT '{}',
             active INTEGER NOT NULL DEFAULT 1,
             created_by TEXT NOT NULL DEFAULT '',
+            test_mode INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS erp_edi_documents (
@@ -1144,9 +1148,28 @@ def init_db():
             parsed_json TEXT NOT NULL DEFAULT '{}',
             order_source TEXT NOT NULL DEFAULT '',
             order_id INTEGER NOT NULL DEFAULT 0,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            error_text TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_erp_edi_docs ON erp_edi_documents (partner_id, direction, doc_type, status);
+        CREATE TABLE IF NOT EXISTS erp_edi_ssccs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL,
+            order_id INTEGER NOT NULL,
+            pallet_no INTEGER NOT NULL,
+            sscc TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(source, order_id, pallet_no)
+        );
+        CREATE TABLE IF NOT EXISTS erp_edi_changes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER NOT NULL,
+            order_id INTEGER NOT NULL DEFAULT 0,
+            change_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS erp_qb_oauth (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             access_token TEXT NOT NULL DEFAULT '',
@@ -1373,6 +1396,19 @@ def init_db():
             " avg_cost_cents, cost_cents, active, created_at)"
             " VALUES (?, ?, 'popcorn', 'each', 0, 0, NULL, 1, ?)",
             (_sku, _fname + " Popcorn", _now))
+    # Migration: EDI 6-pack (Nov 2026) — test_mode on partners, retry
+    # tracking on documents, shipping cost on wholesale orders.
+    _pcols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_edi_partners)").fetchall()]
+    if "test_mode" not in _pcols:
+        conn.execute("ALTER TABLE erp_edi_partners ADD COLUMN test_mode INTEGER NOT NULL DEFAULT 0")
+    _dcols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_edi_documents)").fetchall()]
+    if "retry_count" not in _dcols:
+        conn.execute("ALTER TABLE erp_edi_documents ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+    if "error_text" not in _dcols:
+        conn.execute("ALTER TABLE erp_edi_documents ADD COLUMN error_text TEXT NOT NULL DEFAULT ''")
+    _wcols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_orders)").fetchall()]
+    if "shipping_cents" not in _wcols:
+        conn.execute("ALTER TABLE erp_wholesale_orders ADD COLUMN shipping_cents INTEGER NOT NULL DEFAULT 0")
     conn.commit()
     conn.close()
 
@@ -1700,7 +1736,7 @@ def fulfill_order(session, meta):
         total_qty = 0
     ship = session.get("shipping_details") or {}
     ship_addr = ship.get("address") or {}
-    label_url, tracking_number = _create_shippo_label(
+    label_url, tracking_number, _rate_cents = _create_shippo_label(
         _shippo_address_to(
             name=ship.get("name") or name,
             street1=ship_addr.get("line1", ""),
@@ -1941,19 +1977,21 @@ def _create_shippo_label(address_to, total_qty, order_ref=""):
     """Create and purchase a Shippo shipping label.
 
     address_to: dict with name, street1, street2, city, state, zip, country.
-    Returns (label_url, tracking_number); (None, None) on any failure.
+    Returns (label_url, tracking_number, rate_cents); (None, None, None)
+    on any failure. rate_cents is the cheapest Shippo rate in cents
+    (the EDI 810 uses it for the freight SAC segment).
     NEVER raises — a label failure must never break order completion.
     """
     if not SHIPPO_API_KEY:
-        return None, None
+        return None, None, None
     try:
         total_qty = int(total_qty or 0)
     except (TypeError, ValueError):
         total_qty = 0
     if total_qty <= 0:
-        return None, None
+        return None, None, None
     if not (address_to.get("zip") or "").strip():
-        return None, None
+        return None, None, None
     weight_oz = max(8 * total_qty, 8)
     parcel = {
         "length": "12", "width": "9", "height": "6",
@@ -1992,7 +2030,7 @@ def _create_shippo_label(address_to, total_qty, order_ref=""):
                 best_rate_id = r.get("object_id")
         if not best_rate_id:
             print(f"[shippo] no purchasable rates for order {order_ref}")
-            return None, None
+            return None, None, None
         tx = requests.post(
             "https://api.goshippo.com/transactions/",
             headers={
@@ -2007,11 +2045,11 @@ def _create_shippo_label(address_to, total_qty, order_ref=""):
         if tdata.get("status") != "SUCCESS":
             print(f"[shippo] transaction not successful for order {order_ref}: "
                   f"{tdata.get('messages')}")
-            return None, None
-        return tdata.get("label_url"), tdata.get("tracking_number")
+            return None, None, None
+        return tdata.get("label_url"), tdata.get("tracking_number"), best_cents
     except Exception as e:
         print(f"[shippo] label creation failed for order {order_ref}: {e}")
-        return None, None
+        return None, None, None
 
 def _shippo_address_to(name="", street1="", street2="", city="", state="",
                        zip_code="", country="US"):
@@ -3223,7 +3261,7 @@ def paypal_capture_order():
     psh_name = psh.get("name")
     psh_name = psh_name.get("full_name") if isinstance(psh_name, dict) else psh_name
     paddr = psh.get("address") or {}
-    label_url, tracking_number = _create_shippo_label(
+    label_url, tracking_number, _rate_cents = _create_shippo_label(
         _shippo_address_to(
             name=psh_name or name,
             street1=paddr.get("address_line_1", ""),
@@ -5840,7 +5878,7 @@ def admin_order_create_label(order_id):
         conn.close()
         return jsonify(error="could not determine the shipping address"), 400
 
-    label_url, tracking_number = _create_shippo_label(
+    label_url, tracking_number, _rate_cents = _create_shippo_label(
         address_to, total_qty, order_ref=stripe_id)
     if not label_url:
         conn.close()
@@ -8411,7 +8449,7 @@ def fundraiser_order_confirm():
     try:
         order_number = _next_fundraiser_order_number(conn)
         # Shippo label (never blocks the order — blank fields = admin retry).
-        label_url, tracking_number = _create_shippo_label(
+        label_url, tracking_number, _rate_cents = _create_shippo_label(
             _shippo_address_to(
                 name=(meta.get("ship_name") or "")[:120] or customer_name,
                 street1=(meta.get("ship_street") or "")[:200],
@@ -8839,7 +8877,7 @@ def _record_subscription_renewal_payment(conn, sub, renewal, items, amount, orde
         x for x in [sub["ship_name"], sub["ship_street"], sub["ship_city"],
                     sub["ship_state"], sub["ship_zip"]] if x)
     # Shippo label (never blocks the charge — blank fields = admin retry).
-    label_url, tracking_number = _create_shippo_label(
+    label_url, tracking_number, _rate_cents = _create_shippo_label(
         _shippo_address_to(
             name=sub["ship_name"] or "",
             street1=sub["ship_street"] or "",
@@ -16111,7 +16149,7 @@ def erp_wholesale_order_shipping_label(order_id):
     address_to = _shippo_address_to(
         name=acct["name"] if acct else "", street1=addr["street"],
         city=addr["city"], state=addr["state"], zip_code=addr["zip"], country="US")
-    label_url, tracking = _create_shippo_label(address_to, total_qty,
+    label_url, tracking, rate_cents = _create_shippo_label(address_to, total_qty,
                                                order_ref=w["order_number"])
     if not label_url:
         conn.close()
@@ -16119,11 +16157,12 @@ def erp_wholesale_order_shipping_label(order_id):
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "UPDATE erp_wholesale_orders SET shippo_label_url = ?, shippo_tracking_number = ?,"
-        " shippo_label_created_at = ? WHERE id = ?",
-        (label_url, tracking or "", now, order_id))
+        " shippo_label_created_at = ?, shipping_cents = ? WHERE id = ?",
+        (label_url, tracking or "", now, int(rate_cents or 0), order_id))
     conn.commit()
     conn.close()
-    return jsonify(label_url=label_url, tracking_number=tracking or "", created_at=now)
+    return jsonify(label_url=label_url, tracking_number=tracking or "",
+                   shipping_cents=int(rate_cents or 0), created_at=now)
 
 
 def _erp_wholesale_return_dict(conn, return_id):
@@ -16544,6 +16583,7 @@ def _edi_partner_public(conn, p):
     cfg = _edi_config(conn, p)
     return {"id": p["id"], "name": p["name"], "provider": p["provider"],
             "transport": p["transport"], "active": bool(p["active"]),
+            "test_mode": _edi_test_mode(p),
             "has_webhook_key": bool(cfg.get("webhook_key_hash")),
             "created_at": p["created_at"]}
 
@@ -16690,6 +16730,83 @@ def _x12_parse_850(text):
     return parsed, errors
 
 
+def _x12_parse_997(text):
+    """Parse an inbound 997. Returns ({ack_code, ref_doc_type, ref_st02,
+    ref_gs06}, errors). AK2 carries the referenced doc type + ST02; AK9
+    carries the outcome (A accepted, E accepted with errors, R rejected)."""
+    segs = _x12_split_segments(text)
+    sep = segs[0][3:4] if segs and segs[0].startswith("ISA") else "*"
+    parsed = {"doc_type": "997", "ack_code": "", "ref_doc_type": "",
+              "ref_st02": "", "ref_gs06": ""}
+    errors = []
+    for sg in segs:
+        e = sg.split(sep)
+        if e[0] == "AK1" and len(e) > 2:
+            parsed["ref_gs06"] = e[2]
+        elif e[0] == "AK2" and len(e) > 2:
+            parsed["ref_doc_type"] = e[1]
+            parsed["ref_st02"] = e[2]
+        elif e[0] == "AK9" and len(e) > 1:
+            parsed["ack_code"] = e[1]
+    if not parsed["ref_doc_type"] or not parsed["ref_st02"]:
+        errors.append("997 has no AK2 reference to an outbound document")
+    if parsed["ack_code"] not in ("A", "E", "R"):
+        errors.append("997 AK9 code '%s' is not A, E or R" % parsed["ack_code"])
+    return parsed, errors
+
+
+def _x12_parse_860(text):
+    """Parse an inbound 860 (purchase order change). Returns ({po_number,
+    po_date, changes: [{line, change_type, qty, unit_price_cents,
+    product_id, description}]}, errors). POC layout: POC01 line,
+    POC02 change type (AI add / CA change / DI delete), POC03 quantity
+    ordered, POC04 quantity change, POC05 UOM, POC06 unit price,
+    POC08 qualifier, POC09 product id (POC07-style layouts fall back to
+    element 7 for the id)."""
+    segs = _x12_split_segments(text)
+    sep = segs[0][3:4] if segs and segs[0].startswith("ISA") else "*"
+    parsed = {"doc_type": "860", "po_number": "", "po_date": "", "changes": []}
+    errors = []
+    cur = None
+    for sg in segs:
+        e = sg.split(sep)
+        if e[0] == "BCH":
+            # BCH mirrors BEG: BCH03 purchase order number, BCH05 date.
+            parsed["po_number"] = e[3] if len(e) > 3 else ""
+            parsed["po_date"] = e[5] if len(e) > 5 else ""
+        elif e[0] == "POC":
+            try:
+                qty = float(e[3]) if len(e) > 3 and e[3] else 0
+            except ValueError:
+                qty = -1
+            try:
+                price_cents = int(round(float(e[6]) * 100)) if len(e) > 6 and e[6] else 0
+            except ValueError:
+                price_cents = -1
+            pid = ""
+            if len(e) > 9 and e[9]:
+                pid = e[9]
+            elif len(e) > 7 and e[7]:
+                pid = e[7]
+            cur = {"line": int(e[1]) if len(e) > 1 and e[1].isdigit() else len(parsed["changes"]) + 1,
+                   "change_type": e[2] if len(e) > 2 else "",
+                   "qty": qty, "unit_price_cents": price_cents,
+                   "product_id": pid, "description": ""}
+            if qty < 0:
+                errors.append("POC line %s: quantity is not a number" % cur["line"])
+            if price_cents < 0:
+                errors.append("POC line %s: unit price is not a number" % cur["line"])
+            parsed["changes"].append(cur)
+        elif e[0] == "PID" and cur is not None:
+            if len(e) > 5 and e[5]:
+                cur["description"] = e[5]
+    if not parsed["po_number"]:
+        errors.append("860 has no BCH purchase order number")
+    if not parsed["changes"]:
+        errors.append("860 has no POC change lines")
+    return parsed, errors
+
+
 # ----- X12 generation -----
 
 def _edi_next_control(conn):
@@ -16703,17 +16820,20 @@ def _x12_pad(s, n):
     return s + " " * (n - len(s))
 
 
-def _x12_envelope(doc_type, gs_code, body, sender, receiver, ctrl):
-    """Wrap ST..CTT body segments in ISA/GS/GE/IEA. Returns full X12 string."""
+def _x12_envelope(doc_type, gs_code, body, sender, receiver, ctrl,
+                  test_mode=False):
+    """Wrap ST..CTT body segments in ISA/GS/GE/IEA. Returns full X12 string.
+    test_mode sets ISA15 to 'T' (test) instead of 'P' (production)."""
     now = datetime.now(timezone.utc)
     ymd = now.strftime("%Y%m%d")
     hm = now.strftime("%H%M")
     isa13 = "%09d" % (ctrl % 1000000000)
     st02 = "%04d" % (ctrl % 10000)
     segs = []
-    segs.append("ISA*00*%s*00*%s*ZZ*%s*ZZ*%s*%s*%s*U*00401*%s*0*P*>"
+    segs.append("ISA*00*%s*00*%s*ZZ*%s*ZZ*%s*%s*%s*U*00401*%s*0*%s*>"
                 % (" " * 10, " " * 10, _x12_pad(sender, 15),
-                   _x12_pad(receiver, 15), now.strftime("%y%m%d"), hm, isa13))
+                   _x12_pad(receiver, 15), now.strftime("%y%m%d"), hm, isa13,
+                   "T" if test_mode else "P"))
     segs.append("GS*%s*%s*%s*%s*%s*%d*X*004010"
                 % (gs_code, sender or "POPALICIOUS", receiver or "PARTNER",
                    ymd, hm, ctrl))
@@ -16726,10 +16846,13 @@ def _x12_envelope(doc_type, gs_code, body, sender, receiver, ctrl):
     return "~".join(segs) + "~"
 
 
-def _x12_build_856(order, lines, partner_cfg, ctrl):
-    """Ship notice for an order. lines: [{line, qty, product_id, description}]."""
-    sender = (partner_cfg.get("isa_sender") or "POPALICIOUS")
-    receiver = (partner_cfg.get("isa_receiver") or "PARTNER")
+def _x12_build_856(order, cartons, ssccs, partner_cfg, ctrl, test_mode=False):
+    """Ship notice with a carton/pallet HL hierarchy and SSCC-18s.
+    cartons: list of cartons from _edi_split_cartons; ssccs: one SSCC-18
+    per carton, same order. HL levels: S(hipment) -> O(rder) -> P(allet)
+    -> I(tem). CTT counts HL segments."""
+    sender = _edi_map_value(partner_cfg, "isa_sender", "POPALICIOUS")
+    receiver = _edi_map_value(partner_cfg, "isa_receiver", "PARTNER")
     now = datetime.now(timezone.utc)
     ymd = now.strftime("%Y%m%d")
     ship_id = "SHP-%s-%d" % ((order.get("number") or "NA").replace("#", ""), ctrl)
@@ -16748,20 +16871,57 @@ def _x12_build_856(order, lines, partner_cfg, ctrl):
     hl += 1
     body.append("PRF*%s*%s" % (order.get("po_number") or order.get("number") or "",
                                order.get("po_date") or ymd))
-    for ln in lines:
-        body.append("HL*%d**I*2" % hl)
+    for i, carton in enumerate(cartons):
+        pallet_hl = hl
+        body.append("HL*%d**P*2" % pallet_hl)
         hl += 1
-        body.append("LIN**%s*%s" % (ln.get("id_qualifier") or "VP",
-                                    ln.get("product_id") or ""))
-        body.append("SN1**%s*EA" % _erp_fmt_qty(ln.get("qty") or 0))
+        body.append("MAN*GM*%s" % (ssccs[i] if i < len(ssccs) else ""))
+        for ln in carton:
+            body.append("HL*%d**I*%d" % (hl, pallet_hl))
+            hl += 1
+            body.append("LIN**%s*%s" % (ln.get("id_qualifier") or "VP",
+                                        ln.get("product_id") or ""))
+            body.append("SN1**%s*EA" % _erp_fmt_qty(ln.get("qty") or 0))
+    body.append("CTT*%d" % (hl - 1))
+    return _x12_envelope("856", "SH", body, sender, receiver, ctrl,
+                         test_mode=test_mode)
+
+
+def _x12_build_855(order, lines, partner_cfg, ctrl, test_mode=False):
+    """PO acknowledgement for a wholesale order (retailers expect an 855
+    confirming their 850). BAK*00*AC = original acknowledgement, accepted."""
+    sender = _edi_map_value(partner_cfg, "isa_sender", "POPALICIOUS")
+    receiver = _edi_map_value(partner_cfg, "isa_receiver", "PARTNER")
+    now = datetime.now(timezone.utc)
+    ymd = now.strftime("%Y%m%d")
+    ship_to = order.get("ship_to") or {}
+    body = [
+        "ST*855*0001",
+        "BAK*00*AC*%s*%s" % (order.get("po_number") or order.get("number") or "", ymd),
+        "N1*ST*%s*%s*%s" % (ship_to.get("name") or "Customer",
+                            ship_to.get("qualifier") or "92",
+                            ship_to.get("id") or ""),
+    ]
+    for i, ln in enumerate(lines, 1):
+        qty = float(ln.get("qty") or 0)
+        unit_cents = int(ln.get("unit_price_cents") or 0)
+        body.append("PO1*%d*%s*EA*%.2f**%s*%s"
+                    % (i, _erp_fmt_qty(qty), unit_cents / 100.0,
+                       ln.get("id_qualifier") or "VP", ln.get("product_id") or ""))
     body.append("CTT*%d" % len(lines))
-    return _x12_envelope("856", "SH", body, sender, receiver, ctrl)
+    return _x12_envelope("855", "PR", body, sender, receiver, ctrl,
+                         test_mode=test_mode)
 
 
-def _x12_build_810(order, lines, partner_cfg, ctrl):
-    """Invoice for a wholesale order."""
-    sender = (partner_cfg.get("isa_sender") or "POPALICIOUS")
-    receiver = (partner_cfg.get("isa_receiver") or "PARTNER")
+def _x12_build_810(order, lines, partner_cfg, ctrl, freight_cents=0,
+                     tax_cents=0, test_mode=False):
+    """Invoice for a wholesale order. Amounts are integer cents throughout
+    (matches the existing TDS convention in this codebase, not X12's usual
+    dollars-with-implied-decimals). SAC segments state freight (D240) and
+    tax (H850) only when there is something to state; wholesale is
+    tax-exempt by default, so the tax SAC is usually omitted."""
+    sender = _edi_map_value(partner_cfg, "isa_sender", "POPALICIOUS")
+    receiver = _edi_map_value(partner_cfg, "isa_receiver", "PARTNER")
     now = datetime.now(timezone.utc)
     ymd = now.strftime("%Y%m%d")
     inv_num = "INV-%s" % (order.get("number") or ctrl)
@@ -16782,15 +16942,22 @@ def _x12_build_810(order, lines, partner_cfg, ctrl):
         body.append("IT1*%d*%s*EA*%.2f**%s*%s"
                     % (i, _erp_fmt_qty(qty), unit_cents / 100.0,
                        ln.get("id_qualifier") or "VP", ln.get("product_id") or ""))
-    body.append("TDS*%d" % total_cents)
+    freight_cents = int(freight_cents or 0)
+    tax_cents = int(tax_cents or 0)
+    if freight_cents > 0:
+        body.append("SAC*C*D240***%d" % freight_cents)
+    if tax_cents > 0:
+        body.append("SAC*C*H850***%d" % tax_cents)
+    body.append("TDS*%d" % (total_cents + freight_cents + tax_cents))
     body.append("CTT*%d" % len(lines))
-    return _x12_envelope("810", "IN", body, sender, receiver, ctrl), inv_num
+    return _x12_envelope("810", "IN", body, sender, receiver, ctrl,
+                         test_mode=test_mode), inv_num
 
 
-def _x12_build_997(inbound_ctrl, partner_cfg, ctrl):
+def _x12_build_997(inbound_ctrl, partner_cfg, ctrl, test_mode=False):
     """Functional acknowledgement for a received 850."""
-    sender = (partner_cfg.get("isa_sender") or "POPALICIOUS")
-    receiver = (partner_cfg.get("isa_receiver") or "PARTNER")
+    sender = _edi_map_value(partner_cfg, "isa_sender", "POPALICIOUS")
+    receiver = _edi_map_value(partner_cfg, "isa_receiver", "PARTNER")
     body = [
         "ST*997*0001",
         "AK1*PO*%s" % (inbound_ctrl.get("gs06") or "1"),
@@ -16798,7 +16965,106 @@ def _x12_build_997(inbound_ctrl, partner_cfg, ctrl):
         "AK5*A",
         "AK9*A*1*1*1",
     ]
-    return _x12_envelope("997", "FA", body, sender, receiver, ctrl)
+    return _x12_envelope("997", "FA", body, sender, receiver, ctrl,
+                         test_mode=test_mode)
+
+
+
+# SSCC-18 company prefix, derived from the brand's primary UPC range:
+# Bacon UPC-A 602581038092 -> 6-digit GS1 company prefix 602581. The brand
+# also carries other UPC blocks (794969 for Birthday Cake / Cheddar,
+# 766429 for White Cheddar); 602581 is the flagship range. A partner's
+# segment_map can override with sscc_company_prefix. Formal GS1 prefix
+# confirmation is a follow-up, not a blocker: the SSCCs are structurally
+# valid (correct GS1 Mod10 check digit) and stable per carton.
+_EDI_SSCC_COMPANY_PREFIX = "602581"
+_EDI_SSCC_EXTENSION = "0"
+_EDI_SSCC_PER_CARTON = 12
+
+
+def _edi_map_value(cfg, key, default):
+    """Per-partner segment-map override: cfg['segment_map'][key] wins, then
+    the top-level cfg key (the historical spot for isa_sender /
+    isa_receiver), then the default."""
+    sm = (cfg or {}).get("segment_map") or {}
+    if isinstance(sm, dict) and sm.get(key) not in (None, ""):
+        return sm[key]
+    if (cfg or {}).get(key) not in (None, ""):
+        return cfg[key]
+    return default
+
+
+def _edi_test_mode(partner):
+    """test_mode flag off a partner row (defensive: older rows may lack it)."""
+    try:
+        return bool(partner["test_mode"]) if "test_mode" in partner.keys() else False
+    except (KeyError, TypeError):
+        return False
+
+
+def _gs1_mod10(digits):
+    """GS1 Mod10 check digit for the digit string WITHOUT the check digit:
+    from the rightmost digit, weights 3, 1, 3, 1, ...; check = (10 - sum % 10) % 10."""
+    total = 0
+    for i, ch in enumerate(reversed(str(digits))):
+        d = int(ch)
+        total += d * 3 if i % 2 == 0 else d
+    return (10 - (total % 10)) % 10
+
+
+def _edi_sscc_for(conn, source, order_id, pallet_no, prefix=None):
+    """Return the persisted SSCC-18 for a carton (source, order_id, pallet_no),
+    generating and storing it on first use so a regenerated ASN reuses the
+    same SSCCs (never re-randomize). SSCC-18 = extension (0) + 6-digit
+    company prefix + 10-digit serial + Mod10 check digit. The serial is
+    deterministic: source code (1 wholesale / 2 retail / 3 other) * 10^8 +
+    order_id * 100 + pallet_no, so it is unique while order ids stay under
+    1,000,000 and pallets under 100 per order."""
+    row = conn.execute("SELECT sscc FROM erp_edi_ssccs WHERE source = ?"
+                       " AND order_id = ? AND pallet_no = ?",
+                       (source, int(order_id), int(pallet_no))).fetchone()
+    if row:
+        return row["sscc"]
+    pfx = "".join(ch for ch in str(prefix or _EDI_SSCC_COMPANY_PREFIX)
+                  if ch.isdigit())[:6].rjust(6, "0")
+    src_code = {"wholesale": 1, "retail": 2}.get(source, 3)
+    serial = src_code * 100000000 + int(order_id) * 100 + int(pallet_no)
+    body17 = _EDI_SSCC_EXTENSION + pfx + ("%010d" % serial)
+    sscc = body17 + str(_gs1_mod10(body17))
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("INSERT OR IGNORE INTO erp_edi_ssccs"
+                 " (source, order_id, pallet_no, sscc, created_at)"
+                 " VALUES (?, ?, ?, ?, ?)",
+                 (source, int(order_id), int(pallet_no), sscc, now))
+    row = conn.execute("SELECT sscc FROM erp_edi_ssccs WHERE source = ?"
+                       " AND order_id = ? AND pallet_no = ?",
+                       (source, int(order_id), int(pallet_no))).fetchone()
+    return row["sscc"] if row else sscc
+
+
+def _edi_split_cartons(lines, per_carton=_EDI_SSCC_PER_CARTON):
+    """Split order lines into per_carton-bag cartons, filled in line order.
+    Returns a list of cartons; each carton is a list of
+    {qty, product_id, description} with qty an int bag count."""
+    cartons = []
+    cur = []
+    cur_qty = 0
+    for ln in lines:
+        remaining = int(round(float(ln.get("qty") or 0)))
+        while remaining > 0:
+            room = per_carton - cur_qty
+            take = min(remaining, room)
+            cur.append({"qty": take, "product_id": ln.get("product_id") or "",
+                        "description": ln.get("description") or ""})
+            cur_qty += take
+            remaining -= take
+            if cur_qty >= per_carton:
+                cartons.append(cur)
+                cur = []
+                cur_qty = 0
+    if cur:
+        cartons.append(cur)
+    return cartons
 
 
 # ----- EDI document helpers -----
@@ -16819,6 +17085,8 @@ def _edi_doc_dict(conn, d, include_content=False):
            "direction": d["direction"], "doc_type": d["doc_type"],
            "status": d["status"], "order_source": d["order_source"],
            "order_id": d["order_id"], "order_number": order_number,
+           "retry_count": d["retry_count"] if "retry_count" in d.keys() else 0,
+           "error_text": d["error_text"] if "error_text" in d.keys() else "",
            "created_at": d["created_at"]}
     if include_content:
         out["raw_text"] = d["raw_text"]
@@ -16856,16 +17124,64 @@ def _edi_match_account(conn, partner, parsed):
     return acct, note, None
 
 
+def _edi_resolve_outbound_by_997(conn, partner_id, ref_doc_type, ref_st02):
+    """Find the most recent outbound doc for this partner whose ST02 matches
+    the 997's AK2 reference. ST02 is ctrl % 10000, zero-padded 4. Docs
+    generated before the EDI 6-pack carry no st02 in parsed_json and never
+    resolve (they predate 997 tracking)."""
+    st02 = str(ref_st02 or "").strip().zfill(4)
+    rows = conn.execute(
+        "SELECT * FROM erp_edi_documents WHERE partner_id = ? AND direction = 'outbound'"
+        " AND doc_type = ? ORDER BY id DESC", (partner_id, ref_doc_type)).fetchall()
+    for d in rows:
+        try:
+            parsed = json.loads(d["parsed_json"] or "{}")
+        except (TypeError, ValueError):
+            parsed = {}
+        if str(parsed.get("st02") or "").strip().zfill(4) == st02:
+            return d
+    return None
+
+
+def _edi_resolve_order_by_po(conn, po_number):
+    """Find a wholesale order by its PO number: first by order_number, then
+    via the inbound 850 doc that carried that PO number (the usual path —
+    ERP order numbers are W- numbers, not the retailer's PO number)."""
+    if not po_number:
+        return None
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE order_number = ?",
+                     (po_number,)).fetchone()
+    if w:
+        return w
+    # Oldest first: a re-sent PO maps to a second order, but a change
+    # amends the original PO's order, not the duplicate.
+    docs = conn.execute(
+        "SELECT * FROM erp_edi_documents WHERE direction = 'inbound'"
+        " AND doc_type = '850' ORDER BY id ASC").fetchall()
+    for d in docs:
+        try:
+            parsed = json.loads(d["parsed_json"] or "{}")
+        except (TypeError, ValueError):
+            parsed = {}
+        if parsed.get("po_number") == po_number and d["order_id"]:
+            return conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                                (d["order_id"],)).fetchone()
+    return None
+
+
 def _edi_create_997(conn, partner, parsed, actor):
     cfg = _edi_config(conn, partner)
     ctrl = _edi_next_control(conn)
-    x12 = _x12_build_997(parsed.get("control") or {}, cfg, ctrl)
+    x12 = _x12_build_997(parsed.get("control") or {}, cfg, ctrl,
+                         test_mode=_edi_test_mode(partner))
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
         " raw_text, parsed_json, created_at)"
         " VALUES (?, 'outbound', '997', 'sent', ?, ?, ?)",
-        (partner["id"], x12, json.dumps({"ack_for": "850"}), now))
+        (partner["id"], x12,
+         json.dumps({"ack_for": "850", "ctrl": ctrl,
+                     "st02": "%04d" % (ctrl % 10000)}), now))
     return cur.lastrowid
 
 
@@ -16924,10 +17240,77 @@ def _edi_parse_and_store_inbound(conn, partner, content, actor):
     if st:
         parts = st.split(sep)
         doc_type = parts[1] if len(parts) > 1 else ""
-    if doc_type != "850":
-        return None, "unsupported inbound doc_type '%s' (only 850)" % (doc_type or "?")
-    parsed, errors = _x12_parse_850(content)
     now = datetime.now(timezone.utc).isoformat()
+    if doc_type == "997":
+        parsed, errors = _x12_parse_997(content)
+        status = "parsed" if not errors else "failed"
+        cur = conn.execute(
+            "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
+            " raw_text, parsed_json, created_at) VALUES (?, 'inbound', '997', ?, ?, ?, ?)",
+            (partner["id"] if partner else 0, status, content,
+             json.dumps(parsed or {"errors": errors}), now))
+        doc_id = cur.lastrowid
+        acked_id = None
+        outcome = "no matching outbound document"
+        if not errors and partner:
+            target = _edi_resolve_outbound_by_997(
+                conn, partner["id"], parsed.get("ref_doc_type"),
+                parsed.get("ref_st02"))
+            if target is not None:
+                if parsed.get("ack_code") == "R":
+                    conn.execute("UPDATE erp_edi_documents SET status = 'failed',"
+                                 " error_text = ? WHERE id = ?",
+                                 ("rejected by partner 997 (AK9=R)", target["id"]))
+                    outcome = "outbound %s %d marked failed (rejected)" % (
+                        target["doc_type"], target["id"])
+                else:
+                    conn.execute("UPDATE erp_edi_documents SET status = 'acked'"
+                                 " WHERE id = ?", (target["id"],))
+                    outcome = "outbound %s %d acked" % (target["doc_type"], target["id"])
+                acked_id = target["id"]
+        doc = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                           (doc_id,)).fetchone()
+        preview = {"ack_code": parsed.get("ack_code", ""),
+                   "ref_doc_type": parsed.get("ref_doc_type", ""),
+                   "ref_st02": parsed.get("ref_st02", ""),
+                   "acked_document_id": acked_id, "outcome": outcome,
+                   "errors": errors}
+        return doc, preview
+    if doc_type == "860":
+        parsed, errors = _x12_parse_860(content)
+        status = "parsed" if not errors else "failed"
+        cur = conn.execute(
+            "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
+            " raw_text, parsed_json, created_at) VALUES (?, 'inbound', '860', ?, ?, ?, ?)",
+            (partner["id"] if partner else 0, status, content,
+             json.dumps(parsed or {"errors": errors}), now))
+        doc_id = cur.lastrowid
+        change_id = None
+        order_id = 0
+        order_number = ""
+        if not errors:
+            w = _edi_resolve_order_by_po(conn, parsed.get("po_number"))
+            if w is not None:
+                order_id = w["id"]
+                order_number = w["order_number"]
+            cur2 = conn.execute(
+                "INSERT INTO erp_edi_changes (doc_id, order_id, change_json,"
+                " status, created_at) VALUES (?, ?, ?, 'pending', ?)",
+                (doc_id, order_id, json.dumps(parsed), now))
+            change_id = cur2.lastrowid
+            if order_id:
+                conn.execute("UPDATE erp_edi_documents SET order_source = 'wholesale',"
+                             " order_id = ? WHERE id = ?", (order_id, doc_id))
+        doc = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                           (doc_id,)).fetchone()
+        preview = {"po_number": parsed.get("po_number", ""),
+                   "order_id": order_id, "order_number": order_number,
+                   "change_id": change_id,
+                   "changes": parsed.get("changes", []), "errors": errors}
+        return doc, preview
+    if doc_type != "850":
+        return None, "unsupported inbound doc_type '%s' (850, 997, 860)" % (doc_type or "?")
+    parsed, errors = _x12_parse_850(content)
     status = "parsed" if not errors else "failed"
     cur = conn.execute(
         "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
@@ -16955,6 +17338,64 @@ def _edi_parse_and_store_inbound(conn, partner, content, actor):
         else:
             preview["errors"] = errors + [match_err]
     return doc, preview
+
+
+# Test double for the HTTP send path: tests set _EDI_HTTP_TEST_DOUBLE to a
+# callable(url, data, headers) -> (status_code, text). Same pattern as
+# _MAIL_TEST_DOUBLE.
+_EDI_HTTP_TEST_DOUBLE = None
+
+
+def _edi_http_post(url, data, headers=None):
+    """POST X12 to a partner URL. Returns (status_code, text)."""
+    if _EDI_HTTP_TEST_DOUBLE is not None:
+        return _EDI_HTTP_TEST_DOUBLE(url, data, headers or {})
+    resp = requests.post(url, data=data, headers=headers or {}, timeout=30)
+    return resp.status_code, getattr(resp, "text", "")
+
+
+def _edi_sftp_send(cfg, x12_text):
+    """Send X12 via the system sftp batch CLI. Returns (ok, error).
+    No new dependencies: uses the `sftp` binary if present. Fails cleanly
+    (ok=False) when the CLI, host, user, remote path, or key is unavailable.
+    Never exercised against a real SFTP server in this codebase — only the
+    failure paths are covered by tests."""
+    host = (cfg.get("sftp_host") or "").strip()
+    user = (cfg.get("sftp_user") or "").strip()
+    key = (cfg.get("sftp_key_path") or "").strip()
+    remote = (cfg.get("sftp_remote_path") or "").strip()
+    port = str(cfg.get("sftp_port") or "22").strip()
+    if not host:
+        return False, "no SFTP host configured for partner"
+    if not user:
+        return False, "no SFTP user configured for partner"
+    if not remote:
+        return False, "no SFTP remote path configured for partner"
+    if key and not os.path.exists(key):
+        return False, "SFTP key not found: %s" % key
+    if shutil.which("sftp") is None:
+        return False, "sftp command not available on this server"
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            local = os.path.join(td, "edi.x12")
+            batch = os.path.join(td, "batch.txt")
+            with open(local, "w", encoding="utf-8") as f:
+                f.write(x12_text)
+            with open(batch, "w", encoding="utf-8") as f:
+                f.write("put %s %s\n" % (local, remote))
+            cmd = ["sftp", "-b", batch, "-P", port]
+            if key:
+                cmd += ["-i", key]
+            cmd.append("%s@%s" % (user, host))
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except FileNotFoundError:
+        return False, "sftp command not available on this server"
+    except subprocess.TimeoutExpired:
+        return False, "SFTP send timed out after 30s"
+    if res.returncode != 0:
+        return False, "sftp exited %d: %s" % (
+            res.returncode, (res.stderr or "").strip()[:300])
+    return True, ""
 
 
 # ----- EDI endpoints -----
@@ -16992,9 +17433,10 @@ def erp_create_edi_partner():
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO erp_edi_partners (name, provider, transport, config_json,"
-        " active, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        " active, test_mode, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (name, (data.get("provider") or "").strip(), transport,
-         json.dumps(cfg), 1 if data.get("active", True) else 0, actor, now))
+         json.dumps(cfg), 1 if data.get("active", True) else 0,
+         1 if data.get("test_mode") else 0, actor, now))
     p = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
                      (cur.lastrowid,)).fetchone()
     out = _edi_partner_detail(conn, p)
@@ -17050,6 +17492,8 @@ def erp_update_edi_partner(partner_id):
         fields["transport"] = t
     if "active" in data:
         fields["active"] = 1 if data.get("active") else 0
+    if "test_mode" in data:
+        fields["test_mode"] = 1 if data.get("test_mode") else 0
     cfg = _edi_config(conn, p)
     webhook_key = None
     if isinstance(data.get("config"), dict):
@@ -17315,8 +17759,22 @@ def erp_wholesale_order_edi810(order_id):
              "po_date": w["order_date"],
              "ship_to": {"name": (acct["name"] if acct else "")[:40],
                          "qualifier": "92", "id": str(acct["id"]) if acct else ""}}
+    freight_cents = 0
+    try:
+        freight_cents = int(data.get("freight_cents") or 0)
+    except (TypeError, ValueError):
+        freight_cents = 0
+    if freight_cents > 0:
+        conn.execute("UPDATE erp_wholesale_orders SET shipping_cents = ?"
+                     " WHERE id = ?", (freight_cents, order_id))
+    else:
+        freight_cents = int(w["shipping_cents"] or 0)
+    tax_cents = 0
     ctrl = _edi_next_control(conn)
-    x12, inv_num = _x12_build_810(order, lines, cfg, ctrl)
+    x12, inv_num = _x12_build_810(order, lines, cfg, ctrl,
+                                  freight_cents=freight_cents,
+                                  tax_cents=tax_cents,
+                                  test_mode=_edi_test_mode(partner))
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
@@ -17324,7 +17782,88 @@ def erp_wholesale_order_edi810(order_id):
         " VALUES (?, 'outbound', '810', 'queued', ?, ?, 'wholesale', ?, ?)",
         (partner["id"], x12,
          json.dumps({"invoice_number": inv_num,
-                     "order_number": w["order_number"]}), order_id, now))
+                     "order_number": w["order_number"], "ctrl": ctrl,
+                     "st02": "%04d" % (ctrl % 10000),
+                     "freight_cents": freight_cents,
+                     "tax_cents": tax_cents}), order_id, now))
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (cur.lastrowid,)).fetchone()
+    out = _edi_doc_dict(conn, d, include_content=True)
+    conn.commit()
+    conn.close()
+    return jsonify(document=out), 201
+
+
+@app.post("/api/erp/wholesale-orders/<int:order_id>/edi-855")
+def erp_wholesale_order_edi855(order_id):
+    """Generate an 855 PO acknowledgement X12 for a wholesale order
+    (queued for transport). BAK echoes the retailer's original PO number
+    from the source 850 when the order came in over EDI, else the ERP
+    order number."""
+    actor, err = _erp_check_perm("edi.write")
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    conn = db()
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        conn.close()
+        return jsonify(error="order not found"), 404
+    partner = None
+    if data.get("partner_id"):
+        partner = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                               (data["partner_id"],)).fetchone()
+    src = None
+    if not partner and w["edi_document_id"]:
+        src = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                           (w["edi_document_id"],)).fetchone()
+        if src:
+            partner = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                                   (src["partner_id"],)).fetchone()
+    if not partner:
+        partner = conn.execute("SELECT * FROM erp_edi_partners WHERE active = 1"
+                               " ORDER BY id LIMIT 1").fetchone()
+    if not partner:
+        conn.close()
+        return jsonify(error="no EDI partner configured"), 400
+    cfg = _edi_config(conn, partner)
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (w["account_id"],)).fetchone()
+    lines = [{"line": i + 1, "qty": float(l["qty_bags"]),
+              "unit_price_cents": int(l["unit_price_cents"]),
+              "product_id": (l["flavor_name"] or "")[:30].upper().replace(" ", "_"),
+              "description": l["flavor_name"]}
+             for i, l in enumerate(conn.execute(
+                 "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ?"
+                 " ORDER BY id", (order_id,)).fetchall())]
+    if not lines:
+        conn.close()
+        return jsonify(error="order has no lines"), 400
+    po_number = w["order_number"]
+    if src is not None:
+        try:
+            src_parsed = json.loads(src["parsed_json"] or "{}")
+        except (TypeError, ValueError):
+            src_parsed = {}
+        if src_parsed.get("po_number"):
+            po_number = src_parsed["po_number"]
+    order = {"number": w["order_number"], "po_number": po_number,
+             "po_date": w["order_date"],
+             "ship_to": {"name": (acct["name"] if acct else "")[:40],
+                         "qualifier": "92", "id": str(acct["id"]) if acct else ""}}
+    ctrl = _edi_next_control(conn)
+    x12 = _x12_build_855(order, lines, cfg, ctrl,
+                         test_mode=_edi_test_mode(partner))
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
+        " raw_text, parsed_json, order_source, order_id, created_at)"
+        " VALUES (?, 'outbound', '855', 'queued', ?, ?, 'wholesale', ?, ?)",
+        (partner["id"], x12,
+         json.dumps({"po_number": po_number,
+                     "order_number": w["order_number"], "ctrl": ctrl,
+                     "st02": "%04d" % (ctrl % 10000)}), order_id, now))
     d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
                      (cur.lastrowid,)).fetchone()
     out = _edi_doc_dict(conn, d, include_content=True)
@@ -17378,15 +17917,25 @@ def erp_order_edi856(source, order_id):
     o = {"number": order["number"], "po_number": order["number"],
          "ship_to": {"name": (ship_name or "Customer")[:40],
                      "qualifier": "92", "id": str(order_id)}}
+    cartons = _edi_split_cartons(lines)
+    if not cartons:
+        conn.close()
+        return jsonify(error="order has no shippable quantity"), 400
+    prefix = _edi_map_value(cfg, "sscc_company_prefix", _EDI_SSCC_COMPANY_PREFIX)
+    ssccs = [_edi_sscc_for(conn, source, order_id, i + 1, prefix)
+             for i in range(len(cartons))]
     ctrl = _edi_next_control(conn)
-    x12 = _x12_build_856(o, lines, cfg, ctrl)
+    x12 = _x12_build_856(o, cartons, ssccs, cfg, ctrl,
+                         test_mode=_edi_test_mode(partner))
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO erp_edi_documents (partner_id, direction, doc_type, status,"
         " raw_text, parsed_json, order_source, order_id, created_at)"
         " VALUES (?, 'outbound', '856', 'queued', ?, ?, ?, ?, ?)",
         (partner["id"], x12,
-         json.dumps({"order_number": order["number"], "source": source}),
+         json.dumps({"order_number": order["number"], "source": source,
+                     "ssccs": ssccs, "cartons": len(cartons), "ctrl": ctrl,
+                     "st02": "%04d" % (ctrl % 10000)}),
          source, order_id, now))
     d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
                      (cur.lastrowid,)).fetchone()
@@ -17394,6 +17943,213 @@ def erp_order_edi856(source, order_id):
     conn.commit()
     conn.close()
     return jsonify(document=out), 201
+
+
+@app.post("/api/erp/edi-documents/<int:doc_id>/send")
+def erp_edi_send_document(doc_id):
+    """Explicit-click transport delivery for a queued outbound doc.
+    Never auto-sends on generation. api/webhook POST the stored X12 to the
+    partner URL (test mode uses the configured test URL); sftp uses the
+    system sftp CLI; manual-file returns the document for hand download and
+    the doc stays queued (it has not been sent). Only queued docs can be
+    sent; failed docs go through retry."""
+    actor, err = _erp_check_perm("edi.write")
+    if err:
+        return err
+    conn = db()
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (doc_id,)).fetchone()
+    if not d:
+        conn.close()
+        return jsonify(error="document not found"), 404
+    if d["direction"] != "outbound":
+        conn.close()
+        return jsonify(error="only outbound documents can be sent"), 400
+    if d["status"] == "sent":
+        conn.close()
+        return jsonify(error="document already sent"), 400
+    if d["status"] == "failed":
+        conn.close()
+        return jsonify(error="document failed — use retry to re-queue it"), 400
+    if d["status"] != "queued":
+        conn.close()
+        return jsonify(error="only queued documents can be sent"), 400
+    partner = conn.execute("SELECT * FROM erp_edi_partners WHERE id = ?",
+                           (d["partner_id"],)).fetchone()
+    if not partner:
+        conn.close()
+        return jsonify(error="no trading partner on this document"), 400
+    cfg = _edi_config(conn, partner)
+    transport = partner["transport"]
+    if transport == "manual-file":
+        conn.close()
+        return jsonify(document=_edi_doc_dict_careful(d), download=True,
+                       filename="edi-%s-%d.x12" % (d["doc_type"], d["id"]),
+                       content=d["raw_text"])
+    ok = False
+    send_err = ""
+    if transport in ("api", "webhook"):
+        url = ""
+        if _edi_test_mode(partner):
+            url = (cfg.get("test_url") or "").strip()
+        if not url:
+            url = (cfg.get("url") or cfg.get("endpoint_url") or "").strip()
+        if not url:
+            conn.close()
+            return jsonify(error="no send URL configured for partner"), 502
+        try:
+            status_code, _text = _edi_http_post(
+                url, d["raw_text"], {"Content-Type": "application/EDI-X12"})
+        except Exception as e:
+            status_code = 0
+            send_err = str(e)
+        if 200 <= status_code < 300:
+            ok = True
+        elif not send_err:
+            send_err = "HTTP %s from %s" % (status_code, url)
+    elif transport == "sftp":
+        ok, send_err = _edi_sftp_send(cfg, d["raw_text"])
+    else:
+        conn.close()
+        return jsonify(error="unknown transport '%s'" % transport), 400
+    if ok:
+        conn.execute("UPDATE erp_edi_documents SET status = 'sent',"
+                     " error_text = '' WHERE id = ?", (doc_id,))
+        conn.commit()
+    else:
+        conn.execute("UPDATE erp_edi_documents SET status = 'failed',"
+                     " error_text = ? WHERE id = ?", (send_err, doc_id))
+        conn.commit()
+    d = conn.execute("SELECT * FROM erp_edi_documents WHERE id = ?",
+                     (doc_id,)).fetchone()
+    conn.close()
+    if ok:
+        return jsonify(document=_edi_doc_dict_careful(d))
+    return jsonify(document=_edi_doc_dict_careful(d),
+                   error=send_err), 502
+
+
+@app.get("/api/erp/edi/alerts")
+def erp_edi_alerts():
+    """Failed-doc alerting: total failed count + the failed docs (latest 50)."""
+    actor, err = _erp_check_perm("edi.read")
+    if err:
+        return err
+    conn = db()
+    total = conn.execute(
+        "SELECT COUNT(*) AS n FROM erp_edi_documents WHERE status = 'failed'"
+        ).fetchone()["n"]
+    rows = conn.execute(
+        "SELECT * FROM erp_edi_documents WHERE status = 'failed'"
+        " ORDER BY id DESC LIMIT 50").fetchall()
+    out = [_edi_doc_dict(conn, d) for d in rows]
+    conn.close()
+    return jsonify(failed_count=total, failed=out)
+
+
+@app.post("/api/erp/edi/retry-failed")
+def erp_edi_retry_failed():
+    """Cron-gated: re-queue failed outbound docs, max 3 attempts each.
+    Docs at 3 attempts stay failed. No cron is created by this build;
+    the cron is a deploy-time step. Same CRON_SECRET gate as the other
+    cron endpoints (503 when unconfigured, 403 on mismatch)."""
+    secret = os.environ.get("CRON_SECRET") or ""
+    if not secret:
+        return jsonify(error="cron not configured"), 503
+    if request.headers.get("X-Cron-Secret") != secret:
+        return jsonify(error="forbidden"), 403
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_edi_documents WHERE status = 'failed'"
+        " AND direction = 'outbound' ORDER BY id").fetchall()
+    requeued = []
+    skipped = []
+    for d in rows:
+        if int(d["retry_count"] or 0) >= 3:
+            skipped.append(d["id"])
+            continue
+        conn.execute("UPDATE erp_edi_documents SET status = 'queued',"
+                     " retry_count = retry_count + 1 WHERE id = ?", (d["id"],))
+        requeued.append(d["id"])
+    conn.commit()
+    conn.close()
+    return jsonify(requeued=requeued, skipped=skipped)
+
+
+@app.get("/api/erp/edi-changes")
+def erp_list_edi_changes():
+    """Inbound 860 change records. Filter by order_id and/or status."""
+    actor, err = _erp_check_perm("edi.read")
+    if err:
+        return err
+    order_id = request.args.get("order_id", type=int)
+    status = (request.args.get("status") or "").strip()
+    conn = db()
+    q = "SELECT * FROM erp_edi_changes WHERE 1=1"
+    args = []
+    if order_id:
+        q += " AND order_id = ?"
+        args.append(order_id)
+    if status:
+        if status not in ("pending", "accepted", "rejected"):
+            conn.close()
+            return jsonify(error="unknown status"), 400
+        q += " AND status = ?"
+        args.append(status)
+    q += " ORDER BY id DESC"
+    out = []
+    for r in conn.execute(q, args).fetchall():
+        try:
+            change = json.loads(r["change_json"] or "{}")
+        except (TypeError, ValueError):
+            change = {}
+        out.append({"id": r["id"], "doc_id": r["doc_id"],
+                    "order_id": r["order_id"], "status": r["status"],
+                    "created_at": r["created_at"], "change": change})
+    conn.close()
+    return jsonify(changes=out)
+
+
+def _edi_change_decide(change_id, new_status):
+    actor, err = _erp_check_perm("edi.write")
+    if err:
+        return err
+    conn = db()
+    r = conn.execute("SELECT * FROM erp_edi_changes WHERE id = ?",
+                     (change_id,)).fetchone()
+    if not r:
+        conn.close()
+        return jsonify(error="change not found"), 404
+    if r["status"] != "pending":
+        conn.close()
+        return jsonify(error="change is already %s" % r["status"]), 400
+    conn.execute("UPDATE erp_edi_changes SET status = ? WHERE id = ?",
+                 (new_status, change_id))
+    conn.commit()
+    r = conn.execute("SELECT * FROM erp_edi_changes WHERE id = ?",
+                     (change_id,)).fetchone()
+    try:
+        change = json.loads(r["change_json"] or "{}")
+    except (TypeError, ValueError):
+        change = {}
+    conn.close()
+    return jsonify(change={"id": r["id"], "doc_id": r["doc_id"],
+                           "order_id": r["order_id"], "status": r["status"],
+                           "created_at": r["created_at"], "change": change})
+
+
+@app.post("/api/erp/edi-changes/<int:change_id>/accept")
+def erp_accept_edi_change(change_id):
+    """Accept a pending 860 change. Records the decision only — the order
+    itself is NOT modified here; staff apply an accepted change to the
+    order by hand through the normal order flow."""
+    return _edi_change_decide(change_id, "accepted")
+
+
+@app.post("/api/erp/edi-changes/<int:change_id>/reject")
+def erp_reject_edi_change(change_id):
+    """Reject a pending 860 change. Records the decision only."""
+    return _edi_change_decide(change_id, "rejected")
 
 
 @app.post("/api/erp/edi-webhook/<partner_key>")
