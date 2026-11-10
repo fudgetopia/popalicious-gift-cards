@@ -1438,6 +1438,7 @@ async function renderHome() {
     kpi.appendChild(card("Orders today", String(dashData.orders_today || 0), "#/reports"));
     kpi.appendChild(card("All-time revenue", money((dashData.revenue_cents || 0) / 100), "#/reports"));
     kpi.appendChild(card("Gift-card liability", money((dashData.gift_cards_outstanding_cents || 0) / 100), null));
+    kpi.appendChild(card("Awaiting payment", money((dashData.awaiting_payment_cents || 0) / 100) + " \u00b7 " + String(dashData.awaiting_payment_count || 0) + " order" + ((dashData.awaiting_payment_count || 0) === 1 ? "" : "s"), "#/orders"));
     await renderDashAttention(body, dashData);
     renderDashRecentOrders(body, dashData);
     await renderDashTrend(body);
