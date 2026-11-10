@@ -10055,7 +10055,7 @@ function renderErpFaireSection(body) {
   if (!st) {
     meta.textContent = "Loading Faire sync status…";
   } else if (st.configured === false) {
-    meta.textContent = "Faire is not configured yet (FAIRE_APP_ID / FAIRE_APP_SECRET). Orders are not being polled.";
+    meta.textContent = "Faire is not configured yet (FAIRE_APP_ID / FAIRE_APP_SECRET / FAIRE_ACCESS_TOKEN). Orders are not being polled.";
   } else {
     var parts = [];
     parts.push("Last sync: " + (st.last_run_at ? erpFmtDate(st.last_run_at) : "never"));
