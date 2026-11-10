@@ -5827,7 +5827,7 @@ def admin_order_detail(order_id):
         gift_card_code=r["gift_card_code"] or "",
         gift_card_discount_cents=r["gift_card_discount_cents"] or 0,
         promo_code=r["promo_code"] or "", reward_code=r["reward_code"] or "",
-        total_qty=r["total_qty"] or 0,
+        total_qty=_erp_online_bags(r),
         shippo_label_url=r["shippo_label_url"] or "",
         shippo_tracking_number=r["shippo_tracking_number"] or "",
         shippo_label_created_at=r["shippo_label_created_at"] or "",
@@ -14395,7 +14395,7 @@ def _erp_online_order(conn, source, order_id):
                 "shipping_address": r["shipping_address"] or "",
                 "items_summary": r["items_summary"] or "",
                 "total_cents": r["amount_total_cents"] or 0,
-                "total_qty": r["total_qty"] or 0,
+                "total_qty": _erp_online_bags(r),
                 "tracking_number": r["shippo_tracking_number"] or "",
                 "created_at": r["created_at"]}
     if source == "paypal":
@@ -14410,7 +14410,7 @@ def _erp_online_order(conn, source, order_id):
                 "shipping_address": "",
                 "items_summary": r["items_summary"] or "",
                 "total_cents": r["amount_total_cents"] or 0,
-                "total_qty": r["total_qty"] or 0,
+                "total_qty": _erp_online_bags(r),
                 "tracking_number": "",
                 "created_at": r["created_at"]}
     return None
