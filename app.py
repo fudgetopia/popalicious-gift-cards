@@ -7462,7 +7462,7 @@ def admin_dashboard():
         "SELECT COUNT(*) AS c FROM erp_purchase_orders"
         " WHERE status IN ('draft', 'sent', 'partial')").fetchone()["c"]
     recent_orders = conn.execute(
-        "SELECT email, items_summary, amount_total_cents, created_at FROM orders"
+        "SELECT id, email, items_summary, amount_total_cents, created_at FROM orders"
         " ORDER BY id DESC LIMIT 10").fetchall()
     conn.close()
     return jsonify(
@@ -7475,7 +7475,7 @@ def admin_dashboard():
         inventory_value_cents=int(erp_inventory_value or 0),
         open_purchase_orders=erp_open_pos,
         recent_orders=[
-            {"email": r["email"], "items": r["items_summary"] or "",
+            {"id": r["id"], "email": r["email"], "items": r["items_summary"] or "",
              "total_cents": r["amount_total_cents"] or 0, "created_at": r["created_at"]}
             for r in recent_orders
         ],
