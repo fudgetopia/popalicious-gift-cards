@@ -639,6 +639,24 @@ function enterApp() {
   if (brand) brand.textContent = s.role === "wholesale" ? "Pop-A-Licious Wholesale" : "Pop-A-Licious ERP";
   var vsLink = document.getElementById("viewStorefrontLink");
   if (vsLink) vsLink.style.display = s.role === "admin" ? "" : "none";
+  // One-time login handoff (Nov 2026): the storefront signs the admin in only
+  // through the shared pal_session cookie, which is third-party there — a
+  // browser blocking third-party cookies would show the admin logged out.
+  // Open the tab synchronously (a direct gesture, so popup blockers allow
+  // it), mint the code, then point the tab at the handoff URL. If minting
+  // fails the tab stays on the plain storefront.
+  if (vsLink && !vsLink.dataset.handoffBound) {
+    vsLink.dataset.handoffBound = "1";
+    vsLink.addEventListener("click", function (event) {
+      event.preventDefault();
+      var win = window.open("https://pop-a-licious.com/", "_blank");
+      erpPost("/api/erp/auth/handoff", {}).then(function (data) {
+        var url = "https://pop-a-licious.com/?erp_login=" + encodeURIComponent(data.code || "");
+        if (win) { try { win.location.href = url; } catch (e) { window.open(url, "_blank"); } }
+        else window.open(url, "_blank");
+      }).catch(function () { /* plain storefront tab stays open */ });
+    });
+  }
   if ((location.hash || "#/") === "#/") location.hash = "#/";
   renderRoute();
 }
