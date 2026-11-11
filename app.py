@@ -27466,6 +27466,356 @@ def erp_acct_qb_pull_probe_types():
     })
 
 
+def _qb_pull_fetch_all(client, query_base):
+    """All rows for one `select * from <Entity> ...` query, paginated
+    (MAXRESULTS 1000). Raises _QBOError on any failure -- including
+    429, which the caller must not retry."""
+    out = []
+    start = 1
+    total = None
+    for _page in range(100):
+        data = client.query(
+            "%s STARTPOSITION %d MAXRESULTS %d"
+            % (query_base, start, _QB_PULL_PAGE_SIZE))
+        resp = (data or {}).get("QueryResponse") or {}
+        page = []
+        for key, val in resp.items():
+            if isinstance(val, list):
+                page.extend(val)
+        if total is None:
+            total = resp.get("totalCount")
+        out.extend(page)
+        if len(page) < _QB_PULL_PAGE_SIZE:
+            break
+        if total is not None and len(out) >= total:
+            break
+        start += _QB_PULL_PAGE_SIZE
+    else:
+        raise _QBOError("QuickBooks query too large to page: %s"
+                        % query_base)
+    return out
+
+
+def _qb_pull_vendor_row(v):
+    """A raw QuickBooks Vendor dict -> the snapshot vendor shape the
+    migration import reads (name, contact, email, phone)."""
+    qid = str(v.get("Id") or "")
+    if not qid:
+        return None
+    email = (v.get("PrimaryEmailAddr") or {}).get("Address") or ""
+    phone = (v.get("PrimaryPhone") or {}).get("FreeFormNumber") or ""
+    contact = ((v.get("GivenName") or "") + " "
+               + (v.get("FamilyName") or "")).strip()
+    return {
+        "qb_id": qid,
+        "name": v.get("DisplayName") or "",
+        "contact_name": contact,
+        "email": email,
+        "phone": phone,
+        "payment_terms": "",
+        "notes": "",
+    }
+
+
+def _qb_pull_bill_row(b):
+    """A raw QuickBooks Bill dict -> the snapshot bill shape the
+    migration import reads."""
+    qid = str(b.get("Id") or "")
+    if not qid:
+        return None
+    vend = b.get("VendorRef") or {}
+    lines = []
+    for ln in b.get("Line") or []:
+        if not isinstance(ln, dict):
+            continue
+        detail = ln.get("AccountBasedExpenseLineDetail") or {}
+        acct = detail.get("AccountRef") or {}
+        lines.append({
+            "description": ln.get("Description") or acct.get("name") or "",
+            "amount_cents": _qb_pull_to_cents(ln.get("Amount")) or 0,
+            "account_name": acct.get("name") or "",
+        })
+    total = _qb_pull_to_cents(b.get("TotalAmt"))
+    if total is None:
+        total = sum(l["amount_cents"] for l in lines)
+    balance = _qb_pull_to_cents(b.get("Balance"))
+    return {
+        "qb_id": qid,
+        "date": b.get("TxnDate") or "",
+        "due_date": b.get("DueDate") or "",
+        "vendor_name": vend.get("name") or "",
+        "vendor_qb_id": str(vend.get("value") or ""),
+        "lines": lines,
+        "total_cents": total,
+        "balance_cents": balance if balance is not None else 0,
+        "status": "open" if (balance or 0) > 0 else "paid",
+    }
+
+
+def _qb_pull_payment_row(p):
+    """A raw QuickBooks Payment dict -> the snapshot payment shape the
+    migration import reads. The linked invoice (or bill) comes from
+    the line's LinkedTxn; the deposit account is DepositToAccountRef
+    (usually Undeposited Funds, which the import resolves to the
+    default cash account)."""
+    qid = str(p.get("Id") or "")
+    if not qid:
+        return None
+    inv_qb = None
+    bill_qb = None
+    for ln in p.get("Line") or []:
+        if not isinstance(ln, dict):
+            continue
+        for lt in (ln.get("LinkedTxn") or []):
+            if not isinstance(lt, dict):
+                continue
+            if lt.get("TxnType") == "Invoice" and not inv_qb:
+                inv_qb = str(lt.get("TxnId") or "")
+            elif lt.get("TxnType") == "Bill" and not bill_qb:
+                bill_qb = str(lt.get("TxnId") or "")
+    dep = p.get("DepositToAccountRef") or {}
+    method = ((p.get("PaymentMethodRef") or {}).get("name") or "").strip()
+    total = _qb_pull_to_cents(p.get("TotalAmt"))
+    return {
+        "qb_id": qid,
+        "date": p.get("TxnDate") or "",
+        "amount_cents": total if total is not None else 0,
+        "invoice_qb_id": inv_qb,
+        "bill_qb_id": bill_qb,
+        "bank_account_qb_id": str(dep.get("value") or ""),
+        "method": method or "cash",
+    }
+
+
+def _qb_pull_journal_entry_row(j):
+    """A raw QuickBooks JournalEntry dict -> the snapshot journal-entry
+    shape the migration import reads. Each line carries the account
+    NAME (the import resolves it against the merged chart)."""
+    qid = str(j.get("Id") or "")
+    if not qid:
+        return None
+    lines = []
+    for ln in j.get("Line") or []:
+        if not isinstance(ln, dict):
+            continue
+        detail = ln.get("JournalEntryLineDetail") or {}
+        acct = detail.get("AccountRef") or {}
+        amt = _qb_pull_to_cents(ln.get("Amount")) or 0
+        ptype = (detail.get("PostingType") or "").strip().lower()
+        lines.append({
+            "account_name": acct.get("name") or "",
+            "debit_cents": amt if ptype == "debit" else 0,
+            "credit_cents": amt if ptype == "credit" else 0,
+            "memo": ln.get("Description") or "",
+        })
+    return {
+        "qb_id": qid,
+        "date": j.get("TxnDate") or "",
+        "memo": (j.get("PrivateNote") or "").strip(),
+        "lines": lines,
+    }
+
+
+def _qb_pull_bank_txn_row(entity, t, bank_ids):
+    """A raw Purchase / Deposit / BillPayment / Transfer dict -> a
+    minimal bank-transaction shape (reference only: the migration
+    import deliberately does not import bank transactions). Returns
+    None when the row touches none of the ERP's bank accounts."""
+    qid = str(t.get("Id") or "")
+    if not qid:
+        return None
+    acct_qb = None
+    from_qb = None
+    to_qb = None
+    if entity == "Purchase":
+        acct_qb = str(((t.get("AccountRef") or {}).get("value")) or "")
+    elif entity == "Deposit":
+        acct_qb = str(((t.get("DepositToAccountRef") or {}).get("value"))
+                      or "")
+    elif entity == "BillPayment":
+        check = t.get("CheckPayment") or {}
+        card = t.get("CreditCardPayment") or {}
+        acct_qb = str(((check.get("BankAccountRef") or {}).get("value"))
+                      or ((card.get("CreditCardAccountRef") or {})
+                          .get("value")) or "")
+    elif entity == "Transfer":
+        from_qb = str(((t.get("FromAccountRef") or {}).get("value")) or "")
+        to_qb = str(((t.get("ToAccountRef") or {}).get("value")) or "")
+        acct_qb = from_qb if from_qb in bank_ids else to_qb
+    if acct_qb not in bank_ids:
+        return None
+    total = _qb_pull_to_cents(t.get("TotalAmt"))
+    if total is None:
+        total = _qb_pull_to_cents(t.get("Amount"))
+    return {
+        "qb_id": qid,
+        "type": entity.lower(),
+        "date": t.get("TxnDate") or "",
+        "account_qb_id": acct_qb,
+        "from_account_qb_id": from_qb,
+        "to_account_qb_id": to_qb,
+        "amount_cents": total if total is not None else 0,
+        "memo": (t.get("PrivateNote") or "").strip(),
+    }
+
+
+@app.post("/api/erp/accounting/qb-pull/run-types")
+def erp_acct_qb_pull_run_types():
+    """Pull the five export types the invoice pull never covered --
+    vendors, bills, customer payments, journal entries, and bank
+    transactions -- through the ERP's own QuickBooks OAuth connection,
+    into the migration snapshot. Rows are shaped exactly as the
+    migration import reads them; bank transactions are reference only
+    (the import deliberately skips them). One entity at a time, saved
+    after each; STOPS on the first 429 and saves the partial progress
+    first -- no retry, no sleep-loop."""
+    actor, err = _qb_pull_auth()
+    if err:
+        return err
+    try:
+        snap, read_path = _qb_pull_load_snapshot()
+    except (OSError, ValueError) as exc:
+        return jsonify(error="QuickBooks migration snapshot unreadable: %s"
+                       % exc, snapshot_status="unreadable"), 500
+    if snap is None:
+        return jsonify(error="QuickBooks migration snapshot not found",
+                       snapshot_status="missing"), 404
+    meta = snap.get("meta")
+    if not isinstance(meta, dict):
+        return jsonify(error="snapshot.meta must be an object"), 400
+    for key in ("vendors", "bills", "payments", "journal_entries",
+                "bank_transactions"):
+        if not isinstance(snap.get(key), list):
+            return jsonify(error="snapshot.%s must be a list" % key), 400
+    conn = db()
+    bank_ids = {str(b.get("qb_id"))
+                for b in snap.get("bank_accounts") or []
+                if b.get("qb_id")}
+    now = datetime.now(timezone.utc).isoformat()
+    counts = {}
+    rate_limited = False
+    error = None
+    error_status = None
+    jobs = [
+        ("vendors", "Vendor", "select * from Vendor ORDER BY DisplayName",
+         _qb_pull_vendor_row),
+        ("bills", "Bill", "select * from Bill ORDER BY TxnDate",
+         _qb_pull_bill_row),
+        ("payments", "Payment", "select * from Payment ORDER BY TxnDate",
+         _qb_pull_payment_row),
+        ("journal_entries", "JournalEntry",
+         "select * from JournalEntry ORDER BY TxnDate",
+         _qb_pull_journal_entry_row),
+    ]
+    for key, _entity, query_base, shape in jobs:
+        time.sleep(_QB_PULL_PACE_SECONDS)
+        try:
+            rows = _qb_call_with_refresh(
+                conn, lambda c, q=query_base: _qb_pull_fetch_all(c, q))
+        except _QBOError as e:
+            if _qb_is_rate_limited(e):
+                rate_limited = True
+            else:
+                error = str(e)
+                error_status = e.status
+            break
+        seen = {}
+        for old in snap[key]:
+            if isinstance(old, dict) and old.get("qb_id"):
+                seen[_qb_pull_norm_id(old["qb_id"])] = old
+        for raw in rows:
+            row = shape(raw)
+            if row is None:
+                continue
+            seen[_qb_pull_norm_id(row["qb_id"])] = row
+        snap[key] = sorted(
+            seen.values(), key=lambda r: (r.get("date") or "",
+                                          r.get("qb_id") or ""))
+        counts[key] = len(seen)
+        meta.setdefault("types", {})[key] = {
+            "status": "pulled", "count": len(seen),
+            "pulled_at": now,
+            "note": "pulled via the ERP QuickBooks OAuth connection"
+                    " (qb-pull/run-types)"}
+        meta.setdefault("verification", {}) \
+            .setdefault("qb_counts", {})[key] = len(seen)
+        try:
+            _qb_pull_save_snapshot(snap, _qb_pull_write_path(read_path))
+        except OSError as exc:
+            error = "could not store snapshot: %s" % exc
+            error_status = 500
+            break
+    if not rate_limited and error is None:
+        # Bank transactions: one pass over the four bank-touching
+        # entity types, kept only when they touch an ERP bank account.
+        bank_rows = {}
+        for old in snap["bank_transactions"]:
+            if isinstance(old, dict) and old.get("qb_id"):
+                bank_rows[_qb_pull_norm_id(old["qb_id"])] = old
+        for entity in ("Purchase", "Deposit", "BillPayment", "Transfer"):
+            time.sleep(_QB_PULL_PACE_SECONDS)
+            try:
+                rows = _qb_call_with_refresh(
+                    conn, lambda c, e=entity: _qb_pull_fetch_all(
+                        c, "select * from %s ORDER BY TxnDate" % e))
+            except _QBOError as e:
+                if _qb_is_rate_limited(e):
+                    rate_limited = True
+                else:
+                    error = str(e)
+                    error_status = e.status
+                break
+            for raw in rows:
+                row = _qb_pull_bank_txn_row(entity, raw, bank_ids)
+                if row is None:
+                    continue
+                bank_rows[_qb_pull_norm_id(row["qb_id"])] = row
+            if rate_limited or error is not None:
+                break
+        if not rate_limited and error is None:
+            snap["bank_transactions"] = sorted(
+                bank_rows.values(),
+                key=lambda r: (r.get("date") or "", r.get("qb_id") or ""))
+            counts["bank_transactions"] = len(bank_rows)
+            meta.setdefault("types", {})["bank_transactions"] = {
+                "status": "pulled", "count": len(bank_rows),
+                "pulled_at": now,
+                "note": "reference only -- the migration import does not"
+                        " import bank transactions; pulled via the ERP"
+                        " QuickBooks OAuth connection (qb-pull/run-types)"}
+            try:
+                _qb_pull_save_snapshot(snap,
+                                       _qb_pull_write_path(read_path))
+            except OSError as exc:
+                error = "could not store snapshot: %s" % exc
+                error_status = 500
+    if not rate_limited and error is None:
+        meta["complete"] = all(
+            (meta.get("types") or {}).get(t, {}).get("status")
+            in ("pulled", "not_available", "not_pulled")
+            for t in _QB_PULL_COMPLETE_TYPES)
+        try:
+            _qb_pull_save_snapshot(snap, _qb_pull_write_path(read_path))
+        except OSError as exc:
+            error = "could not store snapshot: %s" % exc
+            error_status = 500
+    _acct_audit(conn, actor, "qb.pull_run_types", "qb_snapshot", 0,
+                "pulled types %s, rate_limited %s"
+                % (counts, rate_limited))
+    conn.commit()
+    conn.close()
+    out = {"ok": True, "counts": counts,
+           "complete": bool(meta.get("complete")),
+           "rate_limited": rate_limited}
+    if rate_limited:
+        out["error"] = "QuickBooks rate-limited (HTTP 429)"
+        return jsonify(out), 429
+    if error is not None:
+        out["error"] = error
+        return jsonify(out), error_status or 502
+    return jsonify(out)
+
+
 @app.post("/api/erp/accounting/qb-pull/run")
 def erp_acct_qb_pull_run():
     """Pull invoice windows through the ERP's own QuickBooks OAuth
