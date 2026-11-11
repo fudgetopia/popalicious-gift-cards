@@ -23,14 +23,20 @@ import shutil
 import sqlite3
 import string
 import subprocess
+import tempfile
+import time
+import zipfile
 import unicodedata
 import hmac
 import hashlib
 import base64
+import csv
 import html
+import io
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from contextlib import contextmanager
+from decimal import Decimal, ROUND_HALF_UP
 from urllib.parse import urlencode
 
 import requests
@@ -46,6 +52,11 @@ STRIPE_SECRET_KEY = os.environ["STRIPE_SECRET_KEY"]
 STRIPE_WEBHOOK_SECRET = os.environ["STRIPE_WEBHOOK_SECRET"]
 STRIPE_PUBLISHABLE_KEY = os.environ.get("STRIPE_PUBLISHABLE_KEY", "")
 RESEND_API_KEY = os.environ["RESEND_API_KEY"]
+# Svix signing secret for Resend webhooks (RESEND_WEBHOOK_SECRET, "whsec_..."
+# from the Resend dashboard). Empty until it is configured in Resend:
+# until then the newsletter webhook accepts payloads unsigned and logs that
+# signature verification is owed — no secret is invented here.
+RESEND_WEBHOOK_SECRET = os.environ.get("RESEND_WEBHOOK_SECRET", "")
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "https://muse.ai")
 EMAIL_FROM = os.environ.get("EMAIL_FROM", "Pop-A-Licious <noreply@pop-a-licious.com>")
 SITE_URL = os.environ.get("SITE_URL", "https://pop-a-licious.com").rstrip("/")
@@ -79,6 +90,9 @@ BACKEND_URL = os.environ.get(
 # Promo codes shown on the site's Offers & Discounts page.
 # percent -> Stripe percent-off coupon (one use). free_shipping -> zeroes the
 # shipping line when the merchandise subtotal meets the minimum.
+# bundle -> any bundle_size bags for bundle_price_cents (e.g. 3 bags for
+# $20 = $4 off per set of 3 at the $8 bag price); discount is a flat
+# amount computed in _compute_order, never a percent.
 PROMOS = {
     "RELAUNCH15": {
         "type": "percent", "percent_off": 15,
@@ -118,6 +132,233 @@ PROMOS = {
         "description": "25% off your order",
         "windows": [["2026-11-30", "2026-12-01"]],
     },
+    # National-day calendar codes (approved Oct 29; site popup advertises
+    # them, but they were never in this dict, so checkout rejected them
+    # with 404 — fixed Nov 10). One 15%-off code per national day, single-day
+    # window = the next occurrence of that month/day on or after 2026-11-10
+    # (Nov 14/26 + Dec 4/30 use 2026, the rest 2027). Same percent mechanics
+    # as RELAUNCH15/MERRYPOP15 — 15% off the order, one use per email via
+    # promo_redemptions. JUNK21 + DESSERT14 ("Any 3 bags for $20") are the
+    # bundle entries below (type "bundle", built Nov 10); PIZZAMONTH
+    # (October month code, window passed) and the floating first-Saturday
+    # Bacon Day (no fixed date) stay out.
+    'HOTSPICY16': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Hot & Spicy Day',
+        "description": '15% off Nashville Hot, Cheddar Jalapeño',
+        "windows": [["2027-01-16", "2027-01-16"]],
+    },
+    'POPCORN19': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Popcorn Day',
+        "description": '15% off All 25 flavors',
+        "windows": [["2027-01-19", "2027-01-19"]],
+    },
+    'CHEESE20': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Cheese Lovers Day',
+        "description": '15% off Cheddar, White Cheddar, Garlic Parmesan',
+        "windows": [["2027-01-20", "2027-01-20"]],
+    },
+    'HOTSAUCE22': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Hot Sauce Day',
+        "description": '15% off Nashville Hot, Cheddar Jalapeño, Buffalo Ranch',
+        "windows": [["2027-01-22", "2027-01-22"]],
+    },
+    'PIZZA09': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Pizza Day',
+        "description": '15% off Pizza',
+        "windows": [["2027-02-09", "2027-02-09"]],
+    },
+    'CHEDDAR13': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Cheddar Day',
+        "description": '15% off Cheddar, White Cheddar',
+        "windows": [["2027-02-13", "2027-02-13"]],
+    },
+    'STRAWBERRY27': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Strawberry Day',
+        "description": '15% off Strawberry Cheesecake',
+        "windows": [["2027-02-27", "2027-02-27"]],
+    },
+    'CREME06': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Oreo Day',
+        "description": "15% off Cookies N' Creme",
+        "windows": [["2027-03-06", "2027-03-06"]],
+    },
+    'RANCH10': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Ranch Day',
+        "description": '15% off Buffalo Ranch',
+        "windows": [["2027-03-10", "2027-03-10"]],
+    },
+    'SALTVIN14': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Potato Chip Day',
+        "description": '15% off Salt & Vinegar',
+        "windows": [["2027-03-14", "2027-03-14"]],
+    },
+    'CARAMEL05': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Caramel Day',
+        "description": '15% off Caramel',
+        "windows": [["2027-04-05", "2027-04-05"]],
+    },
+    'CARAMELPOP06': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Caramel Popcorn Day',
+        "description": '15% off Caramel',
+        "windows": [["2027-04-06", "2027-04-06"]],
+    },
+    'GARLIC19': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Garlic Day',
+        "description": '15% off Garlic Butter, Garlic Parmesan',
+        "windows": [["2027-04-19", "2027-04-19"]],
+    },
+    'BURGER28': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Hamburger Day',
+        "description": '15% off Cheeseburger',
+        "windows": [["2027-05-28", "2027-05-28"]],
+    },
+    'CHEESE04': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Cheese Day',
+        "description": '15% off Cheddar, White Cheddar, Garlic Parmesan',
+        "windows": [["2027-06-04", "2027-06-04"]],
+    },
+    'CHURRO06': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Churro Day',
+        "description": '15% off Churro',
+        "windows": [["2027-06-06", "2027-06-06"]],
+    },
+    'ALIEN02': {
+        "type": "percent", "percent_off": 15,
+        "label": 'World UFO Day',
+        "description": '15% off Alien Mix',
+        "windows": [["2027-07-02", "2027-07-02"]],
+    },
+    'SUGAR09': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Sugar Cookie Day',
+        "description": '15% off Sugar Cookie',
+        "windows": [["2027-07-09", "2027-07-09"]],
+    },
+    'WING29': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Chicken Wing Day',
+        "description": '15% off Buffalo Ranch',
+        "windows": [["2027-07-29", "2027-07-29"]],
+    },
+    'CHEESECAKE30': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Cheesecake Day',
+        "description": '15% off Strawberry Cheesecake',
+        "windows": [["2027-07-30", "2027-07-30"]],
+    },
+    'HOTSPICY19': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Hot & Spicy Day',
+        "description": '15% off Nashville Hot, Cheddar Jalapeño, Buffalo Ranch',
+        "windows": [["2027-08-19", "2027-08-19"]],
+    },
+    'LEMONADE20': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Lemonade Day',
+        "description": '15% off Lemonade',
+        "windows": [["2027-08-20", "2027-08-20"]],
+    },
+    'BACON20': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Bacon Lovers Day',
+        "description": '15% off Bacon',
+        "windows": [["2027-08-20", "2027-08-20"]],
+    },
+    'BANANA29': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Banana Pudding Day',
+        "description": '15% off Banana Pudding',
+        "windows": [["2027-08-29", "2027-08-29"]],
+    },
+    'MUDDY31': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Trail Mix Day',
+        "description": '15% off Muddy Buddy',
+        "windows": [["2027-08-31", "2027-08-31"]],
+    },
+    'CHEESEPIZZA05': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Cheese Pizza Day',
+        "description": '15% off Pizza',
+        "windows": [["2027-09-05", "2027-09-05"]],
+    },
+    'CHEESEBURGER18': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Cheeseburger Day',
+        "description": '15% off Cheeseburger',
+        "windows": [["2027-09-18", "2027-09-18"]],
+    },
+    'HOMEMADE01': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Homemade Cookies Day',
+        "description": "15% off Snickerdoodle, Sugar Cookie, Cookies N' Creme",
+        "windows": [["2027-10-01", "2027-10-01"]],
+    },
+    'CINNAMON04': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Cinnamon Roll Day',
+        "description": '15% off Cinnamon Roll',
+        "windows": [["2027-10-04", "2027-10-04"]],
+    },
+    'PICKLE14': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Pickle Day',
+        "description": '15% off Dill Pickle',
+        "windows": [["2026-11-14", "2026-11-14"]],
+    },
+    'CAKE26': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Cake Day',
+        "description": '15% off Birthday Cake',
+        "windows": [["2026-11-26", "2026-11-26"]],
+    },
+    'COOKIE04': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Cookie Day',
+        "description": "15% off Cookies N' Creme, Sugar Cookie, Snickerdoodle",
+        "windows": [["2026-12-04", "2026-12-04"]],
+    },
+    'BACON30': {
+        "type": "percent", "percent_off": 15,
+        "label": 'National Bacon Day',
+        "description": '15% off Bacon',
+        "windows": [["2026-12-30", "2026-12-30"]],
+    },
+    # Bundle days: any 3 bags for $20 (=$4 off per set of 3 at $8/bag).
+    # JUNK21 = any flavor; DESSERT14 = sweet flavors only. The sweet list
+    # is the ERP's own erp_flavor_categories seed (13 flavors); the site
+    # popup says "11 sweet flavors" — the two extra here are Kettle Corn
+    # and Lemonade, which the seed classes as sweet. If the user says the
+    # dessert set is 11, drop those two from bundle_flavors.
+    "JUNK21": {
+        "type": "bundle", "bundle_size": 3, "bundle_price_cents": 2000,
+        "label": "National Junk Food Day",
+        "description": "Any 3 bags for $20",
+        "windows": [["2027-07-21", "2027-07-21"]],
+    },
+    "DESSERT14": {
+        "type": "bundle", "bundle_size": 3, "bundle_price_cents": 2000,
+        "label": "National Dessert Day",
+        "description": "Any 3 sweet bags for $20",
+        "bundle_flavors": ['Alien Mix', 'Banana Pudding', 'Birthday Cake', 'Caramel', 'Churro', 'Cinnamon Roll', 'Cookie and Cream', 'Muddy Buddy', 'Snickerdoodle', 'Strawberry Cheesecake', 'Sugar Cookie'],
+        "windows": [["2027-10-14", "2027-10-14"]],
+    },
 }
 
 _LA_TZ = ZoneInfo("America/Los_Angeles")
@@ -130,6 +371,112 @@ def _promo_is_active(promo, now=None):
         return True
     today = (now or datetime.now(timezone.utc)).astimezone(_LA_TZ).date().isoformat()
     return any(start <= today <= end for start, end in windows)
+
+
+def _promo_disabled(code):
+    """True when a Wave D promo override disables this code at checkout.
+
+    PROMOS itself is code-only, so a disable flag is the live-editable half
+    of promo management; the table is created in _init_db above.
+    """
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT disabled FROM erp_mkt_promo_overrides WHERE code = ?",
+            ((code or "").strip().upper(),)).fetchone()
+        conn.close()
+    except Exception:
+        return False
+    return bool(row and row["disabled"])
+
+
+def _promo_bag_key(name):
+    """Normalize a cart item name for flavor matching.
+
+    Same aliases as the label/QR matching: ASCII-folded, upper-case,
+    '&' -> 'and', apostrophes dropped, 'Cookies N Creme' is
+    'Cookie and Cream'. Used to tell popcorn bags from same-priced merch.
+    """
+    ascii_s = unicodedata.normalize("NFKD", str(name or "")).encode("ascii", "ignore").decode("ascii")
+    s = ascii_s.upper().replace("&", " AND ")
+    key = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", s)).strip()
+    key = re.sub(r"\bN\b", "AND", key)
+    if key in ("COOKIES N CREME", "COOKIES AND CREME", "COOKIES AND CREAM"):
+        return "COOKIE AND CREAM"
+    return key
+
+
+def _promo_bundle_bags(items, promo):
+    """Count qualifying popcorn bags in a cart for a bundle promo.
+
+    A bag is an item priced at BAG_PRICE_CENTS whose name is one of the 25
+    live flavors; when the promo lists bundle_flavors (DESSERT14: sweet
+    flavors only) only those count. Merch at the same $8 price never counts.
+    """
+    allowed = promo.get("bundle_flavors")
+    allowed_keys = {_promo_bag_key(f) for f in allowed} if allowed else None
+    flavor_keys = {_promo_bag_key(f) for f in FLAVORS}
+    n = 0
+    for it in items:
+        if int(it.get("amount_cents", 0)) != BAG_PRICE_CENTS:
+            continue
+        key = _promo_bag_key(it.get("name", ""))
+        if key not in flavor_keys:
+            continue
+        if allowed_keys is not None and key not in allowed_keys:
+            continue
+        n += int(it.get("quantity", 0))
+    return n
+
+
+# National-day promo calendar (user-approved Oct 29, 2026;
+# ~/workspace/pop-a-licious/promo-calendar.md, month-by-month list).
+# (month, day, day name, featured flavor(s), close_fit): dates repeat
+# every year. close_fit = the file flags it as the nearest sensible hook,
+# not an exact national day for that flavor — never present it as official.
+# Aug 31 Trail Mix Day comes from the file's flavor checklist / "no exact
+# day" section (Muddy Buddy's closest hook), not the month-by-month list.
+# Excluded on purpose (no single fixed date): the first Saturday in
+# September (International Bacon Day, floating) and October as a whole
+# month (National Pizza Month). Wave D owns promo-calendar management;
+# this constant is read-only here, for the content calendar only.
+_PROMO_CALENDAR_DATES = (
+    (1, 16, "International Hot & Spicy Food Day", "Nashville Hot + Cheddar Jalapeño", False),
+    (1, 19, "National Popcorn Day", "ALL 25 flavors (flagship)", False),
+    (1, 20, "National Cheese Lovers Day", "Cheddar, White Cheddar, Garlic Parmesan", False),
+    (1, 22, "National Hot Sauce Day", "Nashville Hot, Cheddar Jalapeño, Buffalo Ranch", False),
+    (2, 9, "National Pizza Day", "Pizza (flagship)", False),
+    (2, 13, "National Cheddar Day", "Cheddar + White Cheddar", False),
+    (2, 27, "National Strawberry Day", "Strawberry Cheesecake (teaser)", False),
+    (3, 6, "National Oreo Day", "Cookies N' Creme", True),
+    (3, 10, "National Ranch Day", "Buffalo Ranch", False),
+    (3, 14, "National Potato Chip Day", "Salt and Vinegar", True),
+    (4, 5, "National Caramel Day", "Caramel", False),
+    (4, 6, "National Caramel Popcorn Day", "Caramel (day 2)", False),
+    (4, 19, "National Garlic Day", "Garlic Butter + Garlic Parmesan", False),
+    (5, 28, "National Hamburger Day", "Cheeseburger (teaser)", False),
+    (6, 4, "National Cheese Day", "Cheddar, White Cheddar, Garlic Parmesan", False),
+    (6, 6, "National Churro Day", "Churro", True),
+    (7, 2, "World UFO Day", "Alien Mix", False),
+    (7, 9, "National Sugar Cookie Day", "Sugar Cookie", False),
+    (7, 21, "National Junk Food Day", "Kettle Corn + all snack flavors", True),
+    (7, 29, "National Chicken Wing Day", "Buffalo Ranch", False),
+    (7, 30, "National Cheesecake Day", "Strawberry Cheesecake (flagship)", False),
+    (8, 19, "National Hot and Spicy Food Day", "Nashville Hot, Cheddar Jalapeño, Buffalo Ranch", False),
+    (8, 20, "National Lemonade Day", "Lemonade", False),
+    (8, 20, "National Bacon Lovers Day", "Bacon", False),
+    (8, 29, "National Banana Pudding Day", "Banana Pudding", False),
+    (8, 31, "National Trail Mix Day", "Muddy Buddy", True),
+    (9, 5, "National Cheese Pizza Day", "Pizza (second date)", False),
+    (9, 18, "National Cheeseburger Day", "Cheeseburger (flagship)", False),
+    (10, 1, "National Homemade Cookies Day", "Snickerdoodle + Sugar Cookie + Cookies N' Creme (cookie trio)", False),
+    (10, 4, "National Cinnamon Roll Day", "Cinnamon Roll", False),
+    (10, 14, "National Dessert Day", "Birthday Cake + all sweet flavors", False),
+    (11, 14, "National Pickle Day", "Dill Pickle", False),
+    (11, 26, "National Cake Day", "Birthday Cake", False),
+    (12, 4, "National Cookie Day", "Cookies N' Creme, Sugar Cookie, Snickerdoodle (cookie trio, flagship cookie day)", False),
+    (12, 30, "National Bacon Day", "Bacon (flagship bacon day)", False),
+)
 
 MIN_AMOUNT_CENTS = 500      # $5
 MAX_AMOUNT_CENTS = 50000    # $500
@@ -186,9 +533,13 @@ _ERP_GRANTABLE_PERMS = (
     "accounts.read", "accounts.write",
     "edi.read", "edi.write",
     "reports.read",
+    "accounting.read", "accounting.write",
+    "tax.read", "tax.write",
+    "payroll.read", "payroll.write",
     "instagram.read", "instagram.write",
     "newsletter.read", "newsletter.write",
     "support.read", "support.write",
+    "loyalty.read", "loyalty.write",
 )
 # What staff could do before per-staff grants existed. Existing staff rows
 # are seeded with exactly this set once; new staff start with no grants.
@@ -491,6 +842,18 @@ def init_db():
             conn.execute("ALTER TABLE erp_recipes ADD COLUMN serving_grams REAL")
         if "servings_per_bag" not in rcols:
             conn.execute("ALTER TABLE erp_recipes ADD COLUMN servings_per_bag INTEGER")
+    # Migration: hourly_rate_cents on HR employee records (HR Wave B,
+    # Nov 2026) -- the default cash rate for event time records, NULL
+    # until the admin sets one. Never invented: blank means no rate.
+    _hr_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table'"
+        " AND name='erp_hr_employees'").fetchone()
+    if _hr_exists:
+        _hr_cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(erp_hr_employees)").fetchall()]
+        if "hourly_rate_cents" not in _hr_cols:
+            conn.execute("ALTER TABLE erp_hr_employees"
+                         " ADD COLUMN hourly_rate_cents INTEGER")
     # Migration: emailed_at on purchase orders (Purchasing 5-pack, Nov 2026).
     poexists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_purchase_orders'"
@@ -502,6 +865,52 @@ def init_db():
             conn.execute(
                 "ALTER TABLE erp_purchase_orders"
                 " ADD COLUMN emailed_at TEXT NOT NULL DEFAULT ''")
+    # Migration: tenders_json on POS sales (Stores Additions Wave A,
+    # Nov 2026) -- the per-tender split {cash, card, gift_card} in
+    # cents, so a Z-report can total by tender. Older sales have no
+    # split and read back from their single tender string.
+    _ss_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table'"
+        " AND name='erp_store_sales'").fetchone()
+    if _ss_exists:
+        _ss_cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(erp_store_sales)").fetchall()]
+        if "tenders_json" not in _ss_cols:
+            conn.execute("ALTER TABLE erp_store_sales"
+                         " ADD COLUMN tenders_json TEXT NOT NULL DEFAULT '{}'")
+    # Migration: layout_json on planograms + PM/dispatch columns on
+    # maintenance (Stores Additions Wave B, Nov 2026). layout_json is
+    # the shelf grid {shelves: [{name, feet, flavors: [...]}]}; the
+    # maintenance columns link an auto-created job to its PM schedule
+    # and record a vendor dispatch. Older rows read back with the
+    # defaults (empty layout, not auto-created, never dispatched).
+    _pg_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table'"
+        " AND name='erp_store_planograms'").fetchone()
+    if _pg_exists:
+        _pg_cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(erp_store_planograms)").fetchall()]
+        if "layout_json" not in _pg_cols:
+            conn.execute("ALTER TABLE erp_store_planograms"
+                         " ADD COLUMN layout_json TEXT NOT NULL DEFAULT '[]'")
+    _mn_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table'"
+        " AND name='erp_store_maintenance'").fetchone()
+    if _mn_exists:
+        _mn_cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(erp_store_maintenance)").fetchall()]
+        if "pm_schedule_id" not in _mn_cols:
+            conn.execute("ALTER TABLE erp_store_maintenance"
+                         " ADD COLUMN pm_schedule_id INTEGER")
+        if "auto_created" not in _mn_cols:
+            conn.execute("ALTER TABLE erp_store_maintenance"
+                         " ADD COLUMN auto_created INTEGER NOT NULL DEFAULT 0")
+        if "dispatched_to" not in _mn_cols:
+            conn.execute("ALTER TABLE erp_store_maintenance"
+                         " ADD COLUMN dispatched_to TEXT NOT NULL DEFAULT ''")
+        if "dispatched_at" not in _mn_cols:
+            conn.execute("ALTER TABLE erp_store_maintenance"
+                         " ADD COLUMN dispatched_at TEXT NOT NULL DEFAULT ''")
     # Migration: per-staff ERP permissions (Nov 2026). Existing staff keep
     # exactly the access they had; new staff start with no grants.
     _erp_seed_staff_perms(conn)
@@ -713,138 +1122,8 @@ def init_db():
             recipient_count INTEGER NOT NULL DEFAULT 0,
             sent_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS erp_mkt_ig_posts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            kind TEXT NOT NULL,
-            caption TEXT NOT NULL DEFAULT '',
-            media_json TEXT NOT NULL DEFAULT '{"files": [], "covers": []}',
-            promo_date TEXT,
-            status TEXT NOT NULL DEFAULT 'draft',
-            publish_at TEXT,
-            container_expires_at TEXT,
-            ig_media_id TEXT,
-            ig_url TEXT,
-            failure_note TEXT,
-            publish_path TEXT,
-            check_requested_at TEXT,
-            last_checked_at TEXT,
-            check_live INTEGER,
-            check_caption_intact INTEGER,
-            created_by TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            approved_by TEXT,
-            approved_at TEXT,
-            published_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS erp_login_codes (
-            code_hash TEXT PRIMARY KEY,
-            token TEXT NOT NULL,
-            email TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL,
-            used INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS erp_mkt_ig_insights (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            scope TEXT NOT NULL,
-            ig_media_id TEXT,
-            window TEXT NOT NULL,
-            metrics_json TEXT NOT NULL,
-            captured_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS erp_mkt_ig_actions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            post_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            payload_json TEXT NOT NULL DEFAULT '{}',
-            status TEXT NOT NULL DEFAULT 'pending',
-            result_note TEXT,
-            created_at TEXT NOT NULL,
-            done_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS erp_mkt_newsletters (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            issue_month TEXT NOT NULL,
-            theme TEXT NOT NULL DEFAULT '',
-            subject TEXT NOT NULL DEFAULT '',
-            body_html TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'draft',
-            campaign_key TEXT NOT NULL,
-            approved_by TEXT,
-            approved_at TEXT,
-            sent_at TEXT,
-            recipient_count INTEGER
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_mkt_newsletters_month
-            ON erp_mkt_newsletters (issue_month);
-        CREATE TABLE IF NOT EXISTS erp_mkt_tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            source TEXT NOT NULL DEFAULT 'manual',
-            message_id TEXT,
-            customer_email TEXT NOT NULL,
-            customer_name TEXT NOT NULL DEFAULT '',
-            subject TEXT NOT NULL DEFAULT '',
-            body TEXT NOT NULL DEFAULT '',
-            status TEXT NOT NULL DEFAULT 'open',
-            order_source TEXT,
-            order_id INTEGER,
-            created_at TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            resolved_by TEXT,
-            resolved_at TEXT
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_mkt_tickets_message
-            ON erp_mkt_tickets (message_id) WHERE message_id IS NOT NULL;
-        CREATE TABLE IF NOT EXISTS erp_mkt_ticket_replies (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket_id INTEGER NOT NULL,
-            author TEXT NOT NULL DEFAULT '',
-            body TEXT NOT NULL DEFAULT '',
-            is_internal_note INTEGER NOT NULL DEFAULT 0,
-            sent_via TEXT,
-            sent_at TEXT,
-            created_at TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS erp_mkt_audit (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            actor TEXT NOT NULL DEFAULT '',
-            action TEXT NOT NULL,
-            target_type TEXT NOT NULL,
-            target_id INTEGER,
-            detail TEXT NOT NULL DEFAULT '',
-            created_at TEXT NOT NULL
-        );
         """
     )
-    # Seed the first Instagram schedule records from the approved promo
-    # schedule draft (one-stop Phase 3, spec section 6 step 2): the next 4
-    # upcoming entries. Drafts only — approval happens in the ERP.
-    if conn.execute("SELECT COUNT(*) AS c FROM erp_mkt_ig_posts").fetchone()["c"] == 0:
-        _mkt_now = datetime.now(timezone.utc).isoformat()
-        for _kind, _cap, _files, _promo, _pub in (
-                ("post",
-                 "Pickle people are loyal \u2014 give them their day. Dill Pickle, 15% off today.",
-                 ["ad20d5dd03e863b0b25cfd118f2b33cb8b1c1db5d782ad1a069dd012422158af.jpg"],
-                 "2026-11-14", "2026-11-15T02:00:00+00:00"),
-                ("post",
-                 "Every day is someone's birthday. Birthday Cake, 15% off today.",
-                 ["a34ae8828587d87669b243542fcad4798ce37eba183e85a708e7fcd01d697daf.jpg"],
-                 "2026-11-26", "2026-11-27T00:00:00+00:00"),
-                ("carousel",
-                 "Holiday gifting: cookie trio, 15% off today \u2014 or any 3 cookie flavors for $20.",
-                 ["0568b3a85283b0bf4acf851eb4bb391b03546af5e5a8ce6dd3e538e8d3adfcfd.jpg",
-                  "4054cff2ed9c1e496789a8e2bfab12cebb316273f71430d9868bc3f2ca106b21.jpg",
-                  "50914e76e8b578fac0ca29a5bf1be9d304677733dbd48ce819beaad150452aef.jpg"],
-                 "2026-12-04", "2026-12-05T02:00:00+00:00"),
-                ("post",
-                 "Year-end savory closer. Bacon, 15% off today.",
-                 ["7b3dd89a572074294c4bca4681205e96931050584da6696201ccae523d762ddf.jpg"],
-                 "2026-12-30", "2026-12-31T00:00:00+00:00")):
-            conn.execute(
-                "INSERT INTO erp_mkt_ig_posts (kind, caption, media_json, promo_date,"
-                " status, publish_at, created_by, created_at)"
-                " VALUES (?, ?, ?, ?, 'draft', ?, 'seed', ?)",
-                (_kind, _cap, json.dumps({"files": _files, "covers": []}),
-                 _promo, _pub, _mkt_now))
     # Migration: Stripe customer id on users for subscription billing.
     if "stripe_customer_id" not in ucols:
         conn.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT NOT NULL DEFAULT ''")
@@ -906,6 +1185,25 @@ def init_db():
             expiry_date TEXT NOT NULL DEFAULT '',
             location_id INTEGER NOT NULL DEFAULT 0
         );
+        -- Prod9 Wave 2 (item 5): QC holds on lots. A separate table (not a
+        -- column on erp_lots) so the hold is an auditable event: who held it,
+        -- why, when, and who released it and why. A hold is active while
+        -- released_at is '' (the codebase's ''-means-unset convention).
+        -- Only one active hold per (lot_code, location_id); enforced in code.
+        CREATE TABLE IF NOT EXISTS erp_qc_holds (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lot_code TEXT NOT NULL,
+            item_id INTEGER NOT NULL,
+            location_id INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            held_by TEXT NOT NULL DEFAULT '',
+            held_at TEXT NOT NULL DEFAULT '',
+            released_at TEXT NOT NULL DEFAULT '',
+            released_by TEXT NOT NULL DEFAULT '',
+            release_reason TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_qc_holds_lot
+            ON erp_qc_holds (lot_code, location_id);
         CREATE TABLE IF NOT EXISTS erp_vendors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -1012,11 +1310,26 @@ def init_db():
             expiry_date TEXT NOT NULL DEFAULT '',
             location_id INTEGER NOT NULL,
             order_ref TEXT NOT NULL DEFAULT '',
+            scheduled_date TEXT NOT NULL DEFAULT '',
             total_cost_cents INTEGER NOT NULL DEFAULT 0,
+            labor_minutes REAL NOT NULL DEFAULT 0,
+            labor_rate_cents_per_hour INTEGER NOT NULL DEFAULT 2000,
+            overhead_pct REAL NOT NULL DEFAULT 0,
+            ingredient_cost_cents INTEGER NOT NULL DEFAULT 0,
+            labor_cost_cents INTEGER NOT NULL DEFAULT 0,
+            overhead_cents INTEGER NOT NULL DEFAULT 0,
             produced_by TEXT NOT NULL DEFAULT '',
             started_at TEXT NOT NULL DEFAULT '',
             completed_at TEXT NOT NULL DEFAULT '',
             notes TEXT NOT NULL DEFAULT '',
+            qc_hold INTEGER NOT NULL DEFAULT 0,
+            qc_hold_reason TEXT NOT NULL DEFAULT '',
+            qc_hold_by TEXT NOT NULL DEFAULT '',
+            qc_hold_at TEXT NOT NULL DEFAULT '',
+            qc_hold_released_by TEXT NOT NULL DEFAULT '',
+            qc_hold_released_at TEXT NOT NULL DEFAULT '',
+            qc_hold_release_reason TEXT NOT NULL DEFAULT '',
+            waste_reason TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS erp_batch_ingredients (
@@ -1029,6 +1342,731 @@ def init_db():
             unit_cost_cents INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_erp_batch_ingredients ON erp_batch_ingredients (batch_id);
+        -- Prod9 Wave 3 (item 3): per-recipe finished-goods stock
+        -- targets. location_id 0 = all locations. One target per
+        -- (recipe, location); the UI edits the all-locations row.
+        CREATE TABLE IF NOT EXISTS erp_stock_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipe_id INTEGER NOT NULL,
+            location_id INTEGER NOT NULL DEFAULT 0,
+            target_bags REAL NOT NULL DEFAULT 0,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            UNIQUE(recipe_id, location_id)
+        );
+        -- Prod9 Wave 3 (item 4): daily production capacity settings.
+        -- Keys: max_batches_per_day, max_labor_hours_per_day.
+        CREATE TABLE IF NOT EXISTS erp_production_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        );
+        -- Dept 10 Settings Wave A (item 1): company / legal-entity profile,
+        -- single row (id = 1). Known values only are seeded; EIN and fiscal
+        -- year start blank and are never invented.
+        CREATE TABLE IF NOT EXISTS erp_company_profile (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            legal_name TEXT NOT NULL DEFAULT '',
+            facility_address TEXT NOT NULL DEFAULT '',
+            office_address TEXT NOT NULL DEFAULT '',
+            ein TEXT NOT NULL DEFAULT '',
+            fiscal_year TEXT NOT NULL DEFAULT '',
+            base_currency TEXT NOT NULL DEFAULT 'USD',
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        -- Dept 10 Settings Wave B (items 3 + 4): notification
+        -- preferences (one row per alert category; NO row = today's
+        -- behavior) and the Settings audit log. erp_settings_audit is
+        -- deliberately NOT in _ERP_RESET_TABLES: the wipe is
+        -- irreversible, so the audit row for a wipe is written BEFORE
+        -- the wipe runs and must survive it -- the same reason the
+        -- Phase 4 accounting audit (erp_acct_audit) is never wiped.
+        -- erp_notification_prefs is likewise outside the reset list:
+        -- alert routing is admin settings, not ERP data, so a wipe
+        -- leaves it as configured (and the default state already
+        -- sends exactly as today).
+        CREATE TABLE IF NOT EXISTS erp_notification_prefs (
+            category TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            recipients TEXT NOT NULL DEFAULT '',
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_settings_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL DEFAULT '',
+            target_id INTEGER NOT NULL DEFAULT 0,
+            detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        -- Dept 11 Staff & permissions: audit log for staff/permission
+        -- actions ONLY (staff.created/reactivated/deactivated/updated,
+        -- staff.password_reset, staff.permissions_changed). Deliberately
+        -- a separate table from erp_settings_audit, which covers Settings
+        -- actions only. Like the Settings audit it is NOT in
+        -- _ERP_RESET_TABLES (see the assert below): the staff rows
+        -- themselves survive a wipe, so the record of who changed them
+        -- must survive too.
+        CREATE TABLE IF NOT EXISTS erp_staff_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL DEFAULT '',
+            target_id INTEGER NOT NULL DEFAULT 0,
+            detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        -- HR Wave A (items 1 + 2): employee records + onboarding
+        -- checklist. erp_hr_employees is the staff directory: one row per
+        -- person. staff_id links to the staff login row where one exists
+        -- (Matt/DJ); event-only staff with no ERP login get a standalone
+        -- record with staff_id NULL -- never invent names/details, the UI
+        -- starts with zero event-staff records and the admin adds them.
+        -- hire_date is the single source of truth here: for linked rows
+        -- the staff row's hire_date is kept in sync on write. Like the
+        -- staff rows and erp_staff_audit, HR records are people records,
+        -- NOT in _ERP_RESET_TABLES -- a wipe must never erase them.
+        CREATE TABLE IF NOT EXISTS erp_hr_employees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            staff_id INTEGER,
+            name TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            role TEXT NOT NULL DEFAULT '',
+            department TEXT NOT NULL DEFAULT '',
+            phone TEXT NOT NULL DEFAULT '',
+            emergency_contact TEXT NOT NULL DEFAULT '',
+            emergency_phone TEXT NOT NULL DEFAULT '',
+            hire_date TEXT NOT NULL DEFAULT '',
+            hourly_rate_cents INTEGER,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_employees_staff
+            ON erp_hr_employees (staff_id);
+        CREATE TABLE IF NOT EXISTS erp_hr_onboarding (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            done_by TEXT NOT NULL DEFAULT '',
+            done_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_onboarding_employee
+            ON erp_hr_onboarding (employee_id);
+        -- Additions Wave C (Item 8): benefits tracking + role-based
+        -- onboarding templates. erp_hr_benefits is one row per benefit
+        -- per employee: type and carrier are free text, status is
+        -- enrolled/pending/declined, monthly cost is nullable cents.
+        -- ENROLLMENT is not built here -- carriers live outside the
+        -- ERP, and the UI says so plainly. erp_hr_onboarding_templates
+        -- holds role-based checklists (steps_json is an ordered list
+        -- of labels); assigning one to a new employee seeds their
+        -- checklist from it, and the 5-item default stays the fallback.
+        -- HR records are NOT in _ERP_RESET_TABLES.
+        CREATE TABLE IF NOT EXISTS erp_hr_benefits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            benefit_type TEXT NOT NULL DEFAULT '',
+            carrier TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            monthly_cost_cents INTEGER,
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_benefits_employee
+            ON erp_hr_benefits (employee_id);
+        CREATE TABLE IF NOT EXISTS erp_hr_onboarding_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL DEFAULT '',
+            steps_json TEXT NOT NULL DEFAULT '[]',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_erp_hr_onb_tpl_role
+            ON erp_hr_onboarding_templates (role);
+        -- HR Wave B (items 3 + 4): event scheduling/roster + entered-
+        -- hours time tracking with a cash-paid record. Events are
+        -- one-offs (no recurring engine); the list starts empty, the
+        -- admin adds them. erp_hr_event_staff is the roster: one row
+        -- per person per event with a per-assignment role.
+        -- erp_hr_time_records: ENTERED hours (not clock in/out --
+        -- event shifts are one-offs, often logged after the fact).
+        -- hourly_rate_cents is a per-record snapshot, prefilled from
+        -- the employee's rate at entry and editable per record; NULL
+        -- rate means no amount can be computed, so cash_owed_cents
+        -- stays NULL -- never compute an amount from a missing rate.
+        -- cash_paid_cents accumulates (partial payments allowed);
+        -- remaining = owed - paid. This is a CASH RECORD ONLY -- it
+        -- must NEVER post to the ledger or run through payroll/tax/
+        -- withholding: nothing in this wave writes erp_acct_* or any
+        -- payroll table. Like Wave A, HR tables are NOT in
+        -- _ERP_RESET_TABLES -- a wipe must never erase people records.
+        CREATE TABLE IF NOT EXISTS erp_hr_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            date TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_hr_event_staff (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL,
+            employee_id INTEGER NOT NULL,
+            role TEXT NOT NULL DEFAULT '',
+            assigned_by TEXT NOT NULL DEFAULT '',
+            assigned_at TEXT NOT NULL,
+            UNIQUE (event_id, employee_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_event_staff_event
+            ON erp_hr_event_staff (event_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_event_staff_employee
+            ON erp_hr_event_staff (employee_id);
+        CREATE TABLE IF NOT EXISTS erp_hr_time_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL,
+            employee_id INTEGER NOT NULL,
+            hours REAL NOT NULL,
+            hourly_rate_cents INTEGER,
+            cash_owed_cents INTEGER,
+            cash_paid_cents INTEGER NOT NULL DEFAULT 0,
+            paid_date TEXT NOT NULL DEFAULT '',
+            paid_by TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_time_event
+            ON erp_hr_time_records (event_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_time_employee
+            ON erp_hr_time_records (employee_id);
+        -- Dept 13 (Quality & Food Safety) Wave A: recall plan + drill
+        -- log, supplier COAs per lot, and HACCP plan records. Records
+        -- start empty -- nothing is seeded. Like the HR/staff records,
+        -- quality records are food-safety records, NOT in
+        -- _ERP_RESET_TABLES -- a wipe must never erase them.
+        -- erp_quality_recall_plan is a SINGLE record (id 1): the recall
+        -- team contacts + procedure steps, edited in place.
+        CREATE TABLE IF NOT EXISTS erp_quality_recall_plan (
+            id INTEGER PRIMARY KEY,
+            team_contacts TEXT NOT NULL DEFAULT '',
+            procedure_steps TEXT NOT NULL DEFAULT '',
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        -- erp_quality_recall_drills: one row per recall drill run.
+        CREATE TABLE IF NOT EXISTS erp_quality_recall_drills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            drill_date TEXT NOT NULL DEFAULT '',
+            scope TEXT NOT NULL DEFAULT '',
+            outcome TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            actor TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_drills_date
+            ON erp_quality_recall_drills (drill_date);
+        -- erp_quality_coas: supplier certificates of analysis, one row
+        -- per certificate, tied to a lot in erp_lots. The supplier/item
+        -- reference comes from the lot row itself (lot.item_id ->
+        -- erp_items, lot.supplier_lot) -- it is never typed in twice.
+        -- certificate_ref is the certificate reference text (or file
+        -- name); there is no file upload machinery in this wave.
+        CREATE TABLE IF NOT EXISTS erp_quality_coas (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lot_id INTEGER NOT NULL,
+            certificate_ref TEXT NOT NULL DEFAULT '',
+            received_date TEXT NOT NULL DEFAULT '',
+            expiry_date TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'valid',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_coas_lot
+            ON erp_quality_coas (lot_id);
+        -- erp_quality_haccp: HACCP plan records only -- no certification
+        -- workflow in this wave.
+        CREATE TABLE IF NOT EXISTS erp_quality_haccp (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            product_line TEXT NOT NULL DEFAULT '',
+            hazard TEXT NOT NULL DEFAULT '',
+            ccp TEXT NOT NULL DEFAULT '',
+            monitoring_frequency TEXT NOT NULL DEFAULT '',
+            corrective_action TEXT NOT NULL DEFAULT '',
+            owner TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        -- Additions Wave C (Item 7): digital quality checklists.
+        -- erp_quality_checklist_templates holds the reusable templates:
+        -- items_json is [{label, kind}] with kind pass_fail or
+        -- temperature (a temperature field is optional per item).
+        -- erp_quality_checklists holds one completed checklist per
+        -- (template, store, day): items_json snapshots the template's
+        -- items with their answers [{label, kind, result, temperature_f}],
+        -- so editing a template never rewrites history. store_id NULL
+        -- means company-wide (not tied to one store). TEXT ONLY -- no
+        -- photo upload exists anywhere in the ERP, and the UI says so.
+        -- Food-safety records are NOT in _ERP_RESET_TABLES.
+        CREATE TABLE IF NOT EXISTS erp_quality_checklist_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL DEFAULT '',
+            items_json TEXT NOT NULL DEFAULT '[]',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_quality_checklists (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER,
+            template_name TEXT NOT NULL DEFAULT '',
+            checklist_date TEXT NOT NULL DEFAULT '',
+            items_json TEXT NOT NULL DEFAULT '[]',
+            completed_by TEXT NOT NULL DEFAULT '',
+            completed_at TEXT NOT NULL,
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_checklists_store_date
+            ON erp_quality_checklists (store_id, checklist_date);
+        -- Dept 14 (Legal & Compliance) Wave B: trademark/IP register,
+        -- contracts + insurance register, and compliance calendar.
+        -- Like the HR/staff/Quality records, legal records are NOT in
+        -- _ERP_RESET_TABLES -- a wipe must never erase them.
+        -- erp_legal_ip: one row per mark (wordmark, logo, domain, or
+        -- other IP). status is unfiled/filed/pending/registered; the
+        -- renewal deadline is the date to watch -- a registered mark
+        -- lapses if its renewal is missed.
+        CREATE TABLE IF NOT EXISTS erp_legal_ip (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL DEFAULT '',
+            type TEXT NOT NULL DEFAULT 'trademark',
+            status TEXT NOT NULL DEFAULT 'unfiled',
+            filing_date TEXT NOT NULL DEFAULT '',
+            registration_date TEXT NOT NULL DEFAULT '',
+            renewal_deadline TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_legal_ip_renewal
+            ON erp_legal_ip (renewal_deadline);
+        -- erp_legal_agreements: contracts and insurance policies, one
+        -- row per agreement. renewal_notice_days is how many days
+        -- before the end/expiry date the renewal alert fires.
+        CREATE TABLE IF NOT EXISTS erp_legal_agreements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            counterparty TEXT NOT NULL DEFAULT '',
+            type TEXT NOT NULL DEFAULT 'contract',
+            title TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT '',
+            end_date TEXT NOT NULL DEFAULT '',
+            renewal_notice_days INTEGER NOT NULL DEFAULT 30,
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_legal_agreements_end
+            ON erp_legal_agreements (end_date);
+        -- Additions Wave C (Item 6): lease accounting (ASC 842).
+        -- erp_legal_lease_schedules is one row per lease, linked to the
+        -- contracts register (leases live there as agreements -- a lease
+        -- with no agreement row cannot be entered). commencement,
+        -- term, payment, discount rate, ROU asset and liability are ALL
+        -- entered by the user, never computed from invented inputs; the
+        -- present value and the month-by-month amortization table are
+        -- computed from those entered inputs and shown. Monthly
+        -- amortization posts to the ledger only on an explicit admin
+        -- click per month (source 'lease', source_id '<id>:<month>'),
+        -- so a posted month is idempotent by construction. Legal
+        -- records are NOT in _ERP_RESET_TABLES -- a wipe must never
+        -- erase them.
+        CREATE TABLE IF NOT EXISTS erp_legal_lease_schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agreement_id INTEGER NOT NULL,
+            commencement TEXT NOT NULL DEFAULT '',
+            term_months INTEGER NOT NULL DEFAULT 0,
+            monthly_payment_cents INTEGER NOT NULL DEFAULT 0,
+            discount_rate_bps INTEGER NOT NULL DEFAULT 0,
+            rou_asset_cents INTEGER NOT NULL DEFAULT 0,
+            liability_cents INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_legal_leases_agreement
+            ON erp_legal_lease_schedules (agreement_id);
+        -- erp_legal_compliance: obligations with a due date. status is
+        -- stored as open/done only -- "overdue" is computed from the
+        -- due date vs today and never stored.
+        CREATE TABLE IF NOT EXISTS erp_legal_compliance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            obligation TEXT NOT NULL DEFAULT '',
+            authority TEXT NOT NULL DEFAULT '',
+            due_date TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_legal_compliance_due
+            ON erp_legal_compliance (due_date);
+        -- Dept 14 (Stores) Wave A: store locations, the transfer
+        -- workflow, POS sales intake and Z-reports. Stores start
+        -- EMPTY -- nothing is seeded, and the Henderson facility (HEN)
+        -- is production, not a store, so it is never auto-promoted.
+        -- erp_stores.location_id is a nullable link to erp_locations:
+        -- only a store with a linked location has per-store stock,
+        -- read from the existing erp_stock_ledger / erp_lots.
+        CREATE TABLE IF NOT EXISTS erp_stores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            address TEXT NOT NULL DEFAULT '',
+            type TEXT NOT NULL DEFAULT 'prepackaged',
+            open_date TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            location_id INTEGER,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_stores_location
+            ON erp_stores (location_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_stores_status
+            ON erp_stores (status);
+        -- erp_store_transfers: the request/approve/receive workflow on
+        -- top of the immediate-transfer movement model. The receive
+        -- step posts transfer_out / transfer_in stock-ledger movements
+        -- (shared "TR-xxxxxxxx" group ref, same avg cost) exactly like
+        -- POST /api/erp/transfer; lot_codes is the JSON list of
+        -- {lot_code, qty} actually moved (FEFO order for lot-tracked
+        -- items, "" for untracked stock). No transfer ever posts to
+        -- the accounting ledger.
+        CREATE TABLE IF NOT EXISTS erp_store_transfers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_location_id INTEGER NOT NULL,
+            to_location_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            qty REAL NOT NULL,
+            status TEXT NOT NULL DEFAULT 'requested',
+            note TEXT NOT NULL DEFAULT '',
+            transfer_ref TEXT NOT NULL DEFAULT '',
+            lot_codes TEXT NOT NULL DEFAULT '',
+            requested_by TEXT NOT NULL DEFAULT '',
+            requested_at TEXT NOT NULL,
+            approved_by TEXT NOT NULL DEFAULT '',
+            approved_at TEXT NOT NULL DEFAULT '',
+            received_by TEXT NOT NULL DEFAULT '',
+            received_at TEXT NOT NULL DEFAULT '',
+            cancelled_by TEXT NOT NULL DEFAULT '',
+            cancelled_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_transfers_status
+            ON erp_store_transfers (status);
+        CREATE INDEX IF NOT EXISTS idx_erp_store_transfers_item
+            ON erp_store_transfers (item_id);
+        -- erp_store_sales: POS sales intake only. items_json is the
+        -- list of {flavor, qty, amount_cents} as posted; total_cents
+        -- is their sum. (store_id, sale_key) is unique so a POS retry
+        -- with the same client-supplied key is idempotent. Intake
+        -- NEVER touches the accounting ledger -- Dept 9 sales
+        -- auto-posting reads orders; POS sales are a separate feed
+        -- until the user decides how they post.
+        CREATE TABLE IF NOT EXISTS erp_store_sales (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            sale_key TEXT NOT NULL,
+            register TEXT NOT NULL DEFAULT '',
+            tender TEXT NOT NULL DEFAULT '',
+            total_cents INTEGER NOT NULL DEFAULT 0,
+            items_json TEXT NOT NULL DEFAULT '[]',
+            tenders_json TEXT NOT NULL DEFAULT '{}',
+            sold_at TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE (store_id, sale_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_sales_store_date
+            ON erp_store_sales (store_id, sold_at);
+        -- erp_store_zreports: one Z-report per (store, register, date).
+        -- totals_json is {tender: cents}; variance_cents is computed
+        -- as cash_count_cents minus the cash total, never trusted
+        -- from the POS payload.
+        CREATE TABLE IF NOT EXISTS erp_store_zreports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            register TEXT NOT NULL DEFAULT '',
+            report_date TEXT NOT NULL,
+            totals_json TEXT NOT NULL DEFAULT '{}',
+            cash_count_cents INTEGER NOT NULL DEFAULT 0,
+            variance_cents INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE (store_id, register, report_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_zreports_store_date
+            ON erp_store_zreports (store_id, report_date);
+        -- Dept 14 (Stores) Wave B: recurring weekly shift templates
+        -- + timeclock. erp_store_shifts is the weekly template per
+        -- store: weekday is 0=Monday..6=Sunday, times are HH:MM, role
+        -- is free text. employee_id links erp_hr_employees (never
+        -- erp_hr_events / erp_hr_time_records -- those are one-off
+        -- cash-paid event records, not shifts). erp_store_timeclock is
+        -- one row per clock-in: clock_out '' while open, hours computed
+        -- on clock-out. Hours are formally paid -- they are visible to
+        -- the Phase 1 payroll structure (erp_acct_payruns) but this
+        -- build NEVER creates a payrun or posts payroll from them.
+        CREATE TABLE IF NOT EXISTS erp_store_shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            employee_id INTEGER NOT NULL,
+            weekday INTEGER NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_shifts_store
+            ON erp_store_shifts (store_id, weekday);
+        CREATE INDEX IF NOT EXISTS idx_erp_store_shifts_employee
+            ON erp_store_shifts (employee_id);
+        CREATE TABLE IF NOT EXISTS erp_store_timeclock (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shift_id INTEGER NOT NULL,
+            employee_id INTEGER NOT NULL,
+            clock_in TEXT NOT NULL,
+            clock_out TEXT NOT NULL DEFAULT '',
+            hours REAL,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_timeclock_shift
+            ON erp_store_timeclock (shift_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_store_timeclock_employee
+            ON erp_store_timeclock (employee_id);
+        -- Dept 14 (Stores) Wave C: facilities & maintenance, loss
+        -- prevention (register voids + cash audits), and planograms.
+        -- All four tables start EMPTY -- no equipment catalog, no
+        -- seeded rows. equipment / area are free text: nothing is
+        -- invented. erp_store_maintenance.status is open / in-progress
+        -- / done; priority is low / medium / high / urgent.
+        -- erp_store_cash_audits.variance_cents is always computed
+        -- server-side as counted minus expected, never trusted from
+        -- the payload; z_report_id is a nullable link to the Z-report
+        -- the audit counts against (same store only).
+        -- erp_store_planograms is a text record only: no images, no
+        -- drag-and-drop. active = 1 is the current layout for its area.
+        CREATE TABLE IF NOT EXISTS erp_store_maintenance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            equipment TEXT NOT NULL,
+            issue TEXT NOT NULL,
+            priority TEXT NOT NULL DEFAULT 'medium',
+            status TEXT NOT NULL DEFAULT 'open',
+            reported_by TEXT NOT NULL DEFAULT '',
+            due_date TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            pm_schedule_id INTEGER,
+            auto_created INTEGER NOT NULL DEFAULT 0,
+            dispatched_to TEXT NOT NULL DEFAULT '',
+            dispatched_at TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_maintenance_store
+            ON erp_store_maintenance (store_id, status);
+        CREATE TABLE IF NOT EXISTS erp_store_voids (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            register TEXT NOT NULL DEFAULT '',
+            sale_key TEXT NOT NULL DEFAULT '',
+            amount_cents INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            actor TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_voids_store
+            ON erp_store_voids (store_id);
+        CREATE TABLE IF NOT EXISTS erp_store_cash_audits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            z_report_id INTEGER,
+            counted_cents INTEGER NOT NULL DEFAULT 0,
+            expected_cents INTEGER NOT NULL DEFAULT 0,
+            variance_cents INTEGER NOT NULL DEFAULT 0,
+            actor TEXT NOT NULL DEFAULT '',
+            audit_date TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_cash_audits_store
+            ON erp_store_cash_audits (store_id);
+        CREATE TABLE IF NOT EXISTS erp_store_planograms (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            area TEXT NOT NULL,
+            layout_notes TEXT NOT NULL DEFAULT '',
+            effective_date TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            layout_json TEXT NOT NULL DEFAULT '[]',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_planograms_store
+            ON erp_store_planograms (store_id, area);
+        -- Dept 14 (Stores) Additions Wave B: loss-prevention flags +
+        -- preventive-maintenance schedules. Both start EMPTY.
+        -- erp_store_lp_flags is the exception-rules output: rule is
+        -- void_above_threshold / discount_above_threshold /
+        -- refund_above_threshold / nosale_drawer_open; sale_key is
+        -- the POS sale key for sale-based rules and "drawer:<id>"
+        -- for a no-sale drawer open; z_report_id is kept for a
+        -- future Z-report link and is NULL for now. status is open
+        -- / reviewed / dismissed. Flags are computed from existing
+        -- register data (voids, sales, drawers) and deduped on
+        -- (store_id, rule, sale_key) -- a dismissed flag never
+        -- re-creates. erp_store_pm_schedules is the recurring
+        -- schedule: equipment / assigned vendor are free text,
+        -- interval_days is the repeat in days, last_done is the
+        -- last completed date ('' = never done, so next_due is
+        -- unset and nothing auto-creates until a first date is
+        -- set). next_due is always computed, never stored.
+        CREATE TABLE IF NOT EXISTS erp_store_lp_flags (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            rule TEXT NOT NULL,
+            sale_key TEXT NOT NULL DEFAULT '',
+            z_report_id INTEGER,
+            amount_cents INTEGER NOT NULL DEFAULT 0,
+            actor TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            detail TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_lp_flags_store
+            ON erp_store_lp_flags (store_id, status);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_erp_store_lp_flags_dedupe
+            ON erp_store_lp_flags (store_id, rule, sale_key);
+        CREATE TABLE IF NOT EXISTS erp_store_pm_schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            equipment TEXT NOT NULL,
+            interval_days INTEGER NOT NULL,
+            last_done TEXT NOT NULL DEFAULT '',
+            assigned_vendor TEXT NOT NULL DEFAULT '',
+            vendor_email TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_pm_schedules_store
+            ON erp_store_pm_schedules (store_id);
+        -- Dept 14 (Stores) Additions Wave A: cash drawers + store
+        -- settings. erp_store_drawers is one row per drawer open:
+        -- status is open while the register is trading, closed once
+        -- the cashier closes it; closeout itself is the Z-report
+        -- (erp_store_zreports), never a drawer row. At most one open
+        -- drawer per (store, register) -- enforced in the endpoint.
+        -- erp_store_settings is the same key/value mechanism as
+        -- erp_production_settings, for store-wide settings. Keys:
+        -- ot_weekly_threshold_hours (default 40), ot_daily_threshold_hours
+        -- (default 8). Settings survive a wipe like production settings.
+        CREATE TABLE IF NOT EXISTS erp_store_drawers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            register TEXT NOT NULL DEFAULT '',
+            float_cents INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            opened_by TEXT NOT NULL DEFAULT '',
+            opened_at TEXT NOT NULL,
+            closed_by TEXT NOT NULL DEFAULT '',
+            closed_at TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_drawers_store
+            ON erp_store_drawers (store_id, register, status);
+        CREATE TABLE IF NOT EXISTS erp_store_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL DEFAULT ''
+        );
+        -- Dept 10 Settings Wave C (items 5 + 6): wipe-export tokens and
+        -- deletion tombstones. Both deliberately NOT in _ERP_RESET_TABLES
+        -- (see the asserts below): a wipe must not erase the record of
+        -- which export authorized it, and must not resurrect anything the
+        -- user deliberately deleted -- a later restore of a pre-wipe
+        -- export skips tombstoned rows.
+        -- erp_wipe_exports: one row per full-export generation. token is
+        -- single-use and latest-only (see _erp_new_wipe_token): generating
+        -- a new export invalidates older unconsumed tokens, and a
+        -- successful wipe consumes its token and invalidates the rest.
+        CREATE TABLE IF NOT EXISTS erp_wipe_exports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token TEXT UNIQUE NOT NULL,
+            actor TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            consumed_at TEXT NOT NULL DEFAULT '',
+            invalidated_at TEXT NOT NULL DEFAULT '',
+            row_counts TEXT NOT NULL DEFAULT ''
+        );
+        -- erp_deleted_keys: natural keys of user-deleted rows, so an
+        -- import can never bring them back. kind/key are lowercased on
+        -- write and read. Kinds: item (sku), location (code),
+        -- wholesale_account (name), recipe (name).
+        CREATE TABLE IF NOT EXISTS erp_deleted_keys (
+            kind TEXT NOT NULL,
+            key TEXT NOT NULL,
+            deleted_by TEXT NOT NULL DEFAULT '',
+            deleted_at TEXT NOT NULL,
+            PRIMARY KEY (kind, key)
+        );
         CREATE TABLE IF NOT EXISTS erp_wholesale_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -1282,6 +2320,52 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_erp_prod_lines ON erp_order_production_lines (order_id);
         """
     )
+    # Dept 10 Settings Wave A (item 1): seed the company profile once.
+    # INSERT OR IGNORE so an admin-edited row is never overwritten.
+    # Known values only: legal name FUDGETOPIA LLC; facility address is the
+    # address on the nutritional labels; office address is the business
+    # address used elsewhere; base currency USD. EIN and fiscal year are
+    # NOT known -- they start blank and the UI says "Not provided".
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_company_profile (id, legal_name,"
+        " facility_address, office_address, ein, fiscal_year,"
+        " base_currency, updated_at) VALUES (1, 'FUDGETOPIA LLC',"
+        " '6290 McLeod Dr, Suite 120, Las Vegas, NV 89120',"
+        " '2013 Angel Falls Dr, Henderson, NV 89074', '', '', 'USD', ?)",
+        (datetime.now(timezone.utc).isoformat(),))
+    # Dept 14 (Legal & Compliance) Wave B: seed the known legal facts
+    # once. INSERT OR IGNORE with fixed ids so an admin-edited row is
+    # never overwritten -- and so re-running init_db adds nothing. The
+    # wordmark is unfiled (no filing dates invented); the FDA renewal
+    # is due 2028-12-31; the UFI/DUNS mismatch has no due date.
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_legal_ip (id, name, type, status,"
+        " filing_date, registration_date, renewal_deadline, notes,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (1, 'Pop-A-Licious', 'trademark', 'unfiled', '', '', '',"
+        " 'Blocks Amazon Brand Registry until filed', 'seed', ?, 'seed', ?)",
+        (datetime.now(timezone.utc).isoformat(),
+         datetime.now(timezone.utc).isoformat()))
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_legal_compliance (id, obligation,"
+        " authority, due_date, status, notes, created_by, created_at,"
+        " updated_by, updated_at)"
+        " VALUES (1, 'FDA facility registration renewal', 'FDA',"
+        " '2028-12-31', 'open',"
+        " 'Renewed Oct 24, 2026; registration No. 18291194996',"
+        " 'seed', ?, 'seed', ?)",
+        (datetime.now(timezone.utc).isoformat(),
+         datetime.now(timezone.utc).isoformat()))
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_legal_compliance (id, obligation,"
+        " authority, due_date, status, notes, created_by, created_at,"
+        " updated_by, updated_at)"
+        " VALUES (2, 'UFI/DUNS mismatch reconciliation', 'FDA', '', 'open',"
+        " 'Submission in FDA manual-review queue — reconcile the D&B"
+        " record and watch for FDA''s review email',"
+        " 'seed', ?, 'seed', ?)",
+        (datetime.now(timezone.utc).isoformat(),
+         datetime.now(timezone.utc).isoformat()))
     # Item cost fields (manual cost per unit + cup weight for recipe costing);
     # guarded for databases created before these columns existed.
     icols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_items)").fetchall()]
@@ -1315,6 +2399,41 @@ def init_db():
             conn.execute("ALTER TABLE erp_items ADD COLUMN %s REAL" % _ncol)
     if "ingredients_text" not in icols:
         conn.execute("ALTER TABLE erp_items ADD COLUMN ingredients_text TEXT")
+    # Prod9 Wave 1: labor + overhead on batches (guarded for databases
+    # created before these columns existed).
+    bcols = [r["name"] for r in conn.execute(
+        "PRAGMA table_info(erp_production_batches)").fetchall()]
+    for _bcol, _bdef in (
+            ("labor_minutes", "REAL"),
+            ("labor_rate_cents_per_hour", "INTEGER"),
+            ("overhead_pct", "REAL"),
+            ("ingredient_cost_cents", "INTEGER"),
+            ("labor_cost_cents", "INTEGER"),
+            ("overhead_cents", "INTEGER")):
+        if _bcol not in bcols:
+            conn.execute("ALTER TABLE erp_production_batches ADD COLUMN %s %s"
+                         % (_bcol, _bdef))
+    # Prod9 Wave 2: batch QC-hold flag + waste reason (guarded for
+    # databases created before these columns existed).
+    for _bcol, _bdef in (
+            ("qc_hold", "INTEGER"),
+            ("qc_hold_reason", "TEXT"),
+            ("qc_hold_by", "TEXT"),
+            ("qc_hold_at", "TEXT"),
+            ("qc_hold_released_by", "TEXT"),
+            ("qc_hold_released_at", "TEXT"),
+            ("qc_hold_release_reason", "TEXT"),
+            ("waste_reason", "TEXT")):
+        if _bcol not in bcols:
+            conn.execute("ALTER TABLE erp_production_batches ADD COLUMN %s %s"
+                         % (_bcol, _bdef))
+    # Prod9 Wave 3: scheduled date on batches (guarded for databases
+    # created before this column existed).
+    _bcols3 = [r["name"] for r in conn.execute(
+        "PRAGMA table_info(erp_production_batches)").fetchall()]
+    if "scheduled_date" not in _bcols3:
+        conn.execute("ALTER TABLE erp_production_batches"
+                     " ADD COLUMN scheduled_date TEXT NOT NULL DEFAULT ''")
     if "allergens_text" not in icols:
         conn.execute("ALTER TABLE erp_items ADD COLUMN allergens_text TEXT")
     conn.commit()
@@ -1447,6 +2566,660 @@ def init_db():
     _wcols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_orders)").fetchall()]
     if "shipping_cents" not in _wcols:
         conn.execute("ALTER TABLE erp_wholesale_orders ADD COLUMN shipping_cents INTEGER NOT NULL DEFAULT 0")
+    # ---- Accounting ledger (Phase 1) ----
+    # Posted entries are PERMANENT: no edit/delete endpoints exist; a mistake
+    # is fixed with a reversing entry. Audit rows record every write.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS erp_acct_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            parent_id INTEGER,
+            qb_id TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_journal (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL,
+            memo TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            source_id TEXT NOT NULL DEFAULT '',
+            posted_at TEXT NOT NULL,
+            posted_by TEXT NOT NULL DEFAULT '',
+            reversed_by INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_journal_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_id INTEGER NOT NULL,
+            account_id INTEGER NOT NULL,
+            debit_cents INTEGER NOT NULL DEFAULT 0,
+            credit_cents INTEGER NOT NULL DEFAULT 0,
+            memo TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id INTEGER NOT NULL DEFAULT 0,
+            detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_period_locks (
+            period TEXT PRIMARY KEY,
+            locked_at TEXT NOT NULL,
+            locked_by TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_sale_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            ref_id INTEGER NOT NULL DEFAULT 0,
+            journal_entry_id INTEGER,
+            invoice_id INTEGER,
+            store_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'posted',
+            amount_cents INTEGER NOT NULL DEFAULT 0,
+            tax_cents INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '',
+            posted_at TEXT NOT NULL,
+            posted_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS erp_acct_invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_name TEXT NOT NULL,
+            customer_id INTEGER,
+            customer_type TEXT NOT NULL DEFAULT 'wholesale',
+            date TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            lines TEXT NOT NULL DEFAULT '[]',
+            subtotal_cents INTEGER NOT NULL DEFAULT 0,
+            tax_cents INTEGER NOT NULL DEFAULT 0,
+            total_cents INTEGER NOT NULL DEFAULT 0,
+            balance_cents INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            journal_entry_id INTEGER,
+            qb_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_bills (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vendor_id INTEGER NOT NULL,
+            vendor_name TEXT NOT NULL DEFAULT '',
+            date TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            lines TEXT NOT NULL DEFAULT '[]',
+            total_cents INTEGER NOT NULL DEFAULT 0,
+            balance_cents INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            journal_entry_id INTEGER,
+            qb_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        -- Dept 9 wave C, item 5: credit notes. Column names invoice_id /
+        -- date / amount_cents / status are the wave-B contract: wave B's
+        -- _acct_statement_credits reads exactly those columns, so a credit
+        -- note issued here flows into customer statements with no code
+        -- change on that side. status is 'issued'; there is no void for a
+        -- credit note (a wrong credit is corrected by a new invoice-side
+        -- adjustment, never by deleting or editing this row).
+        CREATE TABLE IF NOT EXISTS erp_acct_credit_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            reason TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'issued',
+            journal_entry_id INTEGER,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        -- Dept 9 wave C, item 4: stored bill <-> PO-line links. Bill lines
+        -- as stored carry description/amount/account only (no qty, rate or
+        -- item), so billed quantities and billed unit prices CANNOT be
+        -- computed from bill rows -- they are stored here, one row per
+        -- (bill, PO line), upserted by the link endpoint. Ordered vs
+        -- received is computed on read from erp_po_lines (qty_ordered /
+        -- qty_received, maintained by the Inventory receiving flow, with
+        -- lots in erp_lots and ledger rows movement_type='purchase_receipt'
+        -- ref_id=<po_number>). So: billed side stored, ordered/received
+        -- side computed -- the stored link is the minimum that makes
+        -- matching possible at all, and the match itself is always
+        -- computed live, never a stale stored verdict.
+        -- Dept 9 wave D, item 7: owner draws. One row per draw
+        -- request; the money moves only on approval, as a journal
+        -- entry through _acct_post_entry (source "draw"). status is
+        -- requested / approved / rejected / cancelled; a rejected or
+        -- cancelled draw posts nothing and can never be approved
+        -- later. requested_by / decided_by are _erp_actor() strings
+        -- (admin email, or "staff:<name>"); approval requires a
+        -- different actor than the requester. bank_account_id NULL
+        -- means the seeded Checking -- Operating (1010).
+        CREATE TABLE IF NOT EXISTS erp_acct_draws (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_name TEXT NOT NULL,
+            date TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            memo TEXT NOT NULL DEFAULT '',
+            bank_account_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'requested',
+            requested_by TEXT NOT NULL DEFAULT '',
+            decided_by TEXT NOT NULL DEFAULT '',
+            journal_entry_id INTEGER,
+            created_at TEXT NOT NULL,
+            decided_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_bill_po_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_id INTEGER NOT NULL,
+            po_id INTEGER NOT NULL,
+            po_line_id INTEGER NOT NULL,
+            item_id INTEGER NOT NULL,
+            qty_billed REAL NOT NULL,
+            unit_price_cents INTEGER NOT NULL,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE(bill_id, po_line_id)
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            invoice_id INTEGER,
+            bill_id INTEGER,
+            date TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            method TEXT NOT NULL DEFAULT 'cash',
+            bank_account_id INTEGER,
+            journal_entry_id INTEGER,
+            approval_note TEXT NOT NULL DEFAULT '',
+            qb_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_bank_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            plaid_account_id TEXT,
+            gl_account_id INTEGER NOT NULL,
+            qb_id TEXT,
+            opening_balance_cents INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            last_reconciled_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_bank_txns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bank_account_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            amount_cents INTEGER NOT NULL,
+            plaid_txn_id TEXT UNIQUE,
+            matched_entry_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'unmatched',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_tax_rates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            jurisdiction TEXT NOT NULL,
+            rate_bps INTEGER NOT NULL,
+            effective_from TEXT NOT NULL,
+            effective_to TEXT,
+            source TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_tax_filings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            jurisdiction TEXT NOT NULL,
+            taxable_sales_cents INTEGER NOT NULL DEFAULT 0,
+            tax_collected_cents INTEGER NOT NULL DEFAULT 0,
+            tax_remitted_cents INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            filed_at TEXT,
+            filed_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_tax_remittances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filing_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            reference TEXT NOT NULL DEFAULT '',
+            journal_entry_id INTEGER,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_reconciliations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bank_account_id INTEGER NOT NULL,
+            closed_at TEXT NOT NULL,
+            closed_by TEXT NOT NULL DEFAULT '',
+            book_balance_cents INTEGER NOT NULL,
+            bank_balance_cents INTEGER NOT NULL,
+            difference_cents INTEGER NOT NULL,
+            unmatched_count INTEGER NOT NULL,
+            forced INTEGER NOT NULL DEFAULT 0,
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS erp_acct_employees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            first_name TEXT NOT NULL,
+            last_name TEXT NOT NULL,
+            pay_type TEXT NOT NULL,
+            rate_cents INTEGER NOT NULL,
+            pay_schedule TEXT NOT NULL,
+            filing_status TEXT NOT NULL DEFAULT 'single',
+            step2_checkbox INTEGER NOT NULL DEFAULT 0,
+            step3_credit_cents INTEGER NOT NULL DEFAULT 0,
+            step4a_cents INTEGER NOT NULL DEFAULT 0,
+            step4b_cents INTEGER NOT NULL DEFAULT 0,
+            step4c_cents INTEGER NOT NULL DEFAULT 0,
+            exempt INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            qb_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_payruns (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            pay_date TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'draft',
+            gross_cents INTEGER NOT NULL DEFAULT 0,
+            federal_withheld_cents INTEGER NOT NULL DEFAULT 0,
+            ss_cents INTEGER NOT NULL DEFAULT 0,
+            medicare_cents INTEGER NOT NULL DEFAULT 0,
+            employer_tax_cents INTEGER NOT NULL DEFAULT 0,
+            employer_ss_cents INTEGER NOT NULL DEFAULT 0,
+            employer_medicare_cents INTEGER NOT NULL DEFAULT 0,
+            net_cents INTEGER NOT NULL DEFAULT 0,
+            journal_entry_id INTEGER,
+            approved_by TEXT NOT NULL DEFAULT '',
+            approved_at TEXT,
+            paid_at TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_payrun_lines (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payrun_id INTEGER NOT NULL,
+            employee_id INTEGER NOT NULL,
+            hours REAL,
+            gross_cents INTEGER NOT NULL DEFAULT 0,
+            federal_cents INTEGER NOT NULL DEFAULT 0,
+            ss_cents INTEGER NOT NULL DEFAULT 0,
+            medicare_cents INTEGER NOT NULL DEFAULT 0,
+            net_cents INTEGER NOT NULL DEFAULT 0,
+            pay_stub_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_payroll_tax_tables (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tax_year INTEGER NOT NULL,
+            table_name TEXT NOT NULL,
+            brackets TEXT NOT NULL DEFAULT '{}',
+            source TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_acct_payroll_filings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quarter TEXT NOT NULL UNIQUE,
+            federal_cents INTEGER NOT NULL DEFAULT 0,
+            ss_cents INTEGER NOT NULL DEFAULT 0,
+            medicare_cents INTEGER NOT NULL DEFAULT 0,
+            employer_tax_cents INTEGER NOT NULL DEFAULT 0,
+            filed_at TEXT NOT NULL,
+            filed_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        """
+    )
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS erp_acct_migration_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            qb_type TEXT NOT NULL,
+            qb_id TEXT NOT NULL,
+            erp_type TEXT NOT NULL,
+            erp_id INTEGER NOT NULL,
+            imported_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_acct_migration_links
+            ON erp_acct_migration_links (qb_type, qb_id);
+        CREATE TABLE IF NOT EXISTS erp_mkt_ig_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            caption TEXT NOT NULL DEFAULT '',
+            media_json TEXT NOT NULL DEFAULT '{"files": [], "covers": []}',
+            promo_date TEXT,
+            status TEXT NOT NULL DEFAULT 'draft',
+            publish_at TEXT,
+            container_expires_at TEXT,
+            ig_media_id TEXT,
+            ig_url TEXT,
+            failure_note TEXT,
+            publish_path TEXT,
+            check_requested_at TEXT,
+            last_checked_at TEXT,
+            check_live INTEGER,
+            check_caption_intact INTEGER,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            approved_by TEXT,
+            approved_at TEXT,
+            published_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS erp_login_codes (
+            code_hash TEXT PRIMARY KEY,
+            token TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_ig_insights (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL,
+            ig_media_id TEXT,
+            window TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            captured_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_ig_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending',
+            result_note TEXT,
+            created_at TEXT NOT NULL,
+            done_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_newsletters (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            issue_month TEXT NOT NULL,
+            theme TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL DEFAULT '',
+            body_html TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'draft',
+            campaign_key TEXT NOT NULL,
+            approved_by TEXT,
+            approved_at TEXT,
+            sent_at TEXT,
+            recipient_count INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_mkt_newsletters_month
+            ON erp_mkt_newsletters (issue_month);
+        CREATE TABLE IF NOT EXISTS erp_mkt_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source TEXT NOT NULL DEFAULT 'manual',
+            message_id TEXT,
+            customer_email TEXT NOT NULL,
+            customer_name TEXT NOT NULL DEFAULT '',
+            subject TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            order_source TEXT,
+            order_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            resolved_by TEXT,
+            resolved_at TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_mkt_tickets_message
+            ON erp_mkt_tickets (message_id) WHERE message_id IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS erp_mkt_ticket_replies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticket_id INTEGER NOT NULL,
+            author TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            is_internal_note INTEGER NOT NULL DEFAULT 0,
+            sent_via TEXT,
+            sent_at TEXT,
+            sent_by TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_newsletter_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            campaign_key TEXT,
+            event_type TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            resend_event_id TEXT,
+            url TEXT,
+            received_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_mkt_newsletter_events_eid
+            ON erp_mkt_newsletter_events (resend_event_id)
+            WHERE resend_event_id IS NOT NULL;
+        CREATE TABLE IF NOT EXISTS erp_mkt_audit (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor TEXT NOT NULL DEFAULT '',
+            action TEXT NOT NULL,
+            target_type TEXT NOT NULL,
+            target_id INTEGER,
+            detail TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_customer_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_key TEXT NOT NULL,
+            email TEXT NOT NULL DEFAULT '',
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            note TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            updated_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_mkt_customer_notes_key
+            ON erp_mkt_customer_notes (customer_key);
+        CREATE TABLE IF NOT EXISTS erp_mkt_ig_comments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_id INTEGER NOT NULL,
+            ig_media_id TEXT NOT NULL DEFAULT '',
+            comment_id TEXT NOT NULL,
+            username TEXT NOT NULL DEFAULT '',
+            text TEXT NOT NULL DEFAULT '',
+            commented_at TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            fetched_at TEXT NOT NULL,
+            UNIQUE(comment_id)
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_promo_overrides (
+            code TEXT PRIMARY KEY,
+            disabled INTEGER NOT NULL DEFAULT 0,
+            note TEXT NOT NULL DEFAULT '',
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS erp_mkt_winback_sends (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            customer_key TEXT NOT NULL,
+            email TEXT NOT NULL,
+            subject TEXT NOT NULL DEFAULT '',
+            sent_at TEXT NOT NULL,
+            sent_by TEXT NOT NULL DEFAULT ''
+        );
+    """)
+    # Migration: sent_by on ticket replies (who sent a reply email, Dept 8
+    # item 1). Fresh DBs get it from the CREATE TABLE above.
+    _mkt_reply_cols = [r[1] for r in conn.execute(
+        "PRAGMA table_info(erp_mkt_ticket_replies)").fetchall()]
+    if "sent_by" not in _mkt_reply_cols:
+        conn.execute("ALTER TABLE erp_mkt_ticket_replies"
+                     " ADD COLUMN sent_by TEXT")
+    # Seed the first Instagram schedule records from the approved promo
+    # schedule draft (one-stop Phase 3, spec section 6 step 2): the next 4
+    # upcoming entries. Drafts only — approval happens in the ERP.
+    if conn.execute("SELECT COUNT(*) AS c FROM erp_mkt_ig_posts").fetchone()["c"] == 0:
+        _mkt_now = datetime.now(timezone.utc).isoformat()
+        for _kind, _cap, _files, _promo, _pub in (
+                ("post",
+                 "Pickle people are loyal \u2014 give them their day. Dill Pickle, 15% off today.",
+                 ["ad20d5dd03e863b0b25cfd118f2b33cb8b1c1db5d782ad1a069dd012422158af.jpg"],
+                 "2026-11-14", "2026-11-15T02:00:00+00:00"),
+                ("post",
+                 "Every day is someone's birthday. Birthday Cake, 15% off today.",
+                 ["a34ae8828587d87669b243542fcad4798ce37eba183e85a708e7fcd01d697daf.jpg"],
+                 "2026-11-26", "2026-11-27T00:00:00+00:00"),
+                ("carousel",
+                 "Holiday gifting: cookie trio, 15% off today \u2014 or any 3 cookie flavors for $20.",
+                 ["0568b3a85283b0bf4acf851eb4bb391b03546af5e5a8ce6dd3e538e8d3adfcfd.jpg",
+                  "4054cff2ed9c1e496789a8e2bfab12cebb316273f71430d9868bc3f2ca106b21.jpg",
+                  "50914e76e8b578fac0ca29a5bf1be9d304677733dbd48ce819beaad150452aef.jpg"],
+                 "2026-12-04", "2026-12-05T02:00:00+00:00"),
+                ("post",
+                 "Year-end savory closer. Bacon, 15% off today.",
+                 ["7b3dd89a572074294c4bca4681205e96931050584da6696201ccae523d762ddf.jpg"],
+                 "2026-12-30", "2026-12-31T00:00:00+00:00")):
+            conn.execute(
+                "INSERT INTO erp_mkt_ig_posts (kind, caption, media_json, promo_date,"
+                " status, publish_at, created_by, created_at)"
+                " VALUES (?, ?, ?, ?, 'draft', ?, 'seed', ?)",
+                (_kind, _cap, json.dumps({"files": _files, "covers": []}),
+                 _promo, _pub, _mkt_now))
+    # Seed a standard small-business chart of accounts, only when empty.
+    # (code, name, type, parent code or None)
+    if conn.execute("SELECT COUNT(*) AS c FROM erp_acct_accounts").fetchone()["c"] == 0:
+        _now = datetime.now(timezone.utc).isoformat()
+        _acct_ids = {}
+        for _code, _name, _type, _parent in (
+                ("1000", "Cash and Cash Equivalents", "asset", None),
+                ("1010", "Checking — Operating", "asset", "1000"),
+                ("1020", "Petty Cash", "asset", "1000"),
+                ("1100", "Accounts Receivable", "asset", None),
+                ("1200", "Inventory — Finished Goods", "asset", None),
+                ("1210", "Inventory — Raw Materials", "asset", None),
+                ("1300", "Prepaid Expenses", "asset", None),
+                ("1500", "Equipment", "asset", None),
+                ("1510", "Accumulated Depreciation — Equipment", "asset", None),
+                ("2000", "Accounts Payable", "liability", None),
+                ("2100", "Sales Tax Payable", "liability", None),
+                ("2200", "Payroll Liabilities", "liability", None),
+                ("2300", "Credit Card Payable", "liability", None),
+                ("2400", "Lease Liability", "liability", None),
+                ("2350", "Gift Card Liability", "liability", None),
+                ("3000", "Owner's Equity", "equity", None),
+                ("3100", "Retained Earnings", "equity", None),
+                ("4000", "Sales — Retail", "income", None),
+                ("4100", "Sales — Wholesale", "income", None),
+                ("4200", "Shipping Income", "income", None),
+                ("4300", "Other Income", "income", None),
+                ("5000", "Cost of Goods Sold", "expense", None),
+                ("5100", "Packaging Expense", "expense", None),
+                ("1400", "Right-of-Use Asset \u2014 Leases", "asset", None),
+                ("6000", "Rent", "expense", None),
+                ("6050", "Lease Amortization Expense", "expense", None),
+                ("6100", "Utilities", "expense", None),
+                ("6200", "Marketing and Advertising", "expense", None),
+                ("6300", "Shipping Expense", "expense", None),
+                ("6400", "Merchant Fees", "expense", None),
+                ("6500", "Payroll Expense", "expense", None),
+                ("6600", "Payroll Tax Expense", "expense", None),
+                ("6700", "Supplies", "expense", None),
+                ("6800", "Professional Services", "expense", None),
+                ("6900", "Other Expenses", "expense", None),
+                ("6950", "Lease Interest Expense", "expense", None)):
+            _pid = _acct_ids.get(_parent) if _parent else None
+            _cur = conn.execute(
+                "INSERT INTO erp_acct_accounts (code, name, type, parent_id, qb_id,"
+                " active, created_at) VALUES (?, ?, ?, ?, NULL, 1, ?)",
+                (_code, _name, _type, _pid, _now))
+            _acct_ids[_code] = _cur.lastrowid
+    # Dept 9 (Nov 10, 2026): Gift Card Liability (2350) for gift-card
+    # purchase/redemption postings. INSERT OR IGNORE so pre-Dept-9 DBs
+    # gain it without touching the 31 seeded accounts.
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_acct_accounts (code, name, type,"
+        " parent_id, qb_id, active, created_at) VALUES"
+        " ('2350', 'Gift Card Liability', 'liability', NULL, NULL, 1, ?)",
+        (datetime.now(timezone.utc).isoformat(),))
+    # Additions Wave C (Nov 11, 2026): the four ASC 842 lease accounts
+    # (1400 ROU asset, 2400 lease liability, 6050 amortization expense,
+    # 6950 interest expense). INSERT OR IGNORE so pre-Wave-C DBs gain
+    # them without touching the seeded accounts.
+    for _code, _name, _type in (
+            ("1400", "Right-of-Use Asset \u2014 Leases", "asset"),
+            ("2400", "Lease Liability", "liability"),
+            ("6050", "Lease Amortization Expense", "expense"),
+            ("6950", "Lease Interest Expense", "expense")):
+        conn.execute(
+            "INSERT OR IGNORE INTO erp_acct_accounts (code, name, type,"
+            " parent_id, qb_id, active, created_at) VALUES"
+            " (?, ?, ?, NULL, NULL, 1, ?)",
+            (_code, _name, _type, datetime.now(timezone.utc).isoformat()))
+    # Seed sales-tax rates (Nevada only), only when the table is empty.
+    # Rates verified Nov 9, 2026 against the Nevada Department of Taxation
+    # county rate table: Clark County (Las Vegas/Henderson) combined rate
+    # 8.375%, in effect since Jan 1, 2020; statewide base 6.85%.
+    if conn.execute("SELECT COUNT(*) AS c FROM erp_acct_tax_rates").fetchone()["c"] == 0:
+        for _jur, _bps, _frm, _src in (
+                ("Clark County", 8375, "2020-01-01",
+                 "Nevada Department of Taxation county rate table — combined"
+                 " rate 8.375% in effect since Jan 1, 2020 (verified Nov 9, 2026)"),
+                ("Nevada — statewide base", 6850, "2020-01-01",
+                 "Nevada Department of Taxation — statewide base rate 6.85%"
+                 " (verified Nov 9, 2026)")):
+            conn.execute(
+                "INSERT INTO erp_acct_tax_rates (jurisdiction, rate_bps,"
+                " effective_from, effective_to, source, created_at)"
+                " VALUES (?, ?, ?, NULL, ?, ?)",
+                (_jur, _bps, _frm, _src, _now))
+    # Seed 2026 federal withholding tables (IRS Publication 15-T) and
+    # FICA parameters, only when the table is empty. Tables are DATA: a new
+    # tax year is a new set of rows, never a code change. Nevada has no
+    # state income tax, so there is no state withholding table.
+    if conn.execute("SELECT COUNT(*) AS c FROM erp_acct_payroll_tax_tables").fetchone()["c"] == 0:
+        _federal_src = ("IRS Publication 15-T (2026), Federal Income Tax"
+                        " Withholding Methods — Percentage Method Tables,"
+                        " STANDARD Withholding Rate Schedules"
+                        " (verified Nov 9, 2026)")
+        _federal_src2 = ("IRS Publication 15-T (2026) — Percentage Method"
+                         " Tables, Form W-4 Step 2 Checkbox Withholding Rate"
+                         " Schedules (verified Nov 9, 2026)")
+        for _name, _brackets, _src in (
+            ("federal-single-standard", [{"min_cents": 0, "base_cents": 0, "rate_bps": 0}, {"min_cents": 750000, "base_cents": 0, "rate_bps": 1000}, {"min_cents": 1990000, "base_cents": 124000, "rate_bps": 1200}, {"min_cents": 5790000, "base_cents": 580000, "rate_bps": 2200}, {"min_cents": 11320000, "base_cents": 1796600, "rate_bps": 2400}, {"min_cents": 20927500, "base_cents": 4102400, "rate_bps": 3200}, {"min_cents": 26372500, "base_cents": 5844800, "rate_bps": 3500}, {"min_cents": 64810000, "base_cents": 19297925, "rate_bps": 3700}], _federal_src),
+            ("federal-single-step2", [{"min_cents": 0, "base_cents": 0, "rate_bps": 0}, {"min_cents": 805000, "base_cents": 0, "rate_bps": 1000}, {"min_cents": 1425000, "base_cents": 62000, "rate_bps": 1200}, {"min_cents": 3325000, "base_cents": 290000, "rate_bps": 2200}, {"min_cents": 6090000, "base_cents": 898300, "rate_bps": 2400}, {"min_cents": 10893800, "base_cents": 2051200, "rate_bps": 3200}, {"min_cents": 13616300, "base_cents": 2922400, "rate_bps": 3500}, {"min_cents": 32835000, "base_cents": 9648963, "rate_bps": 3700}], _federal_src2),
+            ("federal-married_jointly-standard", [{"min_cents": 0, "base_cents": 0, "rate_bps": 0}, {"min_cents": 1930000, "base_cents": 0, "rate_bps": 1000}, {"min_cents": 4410000, "base_cents": 248000, "rate_bps": 1200}, {"min_cents": 12010000, "base_cents": 1160000, "rate_bps": 2200}, {"min_cents": 23070000, "base_cents": 3593200, "rate_bps": 2400}, {"min_cents": 42285000, "base_cents": 8204800, "rate_bps": 3200}, {"min_cents": 53175000, "base_cents": 11689600, "rate_bps": 3500}, {"min_cents": 78800000, "base_cents": 20658350, "rate_bps": 3700}], _federal_src),
+            ("federal-married_jointly-step2", [{"min_cents": 0, "base_cents": 0, "rate_bps": 0}, {"min_cents": 1610000, "base_cents": 0, "rate_bps": 1000}, {"min_cents": 2850000, "base_cents": 124000, "rate_bps": 1200}, {"min_cents": 6650000, "base_cents": 580000, "rate_bps": 2200}, {"min_cents": 12180000, "base_cents": 1796600, "rate_bps": 2400}, {"min_cents": 21787500, "base_cents": 4102400, "rate_bps": 3200}, {"min_cents": 27232500, "base_cents": 5844800, "rate_bps": 3500}, {"min_cents": 40045000, "base_cents": 10329175, "rate_bps": 3700}], _federal_src2),
+            ("federal-married_separately-standard", [{"min_cents": 0, "base_cents": 0, "rate_bps": 0}, {"min_cents": 750000, "base_cents": 0, "rate_bps": 1000}, {"min_cents": 1990000, "base_cents": 124000, "rate_bps": 1200}, {"min_cents": 5790000, "base_cents": 580000, "rate_bps": 2200}, {"min_cents": 11320000, "base_cents": 1796600, "rate_bps": 2400}, {"min_cents": 20927500, "base_cents": 4102400, "rate_bps": 3200}, {"min_cents": 26372500, "base_cents": 5844800, "rate_bps": 3500}, {"min_cents": 64810000, "base_cents": 19297925, "rate_bps": 3700}], _federal_src),
+            ("federal-married_separately-step2", [{"min_cents": 0, "base_cents": 0, "rate_bps": 0}, {"min_cents": 805000, "base_cents": 0, "rate_bps": 1000}, {"min_cents": 1425000, "base_cents": 62000, "rate_bps": 1200}, {"min_cents": 3325000, "base_cents": 290000, "rate_bps": 2200}, {"min_cents": 6090000, "base_cents": 898300, "rate_bps": 2400}, {"min_cents": 10893800, "base_cents": 2051200, "rate_bps": 3200}, {"min_cents": 13616300, "base_cents": 2922400, "rate_bps": 3500}, {"min_cents": 32835000, "base_cents": 9648963, "rate_bps": 3700}], _federal_src2),
+            ("federal-head_of_household-standard", [{"min_cents": 0, "base_cents": 0, "rate_bps": 0}, {"min_cents": 1555000, "base_cents": 0, "rate_bps": 1000}, {"min_cents": 3325000, "base_cents": 177000, "rate_bps": 1200}, {"min_cents": 8300000, "base_cents": 774000, "rate_bps": 2200}, {"min_cents": 12125000, "base_cents": 1615500, "rate_bps": 2400}, {"min_cents": 21730000, "base_cents": 3920700, "rate_bps": 3200}, {"min_cents": 27175000, "base_cents": 5663100, "rate_bps": 3500}, {"min_cents": 65615000, "base_cents": 19117100, "rate_bps": 3700}], _federal_src),
+            ("federal-head_of_household-step2", [{"min_cents": 0, "base_cents": 0, "rate_bps": 0}, {"min_cents": 1207500, "base_cents": 0, "rate_bps": 1000}, {"min_cents": 2092500, "base_cents": 88500, "rate_bps": 1200}, {"min_cents": 4580000, "base_cents": 387000, "rate_bps": 2200}, {"min_cents": 6492500, "base_cents": 807750, "rate_bps": 2400}, {"min_cents": 11295000, "base_cents": 1960350, "rate_bps": 3200}, {"min_cents": 14017500, "base_cents": 2831550, "rate_bps": 3500}, {"min_cents": 33237500, "base_cents": 9558550, "rate_bps": 3700}], _federal_src2),):
+            conn.execute(
+                "INSERT INTO erp_acct_payroll_tax_tables (tax_year, table_name,"
+                " brackets, source, created_at) VALUES (2026, ?, ?, ?, ?)",
+                (_name, json.dumps(_brackets), _src, _now))
+        conn.execute(
+            "INSERT INTO erp_acct_payroll_tax_tables (tax_year, table_name,"
+            " brackets, source, created_at) VALUES (2026, 'fica', ?, ?, ?)",
+            (json.dumps({"ss_rate_bps": 620, "ss_wage_base_cents": 18450000,
+                         "medicare_rate_bps": 145, "addl_medicare_rate_bps": 90,
+                         "addl_medicare_threshold_cents": 20000000}),
+             "Social Security Administration, Contribution and Benefit Base"
+             " 2026 ($184,500); IRS Topic No. 751, Social Security and"
+             " Medicare withholding rates (verified Nov 9, 2026)", _now))
+    # Invoices created before the tax step have no jurisdiction; they were
+    # all Clark County sales. Add the column if it is missing.
+    _inv_cols = [r[1] for r in conn.execute(
+        "PRAGMA table_info(erp_acct_invoices)").fetchall()]
+    if "tax_jurisdiction" not in _inv_cols:
+        conn.execute("ALTER TABLE erp_acct_invoices ADD COLUMN"
+                     " tax_jurisdiction TEXT NOT NULL DEFAULT 'Clark County'")
     conn.commit()
     conn.close()
 
@@ -1611,17 +3384,13 @@ def notify_merchant_of_order(order_ref, name, email, items_summary,
     notification must not break order fulfillment."""
     if not ORDER_NOTIFY_EMAIL:
         return
-    try:
-        send_email(
-            ORDER_NOTIFY_EMAIL,
-            f"New order {order_ref} — ${amount_total_cents / 100:,.2f}",
-            merchant_order_email_html(order_ref, name, email, items_summary,
-                                      amount_total_cents, gift_card_code,
-                                      discount_cents, promo_code, shipping,
-                                      label_url, tracking_number),
-        )
-    except Exception:
-        pass
+    _erp_send_alert(None, "order",
+                    [ORDER_NOTIFY_EMAIL] if ORDER_NOTIFY_EMAIL else [],
+                    f"New order {order_ref} — ${amount_total_cents / 100:,.2f}",
+                    merchant_order_email_html(order_ref, name, email, items_summary,
+                                              amount_total_cents, gift_card_code,
+                                              discount_cents, promo_code, shipping,
+                                              label_url, tracking_number))
 
 # ---------------------------------------------------------------- routes
 
@@ -1853,6 +3622,8 @@ def fulfill_order(session, meta):
                             "purchase", order_ref=session_id)
     conn.commit()
     conn.close()
+    # Dept 9: auto-post the completed sale (best-effort; never raises).
+    _acct_try_auto_post_online("online_stripe", session_id)
 
     ship = session.get("shipping_details") or {}
     ship_addr = ship.get("address") or {}
@@ -1895,6 +3666,8 @@ def fulfill_gift_card(session, meta):
     )
     conn.commit()
     conn.close()
+    # Dept 9: auto-post the gift-card purchase (best-effort; never raises).
+    _acct_try_auto_post_gift_card(session_id)
 
     send_gift_card_email(
         meta["recipient_email"], meta["purchaser_name"],
@@ -2150,8 +3923,25 @@ def validate_discount():
     code = (request.args.get("code") or "").strip().upper()
     if not code:
         return jsonify(error="code is required"), 400
-    if code in PROMOS and _promo_is_active(PROMOS[code]):
+    if code in PROMOS and _promo_is_active(PROMOS[code]) and not _promo_disabled(code):
         p = PROMOS[code]
+        if p["type"] == "bundle":
+            # Optional cart-qualification gate: ?bags=N lets the storefront
+            # check the code against the cart before checkout; without it
+            # the code validates in-window and checkout enforces the
+            # 3-bag minimum (same as FREESHIP50's $50 gate).
+            try:
+                bags = int(request.args.get("bags", ""))
+            except (TypeError, ValueError):
+                bags = None
+            if bags is not None and bags < int(p.get("bundle_size", 3)):
+                return jsonify(error="this code needs at least %d %s in the cart"
+                               % (int(p.get("bundle_size", 3)),
+                                  "sweet bags" if p.get("bundle_flavors") else "bags")), 404
+            return jsonify(type="bundle", code=code, label=p["label"],
+                           description=p["description"],
+                           bundle_size=int(p.get("bundle_size", 3)),
+                           bundle_price_cents=int(p.get("bundle_price_cents", 2000)))
         return jsonify(type="promo", code=code, label=p["label"], description=p["description"])
     conn = db()
     row = conn.execute(
@@ -2693,19 +4483,13 @@ def staff_redeem_merch():
     template_id = _merch_template_id(sku)
     printful_url = (f"https://www.printful.com/dashboard/stores/18907610/products/templates/{template_id}"
                     if template_id else "https://www.printful.com/dashboard")
-    try:
-        for admin_email in ADMIN_EMAILS:
-            send_email(
-                admin_email,
-                f"Employee merch redemption: {staff['name']}",
-                f"<p><b>{staff['name']}</b> ({staff['email']}) redeemed "
-                f"<b>{prod['name']} ({size})</b> for {reward['kernels']} kernels.</p>"
-                f"<p>Place the order in Printful:<br>"
-                f"<a href='{printful_url}'>{printful_url}</a></p>"
-                f"<p>Ship to the employee's address on file.</p>",
-            )
-    except Exception:
-        pass
+    _erp_send_alert(None, "order", list(ADMIN_EMAILS),
+                    f"Employee merch redemption: {staff['name']}",
+                    f"<p><b>{staff['name']}</b> ({staff['email']}) redeemed "
+                    f"<b>{prod['name']} ({size})</b> for {reward['kernels']} kernels.</p>"
+                    f"<p>Place the order in Printful:<br>"
+                    f"<a href='{printful_url}'>{printful_url}</a></p>"
+                    f"<p>Ship to the employee's address on file.</p>")
     return jsonify(ok=True, kernels_spent=reward["kernels"],
                    item=f"{prod['name']} ({size})",
                    message="Kernels deducted. Admins have been notified to place your order.")
@@ -2848,7 +4632,8 @@ def _compute_order(data):
     Returns (order, None) on success, or (None, (response, status)) on error.
     order keys: items, merchandise_total, email, shipping_cents, shipping_label,
     discount_kind (None|'promo'|'gift_card'), promo_code, promo_label,
-    promo_percent_off, gift_card_code, gift_card_discount_cents, summary.
+    promo_percent_off, promo_bundle_cents, gift_card_code,
+    gift_card_discount_cents, summary.
     """
     raw_items = data.get("items") or []
     email = (data.get("email") or "").strip()
@@ -2899,13 +4684,14 @@ def _compute_order(data):
         "promo_code": "",
         "promo_label": "",
         "promo_percent_off": 0,
+        "promo_bundle_cents": 0,
         "gift_card_code": "",
         "gift_card_discount_cents": 0,
         "reward_code": "",
         "reward_type": "",
         "reward_discount_cents": 0,
     }
-    if code and code in PROMOS and _promo_is_active(PROMOS[code]):
+    if code and code in PROMOS and _promo_is_active(PROMOS[code]) and not _promo_disabled(code):
         # Offers-page promo code: one use per email address, one per order.
         if not email:
             return None, (jsonify(error="an email address is required to use a promo code"), 400)
@@ -2927,6 +4713,18 @@ def _compute_order(data):
                 return None, (jsonify(error="free shipping needs a $50+ order"), 400)
             order["shipping_cents"] = 0
             order["shipping_label"] = f"FREE ({code})"
+        elif promo["type"] == "bundle":
+            # Any N bags for $M: $4 off per set of 3 bags at the $8 bag price.
+            # Gate mirrors free_shipping's $50 gate — a cart that does not
+            # qualify is rejected here, never charged with a dead code.
+            bags = _promo_bundle_bags(items, promo)
+            size = int(promo.get("bundle_size", 3))
+            per_set = size * BAG_PRICE_CENTS - int(promo.get("bundle_price_cents", 2000))
+            sets = bags // size
+            if sets <= 0:
+                return None, (jsonify(error="this code needs at least %d %s in the cart"
+                                      % (size, "sweet bags" if promo.get("bundle_flavors") else "bags")), 400)
+            order["promo_bundle_cents"] = sets * per_set
     elif code:
         conn = db()
         reward = conn.execute(
@@ -3021,6 +4819,16 @@ def create_order_checkout():
         if order["discount_kind"] == "promo" and order["promo_percent_off"]:
             coupon = stripe.Coupon.create(
                 percent_off=order["promo_percent_off"],
+                duration="once",
+                max_redemptions=1,
+                redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
+                metadata={"promo_code": order["promo_code"]},
+            )
+            discounts = [{"coupon": coupon.id}]
+        elif order["discount_kind"] == "promo" and order["promo_bundle_cents"]:
+            coupon = stripe.Coupon.create(
+                amount_off=order["promo_bundle_cents"],
+                currency="usd",
                 duration="once",
                 max_redemptions=1,
                 redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
@@ -3137,6 +4945,8 @@ def paypal_create_order():
     ship = order["shipping_cents"]
     if order["discount_kind"] == "promo" and order["promo_percent_off"]:
         disc = round((merch + ship) * order["promo_percent_off"] / 100)
+    elif order["discount_kind"] == "promo" and order["promo_bundle_cents"]:
+        disc = order["promo_bundle_cents"]
     elif order["discount_kind"] == "gift_card":
         disc = order["gift_card_discount_cents"]
     elif order["discount_kind"] == "reward":
@@ -3382,6 +5192,8 @@ def paypal_capture_order():
                             "purchase", order_ref=f"paypal:{order_id}")
     conn.commit()
     conn.close()
+    # Dept 9: auto-post the captured PayPal sale (best-effort; never raises).
+    _acct_try_auto_post_online("online_paypal", order_id)
     return jsonify(ok=True)
 
 
@@ -4248,6 +6060,7 @@ def auth_me():
     return jsonify(id=row["id"], name=row["name"], email=row["email"],
                    is_admin=row["email"].lower() in ADMIN_EMAILS)
 
+
 @app.post("/api/auth/erp-handoff")
 def auth_erp_handoff():
     """Redeem a one-time ERP login code for the admin's session token.
@@ -4923,17 +6736,16 @@ def staff_me():
         return err[0], err[1]
     return jsonify(id=staff["id"], email=staff["email"], name=staff["name"])
 
-@app.get("/api/loyalty/staff/members")
-def staff_member_search():
-    staff, err = _require_staff()
-    if err:
-        return err[0], err[1]
-    q = (request.args.get("q") or "").strip()
+def _loyalty_member_search(conn, q):
+    """Member lookup shared by the storefront staff console and the ERP
+    loyalty console. Accepts a QR URL (member=PAL:<id>), a raw PAL:<id>,
+    an email, or a name. Max 20 results; each carries the live balance
+    and tier from the customer kernel ledger."""
+    q = (q or "").strip()
     if not q:
-        return jsonify(members=[])
+        return []
     # Accept a scanned member QR code (full URL with ?member=PAL:<id>),
     # a raw PAL:<user_id>, or email/name.
-    conn = db()
     qr_member = ""
     if "member=" in q:
         # Extract member=... from a scanned QR URL.
@@ -4963,8 +6775,22 @@ def staff_member_search():
             "kernels": _kernel_balance(conn, r["id"]),
             "tier": _loyalty_tier(_lifetime_kernels(conn, r["id"])),
         })
+    return members
+
+
+@app.get("/api/loyalty/staff/members")
+def staff_member_search():
+    staff, err = _require_staff()
+    if err:
+        return err[0], err[1]
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify(members=[])
+    conn = db()
+    members = _loyalty_member_search(conn, q)
     conn.close()
     return jsonify(members=members)
+
 
 @app.post("/api/loyalty/staff/credit")
 def staff_credit_kernels():
@@ -5168,22 +6994,20 @@ def staff_birthday():
     conn.close()
     return jsonify(ok=True)
 
-@app.get("/api/loyalty/staff/profile")
-def staff_profile():
-    staff, err = _require_staff()
-    if err:
-        return err
-    conn = db()
+def _loyalty_staff_profile_payload(conn, staff_id):
+    """My-profile payload shared by /api/loyalty/staff/profile and
+    /api/erp/loyalty/profile. Read-only; the staff ledger stays the
+    single source for the staff member's own balance and work stats."""
     row = conn.execute(
         "SELECT id, name, email, headshot, kernels, birthday, hire_date,"
         " referral_code, created_at"
         " FROM staff WHERE id = ?",
-        (staff["id"],),
+        (staff_id,),
     ).fetchone()
     history = conn.execute(
         "SELECT kernels, reason, ref, created_at FROM staff_kernel_transactions"
         " WHERE staff_id = ? ORDER BY id DESC LIMIT 50",
-        (staff["id"],),
+        (staff_id,),
     ).fetchall()
     # Work stats: this employee's customer-facing activity, aggregated from
     # the customer kernel ledger (kernel_transactions.staff_id) — the same
@@ -5194,32 +7018,31 @@ def staff_profile():
     credited = conn.execute(
         "SELECT COALESCE(SUM(kernels), 0) AS total, COUNT(*) AS n"
         " FROM kernel_transactions WHERE staff_id = ? AND kernels > 0",
-        (staff["id"],),
+        (staff_id,),
     ).fetchone()
     redeemed = conn.execute(
         "SELECT COALESCE(SUM(-kernels), 0) AS total, COUNT(*) AS n"
         " FROM kernel_transactions WHERE staff_id = ? AND kernels < 0",
-        (staff["id"],),
+        (staff_id,),
     ).fetchone()
     staff_rewards = conn.execute(
         "SELECT code, reward_type, created_at FROM loyalty_rewards"
         " WHERE staff_id = ? AND used = 0 ORDER BY created_at DESC",
-        (staff["id"],),
+        (staff_id,),
     ).fetchall()
     staff_gift_cards = conn.execute(
         "SELECT code, amount_cents, balance_cents, created_at FROM gift_cards"
         " WHERE stripe_session_id = ? AND active = 1 AND balance_cents > 0"
         " ORDER BY created_at DESC",
-        (f"staff:{staff['id']}",),
+        (f"staff:{staff_id}",),
     ).fetchall()
-    conn.close()
     work_stats = {
         "kernels_credited": credited["total"] or 0,
         "credit_count": credited["n"] or 0,
         "kernels_redeemed": redeemed["total"] or 0,
         "redeem_count": redeemed["n"] or 0,
     }
-    return jsonify(
+    return dict(
         id=row["id"], name=row["name"], email=row["email"],
         headshot=row["headshot"] or "", kernels=row["kernels"] or 0,
         staff_kernels=row["kernels"] or 0,
@@ -5247,6 +7070,7 @@ def staff_profile():
         ],
         reward_tiers={k: v["kernels"] for k, v in STAFF_REWARD_TIERS.items()},
         reward_labels={k: v["label"] for k, v in STAFF_REWARD_TIERS.items()},
+        reward_kinds={k: v["kind"] for k, v in STAFF_REWARD_TIERS.items()},
         history=[
             {"kernels": h["kernels"], "reason": h["reason"], "ref": h["ref"] or "",
              "note": h["ref"] or "",
@@ -5254,6 +7078,19 @@ def staff_profile():
             for h in history
         ],
     )
+
+
+
+@app.get("/api/loyalty/staff/profile")
+def staff_profile():
+    staff, err = _require_staff()
+    if err:
+        return err
+    conn = db()
+    payload = _loyalty_staff_profile_payload(conn, staff["id"])
+    conn.close()
+    return jsonify(**payload)
+
 
 @app.post("/api/loyalty/staff/password")
 def staff_change_password():
@@ -5351,44 +7188,40 @@ def staff_signup_member():
         pass
     return jsonify(ok=True, staff_kernels=staff_kernels)
 
-@app.post("/api/loyalty/staff/redeem")
-def staff_redeem():
-    """Staff redeems their own kernels for an employee reward."""
-    staff, err = _require_staff()
-    if err:
-        return err
-    data = request.get_json(force=True) or {}
-    reward_type = (data.get("reward_type") or "").strip()
+def _do_staff_self_redeem(staff_id, reward_type, gift_card_choice=""):
+    """Staff member redeems their own Kernels for an employee reward.
+    Returns (status, payload). Shared by /api/loyalty/staff/redeem-self
+    and /api/erp/loyalty/redeem-self so the logic is single-sourced."""
     tier = STAFF_REWARD_TIERS.get(reward_type)
     if not tier:
-        return jsonify(error="unknown reward"), 400
+        return 400, {"error": "unknown reward"}
     conn = db()
     srow = conn.execute(
-        "SELECT name, email, kernels FROM staff WHERE id = ?", (staff["id"],)
+        "SELECT name, email, kernels FROM staff WHERE id = ?", (staff_id,)
     ).fetchone()
     if not srow or (srow["kernels"] or 0) < tier["kernels"]:
         conn.close()
-        return jsonify(error="not enough Kernels"), 402
+        return 402, {"error": "not enough Kernels"}
     now = datetime.now(timezone.utc).isoformat()
     kind = tier["kind"]
     if kind == "giftcard_choice":
         # Employee picks which gift card they want — fulfilled by DJ/Matt.
-        choice = (data.get("gift_card_choice") or "").strip()[:80]
+        choice = (gift_card_choice or "").strip()[:80]
         if not choice:
             conn.close()
-            return jsonify(error="please choose which gift card you want"), 400
+            return 400, {"error": "please choose which gift card you want"}
         # Visa prepaid cards start at $25 and DoorDash digital cards start at $15 —
         # neither is available for the $10 tier.
         if tier.get("amount_cents", 0) < 2500 and "visa" in choice.lower():
             conn.close()
-            return jsonify(error="Visa prepaid cards start at $25 — please pick"
-                                  " another gift card for the $10 reward"), 400
+            return 400, {"error": "Visa prepaid cards start at $25 — please pick"
+                                  " another gift card for the $10 reward"}
         if tier.get("amount_cents", 0) < 1500 and "doordash" in choice.lower():
             conn.close()
-            return jsonify(error="DoorDash gift cards start at $15 — please pick"
-                                  " another gift card for the $10 reward"), 400
+            return 400, {"error": "DoorDash gift cards start at $15 — please pick"
+                                  " another gift card for the $10 reward"}
         code = "GC-" + secrets.token_hex(3).upper()
-        _credit_staff_kernels(conn, staff["id"], -tier["kernels"], "redemption",
+        _credit_staff_kernels(conn, staff_id, -tier["kernels"], "redemption",
                               ref=f"{code} ({choice})")
         conn.commit()
         detail = {"claim_code": code, "gift_card_choice": choice,
@@ -5397,7 +7230,7 @@ def staff_redeem():
     elif kind == "merch":
         # Claimed in person from DJ/Matt — claim ticket for tracking.
         code = "MERCH-" + secrets.token_hex(3).upper()
-        _credit_staff_kernels(conn, staff["id"], -tier["kernels"], "redemption",
+        _credit_staff_kernels(conn, staff_id, -tier["kernels"], "redemption",
                               ref=code)
         conn.commit()
         detail = {"claim_code": code,
@@ -5405,22 +7238,42 @@ def staff_redeem():
     else:
         # Popcorn rewards work in the store checkout like customer rewards.
         code = _new_reward_code()
-        _credit_staff_kernels(conn, staff["id"], -tier["kernels"], "redemption",
+        _credit_staff_kernels(conn, staff_id, -tier["kernels"], "redemption",
                               ref=code)
         conn.execute(
             "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent,"
             " created_at, staff_id) VALUES (0, ?, ?, ?, ?, ?)",
-            (reward_type, code, tier["kernels"], now, staff["id"]),
+            (reward_type, code, tier["kernels"], now, staff_id),
         )
         conn.commit()
         detail = {"reward_code": code,
                   "note": "Use this code in the store checkout discount field."}
     balance = conn.execute(
-        "SELECT kernels FROM staff WHERE id = ?", (staff["id"],)
+        "SELECT kernels FROM staff WHERE id = ?", (staff_id,)
     ).fetchone()["kernels"]
     conn.close()
-    return jsonify(ok=True, label=tier["label"], balance=balance,
-                   kind=kind, **detail)
+    return 200, dict(ok=True, label=tier["label"], balance=balance,
+                     kind=kind, **detail)
+
+
+@app.post("/api/loyalty/staff/redeem-self")
+def staff_redeem_self():
+    """Staff redeems their own kernels for an employee reward.
+
+    Distinct route from /api/loyalty/staff/redeem (member in-person
+    redeem): the two shared one route and the FIRST handler always won,
+    so every self-redeem landed in the member handler and failed 400
+    "invalid input" (Nov 2026). The storefront self-redeem caller must
+    post here to work."""
+    staff, err = _require_staff()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    code, payload = _do_staff_self_redeem(
+        staff["id"], (data.get("reward_type") or "").strip(),
+        (data.get("gift_card_choice") or "").strip())
+    return jsonify(**payload), code
+
 
 # ---------------- analytics: tracking (public, no auth) ----------------
 
@@ -6073,6 +7926,8 @@ def admin_create_staff():
             "INSERT INTO staff_verification_tokens (token, staff_id, expires_at) VALUES (?, ?, ?)",
             (vtoken, staff_id, vexpires),
         )
+        _erp_staff_audit(conn, user["email"], "staff.reactivated", "staff",
+                         staff_id, "reactivated %s (%s)" % (name or email, email))
         conn.commit()
         conn.close()
         verify_url = f"{SITE_URL}/#staff-verify?token={vtoken}"
@@ -6102,6 +7957,8 @@ def admin_create_staff():
             "INSERT INTO staff_verification_tokens (token, staff_id, expires_at) VALUES (?, ?, ?)",
             (vtoken, staff_id, vexpires),
         )
+        _erp_staff_audit(conn, user["email"], "staff.created", "staff",
+                         staff_id, "created %s (%s)" % (name or email, email))
         conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
@@ -6153,17 +8010,32 @@ def erp_admin_set_staff_perms(staff_id):
             not isinstance(p, str) or p not in _ERP_GRANTABLE_PERMS for p in perms):
         return jsonify(error="perms must be a list of valid permissions"), 400
     conn = db()
-    if not conn.execute("SELECT id FROM staff WHERE id = ?",
-                        (staff_id,)).fetchone():
+    row = conn.execute("SELECT id, name, email FROM staff WHERE id = ?",
+                       (staff_id,)).fetchone()
+    if not row:
         conn.close()
         return jsonify(error="staff member not found"), 404
+    old_perms = {p[0] for p in conn.execute(
+        "SELECT perm FROM erp_staff_perms WHERE staff_id = ?", (staff_id,)).fetchall()}
+    new_perms = sorted(set(perms))
     conn.execute("DELETE FROM erp_staff_perms WHERE staff_id = ?", (staff_id,))
-    for perm in sorted(set(perms)):
+    for perm in new_perms:
         conn.execute("INSERT INTO erp_staff_perms (staff_id, perm) VALUES (?, ?)",
                      (staff_id, perm))
+    granted = sorted(set(new_perms) - old_perms)
+    revoked = sorted(old_perms - set(new_perms))
+    detail = "%s (%s): " % (row["name"] or row["email"], row["email"])
+    parts = []
+    if granted:
+        parts.append("granted: " + ", ".join(granted))
+    if revoked:
+        parts.append("revoked: " + ", ".join(revoked))
+    detail += "; ".join(parts) if parts else "no change"
+    _erp_staff_audit(conn, user["email"], "staff.permissions_changed",
+                     "staff", staff_id, detail)
     conn.commit()
     conn.close()
-    return jsonify(ok=True, staff_id=staff_id, perms=sorted(set(perms)))
+    return jsonify(ok=True, staff_id=staff_id, perms=new_perms)
 
 
 @app.get("/api/erp/session")
@@ -6274,6 +8146,11 @@ def _send_marketing_batch(batch):
                 "subject": item["subject"],
                 "html": item["html"],
                 "headers": {"List-Unsubscribe": f"<{item['unsub_url']}>"},
+                # Newsletter sends stamp their campaign_key so Resend
+                # webhook events join back to the issue (Dept 8 item 6).
+                **({"tags": [{"name": "campaign_key",
+                              "value": item["campaign_key"]}]}
+                   if item.get("campaign_key") else {}),
             }
             for item in batch
         ],
@@ -6574,6 +8451,134 @@ _MKT_REFUND_POLICY = (
     " Refunds are not offered \u2014 replacement or exchange only."
 )
 
+# Support replies are sent from the real service inbox, on the same
+# pop-a-licious.com domain the ERP already sends from (EMAIL_FROM defaults
+# to noreply@pop-a-licious.com, and gift-card / order / newsletter mail
+# goes out through Resend from that domain live). Resend verifies senders
+# at the domain level, so customerservice@ on the same verified domain is
+# the sender — no new domain, no invented address.
+_MKT_SUPPORT_FROM = "Pop-A-Licious <customerservice@pop-a-licious.com>"
+
+
+def _support_reply_html(ticket, body):
+    """Reply email body: the staff reply, escaped, with the service sign-off."""
+    name = (ticket.get("customer_name") or "").strip()
+    safe_body = html.escape(body or "").replace("\n", "<br>")
+    return (
+        "<html><body style=\"font-family: Arial, sans-serif; line-height: 1.6;\">"
+        "<p>Hi %s,</p><p>%s</p>"
+        "<p>Thanks,<br><strong>The Pop-A-Licious Team</strong><br>"
+        "Customer Service — customerservice@pop-a-licious.com</p>"
+        "<p style=\"font-size:12px;color:#888;\">%s</p>"
+        "</body></html>"
+        % (html.escape(name) if name else "there", safe_body,
+           MARKETING_ADDRESS_HTML))
+
+
+def _mkt_newsletter_analytics(conn):
+    """Per-campaign open/click counts from stored Resend webhook events.
+
+    Counts are UNIQUE recipients (one open/click per email), rates are
+    against the issue's stored recipient_count. A campaign with no stored
+    events reports has_data False and None counts — never zeros presented
+    as measured. Keyed by campaign_key.
+    """
+    out = {}
+    for row in conn.execute(
+            "SELECT campaign_key, event_type, COUNT(DISTINCT email) AS c"
+            " FROM erp_mkt_newsletter_events"
+            " WHERE campaign_key IS NOT NULL AND email != ''"
+            " GROUP BY campaign_key, event_type").fetchall():
+        slot = out.setdefault(row["campaign_key"],
+                              {"opens": None, "clicks": None})
+        if row["event_type"] == "open":
+            slot["opens"] = row["c"]
+        elif row["event_type"] == "click":
+            slot["clicks"] = row["c"]
+    recipients = {r["campaign_key"]: r["recipient_count"] for r in conn.execute(
+        "SELECT campaign_key, recipient_count FROM erp_mkt_newsletters"
+        ).fetchall()}
+    for key, slot in out.items():
+        total = recipients.get(key)
+        slot["has_data"] = True
+        slot["open_rate_pct"] = (
+            round(100.0 * slot["opens"] / total, 1)
+            if slot["opens"] is not None and total else None)
+        slot["click_rate_pct"] = (
+            round(100.0 * slot["clicks"] / total, 1)
+            if slot["clicks"] is not None and total else None)
+    return out
+
+
+def _resend_event_campaign_key(conn, data):
+    """Resolve a Resend webhook event to a newsletter campaign_key.
+
+    Primary: the tags the newsletter send stamps on every email
+    (campaign_key tag, added by _send_marketing_batch). Fallback: the
+    subject, when it matches exactly one sent newsletter issue. Returns
+    None when neither resolves — the event is still stored, unattributed,
+    and never counted for any campaign.
+    """
+    tags = data.get("tags")
+    if isinstance(tags, dict):
+        val = tags.get("campaign_key")
+        if val:
+            return str(val)
+    elif isinstance(tags, list):
+        for tag in tags:
+            if isinstance(tag, dict) and tag.get("name") == "campaign_key" \
+                    and tag.get("value"):
+                return str(tag["value"])
+    subject = (data.get("subject") or "").strip()
+    if subject:
+        rows = conn.execute(
+            "SELECT campaign_key FROM erp_mkt_newsletters"
+            " WHERE subject = ? AND status = 'sent'",
+            (subject,)).fetchall()
+        if len(rows) == 1:
+            return rows[0]["campaign_key"]
+    return None
+
+
+def _verify_resend_webhook(payload):
+    """Svix verification for a Resend webhook payload.
+
+    Returns None when the signature checks out. When RESEND_WEBHOOK_SECRET
+    is not configured there is nothing to verify against, so the payload is
+    accepted and a warning is logged — signature verification is owed (the
+    secret has to be created in the Resend dashboard and set as env), not
+    silently treated as verified. Returns an error string on a bad or
+    missing signature when a secret IS configured.
+    """
+    secret = RESEND_WEBHOOK_SECRET or os.environ.get("RESEND_WEBHOOK_SECRET", "")
+    if not secret:
+        app.logger.warning(
+            "resend webhook: RESEND_WEBHOOK_SECRET is not set; signature"
+            " verification is owed, accepting unsigned payload")
+        return None
+    svix_id = request.headers.get("svix-id", "")
+    svix_ts = request.headers.get("svix-timestamp", "")
+    svix_sig = request.headers.get("svix-signature", "")
+    if not svix_id or not svix_ts or not svix_sig:
+        return "missing svix signature headers"
+    try:
+        ts = int(svix_ts)
+    except (TypeError, ValueError):
+        return "invalid svix timestamp"
+    if abs(time.time() - ts) > 300:
+        return "svix timestamp outside tolerance"
+    key = base64.b64decode(secret[6:] if secret.startswith("whsec_")
+                           else secret)
+    signed = ("%s.%s.%s" % (svix_id, svix_ts,
+                            payload.decode("utf-8", "replace"))).encode()
+    expected = base64.b64encode(
+        hmac.new(key, signed, hashlib.sha256).digest()).decode()
+    for part in svix_sig.split():
+        if part.startswith("v1,") and hmac.compare_digest(
+                part[3:], expected):
+            return None
+    return "invalid svix signature"
+
 
 def _mkt_audit(conn, actor, action, target_type, target_id, detail=""):
     """Audit line for a Phase 3 write, mirroring erp_acct_audit."""
@@ -6683,19 +8688,6 @@ def _mkt_orders_by_email(conn, email):
         if o:
             out.append(o)
     return out
-
-
-def _erp_online_bags(r):
-    """Bag count for an online sales row: parse items_summary; fall back to
-    total_qty only when the summary parses to 0 (empty/unparseable). The
-    Stripe webhook stores total_qty from session metadata, which is 0 on
-    rows whose metadata never carried it (live order #1001) — items_summary
-    is correct there, and the by-flavor table + forecast already count from
-    the same parse."""
-    parsed = sum(q for q, _ in _erp_parse_summary_flavors(r["items_summary"]))
-    if parsed:
-        return parsed
-    return int(r["total_qty"] or 0)
 
 
 def _mkt_order_detail(conn, source, order_id):
@@ -7239,8 +9231,20 @@ def mkt_newsletters_list():
     campaigns = [dict(r) for r in conn.execute(
         "SELECT name, subject, recipient_count, sent_at FROM marketing_campaigns"
         " ORDER BY sent_at DESC LIMIT 50").fetchall()]
+    analytics = _mkt_newsletter_analytics(conn)
+    for issue in issues:
+        issue["analytics"] = analytics.get(
+            issue["campaign_key"],
+            {"opens": None, "clicks": None, "open_rate_pct": None,
+             "click_rate_pct": None, "has_data": False})
+    for campaign in campaigns:
+        campaign["analytics"] = analytics.get(
+            campaign["name"],
+            {"opens": None, "clicks": None, "open_rate_pct": None,
+             "click_rate_pct": None, "has_data": False})
     conn.close()
-    return jsonify(issues=issues, subscriber_count=sub_count, campaigns=campaigns)
+    return jsonify(issues=issues, subscriber_count=sub_count,
+                   campaigns=campaigns, analytics=analytics)
 
 
 @app.post("/api/erp/marketing/newsletters")
@@ -7351,6 +9355,7 @@ def mkt_newsletter_send(issue_id):
                 "subject": r["subject"],
                 "html": _marketing_email_html(r["body_html"], email),
                 "unsub_url": unsub_url,
+                "campaign_key": r["campaign_key"],
             })
         try:
             _send_marketing_batch(batch)
@@ -7370,6 +9375,70 @@ def mkt_newsletter_send(issue_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True, sent=sent)
+
+
+# ---------- Newsletter open/click analytics (Resend webhook, Dept 8 item 6) ----------
+@app.post("/api/erp/marketing/newsletter/webhook")
+def mkt_newsletter_webhook():
+    """Public Resend webhook receiver for newsletter open/click events.
+
+    Resend must be pointed at this URL in the Resend dashboard (webhooks are
+    not configured anywhere in the code today, so until then no events
+    arrive and every campaign renders "no data yet"). Only email.opened /
+    email.clicked are stored; other event types are acknowledged and
+    ignored. Events join to a campaign on campaign_key (the tag stamped on
+    every newsletter send, or — for sends made before tagging — the subject
+    when it matches exactly one sent issue). Storage is idempotent on the
+    Resend email id. Never crashes on a malformed body.
+    """
+    raw = request.get_data()
+    sig_err = _verify_resend_webhook(raw)
+    if sig_err:
+        return jsonify(error=sig_err), 400
+    try:
+        event = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return jsonify(error="invalid webhook body"), 400
+    if not isinstance(event, dict):
+        return jsonify(error="invalid webhook body"), 400
+    etype = event.get("type") or ""
+    if etype not in ("email.opened", "email.clicked"):
+        return jsonify(received=True, ignored=True)
+    data = event.get("data") or {}
+    if not isinstance(data, dict):
+        data = {}
+    kind = "open" if etype == "email.opened" else "click"
+    to_field = data.get("to")
+    if isinstance(to_field, list):
+        email = str(to_field[0]) if to_field else ""
+    else:
+        email = str(to_field or "")
+    click = data.get("click") or {}
+    url = ""
+    if isinstance(click, dict):
+        url = str(click.get("link") or click.get("url") or "")
+    if not url:
+        url = str(data.get("link") or data.get("url") or "")
+    resend_event_id = str(data.get("email_id") or event.get("id") or "") or None
+    conn = db()
+    campaign_key = _resend_event_campaign_key(conn, data)
+    now = datetime.now(timezone.utc).isoformat()
+    if resend_event_id and conn.execute(
+            "SELECT 1 FROM erp_mkt_newsletter_events"
+            " WHERE resend_event_id = ?", (resend_event_id,)).fetchone():
+        conn.close()
+        return jsonify(received=True, stored=False, note="duplicate event")
+    conn.execute(
+        "INSERT INTO erp_mkt_newsletter_events (campaign_key, event_type,"
+        " email, resend_event_id, url, received_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (campaign_key, kind, email.lower(), resend_event_id, url or None,
+         now))
+    _mkt_audit(conn, "resend-webhook", "newsletter_event", "newsletter", 0,
+               "%s %s %s" % (kind, campaign_key or "(unattributed)", email))
+    conn.commit()
+    conn.close()
+    return jsonify(received=True, stored=True, campaign_key=campaign_key)
 
 
 # ---------- Support inbox ----------
@@ -7538,8 +9607,10 @@ def mkt_ticket_reply(ticket_id):
         conn.close()
         return jsonify(error="ticket not found"), 404
     now = datetime.now(timezone.utc).isoformat()
-    # v1: replies are drafts only — sent_via / sent_at stay NULL. Nothing
-    # is sent anywhere until the email source (IMAP) send step is built.
+    # Replies are saved as drafts here — sent_via / sent_at stay NULL until
+    # a staff member explicitly clicks "Send reply" on the draft, which
+    # sends it via mkt_ticket_reply_send (Dept 8 item 1). IMAP inbound
+    # import stays hand-import; this endpoint only sends outbound mail.
     cur = conn.execute(
         "INSERT INTO erp_mkt_ticket_replies (ticket_id, author, body,"
         " is_internal_note, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -7550,6 +9621,62 @@ def mkt_ticket_reply(ticket_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True, reply_id=rid, sent=False), 201
+
+
+@app.post("/api/erp/marketing/support/tickets/<int:ticket_id>/replies/<int:reply_id>/send")
+def mkt_ticket_reply_send(ticket_id, reply_id):
+    """Send a saved reply draft to the customer (Dept 8 item 1).
+
+    Explicit click only — nothing here sends on its own, and the reply
+    endpoint above still only saves drafts. Sends via the existing
+    send_email/Resend path from customerservice@pop-a-licious.com (same
+    verified pop-a-licious.com domain the ERP already sends from). On
+    success the reply records sent_via/sent_at/sent_by; a failed send
+    returns 502 and leaves the draft unsent. Re-sending an already-sent
+    reply is a no-op — it is never emailed twice.
+    """
+    actor, err = _erp_check_perm("support.write")
+    if err:
+        return err
+    conn = db()
+    ticket = conn.execute("SELECT * FROM erp_mkt_tickets WHERE id = ?",
+                          (ticket_id,)).fetchone()
+    if not ticket:
+        conn.close()
+        return jsonify(error="ticket not found"), 404
+    reply = conn.execute(
+        "SELECT * FROM erp_mkt_ticket_replies WHERE id = ? AND ticket_id = ?",
+        (reply_id, ticket_id)).fetchone()
+    if not reply:
+        conn.close()
+        return jsonify(error="reply not found"), 404
+    if reply["is_internal_note"]:
+        conn.close()
+        return jsonify(error="internal notes are never sent"), 400
+    if reply["sent_at"]:
+        conn.close()
+        return jsonify(ok=True, sent=False, note="already sent")
+    subject = "Re: " + (ticket["subject"] or "Your Pop-A-Licious message")
+    try:
+        send_email(ticket["customer_email"], subject,
+                   _support_reply_html(dict(ticket), reply["body"]),
+                   from_email=_MKT_SUPPORT_FROM)
+    except Exception as e:
+        conn.close()
+        return jsonify(error="send failed: %s" % e), 502
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_mkt_ticket_replies SET sent_via = 'email',"
+        " sent_at = ?, sent_by = ? WHERE id = ?",
+        (now, actor, reply_id))
+    conn.execute("UPDATE erp_mkt_tickets SET updated_at = ? WHERE id = ?",
+                 (now, ticket_id))
+    _mkt_audit(conn, actor, "ticket_reply_sent", "ticket", ticket_id,
+               str(reply_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, sent=True, reply_id=reply_id, sent_at=now,
+                   sent_by=actor)
 
 
 @app.post("/api/erp/marketing/support/import")
@@ -7589,6 +9716,1191 @@ def mkt_support_import():
     conn.commit()
     conn.close()
     return jsonify(ok=True, created=created, skipped=len(emails) - created)
+
+
+
+# ---------- Customer master / CRM (Dept 8 item 2) ----------
+# List + detail + staff tags/notes only — no segments, campaigns, or
+# pipelines. Retail keying reuses _erp_customer_rows (the Reports
+# customers keying, exactly). Loyalty members come from the storefront
+# users table (email key; kernels via _kernel_balance /
+# _lifetime_kernels / _loyalty_tier). Wholesale accounts come from
+# erp_wholesale_accounts. Notes are staff-editable under the existing
+# support.write perm; no new perms are invented here.
+
+
+def _mkt_check_any_read():
+    """Allowed when the caller holds any Marketing & Service read perm."""
+    for perm in ("instagram.read", "newsletter.read", "support.read"):
+        actor, err = _erp_check_perm(perm)
+        if actor is not None:
+            return actor, None
+    return _erp_check_perm("instagram.read")
+
+
+def _mkt_note_map(conn):
+    out = {}
+    for r in conn.execute("SELECT * FROM erp_mkt_customer_notes").fetchall():
+        try:
+            tags = json.loads(r["tags_json"] or "[]")
+        except (ValueError, TypeError):
+            tags = []
+        out[r["customer_key"]] = {
+            "tags": tags if isinstance(tags, list) else [],
+            "note": r["note"] or "",
+            "updated_by": r["updated_by"] or "",
+            "updated_at": r["updated_at"] or "",
+        }
+    return out
+
+
+def _mkt_loyalty_for_email(conn, email):
+    """Loyalty member record for an email, or None (not a member)."""
+    if not email:
+        return None
+    u = conn.execute(
+        "SELECT id, email, name FROM users WHERE lower(email) = lower(?)",
+        (email,)).fetchone()
+    if not u:
+        return None
+    lifetime = _lifetime_kernels(conn, u["id"])
+    return {"user_id": u["id"], "name": u["name"] or "",
+            "kernels": _kernel_balance(conn, u["id"]),
+            "lifetime_kernels": lifetime,
+            "tier": _loyalty_tier(lifetime)}
+
+
+def _mkt_wholesale_for_email(conn, email):
+    if not email:
+        return None
+    a = conn.execute(
+        "SELECT id, name, email FROM erp_wholesale_accounts"
+        " WHERE lower(email) = lower(?)", (email,)).fetchone()
+    return dict(a) if a else None
+
+
+def _mkt_enrich_customer(conn, c, notes):
+    """Attach notes/tags, loyalty, and wholesale account to a CRM row."""
+    c = dict(c)
+    c["repeat"] = c["order_count"] >= 2
+    n = notes.get(c["key"])
+    c["tags"] = n["tags"] if n else []
+    c["note"] = n["note"] if n else ""
+    c["note_updated_by"] = n["updated_by"] if n else ""
+    c["note_updated_at"] = n["updated_at"] if n else ""
+    email = c.get("email") or ""
+    c["loyalty"] = _mkt_loyalty_for_email(conn, email)
+    if c["key"].startswith("account:"):
+        try:
+            aid = int(c["key"].split(":", 1)[1])
+        except ValueError:
+            aid = -1
+        a = conn.execute(
+            "SELECT id, name, email FROM erp_wholesale_accounts WHERE id = ?",
+            (aid,)).fetchone()
+        c["wholesale_account"] = dict(a) if a else None
+    else:
+        c["wholesale_account"] = _mkt_wholesale_for_email(conn, email)
+    return c
+
+
+def _mkt_crm_rows(conn, df="", dt=""):
+    """CRM rows: Reports rows (orders) + wholesale accounts and loyalty
+    members with no orders yet (order_count 0, totals 0 — never invented
+    orders or spend). Keying matches _erp_customer_rows exactly."""
+    rows = _erp_customer_rows(conn, df, dt)
+    notes = _mkt_note_map(conn)
+    # Wholesale accounts with no orders in the window.
+    for a in conn.execute(
+            "SELECT id, name, email FROM erp_wholesale_accounts"
+            " ORDER BY name").fetchall():
+        email = (a["email"] or "").strip().lower()
+        key = ("email:" + email) if email else ("account:%d" % a["id"])
+        if key in rows:
+            continue
+        rows[key] = {"key": key, "display": email or a["name"],
+                     "email": email, "account_name": a["name"],
+                     "order_count": 0, "total_bags": 0,
+                     "total_spent_cents": 0, "first_order_at": None,
+                     "last_order_at": None}
+    # Loyalty members with no orders in the window.
+    for u in conn.execute(
+            "SELECT id, email, name FROM users ORDER BY email").fetchall():
+        email = (u["email"] or "").strip().lower()
+        if not email:
+            continue
+        key = "email:" + email
+        if key in rows:
+            continue
+        rows[key] = {"key": key, "display": email, "email": email,
+                     "account_name": "", "order_count": 0, "total_bags": 0,
+                     "total_spent_cents": 0, "first_order_at": None,
+                     "last_order_at": None}
+    out = [_mkt_enrich_customer(conn, c, notes) for c in rows.values()]
+    out.sort(key=lambda c: -c["total_spent_cents"])
+    return out
+
+
+def _mkt_crm_row_for_key(conn, key):
+    """One enriched CRM row for a customer key, or None."""
+    if not key or ":" not in key:
+        return None
+    kind, rest = key.split(":", 1)
+    if kind == "email":
+        rows = _mkt_crm_rows(conn)
+        return next((c for c in rows if c["key"] == key), None)
+    if kind == "account":
+        try:
+            aid = int(rest)
+        except ValueError:
+            return None
+        a = conn.execute(
+            "SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+            (aid,)).fetchone()
+        if not a:
+            return None
+        rows = _mkt_crm_rows(conn)
+        row = next((c for c in rows if c["key"] == key), None)
+        if row:
+            return row
+        notes = _mkt_note_map(conn)
+        return _mkt_enrich_customer(conn, {
+            "key": key, "display": a["name"], "email": "",
+            "account_name": a["name"], "order_count": 0, "total_bags": 0,
+            "total_spent_cents": 0, "first_order_at": None,
+            "last_order_at": None}, notes)
+    return None
+
+
+@app.get("/api/erp/marketing/customers")
+def mkt_customers_list():
+    actor, err = _mkt_check_any_read()
+    if err:
+        return err
+    df, dt = _erp_report_dates(request.args)
+    if df is None:
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    q = (request.args.get("q") or "").strip().lower()
+    conn = db()
+    rows = _mkt_crm_rows(conn, df, dt)
+    conn.close()
+    if q:
+        rows = [c for c in rows
+                if q in (c["display"] or "").lower()
+                or q in (c["email"] or "").lower()
+                or q in (c["account_name"] or "").lower()
+                or any(q in (t or "").lower() for t in (c["tags"] or []))]
+    summary = {
+        "total_customers": len(rows),
+        "repeat_customers": sum(1 for c in rows if c["repeat"]),
+        "total_spent_cents": sum(c["total_spent_cents"] for c in rows),
+        "wholesale_accounts": sum(
+            1 for c in rows if c["wholesale_account"]),
+        "loyalty_members": sum(1 for c in rows if c["loyalty"]),
+    }
+    return jsonify({"from": df, "to": dt, "summary": summary,
+                    "customers": rows})
+
+
+@app.get("/api/erp/marketing/customers/<path:key>")
+def mkt_customer_detail(key):
+    actor, err = _mkt_check_any_read()
+    if err:
+        return err
+    conn = db()
+    row = _mkt_crm_row_for_key(conn, key)
+    if not row:
+        conn.close()
+        return jsonify(error="customer not found"), 404
+    orders = []
+    if row["key"].startswith("email:"):
+        email = row["email"]
+        if email:
+            orders = _mkt_orders_by_email(conn, email)
+        else:
+            for r in conn.execute(
+                    "SELECT id FROM orders WHERE email IS NULL OR email = ''"
+                    ).fetchall():
+                o = _erp_order_brief(conn, "stripe", r["id"])
+                if o:
+                    orders.append(o)
+            for r in conn.execute(
+                    "SELECT id FROM paypal_orders"
+                    " WHERE email IS NULL OR email = ''").fetchall():
+                o = _erp_order_brief(conn, "paypal", r["id"])
+                if o:
+                    orders.append(o)
+    elif row["key"].startswith("account:"):
+        acct = row["wholesale_account"] or {}
+        for r in conn.execute(
+                "SELECT id FROM erp_wholesale_orders WHERE account_id = ?"
+                " ORDER BY id", (acct.get("id"),)).fetchall():
+            o = _erp_order_brief(conn, "wholesale", r["id"])
+            if o:
+                orders.append(o)
+    conn.close()
+    return jsonify(customer=row, orders=orders)
+
+
+@app.post("/api/erp/marketing/customers/<path:key>/notes")
+def mkt_customer_notes_save(key):
+    actor, err = _erp_check_perm("support.write")
+    if err:
+        return err
+    conn = db()
+    row = _mkt_crm_row_for_key(conn, key)
+    if not row:
+        conn.close()
+        return jsonify(error="customer not found"), 404
+    data = request.get_json(silent=True) or {}
+    tags = data.get("tags", [])
+    if isinstance(tags, str):
+        tags = tags.split(",")
+    if not isinstance(tags, list):
+        conn.close()
+        return jsonify(error="tags must be a list or comma-separated string"), 400
+    clean = []
+    for t in tags:
+        t = str(t).strip()
+        if not t:
+            continue
+        if len(t) > 40:
+            conn.close()
+            return jsonify(error="each tag must be 40 characters or fewer"), 400
+        if t not in clean:
+            clean.append(t)
+    if len(clean) > 20:
+        conn.close()
+        return jsonify(error="at most 20 tags"), 400
+    note = data.get("note", "")
+    if not isinstance(note, str):
+        conn.close()
+        return jsonify(error="note must be a string"), 400
+    note = note.strip()
+    if len(note) > 2000:
+        conn.close()
+        return jsonify(error="note must be 2000 characters or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    email = row.get("email") or ""
+    cur = conn.execute(
+        "UPDATE erp_mkt_customer_notes SET tags_json = ?, note = ?,"
+        " updated_by = ?, updated_at = ? WHERE customer_key = ?",
+        (json.dumps(clean), note, actor or "", now, key))
+    if cur.rowcount == 0:
+        conn.execute(
+            "INSERT INTO erp_mkt_customer_notes (customer_key, email,"
+            " tags_json, note, created_by, updated_by, created_at,"
+            " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (key, email, json.dumps(clean), note, actor or "", actor or "",
+             now, now))
+    _mkt_audit(conn, actor, "customer_note_save", "customer", 0, key)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, customer_key=key, tags=clean, note=note,
+                   updated_by=actor or "", updated_at=now)
+
+
+# ---------- Content calendar (Dept 8 item 9) ----------
+# Read-only month grid combining the three real dated sources: IG
+# scheduled posts (erp_mkt_ig_posts.publish_at, PT date), newsletter
+# issues (sent_at when sent, else the 1st of the issue month — the
+# planned send date — flagged planned), and promo dates (PROMOS windows
+# + the approved national-day dates in _PROMO_CALENDAR_DATES). Nothing
+# is invented: a month shows only rows that exist in those sources.
+
+
+@app.get("/api/erp/marketing/calendar")
+def mkt_calendar():
+    actor, err = _mkt_check_any_read()
+    if err:
+        return err
+    month = (request.args.get("month") or "").strip()
+    if not month:
+        month = datetime.now(timezone.utc).astimezone(_LA_TZ).strftime("%Y-%m")
+    if not re.match(r"^\d{4}-\d{2}$", month):
+        return jsonify(error="month must be YYYY-MM"), 400
+    year, mon = int(month[:4]), int(month[5:7])
+    if not 1 <= mon <= 12:
+        return jsonify(error="month must be YYYY-MM"), 400
+    first = "%04d-%02d-01" % (year, mon)
+    if mon == 12:
+        nxt = "%04d-01-01" % (year + 1)
+    else:
+        nxt = "%04d-%02d-01" % (year, mon + 1)
+    conn = db()
+    items = []
+
+    def _in_month(d):
+        return d is not None and d.year == year and d.month == mon
+
+    for r in conn.execute(
+            "SELECT * FROM erp_mkt_ig_posts"
+            " WHERE publish_at IS NOT NULL AND publish_at != ''"
+            " ORDER BY publish_at").fetchall():
+        dt = _mkt_parse_dt(r["publish_at"])
+        if not dt:
+            continue
+        d = dt.astimezone(_LA_TZ).date()
+        if not _in_month(d):
+            continue
+        items.append({
+            "date": d.isoformat(), "kind": "instagram",
+            "title": "%s: %s" % (r["kind"] or "post",
+                                 (r["caption"] or "").strip()[:80] or "(no caption yet)"),
+            "detail": (r["caption"] or "").strip(),
+            "status": r["status"], "promo_date": r["promo_date"] or "",
+            "ref_type": "instagram", "ref_id": r["id"],
+            "planned": False})
+    for r in conn.execute(
+            "SELECT * FROM erp_mkt_newsletters ORDER BY issue_month").fetchall():
+        planned = False
+        if r["sent_at"]:
+            dt = _mkt_parse_dt(r["sent_at"])
+            d = dt.astimezone(_LA_TZ).date() if dt else None
+        else:
+            try:
+                d = datetime.strptime(r["issue_month"] + "-01", "%Y-%m-%d").date()
+            except ValueError:
+                d = None
+            planned = True
+        if not _in_month(d):
+            continue
+        items.append({
+            "date": d.isoformat(), "kind": "newsletter",
+            "title": "Newsletter %s — %s" % (
+                r["issue_month"], (r["subject"] or r["theme"] or "").strip()
+                or "(no subject yet)"),
+            "detail": "Theme: %s. Status: %s.%s" % (
+                r["theme"] or "—", r["status"],
+                " Planned send: 1st of the issue month." if planned else ""),
+            "status": r["status"], "promo_date": "",
+            "ref_type": "newsletter", "ref_id": r["id"],
+            "planned": planned})
+    # Dates a live PROMOS code starts on are listed once, as the code —
+    # the planned calendar-date placeholder for the same day is skipped
+    # below (before Nov 10 no PROMOS window ever started on a calendar
+    # date, so the two sources never collided).
+    promo_starts = {start for _c, _p in PROMOS.items()
+                    for start, _e in (_p.get("windows") or [])
+                    if not (_e < first or start >= nxt)}
+    for code, promo in PROMOS.items():
+        for start, end in (promo.get("windows") or []):
+            if end < first or start >= nxt:
+                continue
+            d0 = max(start, first)
+            items.append({
+                "date": d0, "kind": "promo",
+                "title": "%s — %s" % (code, promo.get("label") or ""),
+                "detail": "%s (%s to %s)." % (
+                    promo.get("description") or "", start, end),
+                "status": "active" if _promo_is_active(promo) else "scheduled",
+                "promo_date": start,
+                "ref_type": "promo", "ref_id": code,
+                "planned": False, "end_date": end})
+    for m, day, name, flavors, close_fit in _PROMO_CALENDAR_DATES:
+        if m != mon:
+            continue
+        if "%04d-%02d-%02d" % (year, mon, day) in promo_starts:
+            continue
+        items.append({
+            "date": "%04d-%02d-%02d" % (year, mon, day), "kind": "promo",
+            "title": "%s — %s" % (name, flavors),
+            "detail": "Featured: %s.%s" % (
+                flavors,
+                " Close fit — not an exact national day for this flavor."
+                if close_fit else ""),
+            "status": "planned", "promo_date": "%04d-%02d-%02d" % (year, mon, day),
+            "ref_type": "promo", "ref_id": "promo-cal:%02d-%02d" % (mon, day),
+            "planned": True,
+            "close_fit": close_fit})
+    conn.close()
+    items.sort(key=lambda i: (i["date"], {"instagram": 0, "newsletter": 1, "promo": 2}[i["kind"]]))
+    return jsonify(month=month, items=items, sources={
+        "instagram": "erp_mkt_ig_posts publish_at (PT date)",
+        "newsletter": "erp_mkt_newsletters sent_at, else 1st of issue_month (planned)",
+        "promo": "PROMOS windows + approved national-day promo calendar dates"})
+
+
+# ---------------- Dept 8 Wave D: promo calendar, social inbox, automation, reviews ----------------
+# Item 4 — promo-calendar management. PROMOS is a code-only dict at the top
+# of this file (no DB backing): adding a code or changing its discount still
+# needs a code change + deploy, and the UI says so plainly. What IS
+# live-editable is disable/enable, via erp_mkt_promo_overrides, which the
+# checkout promo checks honor at once.
+# Item 5 — unified social inbox, COMMENTS ONLY. Instagram comments are not
+# stored by the app today: the per-post reply/hide endpoints only queue an
+# action (erp_mkt_ig_actions) for the VM job. The inbox therefore lists only
+# comments the IG sync job has stored in erp_mkt_ig_comments (cron-auth
+# sync, account-pinned to popaliciouslv, same pattern as the insights sync).
+# DMs ("messages") are never read, stored, or replied to here — there is no
+# DM endpoint, table, or UI in this build.
+# Item 7 — marketing automation: abandoned-cart list + explicit-click
+# reminder (reuses the cron's template and subject), win-back list (no order
+# in 90 days, from _erp_customer_rows) + explicit-click send with
+# staff-written copy. Nothing sends automatically from these endpoints.
+# Item 8 — review management on the shared reviews table.
+
+
+def _mkt_promo_status(promo, disabled):
+    """active / scheduled / expired / disabled for a PROMOS entry."""
+    if disabled:
+        return "disabled"
+    windows = promo.get("windows") or []
+    if not windows:
+        return "active"
+    today = datetime.now(timezone.utc).astimezone(_LA_TZ).date().isoformat()
+    if any(start <= today <= end for start, end in windows):
+        return "active"
+    if today < windows[0][0]:
+        return "scheduled"
+    return "expired"
+
+
+@app.get("/api/erp/marketing/promos")
+def mkt_promos_list():
+    actor, err = _erp_check_perm("newsletter.read")
+    if err:
+        return err
+    conn = db()
+    overrides = {r["code"]: r for r in conn.execute(
+        "SELECT * FROM erp_mkt_promo_overrides").fetchall()}
+    codes = []
+    for code, promo in PROMOS.items():
+        ov = overrides.get(code)
+        redemptions = conn.execute(
+            "SELECT COUNT(*) AS c FROM promo_redemptions WHERE code = ?",
+            (code,)).fetchone()["c"]
+        codes.append({
+            "code": code,
+            "label": promo.get("label") or "",
+            "description": promo.get("description") or "",
+            "type": promo.get("type") or "",
+            "percent_off": promo.get("percent_off"),
+            "min_subtotal_cents": promo.get("min_subtotal_cents"),
+            "windows": promo.get("windows") or [],
+            "disabled": bool(ov and ov["disabled"]),
+            "status": _mkt_promo_status(promo, bool(ov and ov["disabled"])),
+            "redemptions": redemptions,
+            "note": (ov["note"] or "") if ov else "",
+            "updated_by": (ov["updated_by"] or "") if ov else "",
+            "updated_at": (ov["updated_at"] or "") if ov else "",
+        })
+    conn.close()
+    calendar = [{
+        "month": m, "day": day, "name": name, "flavors": flavors,
+        "close_fit": bool(close_fit),
+        "date": "%02d-%02d" % (m, day),
+    } for m, day, name, flavors, close_fit in _PROMO_CALENDAR_DATES]
+    return jsonify(
+        codes=codes,
+        calendar=calendar,
+        note="Codes live in app code (PROMOS): adding a code or changing its "
+             "discount needs a code change + deploy. Disable/enable below "
+             "takes effect at checkout immediately. National-day calendar "
+             "dates now carry backend codes — the Oct 29 national-day codes "
+             "live in PROMOS with single-day windows (fixed Nov 10).")
+
+
+def _mkt_promo_set_disabled(code, disabled, actor):
+    conn = db()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO erp_mkt_promo_overrides (code, disabled, updated_by,"
+        " updated_at) VALUES (?, ?, ?, ?)"
+        " ON CONFLICT(code) DO UPDATE SET disabled = excluded.disabled,"
+        " updated_by = excluded.updated_by,"
+        " updated_at = excluded.updated_at",
+        (code, 1 if disabled else 0, actor or "", now))
+    _mkt_audit(conn, actor, "promo_disable" if disabled else "promo_enable",
+               "promo", None, code)
+    conn.commit()
+    conn.close()
+
+
+@app.post("/api/erp/marketing/promos/<code>/disable")
+def mkt_promo_disable(code):
+    actor, err = _erp_check_perm("newsletter.write")
+    if err:
+        return err
+    code = (code or "").strip().upper()
+    if code not in PROMOS:
+        return jsonify(error="unknown promo code"), 404
+    _mkt_promo_set_disabled(code, True, actor)
+    return jsonify(ok=True, code=code, disabled=True)
+
+
+@app.post("/api/erp/marketing/promos/<code>/enable")
+def mkt_promo_enable(code):
+    actor, err = _erp_check_perm("newsletter.write")
+    if err:
+        return err
+    code = (code or "").strip().upper()
+    if code not in PROMOS:
+        return jsonify(error="unknown promo code"), 404
+    _mkt_promo_set_disabled(code, False, actor)
+    return jsonify(ok=True, code=code, disabled=False)
+
+
+# ---------- Item 5: unified social inbox, comments only ----------
+
+@app.post("/api/erp/marketing/instagram/comments/sync")
+def mkt_ig_comments_sync():
+    """Cron/VM-job ingest for stored IG comments (same pattern as the
+    insights sync). The job reads comments from @popaliciouslv via the
+    Instagram CLI and posts them here; the app never calls Instagram.
+    Each comment must belong to a known published post."""
+    auth_err = _mkt_cron_auth()
+    if auth_err:
+        return auth_err
+    data = request.get_json(force=True) or {}
+    # Account pinning: the sync job may only ever store popaliciouslv data.
+    if (data.get("account") or "").strip() != _MKT_IG_ACCOUNT:
+        return jsonify(error="account mismatch: expected popaliciouslv"), 400
+    comments = data.get("comments")
+    if not isinstance(comments, list):
+        return jsonify(error="comments must be a list"), 400
+    conn = db()
+    known = {}
+    for c in comments:
+        if (not isinstance(c, dict)
+                or not (c.get("ig_media_id") or "").strip()
+                or not (c.get("comment_id") or "").strip()):
+            conn.close()
+            return jsonify(error="each comment needs ig_media_id + comment_id"), 400
+        row = conn.execute(
+            "SELECT id FROM erp_mkt_ig_posts WHERE ig_media_id = ? AND status = 'published'",
+            ((c.get("ig_media_id") or "").strip(),)).fetchone()
+        if not row:
+            conn.close()
+            return jsonify(error="unknown published post: %s" % c["ig_media_id"]), 400
+        known[(c.get("ig_media_id") or "").strip()] = row["id"]
+    now = datetime.now(timezone.utc).isoformat()
+    stored = 0
+    for c in comments:
+        # Re-sync never clobbers a staff-set status (replied/hidden/archived).
+        conn.execute(
+            "INSERT INTO erp_mkt_ig_comments (post_id, ig_media_id, comment_id,"
+            " username, text, commented_at, status, fetched_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)"
+            " ON CONFLICT(comment_id) DO UPDATE SET"
+            " username = excluded.username, text = excluded.text,"
+            " commented_at = excluded.commented_at,"
+            " fetched_at = excluded.fetched_at",
+            (known[(c.get("ig_media_id") or "").strip()],
+             (c.get("ig_media_id") or "").strip(),
+             (c.get("comment_id") or "").strip(),
+             (c.get("username") or "").strip()[:120],
+             (c.get("text") or "").strip()[:2000],
+             (c.get("commented_at") or "").strip()[:64], now))
+        stored += 1
+    _mkt_audit(conn, "cron", "ig_comments_sync", "ig_comment", None,
+               "%d comments" % stored)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, stored=stored)
+
+
+@app.get("/api/erp/marketing/instagram/comments")
+def mkt_ig_comments_list():
+    """One queue of stored comments across all IG posts. Real stored rows
+    only — never fetched live, never invented."""
+    actor, err = _erp_check_perm("instagram.read")
+    if err:
+        return err
+    status = (request.args.get("status") or "pending").strip()
+    if status not in ("pending", "replied", "hidden", "archived", "all"):
+        return jsonify(error="status must be pending, replied, hidden, archived, or all"), 400
+    conn = db()
+    q = ("SELECT c.*, p.caption AS post_caption, p.kind AS post_kind,"
+         " p.publish_at AS post_publish_at FROM erp_mkt_ig_comments c"
+         " LEFT JOIN erp_mkt_ig_posts p ON p.id = c.post_id")
+    params = ()
+    if status != "all":
+        q += " WHERE c.status = ?"
+        params = (status,)
+    q += " ORDER BY c.commented_at DESC, c.id DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return jsonify(comments=[{
+        "id": r["id"], "post_id": r["post_id"],
+        "ig_media_id": r["ig_media_id"], "comment_id": r["comment_id"],
+        "username": r["username"], "text": r["text"],
+        "commented_at": r["commented_at"], "status": r["status"],
+        "fetched_at": r["fetched_at"],
+        "post_caption": r["post_caption"] or "",
+        "post_kind": r["post_kind"] or "",
+        "post_publish_at": r["post_publish_at"] or "",
+    } for r in rows], count=len(rows))
+
+
+@app.post("/api/erp/marketing/instagram/comments/<int:comment_id>/mark")
+def mkt_ig_comment_mark(comment_id):
+    """Record the outcome of a queue action on a stored comment. Reply and
+    hide themselves go through the existing per-post endpoints
+    (comment-reply / hide-comment, which queue the action for the VM job);
+    this endpoint only updates the queue row afterwards. Archive is a local
+    queue dismissal only — it does not delete anything on Instagram."""
+    actor, err = _erp_check_perm("instagram.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    status = (data.get("status") or "").strip()
+    if status not in ("pending", "replied", "hidden", "archived"):
+        return jsonify(error="status must be pending, replied, hidden, or archived"), 400
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_mkt_ig_comments WHERE id = ?",
+                       (comment_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="comment not found"), 404
+    conn.execute("UPDATE erp_mkt_ig_comments SET status = ? WHERE id = ?",
+                 (status, comment_id))
+    _mkt_audit(conn, actor, "ig_comment_mark_" + status, "ig_comment",
+               comment_id, row["comment_id"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, id=comment_id, status=status)
+
+
+# ---------- Item 7: marketing automation (explicit-click sends only) ----------
+
+def _mkt_age_hours(iso):
+    dt = _mkt_parse_dt(iso)
+    if not dt:
+        return None
+    return round((datetime.now(timezone.utc) - dt).total_seconds() / 3600, 1)
+
+
+@app.get("/api/erp/marketing/automation/abandoned-carts")
+def mkt_automation_abandoned():
+    """Pending abandoned-cart snapshots only, oldest first."""
+    actor, err = _erp_check_perm("newsletter.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM abandoned_carts WHERE status = 'pending'"
+        " ORDER BY updated_at ASC").fetchall()
+    conn.close()
+    carts = []
+    for r in rows:
+        try:
+            items = json.loads(r["items_json"] or "[]")
+        except (TypeError, ValueError):
+            items = []
+        carts.append({
+            "id": r["id"], "email": r["email"],
+            "session_id": r["session_id"] or "",
+            "items": items if isinstance(items, list) else [],
+            "items_summary": r["items_summary"] or "",
+            "item_count": r["item_count"] or 0,
+            "subtotal_cents": r["subtotal_cents"] or 0,
+            "created_at": r["created_at"], "updated_at": r["updated_at"],
+            "age_hours": _mkt_age_hours(r["updated_at"]),
+        })
+    return jsonify(carts=carts, count=len(carts))
+
+
+@app.post("/api/erp/marketing/automation/abandoned-carts/<int:cart_id>/send-reminder")
+def mkt_automation_abandoned_send(cart_id):
+    """Explicit-click reminder for one pending cart. Reuses the cron's
+    subject + template; marks the cart 'sent' exactly once. A failed send
+    leaves the row pending (same as the cron)."""
+    actor, err = _erp_check_perm("newsletter.write")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM abandoned_carts WHERE id = ?",
+                       (cart_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="cart not found"), 404
+    if row["status"] != "pending":
+        conn.close()
+        return jsonify(error="cart already %s" % row["status"]), 409
+    try:
+        items = json.loads(row["items_json"] or "[]")
+    except (TypeError, ValueError):
+        items = []
+    if not items:
+        conn.execute("UPDATE abandoned_carts SET status = 'converted' WHERE id = ?",
+                     (cart_id,))
+        conn.commit()
+        conn.close()
+        return jsonify(error="cart is empty"), 400
+    try:
+        send_email(
+            row["email"],
+            "You left popcorn in your cart \U0001F37F",
+            abandoned_cart_email_html(items, int(row["subtotal_cents"] or 0)),
+        )
+    except Exception:
+        conn.close()
+        return jsonify(error="send failed, cart left pending"), 502
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE abandoned_carts SET status = 'sent', sent_at = ? WHERE id = ?",
+        (now, cart_id))
+    _mkt_audit(conn, actor, "abandoned_reminder_send", "abandoned_cart",
+               cart_id, row["email"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, id=cart_id, sent=True)
+
+
+@app.get("/api/erp/marketing/automation/win-back")
+def mkt_automation_winback():
+    """Customers with no order in 90 days, from _erp_customer_rows (real
+    orders only). Email-less rows cannot be emailed and are excluded."""
+    actor, err = _erp_check_perm("newsletter.read")
+    if err:
+        return err
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=90)).isoformat()
+    conn = db()
+    customers = _erp_customer_rows(conn)
+    sent_map = {r["email"]: r["last_sent"] for r in conn.execute(
+        "SELECT email, MAX(sent_at) AS last_sent FROM erp_mkt_winback_sends"
+        " GROUP BY email").fetchall()}
+    conn.close()
+    rows = []
+    for c in customers.values():
+        if not c["email"]:
+            continue
+        last = c["last_order_at"] or ""
+        if last and last <= cutoff:
+            rows.append({
+                "key": c["key"], "email": c["email"],
+                "display": c["display"],
+                "account_name": c["account_name"] or "",
+                "order_count": c["order_count"],
+                "total_bags": c["total_bags"],
+                "total_spent_cents": c["total_spent_cents"],
+                "first_order_at": c["first_order_at"],
+                "last_order_at": c["last_order_at"],
+                "last_winback_sent_at": sent_map.get(c["email"]) or "",
+            })
+    rows.sort(key=lambda r: r["last_order_at"] or "")
+    return jsonify(customers=rows, count=len(rows), cutoff=cutoff)
+
+
+@app.post("/api/erp/marketing/automation/win-back/send")
+def mkt_automation_winback_send():
+    """Explicit-click win-back email. No canned copy exists for win-back, so
+    the staff member writes the subject + body in the ERP; exactly what they
+    wrote is what sends. One send is recorded per click."""
+    actor, err = _erp_check_perm("newsletter.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not EMAIL_RE.match(email):
+        return jsonify(error="valid email required"), 400
+    subject = (data.get("subject") or "").strip()
+    body = (data.get("body") or "").strip()
+    if not subject or len(subject) > 200:
+        return jsonify(error="subject is required (200 characters max)"), 400
+    if not body or len(body) > 5000:
+        return jsonify(error="body is required (5000 characters max)"), 400
+    html_body = "<p>" + html.escape(body).replace("\n", "<br>") + "</p>"
+    try:
+        send_email(email, subject, html_body)
+    except Exception:
+        return jsonify(error="send failed"), 502
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    conn.execute(
+        "INSERT INTO erp_mkt_winback_sends (customer_key, email, subject,"
+        " sent_at, sent_by) VALUES (?, ?, ?, ?, ?)",
+        ("email:" + email, email, subject, now, actor or ""))
+    _mkt_audit(conn, actor, "winback_send", "winback", None, email)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, email=email, sent=True)
+
+
+# ---------- Item 8: review management ----------
+
+@app.get("/api/erp/marketing/reviews")
+def mkt_reviews_list():
+    actor, err = _erp_check_perm("support.read")
+    if err:
+        return err
+    status = (request.args.get("status") or "pending").strip()
+    if status not in ("pending", "approved", "all"):
+        return jsonify(error="status must be pending, approved, or all"), 400
+    conn = db()
+    q = ("SELECT id, flavor_slug, user_name, rating, text, approved,"
+         " created_at FROM reviews")
+    params = ()
+    if status == "pending":
+        q += " WHERE approved = 0"
+    elif status == "approved":
+        q += " WHERE approved = 1"
+    q += " ORDER BY created_at DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return jsonify(reviews=[{
+        "id": r["id"], "flavor": r["flavor_slug"], "name": r["user_name"],
+        "rating": r["rating"], "text": r["text"],
+        "approved": bool(r["approved"]), "created_at": r["created_at"],
+    } for r in rows], count=len(rows))
+
+
+@app.post("/api/erp/marketing/reviews/<int:review_id>/approve")
+def mkt_review_approve(review_id):
+    actor, err = _erp_check_perm("support.write")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT id FROM reviews WHERE id = ?",
+                       (review_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="review not found"), 404
+    conn.execute("UPDATE reviews SET approved = 1 WHERE id = ?", (review_id,))
+    _mkt_audit(conn, actor, "review_approve", "review", review_id, "")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, id=review_id, approved=True)
+
+
+@app.post("/api/erp/marketing/reviews/<int:review_id>/reject")
+def mkt_review_reject(review_id):
+    actor, err = _erp_check_perm("support.write")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT id FROM reviews WHERE id = ?",
+                       (review_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="review not found"), 404
+    conn.execute("DELETE FROM reviews WHERE id = ?", (review_id,))
+    _mkt_audit(conn, actor, "review_reject", "review", review_id, "")
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, id=review_id, rejected=True)
+
+
+# ---------------- ERP loyalty console (Dept 8 item 3, Nov 2026) ----------------
+# The storefront staff console (#staff-loyalty) stays live until the
+# removal step; these ERP-gated endpoints call the same internal ledger
+# helpers (_credit_kernels, _debit_kernels, _kernel_balance,
+# _loyalty_tier, _credit_staff_kernels) so the money logic stays
+# single-sourced. No daily cap exists anywhere in the backend and none
+# is invented here; Kernel Catch stays demo-only and is not offered.
+
+def _erp_loyalty_actor_staff_id(conn):
+    """Resolve the ERP actor's staff row by exact email match.
+
+    Returns (email, staff_id_or_None). Matt's admin email
+    (matt@fudgetopia.net) has no staff row (his is
+    matt@pop-a-licious.com): member credit/redeem/signup still work
+    with staff_id NULL, and My profile / self-redeem show a note to
+    sign in via the Staff tab instead of failing. Never invents a
+    staff row or attributes one person's work to another."""
+    role = _erp_role()
+    email = ""
+    if role == "admin":
+        user = _current_member()
+        email = (user["email"] if user else "") or ""
+    elif role == "staff":
+        staff = _staff_from_request()
+        email = (staff["email"] if staff else "") or ""
+    staff_id = None
+    if email:
+        row = conn.execute(
+            "SELECT id FROM staff WHERE LOWER(email) = LOWER(?)", (email,)
+        ).fetchone()
+        if row:
+            staff_id = row["id"]
+    return email, staff_id
+
+
+_ERP_LOYALTY_NO_STAFF_NOTE = (
+    "No staff record matches this login email — sign in via the Staff tab "
+    "to use your own profile and rewards. Member lookup, credit, and "
+    "redeem still work.")
+
+
+@app.get("/api/erp/loyalty/members")
+def erp_loyalty_members():
+    """Member lookup for the counter. Same search as
+    /api/loyalty/staff/members (QR URL, PAL:<id>, email, name; max 20),
+    plus the customer reward tiers/labels so the console paints redeem
+    buttons from live values, never hardcoded costs."""
+    actor, err = _erp_check_perm("loyalty.read")
+    if err:
+        return err
+    conn = db()
+    members = _loyalty_member_search(conn, request.args.get("q") or "")
+    conn.close()
+    return jsonify(
+        members=members,
+        reward_tiers={k: v["kernels"] for k, v in REWARD_TIERS.items()},
+        reward_labels={k: v["label"] for k, v in REWARD_TIERS.items()})
+
+
+@app.post("/api/erp/loyalty/credit")
+def erp_loyalty_credit():
+    """Credit Kernels for an in-person sale. Body: {user_id, amount_cents, note?}
+    ERP-gated mirror of /api/loyalty/staff/credit ($1,000/sale cap)."""
+    actor, err = _erp_check_perm("loyalty.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    try:
+        user_id = int(data.get("user_id") or 0)
+        amount_cents = int(data.get("amount_cents") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="invalid input"), 400
+    if user_id <= 0 or amount_cents <= 0 or amount_cents > 100000:
+        return jsonify(error="invalid input"), 400
+    kernels = max(amount_cents // 100 * KERNELS_PER_DOLLAR, 0)
+    conn = db()
+    _, staff_id = _erp_loyalty_actor_staff_id(conn)
+    mrow = conn.execute("SELECT active FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not mrow:
+        conn.close()
+        return jsonify(error="member not found"), 404
+    if not mrow["active"]:
+        conn.close()
+        return jsonify(error="member account is deactivated"), 403
+    _credit_kernels(conn, user_id, kernels, "in_person",
+                    order_ref=(data.get("note") or "")[:120], staff_id=staff_id)
+    conn.commit()
+    balance = _kernel_balance(conn, user_id)
+    conn.close()
+    return jsonify(ok=True, kernels_credited=kernels, balance=balance)
+
+
+@app.post("/api/erp/loyalty/redeem-member")
+def erp_loyalty_redeem_member():
+    """Redeem a reward on a member's behalf in person. Body: {user_id, reward_type}
+    ERP-gated mirror of staff_redeem_for_member; free shipping is online only.
+    Distinct route name — the /api/loyalty/staff/redeem collision is not repeated."""
+    actor, err = _erp_check_perm("loyalty.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    try:
+        user_id = int(data.get("user_id") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="invalid input"), 400
+    reward_type = (data.get("reward_type") or "").strip()
+    tier = REWARD_TIERS.get(reward_type)
+    if user_id <= 0 or not tier:
+        return jsonify(error="invalid input"), 400
+    if reward_type == "free_shipping":
+        return jsonify(error="Free shipping rewards are online only and can't be redeemed in person"), 400
+    conn = db()
+    _, staff_id = _erp_loyalty_actor_staff_id(conn)
+    mrow = conn.execute("SELECT active FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not mrow:
+        conn.close()
+        return jsonify(error="member not found"), 404
+    if not mrow["active"]:
+        conn.close()
+        return jsonify(error="member account is deactivated"), 403
+    code = _new_reward_code()
+    if not _debit_kernels(conn, user_id, tier["kernels"], "redemption_in_person",
+                          order_ref=code, staff_id=staff_id):
+        conn.close()
+        return jsonify(error="not enough Kernels"), 402
+    conn.execute(
+        "INSERT INTO loyalty_rewards (user_id, reward_type, code, kernels_spent, staff_id, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, reward_type, code, tier["kernels"], staff_id,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    balance = _kernel_balance(conn, user_id)
+    # In person the reward is applied on the spot, so mark it used immediately.
+    conn.execute(
+        "UPDATE loyalty_rewards SET used = 1, used_at = ? WHERE code = ?",
+        (datetime.now(timezone.utc).isoformat(), code),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, label=tier["label"], balance=balance)
+
+
+@app.post("/api/erp/loyalty/signup-member")
+def erp_loyalty_signup_member():
+    """Staff registers a new customer in person. Body: {name, email, password}
+    ERP-gated mirror of /api/loyalty/staff/signup-member; the acting staff
+    member earns 1 Kernel when they have a staff row, otherwise no credit
+    is invented and staff_kernels comes back null."""
+    actor, err = _erp_check_perm("loyalty.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+    if not name:
+        return jsonify(error="please enter the customer's name"), 400
+    if not EMAIL_RE.match(email):
+        return jsonify(error="please enter a valid email address"), 400
+    if len(password) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+    conn = db()
+    _, staff_id = _erp_loyalty_actor_staff_id(conn)
+    existing = conn.execute(
+        "SELECT id, active FROM users WHERE email = ?", (email,)
+    ).fetchone()
+    if existing and existing["active"]:
+        conn.close()
+        return jsonify(error="an account with this email already exists"), 409
+    if existing:
+        conn.execute("DELETE FROM users WHERE id = ?", (existing["id"],))
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO users (email, name, password_hash, verified, created_at)"
+        " VALUES (?, ?, ?, 0, ?)",
+        (email, name, generate_password_hash(password), now),
+    )
+    user_id = cur.lastrowid
+    token = secrets.token_urlsafe(32)
+    expires = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+    conn.execute(
+        "INSERT INTO verification_tokens (token, user_id, expires_at) VALUES (?, ?, ?)",
+        (token, user_id, expires),
+    )
+    staff_kernels = None
+    if staff_id is not None:
+        _credit_staff_kernels(conn, staff_id, 1, "member_signup", ref=email)
+        conn.commit()
+        staff_kernels = conn.execute(
+            "SELECT kernels FROM staff WHERE id = ?", (staff_id,)
+        ).fetchone()["kernels"]
+    else:
+        conn.commit()
+    conn.close()
+    verify_url = f"{SITE_URL}/#verify?token={token}"
+    try:
+        send_email(email, "Verify your Pop-A-Licious account",
+                   f"Hi {name},\n\nPlease verify your account:\n{verify_url}\n")
+    except Exception:
+        pass
+    return jsonify(ok=True, user_id=user_id, staff_kernels=staff_kernels)
+
+
+@app.get("/api/erp/loyalty/profile")
+def erp_loyalty_profile():
+    """The signed-in staff member's own profile (My profile). Same payload
+    as /api/loyalty/staff/profile when the login email matches a staff row;
+    otherwise a note to sign in via the Staff tab instead of failing."""
+    actor, err = _erp_check_perm("loyalty.read")
+    if err:
+        return err
+    conn = db()
+    email, staff_id = _erp_loyalty_actor_staff_id(conn)
+    if staff_id is None:
+        conn.close()
+        return jsonify(ok=True, has_staff_row=False, email=email,
+                       note=_ERP_LOYALTY_NO_STAFF_NOTE)
+    payload = _loyalty_staff_profile_payload(conn, staff_id)
+    conn.close()
+    payload["has_staff_row"] = True
+    return jsonify(**payload)
+
+
+@app.post("/api/erp/loyalty/redeem-self")
+def erp_loyalty_redeem_self():
+    """The staff member's own redemption — the logic of the dead
+    /api/loyalty/staff/redeem handler, under a distinct route so it is
+    reachable for the first time. Body: {reward_type, gift_card_choice?}"""
+    actor, err = _erp_check_perm("loyalty.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    _, staff_id = _erp_loyalty_actor_staff_id(conn)
+    conn.close()
+    if staff_id is None:
+        return jsonify(error=_ERP_LOYALTY_NO_STAFF_NOTE), 400
+    code, payload = _do_staff_self_redeem(
+        staff_id, (data.get("reward_type") or "").strip(),
+        (data.get("gift_card_choice") or "").strip())
+    return jsonify(**payload), code
+
+
+@app.post("/api/erp/loyalty/birthday")
+def erp_loyalty_birthday():
+    """Set the signed-in staff member's own birthday. Mirror of
+    /api/loyalty/staff/birthday; needs a matching staff row."""
+    actor, err = _erp_check_perm("loyalty.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    bday = (data.get("birthday") or "").strip()
+    if bday and not re.match(r"^\d{4}-\d{2}-\d{2}$", bday):
+        return jsonify(error="birthday must be YYYY-MM-DD"), 400
+    conn = db()
+    _, staff_id = _erp_loyalty_actor_staff_id(conn)
+    if staff_id is None:
+        conn.close()
+        return jsonify(error=_ERP_LOYALTY_NO_STAFF_NOTE), 400
+    conn.execute("UPDATE staff SET birthday = ? WHERE id = ?", (bday, staff_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/loyalty/password")
+def erp_loyalty_password():
+    """Self-service password change. Mirror of /api/loyalty/staff/password."""
+    actor, err = _erp_check_perm("loyalty.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    current = data.get("current_password") or ""
+    new = data.get("new_password") or ""
+    if len(new) < 8:
+        return jsonify(error="new password must be at least 8 characters"), 400
+    conn = db()
+    _, staff_id = _erp_loyalty_actor_staff_id(conn)
+    if staff_id is None:
+        conn.close()
+        return jsonify(error=_ERP_LOYALTY_NO_STAFF_NOTE), 400
+    row = conn.execute(
+        "SELECT password_hash FROM staff WHERE id = ?", (staff_id,)
+    ).fetchone()
+    if not row or not check_password_hash(row["password_hash"], current):
+        conn.close()
+        return jsonify(error="current password is incorrect"), 401
+    conn.execute(
+        "UPDATE staff SET password_hash = ? WHERE id = ?",
+        (generate_password_hash(new), staff_id),
+    )
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/loyalty/headshot")
+def erp_loyalty_headshot():
+    """Headshot upload for My profile. Mirror of /api/loyalty/staff/headshot
+    (data URL jpeg/png/webp, ~500KB cap)."""
+    actor, err = _erp_check_perm("loyalty.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    img = (data.get("headshot") or "").strip()
+    if not img.startswith("data:image/"):
+        return jsonify(error="upload an image file"), 400
+    if len(img) > 700_000:
+        return jsonify(error="image is too large — keep it under 500KB"), 400
+    conn = db()
+    _, staff_id = _erp_loyalty_actor_staff_id(conn)
+    if staff_id is None:
+        conn.close()
+        return jsonify(error=_ERP_LOYALTY_NO_STAFF_NOTE), 400
+    conn.execute("UPDATE staff SET headshot = ? WHERE id = ?", (img, staff_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
 
 
 @app.get("/api/admin/dashboard")
@@ -7713,41 +11025,7090 @@ def admin_list_staff():
 
 @app.post("/api/admin/staff/<int:staff_id>/deactivate")
 def admin_deactivate_staff(staff_id):
+    """Deactivate a staff member (Dept 11: now wired to the ERP UI).
+
+    Effect is immediate: staff login requires active = 1, and
+    _staff_from_request also requires active = 1, so an in-flight 12-hour
+    staff session stops working on the next request. Grants are kept
+    (hidden in the UI while inactive) so a reactivation restores them.
+    An admin can never deactivate their own account."""
     user = _current_member()
     if not _is_admin(user):
         return jsonify(error="admin required"), 403
     conn = db()
+    row = conn.execute("SELECT id, name, email, active FROM staff WHERE id = ?",
+                       (staff_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="staff not found"), 404
+    if _erp_staff_is_self(user, row):
+        conn.close()
+        return jsonify(error="you cannot deactivate your own account"), 403
+    if not row["active"]:
+        conn.close()
+        return jsonify(ok=True, already_inactive=True)
     conn.execute("UPDATE staff SET active = 0 WHERE id = ?", (staff_id,))
+    _erp_staff_audit(conn, user["email"], "staff.deactivated", "staff",
+                     staff_id, "deactivated %s (%s)" % (row["name"] or row["email"], row["email"]))
     conn.commit()
     conn.close()
     return jsonify(ok=True)
 
 @app.post("/api/admin/staff/<int:staff_id>/activate")
 def admin_activate_staff(staff_id):
+    """Reactivate a deactivated staff member (Dept 11).
+
+    Restores login immediately with the password and grants they had
+    before deactivation (no verification email -- that goes with the
+    create-staff reactivation path, which also resets the password)."""
     user = _current_member()
     if not _is_admin(user):
         return jsonify(error="admin required"), 403
     conn = db()
+    row = conn.execute("SELECT id, name, email, active FROM staff WHERE id = ?",
+                       (staff_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="staff not found"), 404
+    if row["active"]:
+        conn.close()
+        return jsonify(ok=True, already_active=True)
     conn.execute("UPDATE staff SET active = 1 WHERE id = ?", (staff_id,))
+    _erp_staff_audit(conn, user["email"], "staff.reactivated", "staff",
+                     staff_id, "reactivated %s (%s)" % (row["name"] or row["email"], row["email"]))
     conn.commit()
     conn.close()
     return jsonify(ok=True)
 
 @app.post("/api/admin/staff/<int:staff_id>/update")
 def admin_update_staff(staff_id):
+    """Edit a staff member (Dept 11: extended beyond hire_date).
+
+    Accepts name, email, hire_date -- only provided fields change.
+    Email must be valid and unique among staff (409 on a clash). An admin
+    may edit their own row (name/email are display data); deactivation
+    and password reset of your own account stay blocked."""
     user = _current_member()
     if not _is_admin(user):
         return jsonify(error="admin required"), 403
     data = request.get_json(force=True) or {}
-    hire_date = (data.get("hire_date") or "").strip()
+    name = (data.get("name") or "").strip() if "name" in data else None
+    email = (data.get("email") or "").strip().lower() if "email" in data else None
+    hire_date = (data.get("hire_date") or "").strip() if "hire_date" in data else None
+    if name is not None and (not name or len(name) > 100):
+        return jsonify(error="name must be 1-100 characters"), 400
+    if email is not None and not EMAIL_RE.match(email):
+        return jsonify(error="valid email required"), 400
     if hire_date and not re.match(r"^\d{4}-\d{2}-\d{2}$", hire_date):
         return jsonify(error="hire date must be YYYY-MM-DD"), 400
     conn = db()
-    conn.execute("UPDATE staff SET hire_date = ? WHERE id = ?",
-                 (hire_date, staff_id))
+    row = conn.execute("SELECT id, name, email, hire_date FROM staff WHERE id = ?",
+                       (staff_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="staff not found"), 404
+    if email is not None and email != (row["email"] or "").lower():
+        clash = conn.execute(
+            "SELECT id FROM staff WHERE email = ? AND id != ?",
+            (email, staff_id)).fetchone()
+        if clash:
+            conn.close()
+            return jsonify(error="that staff email already exists"), 409
+    changes = []
+    sets = []
+    args = []
+    if name is not None and name != (row["name"] or ""):
+        sets.append("name = ?")
+        args.append(name)
+        changes.append("name: %s -> %s" % (row["name"] or "", name))
+    if email is not None and email != (row["email"] or "").lower():
+        sets.append("email = ?")
+        args.append(email)
+        changes.append("email: %s -> %s" % (row["email"] or "", email))
+    if hire_date is not None and (hire_date or "") != (row["hire_date"] or ""):
+        sets.append("hire_date = ?")
+        args.append(hire_date)
+        changes.append("hire_date: %s -> %s" % (row["hire_date"] or "", hire_date))
+    if sets:
+        args.append(staff_id)
+        conn.execute("UPDATE staff SET %s WHERE id = ?" % ", ".join(sets), args)
+        _erp_staff_audit(conn, user["email"], "staff.updated", "staff",
+                         staff_id, "%s (%s): %s" % (
+                             row["name"] or row["email"], row["email"],
+                             "; ".join(changes)))
+        conn.commit()
+    conn.close()
+    return jsonify(ok=True, changed=bool(sets))
+
+@app.post("/api/admin/staff/<int:staff_id>/reset-password")
+def admin_reset_staff_password(staff_id):
+    """Admin password reset (Dept 11: new endpoint).
+
+    Reuses the existing self-service reset machinery instead of building
+    a parallel one: a temporary password is set (admin-supplied, 8+
+    chars, or generated), and a 1-hour reset token is issued in
+    staff_password_reset_tokens with the existing reset email
+    (_send_staff_password_reset_email, "#staff-reset-password" link).
+    The old password stops working immediately (hash replaced). The
+    temporary password DOES work as-is for login -- verified is left
+    untouched, unlike the add-staff flow -- so the admin can hand it to
+    the person in person and they change it in the loyalty portal
+    (My profile -> POST /api/loyalty/staff/password, current password
+    required). The emailed 1-hour link is the other way back in: it
+    sets a new password without knowing the temporary one. The
+    temporary password is never put in the email. An admin can never
+    reset their own password this way, and a deactivated account cannot
+    be reset (reactivate it first)."""
+    user = _current_member()
+    if not _is_admin(user):
+        return jsonify(error="admin required"), 403
+    data = request.get_json(force=True) or {}
+    temp = data.get("password") or ""
+    if temp and len(temp) < 8:
+        return jsonify(error="password must be at least 8 characters"), 400
+    if not temp:
+        temp = secrets.token_urlsafe(12)
+    conn = db()
+    row = conn.execute("SELECT id, name, email, active FROM staff WHERE id = ?",
+                       (staff_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="staff not found"), 404
+    if _erp_staff_is_self(user, row):
+        conn.close()
+        return jsonify(error="you cannot reset your own password"), 403
+    if not row["active"]:
+        conn.close()
+        return jsonify(error="staff member is inactive -- reactivate first"), 400
+    conn.execute(
+        "UPDATE staff SET password_hash = ? WHERE id = ?",
+        (generate_password_hash(temp), staff_id))
+    conn.execute(
+        "UPDATE staff_password_reset_tokens SET used = 1"
+        " WHERE staff_id = ? AND used = 0", (staff_id,))
+    rtoken = secrets.token_urlsafe(32)
+    rexpires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    conn.execute(
+        "INSERT INTO staff_password_reset_tokens (token, staff_id, expires_at)"
+        " VALUES (?, ?, ?)",
+        (rtoken, staff_id, rexpires),
+    )
+    _erp_staff_audit(conn, user["email"], "staff.password_reset", "staff",
+                     staff_id, "password reset for %s (%s); reset email sent"
+                     % (row["name"] or row["email"], row["email"]))
+    conn.commit()
+    conn.close()
+    try:
+        _send_staff_password_reset_email(row["name"], row["email"], rtoken)
+    except Exception:
+        pass
+    return jsonify(ok=True)
+
+@app.get("/api/erp/admin/staff-audit")
+def erp_admin_staff_audit_list():
+    """Staff audit log (Dept 11): admin-only, newest first.
+
+    Filters: action, actor, from/to (day granularity, inclusive -- same
+    day helper as the Settings audit). Limit 1-500, default 100.
+    Gated like the other ERP admin endpoints: anon -> 401, staff -> 403."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    try:
+        limit = int(request.args.get("limit") or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 500))
+    action = (request.args.get("action") or "").strip()
+    actor_f = (request.args.get("actor") or "").strip()
+    from_day = _erp_settings_audit_day(request.args.get("from") or "")
+    to_day = _erp_settings_audit_day(request.args.get("to") or "")
+    conds = []
+    args = []
+    if action:
+        conds.append("action = ?")
+        args.append(action)
+    if actor_f:
+        conds.append("actor = ?")
+        args.append(actor_f)
+    if from_day:
+        conds.append("substr(created_at, 1, 10) >= ?")
+        args.append(from_day)
+    if to_day:
+        conds.append("substr(created_at, 1, 10) <= ?")
+        args.append(to_day)
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    conn = db()
+    total = conn.execute("SELECT COUNT(*) AS c FROM erp_staff_audit" + where,
+                         args).fetchone()["c"]
+    rows = conn.execute(
+        "SELECT id, actor, action, target_type, target_id, detail, created_at"
+        " FROM erp_staff_audit" + where + " ORDER BY id DESC LIMIT ?",
+        args + [limit]).fetchall()
+    conn.close()
+    return jsonify(audit=[dict(r) for r in rows], total=total, limit=limit)
+
+# ---------------- HR Wave A: employee records + onboarding ----------------
+# Dept 12 (HR), items 1 + 2. Admin-only via _require_erp_admin() -- the
+# same gate as the staff-audit endpoint; "admin" is never a grantable
+# perm, so no staff member can reach these. HR has NO money in this wave
+# (the cash record lands with time tracking in Wave B).
+HR_ONBOARDING_TEMPLATE = (
+    "Account created",
+    "Permissions set",
+    "Training done",
+    "First shift/event assigned",
+    "Emergency contact on file",
+)
+
+
+def _hr_valid_hire_date(value):
+    """YYYY-MM-DD and a real calendar date, or blank."""
+    if not value:
+        return True
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _hr_onboarding_items(conn, employee_id):
+    rows = conn.execute(
+        "SELECT id, employee_id, label, done, done_by, done_at, created_at"
+        " FROM erp_hr_onboarding WHERE employee_id = ? ORDER BY id",
+        (employee_id,)).fetchall()
+    return [{"id": r["id"], "employee_id": r["employee_id"], "label": r["label"],
+             "done": bool(r["done"]), "done_by": r["done_by"] or "",
+             "done_at": r["done_at"] or "", "created_at": r["created_at"]}
+            for r in rows]
+
+
+def _hr_employee_payload(conn, row, with_items=False):
+    items = _hr_onboarding_items(conn, row["id"])
+    done = sum(1 for i in items if i["done"])
+    staff_email = ""
+    staff_active = None
+    if row["staff_id"]:
+        s = conn.execute("SELECT email, active FROM staff WHERE id = ?",
+                         (row["staff_id"],)).fetchone()
+        if s:
+            staff_email = s["email"] or ""
+            staff_active = bool(s["active"])
+    payload = {
+        "id": row["id"], "staff_id": row["staff_id"],
+        "name": row["name"], "email": row["email"] or "",
+        "role": row["role"] or "", "department": row["department"] or "",
+        "phone": row["phone"] or "",
+        "emergency_contact": row["emergency_contact"] or "",
+        "emergency_phone": row["emergency_phone"] or "",
+        "hire_date": row["hire_date"] or "",
+        "hourly_rate_cents": row["hourly_rate_cents"],
+        "active": bool(row["active"]),
+        "linked": bool(row["staff_id"]),
+        "staff_email": staff_email, "staff_active": staff_active,
+        "created_by": row["created_by"] or "", "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+        "onboarding_done": done, "onboarding_total": len(items),
+    }
+    if with_items:
+        payload["onboarding"] = items
+    return payload
+
+
+def _hr_seed_onboarding(conn, employee_id, now, labels=None):
+    """Seed an employee's checklist. `labels` is a role-template step
+    list when one was assigned; otherwise the 5-item default."""
+    for label in (labels if labels else HR_ONBOARDING_TEMPLATE):
+        conn.execute(
+            "INSERT INTO erp_hr_onboarding (employee_id, label, done,"
+            " done_by, done_at, created_at) VALUES (?, ?, 0, '', '', ?)",
+            (employee_id, label, now))
+
+
+def _hr_get_employee(conn, employee_id):
+    try:
+        employee_id = int(employee_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_employees WHERE id = ?",
+                        (employee_id,)).fetchone()
+
+
+@app.get("/api/erp/hr/onboarding-template")
+def hr_onboarding_template():
+    """The 5 default checklist labels seeded on every new record."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    return jsonify(template=list(HR_ONBOARDING_TEMPLATE))
+
+
+@app.get("/api/erp/hr/employees")
+def hr_list_employees():
+    """Staff directory: every record, active and inactive (inactive stay
+    visible as inactive, never silently vanish), with onboarding progress."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_employees ORDER BY active DESC, name, email"
+    ).fetchall()
+    out = [_hr_employee_payload(conn, r) for r in rows]
+    conn.close()
+    return jsonify(employees=out)
+
+
+@app.post("/api/erp/hr/employees")
+def hr_create_employee():
+    """Create an employee record (201) and seed its 5-item onboarding
+    checklist. staff_id links to an existing staff login row; omit it
+    for event-only staff with no ERP login (standalone record). One HR
+    record per staff row (409 on a second link). Name/email/hire_date
+    default from the linked staff row when not supplied. For linked
+    rows the staff row's hire_date is set to the record's hire_date so
+    the two stay in sync; the HR record is the source of truth."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    now = datetime.now(timezone.utc).isoformat()
+    staff_id = data.get("staff_id")
+    if staff_id is not None and staff_id != "":
+        try:
+            staff_id = int(staff_id)
+        except (TypeError, ValueError):
+            return jsonify(error="staff_id must be a staff id"), 400
+    else:
+        staff_id = None
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    role = (data.get("role") or "").strip()
+    department = (data.get("department") or "").strip()
+    phone = (data.get("phone") or "").strip()
+    emergency_contact = (data.get("emergency_contact") or "").strip()
+    emergency_phone = (data.get("emergency_phone") or "").strip()
+    hire_date = (data.get("hire_date") or "").strip()
+    hourly_rate_cents = _hr_parse_rate(data.get("hourly_rate_cents"))
+    if hourly_rate_cents is False:
+        conn = db()
+        conn.close()
+        return jsonify(error="hourly rate must be a whole number of cents, 0 or more"), 400
+    conn = db()
+    staff_row = None
+    if staff_id is not None:
+        staff_row = conn.execute(
+            "SELECT id, name, email, hire_date FROM staff WHERE id = ?",
+            (staff_id,)).fetchone()
+        if not staff_row:
+            conn.close()
+            return jsonify(error="staff not found"), 404
+        clash = conn.execute(
+            "SELECT id FROM erp_hr_employees WHERE staff_id = ?",
+            (staff_id,)).fetchone()
+        if clash:
+            conn.close()
+            return jsonify(error="that staff login already has an HR record"), 409
+        if not name:
+            name = staff_row["name"] or ""
+        if not email:
+            email = (staff_row["email"] or "").lower()
+        if not hire_date:
+            hire_date = staff_row["hire_date"] or ""
+    if not name or len(name) > 100:
+        conn.close()
+        return jsonify(error="name must be 1-100 characters"), 400
+    if email and not EMAIL_RE.match(email):
+        conn.close()
+        return jsonify(error="valid email required"), 400
+    if len(email) > 200 or len(role) > 100 or len(department) > 100 \
+            or len(phone) > 100 or len(emergency_contact) > 200 \
+            or len(emergency_phone) > 100:
+        conn.close()
+        return jsonify(error="a field is too long"), 400
+    if not _hr_valid_hire_date(hire_date):
+        conn.close()
+        return jsonify(error="hire date must be YYYY-MM-DD"), 400
+    # Additions Wave C: onboarding template assignment. An explicit
+    # onboarding_template_id wins; otherwise a template whose role
+    # matches the employee's role (case-insensitive) seeds the
+    # checklist; otherwise the 5-item default is the fallback.
+    _seed_labels = None
+    _seed_template_id = None
+    _tpl_id = data.get("onboarding_template_id")
+    if _tpl_id is not None and _tpl_id != "":
+        try:
+            _tpl_id = int(_tpl_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="onboarding_template_id must be a template id"), 400
+        _trow = conn.execute(
+            "SELECT * FROM erp_hr_onboarding_templates WHERE id = ?",
+            (_tpl_id,)).fetchone()
+        if not _trow:
+            conn.close()
+            return jsonify(error="onboarding template not found"), 404
+        try:
+            _seed_labels = json.loads(_trow["steps_json"] or "[]") or []
+        except (TypeError, ValueError):
+            _seed_labels = []
+        _seed_template_id = _trow["id"]
+    elif role:
+        _trow = conn.execute(
+            "SELECT * FROM erp_hr_onboarding_templates"
+            " WHERE lower(role) = lower(?)", (role,)).fetchone()
+        if _trow:
+            try:
+                _seed_labels = json.loads(_trow["steps_json"] or "[]") or []
+            except (TypeError, ValueError):
+                _seed_labels = []
+            _seed_template_id = _trow["id"]
+    cur = conn.execute(
+        "INSERT INTO erp_hr_employees (staff_id, name, email, role,"
+        " department, phone, emergency_contact, emergency_phone, hire_date,"
+        " hourly_rate_cents,"
+        " active, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, '', '')",
+        (staff_id, name, email, role, department, phone, emergency_contact,
+         emergency_phone, hire_date, hourly_rate_cents, actor, now))
+    employee_id = cur.lastrowid
+    _hr_seed_onboarding(conn, employee_id, now, _seed_labels or None)
+    if staff_row is not None and hire_date and hire_date != (staff_row["hire_date"] or ""):
+        conn.execute("UPDATE staff SET hire_date = ? WHERE id = ?",
+                     (hire_date, staff_id))
+    _erp_staff_audit(conn, actor, "hr.employee_created", "hr_employee",
+                     employee_id, "created HR record for %s%s" % (
+                         name, " (linked to staff #%d)" % staff_id if staff_id else ""))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_employees WHERE id = ?",
+                       (employee_id,)).fetchone()
+    payload = _hr_employee_payload(conn, row, with_items=True)
+    payload["onboarding_template_id"] = _seed_template_id
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.get("/api/erp/hr/employees/<int:employee_id>")
+def hr_get_employee(employee_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_employee(conn, employee_id)
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    payload = _hr_employee_payload(conn, row, with_items=True)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/employees/<int:employee_id>/update")
+def hr_update_employee(employee_id):
+    """Edit a record -- only provided fields change. The staff link is
+    set at creation and cannot be moved here. hire_date syncs to the
+    linked staff row; name/email live on the HR record only and never
+    rewrite the staff login row."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields = ("name", "email", "role", "department", "phone",
+              "emergency_contact", "emergency_phone", "hire_date")
+    vals = {}
+    for f in fields:
+        if f in data:
+            vals[f] = (data.get(f) or "").strip()
+    rate_provided = "hourly_rate_cents" in data
+    rate_val = None
+    if rate_provided:
+        rate_val = _hr_parse_rate(data.get("hourly_rate_cents"))
+        if rate_val is False:
+            return jsonify(error="hourly rate must be a whole number of cents, 0 or more"), 400
+    if "email" in vals:
+        vals["email"] = vals["email"].lower()
+    if "name" in vals and (not vals["name"] or len(vals["name"]) > 100):
+        return jsonify(error="name must be 1-100 characters"), 400
+    if "email" in vals and vals["email"] and not EMAIL_RE.match(vals["email"]):
+        return jsonify(error="valid email required"), 400
+    if "hire_date" in vals and not _hr_valid_hire_date(vals["hire_date"]):
+        return jsonify(error="hire date must be YYYY-MM-DD"), 400
+    if (len(vals.get("email", "")) > 200 or len(vals.get("role", "")) > 100
+            or len(vals.get("department", "")) > 100
+            or len(vals.get("phone", "")) > 100
+            or len(vals.get("emergency_contact", "")) > 200
+            or len(vals.get("emergency_phone", "")) > 100):
+        return jsonify(error="a field is too long"), 400
+    conn = db()
+    row = _hr_get_employee(conn, employee_id)
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    changes = []
+    sets = []
+    args = []
+    for f in fields:
+        if f in vals and vals[f] != (row[f] or ""):
+            sets.append("%s = ?" % f)
+            args.append(vals[f])
+            changes.append("%s: %s -> %s" % (f, row[f] or "", vals[f]))
+    if rate_provided and (not sets or True):
+        sets.append("hourly_rate_cents = ?")
+        args.append(rate_val)
+        if rate_val != (row["hourly_rate_cents"] if "hourly_rate_cents" in row.keys() else None):
+            changes.append("hourly_rate_cents: %s -> %s" % (
+                row["hourly_rate_cents"], rate_val))
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(employee_id)
+        conn.execute("UPDATE erp_hr_employees SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        if "hire_date" in vals and row["staff_id"]:
+            conn.execute("UPDATE staff SET hire_date = ? WHERE id = ?",
+                         (vals["hire_date"], row["staff_id"]))
+        _erp_staff_audit(conn, actor, "hr.employee_updated", "hr_employee",
+                         employee_id, "%s: %s" % (row["name"] or "", "; ".join(changes)))
+        conn.commit()
+    row = _hr_get_employee(conn, employee_id)
+    payload = _hr_employee_payload(conn, row, with_items=True)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/employees/<int:employee_id>/deactivate")
+def hr_deactivate_employee(employee_id):
+    """Mark the HR record inactive. The linked staff row is NOT touched:
+    login and permissions stay exactly as they are -- deactivating the
+    HR record is a directory status, not a staff deactivation. The
+    record stays listed as inactive."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_employee(conn, employee_id)
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    if not row["active"]:
+        conn.close()
+        return jsonify(ok=True, already_inactive=True)
+    conn.execute("UPDATE erp_hr_employees SET active = 0,"
+                 " updated_by = ?, updated_at = ? WHERE id = ?",
+                 (actor, datetime.now(timezone.utc).isoformat(), employee_id))
+    _erp_staff_audit(conn, actor, "hr.employee_deactivated", "hr_employee",
+                     employee_id, "deactivated HR record for %s (staff login untouched)"
+                     % (row["name"] or ""))
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+@app.post("/api/erp/hr/employees/<int:employee_id>/reactivate")
+def hr_reactivate_employee(employee_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_employee(conn, employee_id)
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    if row["active"]:
+        conn.close()
+        return jsonify(ok=True, already_active=True)
+    conn.execute("UPDATE erp_hr_employees SET active = 1,"
+                 " updated_by = ?, updated_at = ? WHERE id = ?",
+                 (actor, datetime.now(timezone.utc).isoformat(), employee_id))
+    _erp_staff_audit(conn, actor, "hr.employee_reactivated", "hr_employee",
+                     employee_id, "reactivated HR record for %s" % (row["name"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/hr/employees/<int:employee_id>/onboarding")
+def hr_list_onboarding(employee_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_employee(conn, employee_id)
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    items = _hr_onboarding_items(conn, employee_id)
+    conn.close()
+    return jsonify(employee_id=employee_id, items=items,
+                   done=sum(1 for i in items if i["done"]), total=len(items))
+
+
+@app.post("/api/erp/hr/employees/<int:employee_id>/onboarding")
+def hr_add_onboarding_item(employee_id):
+    """Add a custom checklist item (starts unchecked)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    label = (data.get("label") or "").strip()
+    if not label or len(label) > 200:
+        return jsonify(error="label must be 1-200 characters"), 400
+    conn = db()
+    row = _hr_get_employee(conn, employee_id)
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_onboarding (employee_id, label, done,"
+        " done_by, done_at, created_at) VALUES (?, ?, 0, '', '', ?)",
+        (employee_id, label, now))
+    item_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.onboarding_added", "hr_employee",
+                     employee_id, "added onboarding item %r for %s"
+                     % (label, row["name"] or ""))
+    conn.commit()
+    item = conn.execute(
+        "SELECT id, employee_id, label, done, done_by, done_at, created_at"
+        " FROM erp_hr_onboarding WHERE id = ?", (item_id,)).fetchone()
+    conn.close()
+    return jsonify({"id": item["id"], "employee_id": item["employee_id"],
+                    "label": item["label"], "done": False, "done_by": "",
+                    "done_at": "", "created_at": item["created_at"]}), 201
+
+
+@app.post("/api/erp/hr/onboarding/<int:item_id>/check")
+def hr_check_onboarding_item(item_id):
+    """Check an item off: stamps who did it and when. Manual by design --
+    'Account created' / 'Permissions set' are ticked by the admin once
+    done, never auto-detected."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    item = conn.execute(
+        "SELECT id, employee_id, label, done FROM erp_hr_onboarding WHERE id = ?",
+        (item_id,)).fetchone()
+    if not item:
+        conn.close()
+        return jsonify(error="onboarding item not found"), 404
+    if item["done"]:
+        conn.close()
+        return jsonify(ok=True, already_done=True)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_hr_onboarding SET done = 1, done_by = ?,"
+                 " done_at = ? WHERE id = ?", (actor, now, item_id))
+    _erp_staff_audit(conn, actor, "hr.onboarding_checked", "hr_employee",
+                     item["employee_id"], "checked off %r" % item["label"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, done_by=actor, done_at=now)
+
+
+@app.post("/api/erp/hr/onboarding/<int:item_id>/uncheck")
+def hr_uncheck_onboarding_item(item_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    item = conn.execute(
+        "SELECT id, employee_id, label, done FROM erp_hr_onboarding WHERE id = ?",
+        (item_id,)).fetchone()
+    if not item:
+        conn.close()
+        return jsonify(error="onboarding item not found"), 404
+    if not item["done"]:
+        conn.close()
+        return jsonify(ok=True, already_unchecked=True)
+    conn.execute("UPDATE erp_hr_onboarding SET done = 0, done_by = '',"
+                 " done_at = '' WHERE id = ?", (item_id,))
+    _erp_staff_audit(conn, actor, "hr.onboarding_unchecked", "hr_employee",
+                     item["employee_id"], "unchecked %r" % item["label"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---------------- Additions Wave C: benefits + onboarding templates ----------------
+# Admin-only via _require_erp_admin(), like the rest of HR. Benefits are
+# a TRACKING record only: type/carrier/status/cost per employee.
+# Enrollment itself is not built -- carriers live outside the ERP.
+# Onboarding templates are role-based step lists; assigning one to a
+# new employee seeds their checklist from it (see hr_create_employee).
+_HR_BENEFIT_STATUSES = ("enrolled", "pending", "declined")
+
+
+def _hr_benefit_dict(row):
+    return {"id": row["id"], "employee_id": row["employee_id"],
+            "benefit_type": row["benefit_type"] or "",
+            "carrier": row["carrier"] or "",
+            "status": row["status"] or "pending",
+            "monthly_cost_cents": row["monthly_cost_cents"],
+            "notes": row["notes"] or "",
+            "created_by": row["created_by"] or "",
+            "created_at": row["created_at"],
+            "updated_by": row["updated_by"] or "",
+            "updated_at": row["updated_at"] or ""}
+
+
+def _hr_benefit_fields(data):
+    """Validate benefit fields. Returns the cleaned dict, or
+    (error_response, status) on a bad value."""
+    benefit_type = (data.get("benefit_type") or "").strip()
+    if not benefit_type or len(benefit_type) > 100:
+        return jsonify(error="benefit_type must be 1-100 characters"), 400
+    carrier = (data.get("carrier") or "").strip()
+    if len(carrier) > 200:
+        return jsonify(error="carrier must be 200 characters or fewer"), 400
+    status = (data.get("status") or "pending").strip()
+    if status not in _HR_BENEFIT_STATUSES:
+        return jsonify(error="status must be enrolled, pending or declined"), 400
+    cost = _hr_parse_rate(data.get("monthly_cost_cents"))
+    if cost is False:
+        return jsonify(error="monthly cost must be a whole number of cents, 0 or more"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    return {"benefit_type": benefit_type, "carrier": carrier,
+            "status": status, "monthly_cost_cents": cost, "notes": notes}
+
+
+def _hr_onboarding_template_dict(row):
+    try:
+        steps = json.loads(row["steps_json"] or "[]") or []
+    except (TypeError, ValueError):
+        steps = []
+    return {"id": row["id"], "role": row["role"] or "", "steps": steps,
+            "created_by": row["created_by"] or "",
+            "created_at": row["created_at"],
+            "updated_by": row["updated_by"] or "",
+            "updated_at": row["updated_at"] or ""}
+
+
+def _hr_template_steps(data):
+    """Validate a steps list: 1-50 non-empty labels, each <= 200 chars.
+    Returns the cleaned list, or (error_response, status)."""
+    raw = data.get("steps")
+    if not isinstance(raw, list) or not raw or len(raw) > 50:
+        return jsonify(error="steps must be a list of 1-50 labels"), 400
+    steps = []
+    for step in raw:
+        label = (step or "").strip() if isinstance(step, str) else ""
+        if not label or len(label) > 200:
+            return jsonify(error="every step must be 1-200 characters"), 400
+        steps.append(label)
+    return steps
+
+
+@app.get("/api/erp/hr/employees/<int:employee_id>/benefits")
+def hr_list_benefits(employee_id):
+    """Benefits tracked for one employee, oldest first."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _hr_get_employee(conn, employee_id):
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_benefits WHERE employee_id = ? ORDER BY id",
+        (employee_id,)).fetchall()
+    conn.close()
+    return jsonify(benefits=[_hr_benefit_dict(r) for r in rows])
+
+
+@app.post("/api/erp/hr/employees/<int:employee_id>/benefits")
+def hr_create_benefit(employee_id):
+    """Add a benefit record for an employee (201). Tracking only --
+    this does not enroll anyone with a carrier."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields = _hr_benefit_fields(data)
+    if isinstance(fields, tuple):
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    if not _hr_get_employee(conn, employee_id):
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    cur = conn.execute(
+        "INSERT INTO erp_hr_benefits (employee_id, benefit_type, carrier,"
+        " status, monthly_cost_cents, notes, created_by, created_at,"
+        " updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (employee_id, fields["benefit_type"], fields["carrier"],
+         fields["status"], fields["monthly_cost_cents"], fields["notes"],
+         actor, now, actor, now))
+    _erp_staff_audit(conn, actor, "hr.benefit_created", "hr_benefit",
+                     cur.lastrowid, "%s for employee #%d (%s)" % (
+                         fields["benefit_type"], employee_id,
+                         fields["status"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_benefits WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(benefit=_hr_benefit_dict(row)), 201
+
+
+@app.post("/api/erp/hr/benefits/<int:benefit_id>/update")
+def hr_update_benefit(benefit_id):
+    """Edit a benefit record (omitted fields keep their value)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_hr_benefits WHERE id = ?",
+                       (benefit_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="benefit not found"), 404
+    merged = {"benefit_type": data.get("benefit_type", row["benefit_type"]),
+              "carrier": data.get("carrier", row["carrier"]),
+              "status": data.get("status", row["status"]),
+              "monthly_cost_cents": data.get("monthly_cost_cents",
+                                             row["monthly_cost_cents"]),
+              "notes": data.get("notes", row["notes"])}
+    fields = _hr_benefit_fields(merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_benefits SET benefit_type = ?, carrier = ?,"
+        " status = ?, monthly_cost_cents = ?, notes = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (fields["benefit_type"], fields["carrier"], fields["status"],
+         fields["monthly_cost_cents"], fields["notes"], actor, now,
+         benefit_id))
+    _erp_staff_audit(conn, actor, "hr.benefit_updated", "hr_benefit",
+                     benefit_id, "%s (%s)" % (fields["benefit_type"],
+                                              fields["status"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_benefits WHERE id = ?",
+                       (benefit_id,)).fetchone()
+    conn.close()
+    return jsonify(benefit=_hr_benefit_dict(row))
+
+
+@app.post("/api/erp/hr/benefits/<int:benefit_id>/delete")
+def hr_delete_benefit(benefit_id):
+    """Delete a benefit record."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_hr_benefits WHERE id = ?",
+                       (benefit_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="benefit not found"), 404
+    conn.execute("DELETE FROM erp_hr_benefits WHERE id = ?", (benefit_id,))
+    _erp_staff_audit(conn, actor, "hr.benefit_deleted", "hr_benefit",
+                     benefit_id, "%s for employee #%d" % (
+                         row["benefit_type"], row["employee_id"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/hr/onboarding-templates")
+def hr_list_onboarding_templates():
+    """Role-based onboarding templates, by role."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_onboarding_templates ORDER BY role, id"
+    ).fetchall()
+    conn.close()
+    return jsonify(templates=[_hr_onboarding_template_dict(r)
+                              for r in rows])
+
+
+@app.post("/api/erp/hr/onboarding-templates")
+def hr_create_onboarding_template():
+    """Add a role-based onboarding template (201). One template per
+    role (case-insensitive, 409 on a second one)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    role = (data.get("role") or "").strip()
+    if not role or len(role) > 100:
+        return jsonify(error="role must be 1-100 characters"), 400
+    steps = _hr_template_steps(data)
+    if isinstance(steps, tuple):
+        return steps
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    clash = conn.execute(
+        "SELECT id FROM erp_hr_onboarding_templates"
+        " WHERE lower(role) = lower(?)", (role,)).fetchone()
+    if clash:
+        conn.close()
+        return jsonify(error="a template already exists for that role"), 409
+    cur = conn.execute(
+        "INSERT INTO erp_hr_onboarding_templates (role, steps_json,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (role, json.dumps(steps), actor, now, actor, now))
+    _erp_staff_audit(conn, actor, "hr.onboarding_template_created",
+                     "hr_onboarding_template", cur.lastrowid,
+                     "template for role %s (%d steps)" % (role, len(steps)))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_hr_onboarding_templates WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(template=_hr_onboarding_template_dict(row)), 201
+
+
+@app.post("/api/erp/hr/onboarding-templates/<int:template_id>/update")
+def hr_update_onboarding_template(template_id):
+    """Edit a template's role and/or steps (omitted fields keep value).
+    The role must stay unique across templates."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_hr_onboarding_templates WHERE id = ?",
+        (template_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="onboarding template not found"), 404
+    role = (data.get("role", row["role"]) or "").strip()
+    if not role or len(role) > 100:
+        conn.close()
+        return jsonify(error="role must be 1-100 characters"), 400
+    if "steps" in data:
+        steps = _hr_template_steps(data)
+        if isinstance(steps, tuple):
+            conn.close()
+            return steps
+    else:
+        try:
+            steps = json.loads(row["steps_json"] or "[]") or []
+        except (TypeError, ValueError):
+            steps = []
+    clash = conn.execute(
+        "SELECT id FROM erp_hr_onboarding_templates"
+        " WHERE lower(role) = lower(?) AND id != ?", (role, template_id)
+    ).fetchone()
+    if clash:
+        conn.close()
+        return jsonify(error="a template already exists for that role"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_onboarding_templates SET role = ?, steps_json = ?,"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (role, json.dumps(steps), actor, now, template_id))
+    _erp_staff_audit(conn, actor, "hr.onboarding_template_updated",
+                     "hr_onboarding_template", template_id,
+                     "template for role %s (%d steps)" % (role, len(steps)))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_hr_onboarding_templates WHERE id = ?",
+        (template_id,)).fetchone()
+    conn.close()
+    return jsonify(template=_hr_onboarding_template_dict(row))
+
+
+@app.post("/api/erp/hr/onboarding-templates/<int:template_id>/delete")
+def hr_delete_onboarding_template(template_id):
+    """Delete a role template. Employees already seeded from it keep
+    their own checklist items -- the template is only the seed."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_hr_onboarding_templates WHERE id = ?",
+        (template_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="onboarding template not found"), 404
+    conn.execute(
+        "DELETE FROM erp_hr_onboarding_templates WHERE id = ?",
+        (template_id,))
+    _erp_staff_audit(conn, actor, "hr.onboarding_template_deleted",
+                     "hr_onboarding_template", template_id,
+                     "template for role %s" % (row["role"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---------------- HR Wave B: events/roster + time tracking ----------------
+# Dept 12 (HR), items 3 + 4. Admin-only via _require_erp_admin(), like
+# Wave A. Events are one-offs -- no recurring engine. Time is ENTERED
+# hours (not clock in/out): event shifts are one-off, often logged after
+# the fact. The cash record here is a record only: it NEVER posts to the
+# ledger and NEVER runs through payroll/tax/withholding -- no endpoint
+# in this section writes erp_acct_* or any payroll table.
+
+
+def _hr_parse_rate(value):
+    """Whole cents >= 0, or None for 'no rate set'. False = invalid."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, float):
+        if not value.is_integer():
+            return False
+        value = int(value)
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return False
+    if value < 0:
+        return False
+    return value
+
+
+def _hr_parse_hours(value):
+    """Decimal hours, 0 < hours <= 24. False = invalid."""
+    if value is None or value == "":
+        return False
+    if isinstance(value, bool):
+        return False
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return False
+    if not (0 < value <= 24):
+        return False
+    return value
+
+
+def _hr_parse_amount_cents(value):
+    """Whole cents >= 0. False = invalid."""
+    if value is None or value == "":
+        return False
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, float):
+        if not value.is_integer():
+            return False
+        value = int(value)
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return False
+    if value < 0:
+        return False
+    return value
+
+
+def _hr_owed_cents(hours, rate_cents):
+    """hours x rate, rounded to whole cents; NULL when rate is blank --
+    never compute an amount from a missing rate."""
+    if rate_cents is None:
+        return None
+    return int(round(float(hours) * int(rate_cents)))
+
+
+def _hr_event_payload(conn, row, with_roster=False, with_time=False):
+    payload = {
+        "id": row["id"], "name": row["name"],
+        "date": row["date"] or "", "location": row["location"] or "",
+        "created_by": row["created_by"] or "", "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+        "roster_count": conn.execute(
+            "SELECT COUNT(*) FROM erp_hr_event_staff WHERE event_id = ?",
+            (row["id"],)).fetchone()[0],
+        "time_record_count": conn.execute(
+            "SELECT COUNT(*) FROM erp_hr_time_records WHERE event_id = ?",
+            (row["id"],)).fetchone()[0],
+    }
+    if with_roster:
+        payload["roster"] = _hr_roster(conn, row["id"])
+    if with_time:
+        payload["time_records"] = [
+            _hr_time_payload(r) for r in conn.execute(
+                "SELECT * FROM erp_hr_time_records WHERE event_id = ?"
+                " ORDER BY id", (row["id"],)).fetchall()]
+        payload["totals"] = _hr_event_totals(conn, row["id"])
+    return payload
+
+
+def _hr_roster(conn, event_id):
+    rows = conn.execute(
+        "SELECT s.id, s.event_id, s.employee_id, s.role, s.assigned_by,"
+        " s.assigned_at, e.name AS employee_name, e.email AS employee_email,"
+        " e.active AS employee_active"
+        " FROM erp_hr_event_staff s"
+        " JOIN erp_hr_employees e ON e.id = s.employee_id"
+        " WHERE s.event_id = ? ORDER BY e.name, e.email",
+        (event_id,)).fetchall()
+    return [{"id": r["id"], "event_id": r["event_id"],
+             "employee_id": r["employee_id"],
+             "employee_name": r["employee_name"] or "",
+             "employee_email": r["employee_email"] or "",
+             "employee_active": bool(r["employee_active"]),
+             "role": r["role"] or "", "assigned_by": r["assigned_by"] or "",
+             "assigned_at": r["assigned_at"]}
+            for r in rows]
+
+
+def _hr_time_payload(row):
+    owed = row["cash_owed_cents"]
+    paid = row["cash_paid_cents"] or 0
+    return {
+        "id": row["id"], "event_id": row["event_id"],
+        "employee_id": row["employee_id"],
+        "hours": row["hours"],
+        "hourly_rate_cents": row["hourly_rate_cents"],
+        "cash_owed_cents": owed, "cash_paid_cents": paid,
+        "remaining_cents": (owed - paid) if owed is not None else None,
+        "paid_date": row["paid_date"] or "",
+        "paid_by": row["paid_by"] or "",
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _hr_time_totals(rows):
+    """Sum a list of time-record rows: hours, owed, paid, outstanding.
+    Owed/paid/outstanding are None when no record in the set has a rate
+    (nothing to owe); hours always sums."""
+    hours = 0.0
+    owed = 0
+    paid = 0
+    any_rate = False
+    for r in rows:
+        hours += float(r["hours"])
+        if r["cash_owed_cents"] is not None:
+            any_rate = True
+            owed += int(r["cash_owed_cents"])
+        paid += int(r["cash_paid_cents"] or 0)
+    return {"hours": round(hours, 4),
+            "cash_owed_cents": owed if any_rate else None,
+            "cash_paid_cents": paid,
+            "outstanding_cents": (owed - paid) if any_rate else None,
+            "record_count": len(rows)}
+
+
+def _hr_event_totals(conn, event_id):
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_time_records WHERE event_id = ?",
+        (event_id,)).fetchall()
+    return _hr_time_totals(rows)
+
+
+def _hr_employee_time_totals(conn, employee_id):
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_time_records WHERE employee_id = ?",
+        (employee_id,)).fetchall()
+    return _hr_time_totals(rows)
+
+
+def _hr_get_event(conn, event_id):
+    try:
+        event_id = int(event_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_events WHERE id = ?",
+                        (event_id,)).fetchone()
+
+
+@app.get("/api/erp/hr/events")
+def hr_list_events():
+    """Every event, newest date first, with roster + time-record counts.
+    The list starts empty -- no events are ever invented."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_events ORDER BY date DESC, name, id DESC"
+    ).fetchall()
+    out = [_hr_event_payload(conn, r) for r in rows]
+    conn.close()
+    return jsonify(events=out)
+
+
+@app.post("/api/erp/hr/events")
+def hr_create_event():
+    """Create a one-off event (201). Name non-empty; date real
+    YYYY-MM-DD or blank; location free text or blank."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    date = (data.get("date") or "").strip()
+    location = (data.get("location") or "").strip()
+    if not name or len(name) > 200:
+        return jsonify(error="event name must be 1-200 characters"), 400
+    if len(location) > 200:
+        return jsonify(error="location must be 200 characters or fewer"), 400
+    if not _hr_valid_hire_date(date):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_events (name, date, location, created_by,"
+        " created_at, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, '', '')",
+        (name, date, location, actor, now))
+    event_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.event_created", "hr_event",
+                     event_id, "created event %r%s" % (
+                         name, (" on " + date) if date else ""))
+    conn.commit()
+    row = _hr_get_event(conn, event_id)
+    payload = _hr_event_payload(conn, row, with_roster=True, with_time=True)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.get("/api/erp/hr/events/<int:event_id>")
+def hr_get_event(event_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_event(conn, event_id)
+    if not row:
+        conn.close()
+        return jsonify(error="event not found"), 404
+    payload = _hr_event_payload(conn, row, with_roster=True, with_time=True)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/events/<int:event_id>/update")
+def hr_update_event(event_id):
+    """Edit name/date/location -- only provided fields change."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    vals = {}
+    for f in ("name", "date", "location"):
+        if f in data:
+            vals[f] = (data.get(f) or "").strip()
+    if "name" in vals and (not vals["name"] or len(vals["name"]) > 200):
+        return jsonify(error="event name must be 1-200 characters"), 400
+    if "location" in vals and len(vals["location"]) > 200:
+        return jsonify(error="location must be 200 characters or fewer"), 400
+    if "date" in vals and not _hr_valid_hire_date(vals["date"]):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    conn = db()
+    row = _hr_get_event(conn, event_id)
+    if not row:
+        conn.close()
+        return jsonify(error="event not found"), 404
+    sets = []
+    args = []
+    changes = []
+    for f in ("name", "date", "location"):
+        if f in vals and vals[f] != (row[f] or ""):
+            sets.append("%s = ?" % f)
+            args.append(vals[f])
+            changes.append("%s: %s -> %s" % (f, row[f] or "", vals[f]))
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(event_id)
+        conn.execute("UPDATE erp_hr_events SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "hr.event_updated", "hr_event",
+                         event_id, "%s: %s" % (row["name"] or "",
+                                               "; ".join(changes)))
+        conn.commit()
+    row = _hr_get_event(conn, event_id)
+    payload = _hr_event_payload(conn, row, with_roster=True, with_time=True)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/events/<int:event_id>/delete")
+def hr_delete_event(event_id):
+    """Delete an event ONLY when it has no time records (409 otherwise):
+    time records are the cash record -- deleting the event would orphan
+    money. Roster assignments are just links and go with the event."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_event(conn, event_id)
+    if not row:
+        conn.close()
+        return jsonify(error="event not found"), 404
+    n_time = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_time_records WHERE event_id = ?",
+        (event_id,)).fetchone()[0]
+    if n_time:
+        conn.close()
+        return jsonify(error="event has %d time record(s) and cannot be"
+                       " deleted; delete the time records first" % n_time), 409
+    conn.execute("DELETE FROM erp_hr_event_staff WHERE event_id = ?",
+                 (event_id,))
+    conn.execute("DELETE FROM erp_hr_events WHERE id = ?", (event_id,))
+    _erp_staff_audit(conn, actor, "hr.event_deleted", "hr_event",
+                     event_id, "deleted event %r" % (row["name"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/hr/events/<int:event_id>/assign")
+def hr_assign_event_staff(event_id):
+    """Assign one person to an event with a per-assignment role (201).
+    Inactive employees cannot be assigned (400); the same person
+    cannot be assigned twice to the same event (409)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    role = (data.get("role") or "").strip()
+    if len(role) > 100:
+        return jsonify(error="role must be 100 characters or fewer"), 400
+    try:
+        employee_id = int(data.get("employee_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="employee_id is required"), 400
+    conn = db()
+    event = _hr_get_event(conn, event_id)
+    if not event:
+        conn.close()
+        return jsonify(error="event not found"), 404
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    if not emp["active"]:
+        conn.close()
+        return jsonify(error="cannot assign an inactive employee"), 400
+    clash = conn.execute(
+        "SELECT id FROM erp_hr_event_staff"
+        " WHERE event_id = ? AND employee_id = ?",
+        (event_id, employee_id)).fetchone()
+    if clash:
+        conn.close()
+        return jsonify(error="that person is already assigned to this event"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_event_staff (event_id, employee_id, role,"
+        " assigned_by, assigned_at) VALUES (?, ?, ?, ?, ?)",
+        (event_id, employee_id, role, actor, now))
+    assign_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.event_assigned", "hr_event",
+                     event_id, "assigned %s to %r%s" % (
+                         emp["name"] or "", event["name"] or "",
+                         (" as " + role) if role else ""))
+    conn.commit()
+    roster = _hr_roster(conn, event_id)
+    conn.close()
+    return jsonify(ok=True, assignment_id=assign_id, roster=roster), 201
+
+
+@app.post("/api/erp/hr/events/<int:event_id>/unassign")
+def hr_unassign_event_staff(event_id):
+    """Remove one person from an event's roster. Unassigning never
+    touches time records -- hours already logged stay on the event."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    try:
+        employee_id = int(data.get("employee_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="employee_id is required"), 400
+    conn = db()
+    event = _hr_get_event(conn, event_id)
+    if not event:
+        conn.close()
+        return jsonify(error="event not found"), 404
+    row = conn.execute(
+        "SELECT id FROM erp_hr_event_staff"
+        " WHERE event_id = ? AND employee_id = ?",
+        (event_id, employee_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="that person is not assigned to this event"), 404
+    conn.execute("DELETE FROM erp_hr_event_staff WHERE id = ?", (row["id"],))
+    _erp_staff_audit(conn, actor, "hr.event_unassigned", "hr_event",
+                     event_id, "unassigned employee #%d from %r"
+                     % (employee_id, event["name"] or ""))
+    conn.commit()
+    roster = _hr_roster(conn, event_id)
+    conn.close()
+    return jsonify(ok=True, roster=roster)
+
+
+@app.get("/api/erp/hr/employees/<int:employee_id>/events")
+def hr_employee_events(employee_id):
+    """Roster per person: which events they are assigned to, with the
+    per-assignment role."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    rows = conn.execute(
+        "SELECT s.id, s.event_id, s.role, s.assigned_by, s.assigned_at,"
+        " e.name AS event_name, e.date AS event_date,"
+        " e.location AS event_location"
+        " FROM erp_hr_event_staff s"
+        " JOIN erp_hr_events e ON e.id = s.event_id"
+        " WHERE s.employee_id = ? ORDER BY e.date DESC, e.name",
+        (employee_id,)).fetchall()
+    out = [{"assignment_id": r["id"], "event_id": r["event_id"],
+            "event_name": r["event_name"] or "",
+            "event_date": r["event_date"] or "",
+            "event_location": r["event_location"] or "",
+            "role": r["role"] or "", "assigned_by": r["assigned_by"] or "",
+            "assigned_at": r["assigned_at"]} for r in rows]
+    conn.close()
+    return jsonify(employee_id=employee_id, events=out)
+
+
+@app.get("/api/erp/hr/events/<int:event_id>/totals")
+def hr_event_totals(event_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    event = _hr_get_event(conn, event_id)
+    if not event:
+        conn.close()
+        return jsonify(error="event not found"), 404
+    totals = _hr_event_totals(conn, event_id)
+    conn.close()
+    return jsonify(event_id=event_id, totals=totals)
+
+
+@app.get("/api/erp/hr/employees/<int:employee_id>/time-totals")
+def hr_employee_time_totals(employee_id):
+    """Per-person totals across all events: hours, owed, paid,
+    outstanding. Owed/outstanding are null when no record has a rate."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    totals = _hr_employee_time_totals(conn, employee_id)
+    conn.close()
+    return jsonify(employee_id=employee_id, totals=totals)
+
+
+@app.get("/api/erp/hr/time-totals")
+def hr_all_time_totals():
+    """Per-person totals for every employee who has any time record."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT DISTINCT employee_id FROM erp_hr_time_records"
+        " ORDER BY employee_id").fetchall()
+    out = []
+    for r in rows:
+        emp = _hr_get_employee(conn, r["employee_id"])
+        out.append({"employee_id": r["employee_id"],
+                    "employee_name": (emp["name"] if emp else "") or "",
+                    "totals": _hr_employee_time_totals(conn, r["employee_id"])})
+    conn.close()
+    return jsonify(totals=out)
+
+
+@app.get("/api/erp/hr/time-records")
+def hr_list_time_records():
+    """Time records, optionally filtered by event_id and/or employee_id."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    where = []
+    args = []
+    for key in ("event_id", "employee_id"):
+        raw = request.args.get(key)
+        if raw is not None and raw != "":
+            try:
+                args.append(int(raw))
+            except ValueError:
+                return jsonify(error="%s must be an id" % key), 400
+            where.append("%s = ?" % key)
+    conn = db()
+    q = "SELECT * FROM erp_hr_time_records"
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY id"
+    rows = conn.execute(q, args).fetchall()
+    out = []
+    for r in rows:
+        p = _hr_time_payload(r)
+        ev = _hr_get_event(conn, r["event_id"])
+        emp = _hr_get_employee(conn, r["employee_id"])
+        p["event_name"] = (ev["name"] if ev else "") or ""
+        p["employee_name"] = (emp["name"] if emp else "") or ""
+        out.append(p)
+    conn.close()
+    return jsonify(time_records=out)
+
+
+@app.post("/api/erp/hr/time-records")
+def hr_create_time_record():
+    """Log ENTERED hours for one person at one event (201). The rate
+    defaults to the employee's hourly_rate_cents when the request omits
+    it; pass an explicit rate (or null) to override per record. Blank
+    rate -> cash_owed_cents NULL, never an invented amount. Hours must
+    be 0 < hours <= 24; rate >= 0 whole cents. Cash record only -- this
+    writes no ledger or payroll row."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    hours = _hr_parse_hours(data.get("hours"))
+    if hours is False:
+        return jsonify(error="hours must be more than 0 and at most 24"), 400
+    if "hourly_rate_cents" in data:
+        rate = _hr_parse_rate(data.get("hourly_rate_cents"))
+        if rate is False:
+            return jsonify(error="hourly rate must be a whole number of cents, 0 or more"), 400
+    else:
+        rate = "prefill"
+    try:
+        event_id = int(data.get("event_id"))
+        employee_id = int(data.get("employee_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="event_id and employee_id are required"), 400
+    conn = db()
+    event = _hr_get_event(conn, event_id)
+    if not event:
+        conn.close()
+        return jsonify(error="event not found"), 404
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    if rate == "prefill":
+        rate = emp["hourly_rate_cents"]
+    owed = _hr_owed_cents(hours, rate)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_time_records (event_id, employee_id, hours,"
+        " hourly_rate_cents, cash_owed_cents, cash_paid_cents, paid_date,"
+        " paid_by, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, 0, '', '', ?, ?, '', '')",
+        (event_id, employee_id, hours, rate, owed, actor, now))
+    rec_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.time_record_created", "hr_time_record",
+                     rec_id, "logged %s hours for %s at %r%s" % (
+                         ("%g" % hours), emp["name"] or "", event["name"] or "",
+                         (" (owed $%.2f)" % (owed / 100)) if owed is not None
+                         else " (no rate set)"))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_time_records WHERE id = ?",
+                       (rec_id,)).fetchone()
+    payload = _hr_time_payload(row)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.get("/api/erp/hr/time-records/<int:record_id>")
+def hr_get_time_record(record_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_hr_time_records WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="time record not found"), 404
+    payload = _hr_time_payload(row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/time-records/<int:record_id>/update")
+def hr_update_time_record(record_id):
+    """Edit hours and/or rate; owed recomputes from the snapshot. The
+    new owed amount may never drop below what is already paid (400) --
+    money already handed over cannot be un-owed by an edit. Setting the
+    rate to null is refused while any cash is paid."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    hours = None
+    rate = None
+    rate_provided = "hourly_rate_cents" in data
+    if "hours" in data:
+        hours = _hr_parse_hours(data.get("hours"))
+        if hours is False:
+            return jsonify(error="hours must be more than 0 and at most 24"), 400
+    if rate_provided:
+        rate = _hr_parse_rate(data.get("hourly_rate_cents"))
+        if rate is False:
+            return jsonify(error="hourly rate must be a whole number of cents, 0 or more"), 400
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_hr_time_records WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="time record not found"), 404
+    new_hours = hours if hours is not None else float(row["hours"])
+    new_rate = rate if rate_provided else row["hourly_rate_cents"]
+    new_owed = _hr_owed_cents(new_hours, new_rate)
+    paid = int(row["cash_paid_cents"] or 0)
+    if new_owed is None and paid > 0:
+        conn.close()
+        return jsonify(error="cannot clear the rate while cash has been paid"), 400
+    if new_owed is not None and new_owed < paid:
+        conn.close()
+        return jsonify(error="new amount owed would be less than the cash"
+                       " already paid"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_time_records SET hours = ?, hourly_rate_cents = ?,"
+        " cash_owed_cents = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+        (new_hours, new_rate, new_owed, actor, now, record_id))
+    _erp_staff_audit(conn, actor, "hr.time_record_updated", "hr_time_record",
+                     record_id, "updated time record #%d" % record_id)
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_time_records WHERE id = ?",
+                       (record_id,)).fetchone()
+    payload = _hr_time_payload(row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/time-records/<int:record_id>/delete")
+def hr_delete_time_record(record_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_hr_time_records WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="time record not found"), 404
+    conn.execute("DELETE FROM erp_hr_time_records WHERE id = ?", (record_id,))
+    _erp_staff_audit(conn, actor, "hr.time_record_deleted", "hr_time_record",
+                     record_id, "deleted time record #%d" % record_id)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/hr/time-records/<int:record_id>/pay")
+def hr_pay_time_record(record_id):
+    """Mark cash paid on a time record. PARTIAL payments are allowed:
+    amount_cents must be > 0 and <= remaining owed, and cash_paid_cents
+    accumulates; the payload always shows remaining_cents. paid_date
+    defaults to today (UTC) when blank; paid_by defaults to the admin
+    who marks it. A record with no rate (owed NULL) can never be paid.
+    Cash record only -- no ledger, payroll, tax, or withholding row."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    amount = _hr_parse_amount_cents(data.get("amount_cents"))
+    if amount is False or amount <= 0:
+        return jsonify(error="amount_cents must be more than 0"), 400
+    paid_date = (data.get("paid_date") or "").strip()
+    if not paid_date:
+        paid_date = datetime.now(timezone.utc).date().isoformat()
+    elif not _hr_valid_hire_date(paid_date):
+        return jsonify(error="paid_date must be YYYY-MM-DD"), 400
+    paid_by = (data.get("paid_by") or "").strip() or actor
+    if len(paid_by) > 200:
+        return jsonify(error="paid_by must be 200 characters or fewer"), 400
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_hr_time_records WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="time record not found"), 404
+    owed = row["cash_owed_cents"]
+    if owed is None:
+        conn.close()
+        return jsonify(error="cannot pay a record with no hourly rate set"), 400
+    remaining = int(owed) - int(row["cash_paid_cents"] or 0)
+    if amount > remaining:
+        conn.close()
+        return jsonify(error="amount exceeds the remaining $%.2f owed"
+                       % (remaining / 100)), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_time_records SET cash_paid_cents = cash_paid_cents + ?,"
+        " paid_date = ?, paid_by = ?, updated_by = ?, updated_at = ?"
+        " WHERE id = ?",
+        (amount, paid_date, paid_by, actor, now, record_id))
+    _erp_staff_audit(conn, actor, "hr.time_record_paid", "hr_time_record",
+                     record_id, "marked $%.2f cash paid on time record #%d"
+                     " (cash record -- not payroll)" % (amount / 100, record_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_time_records WHERE id = ?",
+                       (record_id,)).fetchone()
+    payload = _hr_time_payload(row)
+    conn.close()
+    return jsonify(payload)
+
+
+# ---------------- Dept 13 (Quality & Food Safety) Wave A ----------------
+# Admin-only via _require_erp_admin(), like HR -- "admin" is never a
+# grantable perm, so no staff member can reach these. Records start
+# empty -- nothing is seeded. The recall plan is a single editable
+# record; the drill log, COAs and HACCP plan are plain records.
+# Complaint trending is READ-ONLY over the existing support tickets
+# (erp_mkt_tickets), joined to flavors/batches through the order the
+# ticket references -- no complaint data is invented anywhere.
+QUALITY_COA_STATUSES = ("valid", "pending", "expired")
+
+
+def _quality_valid_date(value):
+    """YYYY-MM-DD and a real calendar date, or blank."""
+    if not value:
+        return True
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _quality_lot_dict(conn, lot):
+    """A lot with its supplier/item reference from the lot row itself."""
+    d = {"id": lot["id"], "lot_code": lot["lot_code"] or "",
+         "item_id": lot["item_id"],
+         "supplier_lot": lot["supplier_lot"] or "",
+         "received_date": lot["received_date"] or "",
+         "expiry_date": lot["expiry_date"] or ""}
+    item = _erp_get_item(conn, lot["item_id"])
+    d["item_sku"] = item["sku"] if item else ""
+    d["item_name"] = item["name"] if item else ""
+    return d
+
+
+def _quality_coa_dict(conn, row):
+    d = dict(row)
+    d["is_expired"] = bool(row["expiry_date"]) and \
+        row["expiry_date"] < datetime.now(timezone.utc).date().isoformat()
+    lot = conn.execute("SELECT * FROM erp_lots WHERE id = ?",
+                       (row["lot_id"],)).fetchone()
+    if lot:
+        d["lot_code"] = lot["lot_code"] or ""
+        d["supplier_lot"] = lot["supplier_lot"] or ""
+        item = _erp_get_item(conn, lot["item_id"])
+        d["item_sku"] = item["sku"] if item else ""
+        d["item_name"] = item["name"] if item else ""
+    else:
+        d["lot_code"] = ""
+        d["supplier_lot"] = ""
+        d["item_sku"] = ""
+        d["item_name"] = ""
+    return d
+
+
+def _quality_haccp_dict(row):
+    return {"id": row["id"], "product_line": row["product_line"] or "",
+            "hazard": row["hazard"] or "", "ccp": row["ccp"] or "",
+            "monitoring_frequency": row["monitoring_frequency"] or "",
+            "corrective_action": row["corrective_action"] or "",
+            "owner": row["owner"] or "",
+            "created_by": row["created_by"] or "",
+            "created_at": row["created_at"],
+            "updated_by": row["updated_by"] or "",
+            "updated_at": row["updated_at"] or ""}
+
+
+def _quality_recall_plan_dict(row):
+    if not row:
+        return None
+    return {"id": row["id"], "team_contacts": row["team_contacts"] or "",
+            "procedure_steps": row["procedure_steps"] or "",
+            "updated_by": row["updated_by"] or "",
+            "updated_at": row["updated_at"] or ""}
+
+
+@app.get("/api/erp/quality/recall-plan")
+def quality_recall_plan_get():
+    """The single recall plan record, or null when never saved."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_quality_recall_plan WHERE id = 1"
+                       ).fetchone()
+    conn.close()
+    return jsonify(plan=_quality_recall_plan_dict(row))
+
+
+@app.post("/api/erp/quality/recall-plan")
+def quality_recall_plan_save():
+    """Create or replace the single recall plan record (id 1). Both
+    fields are free text; either may be blank (clearing the plan)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    contacts = (data.get("team_contacts") or "")
+    if not isinstance(contacts, str):
+        return jsonify(error="team_contacts must be text"), 400
+    steps = (data.get("procedure_steps") or "")
+    if not isinstance(steps, str):
+        return jsonify(error="procedure_steps must be text"), 400
+    if len(contacts) > 20000 or len(steps) > 20000:
+        return jsonify(error="recall plan fields must be 20000 characters"
+                       " or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    row = conn.execute("SELECT id FROM erp_quality_recall_plan WHERE id = 1"
+                       ).fetchone()
+    if row:
+        conn.execute(
+            "UPDATE erp_quality_recall_plan SET team_contacts = ?,"
+            " procedure_steps = ?, updated_by = ?, updated_at = ?"
+            " WHERE id = 1", (contacts, steps, actor, now))
+    else:
+        conn.execute(
+            "INSERT INTO erp_quality_recall_plan (id, team_contacts,"
+            " procedure_steps, updated_by, updated_at)"
+            " VALUES (1, ?, ?, ?, ?)", (contacts, steps, actor, now))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_quality_recall_plan WHERE id = 1"
+                       ).fetchone()
+    conn.close()
+    return jsonify(plan=_quality_recall_plan_dict(row))
+
+
+@app.get("/api/erp/quality/recall-drills")
+def quality_recall_drills_list():
+    """Recall drill log, newest first."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_quality_recall_drills"
+        " ORDER BY drill_date DESC, id DESC").fetchall()
+    out = [{"id": r["id"], "drill_date": r["drill_date"] or "",
+            "scope": r["scope"] or "", "outcome": r["outcome"] or "",
+            "notes": r["notes"] or "", "actor": r["actor"] or "",
+            "created_at": r["created_at"]} for r in rows]
+    conn.close()
+    return jsonify(drills=out)
+
+
+@app.post("/api/erp/quality/recall-drills")
+def quality_recall_drill_create():
+    """Log a recall drill. drill_date (YYYY-MM-DD) and scope are
+    required; outcome and notes are free text."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    drill_date = (data.get("drill_date") or "").strip()
+    if not drill_date or not _quality_valid_date(drill_date):
+        return jsonify(error="drill_date must be YYYY-MM-DD"), 400
+    scope = (data.get("scope") or "").strip()
+    if not scope:
+        return jsonify(error="scope is required"), 400
+    if len(scope) > 500:
+        return jsonify(error="scope must be 500 characters or fewer"), 400
+    outcome = (data.get("outcome") or "").strip()
+    if len(outcome) > 1000:
+        return jsonify(error="outcome must be 1000 characters or fewer"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_recall_drills (drill_date, scope, outcome,"
+        " notes, actor, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (drill_date, scope, outcome, notes, actor, now))
+    row = conn.execute("SELECT * FROM erp_quality_recall_drills WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(drill={"id": row["id"], "drill_date": row["drill_date"],
+                          "scope": row["scope"], "outcome": row["outcome"],
+                          "notes": row["notes"], "actor": row["actor"],
+                          "created_at": row["created_at"]}), 201
+
+
+@app.get("/api/erp/quality/trace-lot")
+def quality_trace_lot():
+    """Trace a lot code: the batches that consumed it as an ingredient,
+    the batch that produced it as a finished lot (if any), and the
+    orders those batches went into. Read-only -- it reuses the existing
+    batch<->order trace tables (erp_batch_ingredients,
+    erp_batch_orders) and duplicates no trace data. 404 when the lot
+    code appears nowhere (no lot row, no ingredient use, no finished
+    batch)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    lot_code = (request.args.get("lot_code") or "").strip()
+    if not lot_code:
+        return jsonify(error="lot_code is required"), 400
+    conn = db()
+    lot = conn.execute("SELECT * FROM erp_lots WHERE lot_code = ?"
+                       " ORDER BY id LIMIT 1", (lot_code,)).fetchone()
+    consumed = conn.execute(
+        "SELECT b.id, b.batch_number, b.recipe_id, b.status, b.lot_code,"
+        " SUM(bi.qty_used) AS qty_used, MIN(bi.unit) AS unit"
+        " FROM erp_batch_ingredients bi"
+        " JOIN erp_production_batches b ON b.id = bi.batch_id"
+        " WHERE bi.lot_code = ?"
+        " GROUP BY b.id, b.batch_number, b.recipe_id, b.status, b.lot_code"
+        " ORDER BY b.id", (lot_code,)).fetchall()
+    batches = []
+    batch_ids = set()
+    for b in consumed:
+        recipe = conn.execute("SELECT name FROM erp_recipes WHERE id = ?",
+                              (b["recipe_id"],)).fetchone()
+        batches.append({"batch_id": b["id"], "batch_number": b["batch_number"],
+                        "recipe_name": recipe["name"] if recipe else "",
+                        "status": b["status"], "finished_lot_code": b["lot_code"] or "",
+                        "qty_used": b["qty_used"], "unit": b["unit"] or ""})
+        batch_ids.add(b["id"])
+    finished = conn.execute(
+        "SELECT * FROM erp_production_batches WHERE lot_code = ?"
+        " ORDER BY id LIMIT 1", (lot_code,)).fetchone()
+    finished_batch = None
+    if finished:
+        recipe = conn.execute("SELECT name FROM erp_recipes WHERE id = ?",
+                              (finished["recipe_id"],)).fetchone()
+        finished_batch = {"batch_id": finished["id"],
+                          "batch_number": finished["batch_number"],
+                          "recipe_name": recipe["name"] if recipe else "",
+                          "status": finished["status"],
+                          "finished_lot_code": finished["lot_code"] or ""}
+        batch_ids.add(finished["id"])
+    if not lot and not batches and not finished_batch:
+        conn.close()
+        return jsonify(error="lot %s not found" % lot_code), 404
+    orders = []
+    seen_orders = set()
+    for bid in sorted(batch_ids):
+        for l in conn.execute(
+                "SELECT * FROM erp_batch_orders WHERE batch_id = ? ORDER BY id",
+                (bid,)).fetchall():
+            key = (l["order_source"], l["order_id"])
+            if key in seen_orders:
+                continue
+            seen_orders.add(key)
+            o = _erp_order_brief(conn, l["order_source"], l["order_id"])
+            orders.append({"order_source": l["order_source"],
+                           "order_id": l["order_id"],
+                           "order_number": o["number"] if o else "",
+                           "customer_name": o["customer_name"] if o else "",
+                           "qty_bags": l["qty_bags"]})
+    lot_out = _quality_lot_dict(conn, lot) if lot else None
+    conn.close()
+    return jsonify(lot_code=lot_code, lot=lot_out,
+                   batches=batches, finished_batch=finished_batch,
+                   orders=orders)
+
+
+@app.get("/api/erp/quality/coas")
+def quality_coas_list():
+    """Every supplier COA (with its lot's supplier/item reference and a
+    computed expired flag), every lot (for the record-a-COA picker),
+    and the lots with no COA at all."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    coas = [_quality_coa_dict(conn, r) for r in conn.execute(
+        "SELECT * FROM erp_quality_coas ORDER BY id DESC").fetchall()]
+    lots = [_quality_lot_dict(conn, r) for r in conn.execute(
+        "SELECT * FROM erp_lots ORDER BY lot_code, id").fetchall()]
+    with_coa = {c["lot_id"] for c in coas}
+    lots_without_coa = [l for l in lots if l["id"] not in with_coa]
+    conn.close()
+    return jsonify(coas=coas, lots=lots, lots_without_coa=lots_without_coa,
+                   expired_count=sum(1 for c in coas if c["is_expired"]))
+
+
+@app.post("/api/erp/quality/coas")
+def quality_coa_create():
+    """Record a supplier COA against a lot. certificate_ref is the
+    certificate reference text (or file name) -- no file upload
+    machinery in this wave. status is valid/pending/expired."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    try:
+        lot_id = int(data.get("lot_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="lot_id is required"), 400
+    cert_ref = (data.get("certificate_ref") or "").strip()
+    if not cert_ref:
+        return jsonify(error="certificate_ref is required"), 400
+    if len(cert_ref) > 500:
+        return jsonify(error="certificate_ref must be 500 characters"
+                       " or fewer"), 400
+    received = (data.get("received_date") or "").strip()
+    if received and not _quality_valid_date(received):
+        return jsonify(error="received_date must be YYYY-MM-DD"), 400
+    expiry = (data.get("expiry_date") or "").strip()
+    if expiry and not _quality_valid_date(expiry):
+        return jsonify(error="expiry_date must be YYYY-MM-DD"), 400
+    status = (data.get("status") or "valid").strip()
+    if status not in QUALITY_COA_STATUSES:
+        return jsonify(error="status must be one of %s"
+                       % ", ".join(QUALITY_COA_STATUSES)), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    lot = conn.execute("SELECT * FROM erp_lots WHERE id = ?",
+                       (lot_id,)).fetchone()
+    if not lot:
+        conn.close()
+        return jsonify(error="lot not found"), 404
+    cur = conn.execute(
+        "INSERT INTO erp_quality_coas (lot_id, certificate_ref,"
+        " received_date, expiry_date, status, created_by, created_at,"
+        " updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (lot_id, cert_ref, received, expiry, status, actor, now, actor, now))
+    row = conn.execute("SELECT * FROM erp_quality_coas WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    out = _quality_coa_dict(conn, row)
+    conn.commit()
+    conn.close()
+    return jsonify(coa=out), 201
+
+
+@app.get("/api/erp/quality/coas/lot/<int:lot_id>")
+def quality_coas_for_lot(lot_id):
+    """COAs recorded against one lot."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    lot = conn.execute("SELECT * FROM erp_lots WHERE id = ?",
+                       (lot_id,)).fetchone()
+    if not lot:
+        conn.close()
+        return jsonify(error="lot not found"), 404
+    coas = [_quality_coa_dict(conn, r) for r in conn.execute(
+        "SELECT * FROM erp_quality_coas WHERE lot_id = ? ORDER BY id DESC",
+        (lot_id,)).fetchall()]
+    out = _quality_lot_dict(conn, lot)
+    conn.close()
+    return jsonify(lot=out, coas=coas)
+
+
+@app.post("/api/erp/quality/coas/<int:coa_id>/delete")
+def quality_coa_delete(coa_id):
+    """Delete a COA record (correction only -- the lot itself is
+    untouched)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_quality_coas WHERE id = ?",
+                       (coa_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="COA not found"), 404
+    conn.execute("DELETE FROM erp_quality_coas WHERE id = ?", (coa_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/quality/haccp")
+def quality_haccp_list():
+    """HACCP plan records, grouped by product line."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_quality_haccp ORDER BY product_line, id"
+        ).fetchall()
+    out = [_quality_haccp_dict(r) for r in rows]
+    conn.close()
+    return jsonify(records=out)
+
+
+@app.post("/api/erp/quality/haccp")
+def quality_haccp_create():
+    """Add a HACCP plan record. product_line and hazard are required;
+    the rest are free text. A record only -- no certification
+    workflow in this wave."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields = _quality_haccp_fields(data)
+    if isinstance(fields, tuple):
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_haccp (product_line, hazard, ccp,"
+        " monitoring_frequency, corrective_action, owner, created_by,"
+        " created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["product_line"], fields["hazard"], fields["ccp"],
+         fields["monitoring_frequency"], fields["corrective_action"],
+         fields["owner"], actor, now, actor, now))
+    row = conn.execute("SELECT * FROM erp_quality_haccp WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=_quality_haccp_dict(row)), 201
+
+
+def _quality_haccp_fields(data):
+    """Validate HACCP record fields. Returns the cleaned fields dict,
+    or (error_response, status) on a bad value."""
+    product_line = (data.get("product_line") or "").strip()
+    if not product_line:
+        return jsonify(error="product_line is required"), 400
+    if len(product_line) > 500:
+        return jsonify(error="product_line must be 500 characters"
+                       " or fewer"), 400
+    hazard = (data.get("hazard") or "").strip()
+    if not hazard:
+        return jsonify(error="hazard is required"), 400
+    if len(hazard) > 1000:
+        return jsonify(error="hazard must be 1000 characters or fewer"), 400
+    ccp = (data.get("ccp") or "").strip()
+    if len(ccp) > 1000:
+        return jsonify(error="ccp must be 1000 characters or fewer"), 400
+    monitoring = (data.get("monitoring_frequency") or "").strip()
+    if len(monitoring) > 500:
+        return jsonify(error="monitoring_frequency must be 500 characters"
+                       " or fewer"), 400
+    corrective = (data.get("corrective_action") or "").strip()
+    if len(corrective) > 2000:
+        return jsonify(error="corrective_action must be 2000 characters"
+                       " or fewer"), 400
+    owner = (data.get("owner") or "").strip()
+    if len(owner) > 200:
+        return jsonify(error="owner must be 200 characters or fewer"), 400
+    return {"product_line": product_line, "hazard": hazard, "ccp": ccp,
+            "monitoring_frequency": monitoring,
+            "corrective_action": corrective, "owner": owner}
+
+
+@app.post("/api/erp/quality/haccp/<int:record_id>/update")
+def quality_haccp_update(record_id):
+    """Edit a HACCP plan record (full replacement of the six text
+    fields; omitted fields keep their value)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_quality_haccp WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="HACCP record not found"), 404
+    merged = {"product_line": data.get("product_line", row["product_line"]),
+              "hazard": data.get("hazard", row["hazard"]),
+              "ccp": data.get("ccp", row["ccp"]),
+              "monitoring_frequency": data.get("monitoring_frequency",
+                                               row["monitoring_frequency"]),
+              "corrective_action": data.get("corrective_action",
+                                            row["corrective_action"]),
+              "owner": data.get("owner", row["owner"])}
+    fields = _quality_haccp_fields(merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_quality_haccp SET product_line = ?, hazard = ?,"
+        " ccp = ?, monitoring_frequency = ?, corrective_action = ?,"
+        " owner = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+        (fields["product_line"], fields["hazard"], fields["ccp"],
+         fields["monitoring_frequency"], fields["corrective_action"],
+         fields["owner"], actor, now, record_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_quality_haccp WHERE id = ?",
+                       (record_id,)).fetchone()
+    conn.close()
+    return jsonify(record=_quality_haccp_dict(row))
+
+
+@app.post("/api/erp/quality/haccp/<int:record_id>/delete")
+def quality_haccp_delete(record_id):
+    """Delete a HACCP plan record."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_quality_haccp WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="HACCP record not found"), 404
+    conn.execute("DELETE FROM erp_quality_haccp WHERE id = ?", (record_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/quality/complaints")
+def quality_complaints():
+    """Complaint trending, READ-ONLY over the existing support tickets
+    (erp_mkt_tickets). A ticket counts once per flavor and once per
+    batch it touches, through the order it references: the order's
+    linked batches give the flavor (batch recipe name) and the batch
+    number; a wholesale order with no batch link falls back to its
+    order lines' flavor names. Tickets with no order are counted as
+    unlinked. Months come from the ticket's created_at. Empty when
+    there are no tickets -- no data is invented."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    tickets = conn.execute(
+        "SELECT * FROM erp_mkt_tickets ORDER BY id").fetchall()
+    by_flavor = {}
+    by_batch = {}
+    by_month = {}
+    unlinked = 0
+    for t in tickets:
+        created = (t["created_at"] or "")[:7]
+        if len(created) == 7 and created[4] == "-":
+            by_month[created] = by_month.get(created, 0) + 1
+        source = t["order_source"]
+        order_id = t["order_id"]
+        if not source or not order_id:
+            unlinked += 1
+            continue
+        flavors = set()
+        batches = set()
+        for l in conn.execute(
+                "SELECT * FROM erp_batch_orders WHERE order_source = ?"
+                " AND order_id = ? ORDER BY id", (source, order_id)).fetchall():
+            b = conn.execute(
+                "SELECT * FROM erp_production_batches WHERE id = ?",
+                (l["batch_id"],)).fetchone()
+            if not b:
+                continue
+            batches.add(b["batch_number"])
+            recipe = conn.execute("SELECT name FROM erp_recipes WHERE id = ?",
+                                  (b["recipe_id"],)).fetchone()
+            if recipe and recipe["name"]:
+                flavors.add(recipe["name"])
+        if not batches and source == "wholesale":
+            for line in conn.execute(
+                    "SELECT flavor_name FROM erp_wholesale_order_lines"
+                    " WHERE order_id = ?", (order_id,)).fetchall():
+                if line["flavor_name"]:
+                    flavors.add(line["flavor_name"])
+        for f in flavors:
+            by_flavor[f] = by_flavor.get(f, 0) + 1
+        for bnum in batches:
+            by_batch[bnum] = by_batch.get(bnum, 0) + 1
+    conn.close()
+    return jsonify(
+        total=len(tickets), unlinked=unlinked,
+        by_flavor=[{"flavor": f, "count": c}
+                   for f, c in sorted(by_flavor.items(),
+                                      key=lambda kv: (-kv[1], kv[0]))],
+        by_batch=[{"batch_number": b, "count": c}
+                  for b, c in sorted(by_batch.items(),
+                                     key=lambda kv: (-kv[1], kv[0]))],
+        by_month=[{"month": m, "count": c}
+                  for m, c in sorted(by_month.items())])
+
+
+# ---------------- Additions Wave C: digital quality checklists ----------------
+# Admin-only via _require_erp_admin(), like the rest of Quality.
+# Templates are reusable item lists (pass/fail or temperature per
+# item); a completion snapshots its template's items with their
+# answers, one per (template, store, day). TEXT ONLY -- no photo
+# upload exists anywhere in the ERP, and the UI says so plainly.
+_QUALITY_CHECKLIST_KINDS = ("pass_fail", "temperature")
+
+
+def _quality_template_dict(row):
+    try:
+        items = json.loads(row["items_json"] or "[]") or []
+    except (TypeError, ValueError):
+        items = []
+    return {"id": row["id"], "name": row["name"] or "", "items": items,
+            "created_by": row["created_by"] or "",
+            "created_at": row["created_at"],
+            "updated_by": row["updated_by"] or "",
+            "updated_at": row["updated_at"] or ""}
+
+
+def _quality_checklist_dict(row):
+    try:
+        items = json.loads(row["items_json"] or "[]") or []
+    except (TypeError, ValueError):
+        items = []
+    return {"id": row["id"], "store_id": row["store_id"],
+            "template_name": row["template_name"] or "",
+            "checklist_date": row["checklist_date"] or "",
+            "items": items,
+            "completed_by": row["completed_by"] or "",
+            "completed_at": row["completed_at"],
+            "notes": row["notes"] or "",
+            "created_by": row["created_by"] or "",
+            "created_at": row["created_at"]}
+
+
+def _quality_template_items(data):
+    """Validate a template item list: 1-50 items, each {label, kind}
+    with kind pass_fail or temperature. Returns the cleaned list, or
+    (error_response, status)."""
+    raw = data.get("items")
+    if not isinstance(raw, list) or not raw or len(raw) > 50:
+        return jsonify(error="items must be a list of 1-50 items"), 400
+    items = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return jsonify(error="every item needs a label and a kind"), 400
+        label = (item.get("label") or "").strip()
+        kind = (item.get("kind") or "").strip()
+        if not label or len(label) > 200:
+            return jsonify(error="every item label must be 1-200 characters"), 400
+        if kind not in _QUALITY_CHECKLIST_KINDS:
+            return jsonify(error="item kind must be pass_fail or temperature"), 400
+        items.append({"label": label, "kind": kind})
+    return items
+
+
+def _quality_completion_items(data, template_items):
+    """Validate completion answers against the template: same items,
+    in the same order, every one answered -- pass/fail for pass_fail
+    items, a temperature in Fahrenheit (-50..500) for temperature
+    items. Returns the cleaned list, or (error_response, status)."""
+    raw = data.get("items")
+    if not isinstance(raw, list) or len(raw) != len(template_items):
+        return jsonify(error="items must answer every template item, in order"), 400
+    items = []
+    for given, tpl in zip(raw, template_items):
+        if not isinstance(given, dict):
+            return jsonify(error="every item needs an answer"), 400
+        label = (given.get("label") or "").strip()
+        if label != tpl["label"] or (given.get("kind") or "").strip() != tpl["kind"]:
+            return jsonify(error="items must match the template items, in order"), 400
+        if tpl["kind"] == "pass_fail":
+            result = (given.get("result") or "").strip()
+            if result not in ("pass", "fail"):
+                return jsonify(error="item '%s' needs a pass or fail result" % tpl["label"]), 400
+            items.append({"label": tpl["label"], "kind": "pass_fail",
+                          "result": result, "temperature_f": None})
+        else:
+            temp = given.get("temperature_f")
+            if isinstance(temp, bool) or not isinstance(temp, (int, float)):
+                return jsonify(error="item '%s' needs a temperature" % tpl["label"]), 400
+            if temp < -50 or temp > 500:
+                return jsonify(error="item '%s' temperature must be -50..500 F" % tpl["label"]), 400
+            items.append({"label": tpl["label"], "kind": "temperature",
+                          "result": None, "temperature_f": temp})
+    return items
+
+
+@app.get("/api/erp/quality/checklist-templates")
+def quality_checklist_templates_list():
+    """Checklist templates, by name."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_quality_checklist_templates ORDER BY name, id"
+    ).fetchall()
+    conn.close()
+    return jsonify(templates=[_quality_template_dict(r) for r in rows])
+
+
+@app.post("/api/erp/quality/checklist-templates")
+def quality_checklist_template_create():
+    """Add a checklist template (201): free-text items, temperature
+    fields optional per item."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name or len(name) > 100:
+        return jsonify(error="name must be 1-100 characters"), 400
+    items = _quality_template_items(data)
+    if isinstance(items, tuple):
+        return items
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_checklist_templates (name, items_json,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (name, json.dumps(items), actor, now, actor, now))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_checklist_templates WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(template=_quality_template_dict(row)), 201
+
+
+@app.post("/api/erp/quality/checklist-templates/<int:template_id>/update")
+def quality_checklist_template_update(template_id):
+    """Edit a template's name and/or items (omitted fields keep
+    value). Past completions keep their own snapshot -- they are
+    never rewritten."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_checklist_templates WHERE id = ?",
+        (template_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="checklist template not found"), 404
+    name = (data.get("name", row["name"]) or "").strip()
+    if not name or len(name) > 100:
+        conn.close()
+        return jsonify(error="name must be 1-100 characters"), 400
+    if "items" in data:
+        items = _quality_template_items(data)
+        if isinstance(items, tuple):
+            conn.close()
+            return items
+    else:
+        try:
+            items = json.loads(row["items_json"] or "[]") or []
+        except (TypeError, ValueError):
+            items = []
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_quality_checklist_templates SET name = ?, items_json = ?,"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (name, json.dumps(items), actor, now, template_id))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_checklist_templates WHERE id = ?",
+        (template_id,)).fetchone()
+    conn.close()
+    return jsonify(template=_quality_template_dict(row))
+
+
+@app.post("/api/erp/quality/checklist-templates/<int:template_id>/delete")
+def quality_checklist_template_delete(template_id):
+    """Delete a template. Past completions keep their snapshot."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_checklist_templates WHERE id = ?",
+        (template_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="checklist template not found"), 404
+    conn.execute(
+        "DELETE FROM erp_quality_checklist_templates WHERE id = ?",
+        (template_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/quality/checklists")
+def quality_checklists_list():
+    """Completed checklists, newest first. Filter by store_id,
+    template (name), from / to (checklist_date)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_quality_checklists"
+        " ORDER BY checklist_date DESC, id DESC").fetchall()
+    out = []
+    store_id = request.args.get("store_id")
+    template = (request.args.get("template") or "").strip()
+    frm = request.args.get("from") or ""
+    to = request.args.get("to") or ""
+    for r in rows:
+        d = _quality_checklist_dict(r)
+        if store_id not in (None, ""):
+            try:
+                want = int(store_id)
+            except (TypeError, ValueError):
+                continue
+            if d["store_id"] != want:
+                continue
+        if template and d["template_name"] != template:
+            continue
+        if frm and d["checklist_date"] < frm:
+            continue
+        if to and d["checklist_date"] > to:
+            continue
+        out.append(d)
+    conn.close()
+    return jsonify(checklists=out)
+
+
+@app.post("/api/erp/quality/checklists")
+def quality_checklist_complete():
+    """Complete a checklist for a store (or company-wide when
+    store_id is omitted) on a day (201). One completion per
+    (template, store, day) -- a second one is refused with 409."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    try:
+        template_id = int(data.get("template_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="template_id must be a template id"), 400
+    store_id = data.get("store_id")
+    if store_id is not None and store_id != "":
+        try:
+            store_id = int(store_id)
+        except (TypeError, ValueError):
+            return jsonify(error="store_id must be a store id"), 400
+    else:
+        store_id = None
+    checklist_date = (data.get("checklist_date") or "").strip()
+    if not checklist_date:
+        checklist_date = datetime.now(timezone.utc).date().isoformat()
+    if not _legal_valid_date(checklist_date):
+        return jsonify(error="checklist_date must be YYYY-MM-DD"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    tpl = conn.execute(
+        "SELECT * FROM erp_quality_checklist_templates WHERE id = ?",
+        (template_id,)).fetchone()
+    if not tpl:
+        conn.close()
+        return jsonify(error="checklist template not found"), 404
+    if store_id is not None and not conn.execute(
+            "SELECT 1 FROM erp_stores WHERE id = ?", (store_id,)).fetchone():
+        conn.close()
+        return jsonify(error="store not found"), 404
+    try:
+        template_items = json.loads(tpl["items_json"] or "[]") or []
+    except (TypeError, ValueError):
+        template_items = []
+    items = _quality_completion_items(data, template_items)
+    if isinstance(items, tuple):
+        conn.close()
+        return items
+    if store_id is None:
+        dup = conn.execute(
+            "SELECT id FROM erp_quality_checklists"
+            " WHERE template_name = ? AND checklist_date = ?"
+            " AND store_id IS NULL",
+            (tpl["name"], checklist_date)).fetchone()
+    else:
+        dup = conn.execute(
+            "SELECT id FROM erp_quality_checklists"
+            " WHERE template_name = ? AND checklist_date = ?"
+            " AND store_id = ?",
+            (tpl["name"], checklist_date, store_id)).fetchone()
+    if dup:
+        conn.close()
+        return jsonify(error="that checklist was already completed for that store and day"), 409
+    cur = conn.execute(
+        "INSERT INTO erp_quality_checklists (store_id, template_name,"
+        " checklist_date, items_json, completed_by, completed_at, notes,"
+        " created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, tpl["name"], checklist_date, json.dumps(items),
+         actor, now, notes, actor, now))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_checklists WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(checklist=_quality_checklist_dict(row)), 201
+
+
+@app.get("/api/erp/quality/checklists/<int:checklist_id>")
+def quality_checklist_detail(checklist_id):
+    """One completed checklist, with its items JSON as stored."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_checklists WHERE id = ?",
+        (checklist_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="checklist not found"), 404
+    payload = _quality_checklist_dict(row)
+    conn.close()
+    return jsonify(checklist=payload)
+
+
+@app.post("/api/erp/quality/checklists/<int:checklist_id>/delete")
+def quality_checklist_delete(checklist_id):
+    """Delete a completed checklist (correction only)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_checklists WHERE id = ?",
+        (checklist_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="checklist not found"), 404
+    conn.execute("DELETE FROM erp_quality_checklists WHERE id = ?",
+                 (checklist_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/quality/temperature-log")
+def quality_temperature_log():
+    """Temperature readings across completed checklists, oldest
+    first. Filter by store_id, from / to (checklist_date)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_quality_checklists"
+        " ORDER BY checklist_date, id").fetchall()
+    store_id = request.args.get("store_id")
+    frm = request.args.get("from") or ""
+    to = request.args.get("to") or ""
+    readings = []
+    for r in rows:
+        d = _quality_checklist_dict(r)
+        if store_id not in (None, ""):
+            try:
+                want = int(store_id)
+            except (TypeError, ValueError):
+                continue
+            if d["store_id"] != want:
+                continue
+        if frm and d["checklist_date"] < frm:
+            continue
+        if to and d["checklist_date"] > to:
+            continue
+        store_name = ""
+        if d["store_id"] is not None:
+            srow = conn.execute(
+                "SELECT name FROM erp_stores WHERE id = ?",
+                (d["store_id"],)).fetchone()
+            store_name = (srow["name"] if srow else "") or ""
+        for item in d["items"]:
+            if item.get("kind") == "temperature" and                     item.get("temperature_f") is not None:
+                readings.append({
+                    "checklist_id": d["id"],
+                    "checklist_date": d["checklist_date"],
+                    "store_id": d["store_id"], "store_name": store_name,
+                    "template_name": d["template_name"],
+                    "label": item.get("label") or "",
+                    "temperature_f": item.get("temperature_f"),
+                    "completed_by": d["completed_by"] or ""})
+    conn.close()
+    return jsonify(readings=readings)
+
+
+# ---------------- Dept 14 Legal & Compliance (Wave B) ----------------
+# Admin-only. Three registers: trademark/IP, contracts + insurance,
+# and a compliance calendar. No new permissions -- admin-only via
+# _require_erp_admin(), like Quality. "Overdue" (compliance) and
+# "expiring soon"/"expired" (agreements) are computed from dates vs
+# today and never stored.
+_LEGAL_IP_TYPES = ("trademark", "logo", "domain", "other")
+_LEGAL_IP_STATUSES = ("unfiled", "filed", "pending", "registered")
+_LEGAL_AGREEMENT_TYPES = ("contract", "insurance", "other")
+
+
+def _legal_valid_date(value):
+    """YYYY-MM-DD and a real calendar date, or blank."""
+    if not value:
+        return True
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _legal_ip_dict(row):
+    d = dict(row)
+    d["is_renewal_overdue"] = bool(row["renewal_deadline"]) and \
+        row["renewal_deadline"] < datetime.now(timezone.utc).date().isoformat()
+    return d
+
+
+def _legal_agreement_dict(row):
+    d = dict(row)
+    today = datetime.now(timezone.utc).date()
+    end = row["end_date"] or ""
+    days = None
+    if end:
+        try:
+            days = (datetime.strptime(end, "%Y-%m-%d").date() - today).days
+        except ValueError:
+            days = None
+    d["days_until_expiry"] = days
+    notice = row["renewal_notice_days"]
+    if notice is None:
+        notice = 30
+    d["is_expired"] = days is not None and days < 0
+    d["expiring_soon"] = days is not None and 0 <= days <= notice
+    return d
+
+
+def _legal_compliance_dict(row):
+    """Effective status: stored status is open/done only -- an open
+    row past its due date reads as overdue, computed, never stored."""
+    d = dict(row)
+    stored = row["status"] or "open"
+    due = row["due_date"] or ""
+    today = datetime.now(timezone.utc).date().isoformat()
+    if stored == "done":
+        d["status"] = "done"
+    elif due and due < today:
+        d["status"] = "overdue"
+    else:
+        d["status"] = "open"
+    return d
+
+
+def _legal_ip_fields(data):
+    """Validate IP register fields. Returns the cleaned fields dict,
+    or (error_response, status) on a bad value."""
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    if len(name) > 500:
+        return jsonify(error="name must be 500 characters or fewer"), 400
+    ip_type = (data.get("type") or "trademark").strip()
+    if ip_type not in _LEGAL_IP_TYPES:
+        return jsonify(error="type must be trademark, logo, domain or"
+                       " other"), 400
+    status = (data.get("status") or "unfiled").strip()
+    if status not in _LEGAL_IP_STATUSES:
+        return jsonify(error="status must be unfiled, filed, pending or"
+                       " registered"), 400
+    filing = (data.get("filing_date") or "").strip()
+    if not _legal_valid_date(filing):
+        return jsonify(error="filing_date must be YYYY-MM-DD"), 400
+    registration = (data.get("registration_date") or "").strip()
+    if not _legal_valid_date(registration):
+        return jsonify(error="registration_date must be YYYY-MM-DD"), 400
+    renewal = (data.get("renewal_deadline") or "").strip()
+    if not _legal_valid_date(renewal):
+        return jsonify(error="renewal_deadline must be YYYY-MM-DD"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    return {"name": name, "type": ip_type, "status": status,
+            "filing_date": filing, "registration_date": registration,
+            "renewal_deadline": renewal, "notes": notes}
+
+
+def _legal_agreement_fields(data):
+    """Validate agreement fields. Returns the cleaned fields dict,
+    or (error_response, status) on a bad value."""
+    counterparty = (data.get("counterparty") or "").strip()
+    if not counterparty:
+        return jsonify(error="counterparty is required"), 400
+    if len(counterparty) > 500:
+        return jsonify(error="counterparty must be 500 characters"
+                       " or fewer"), 400
+    ag_type = (data.get("type") or "contract").strip()
+    if ag_type not in _LEGAL_AGREEMENT_TYPES:
+        return jsonify(error="type must be contract, insurance or"
+                       " other"), 400
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify(error="title is required"), 400
+    if len(title) > 500:
+        return jsonify(error="title must be 500 characters or fewer"), 400
+    start = (data.get("start_date") or "").strip()
+    if not _legal_valid_date(start):
+        return jsonify(error="start_date must be YYYY-MM-DD"), 400
+    end = (data.get("end_date") or "").strip()
+    if not _legal_valid_date(end):
+        return jsonify(error="end_date must be YYYY-MM-DD"), 400
+    notice = data.get("renewal_notice_days", 30)
+    if isinstance(notice, bool):
+        return jsonify(error="renewal_notice_days must be a whole number"
+                       " of days"), 400
+    try:
+        notice = int(notice)
+    except (TypeError, ValueError):
+        return jsonify(error="renewal_notice_days must be a whole number"
+                       " of days"), 400
+    if notice < 0 or notice > 3650:
+        return jsonify(error="renewal_notice_days must be between 0 and"
+                       " 3650"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    return {"counterparty": counterparty, "type": ag_type, "title": title,
+            "start_date": start, "end_date": end,
+            "renewal_notice_days": notice, "notes": notes}
+
+
+def _legal_compliance_fields(data):
+    """Validate compliance fields. status is open/done only -- overdue
+    is computed, never accepted as a stored value. Returns the cleaned
+    fields dict, or (error_response, status) on a bad value."""
+    obligation = (data.get("obligation") or "").strip()
+    if not obligation:
+        return jsonify(error="obligation is required"), 400
+    if len(obligation) > 500:
+        return jsonify(error="obligation must be 500 characters"
+                       " or fewer"), 400
+    authority = (data.get("authority") or "").strip()
+    if len(authority) > 200:
+        return jsonify(error="authority must be 200 characters"
+                       " or fewer"), 400
+    due = (data.get("due_date") or "").strip()
+    if not _legal_valid_date(due):
+        return jsonify(error="due_date must be YYYY-MM-DD"), 400
+    status = (data.get("status") or "open").strip()
+    if status not in ("open", "done"):
+        return jsonify(error="status must be open or done"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    return {"obligation": obligation, "authority": authority,
+            "due_date": due, "status": status, "notes": notes}
+
+
+@app.get("/api/erp/legal/ip")
+def legal_ip_list():
+    """Trademark + IP register, by name. Seeded with the Pop-A-Licious
+    wordmark (unfiled); everything else is added by hand."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_legal_ip ORDER BY name, id").fetchall()
+    out = [_legal_ip_dict(r) for r in rows]
+    conn.close()
+    return jsonify(ip=out)
+
+
+@app.post("/api/erp/legal/ip")
+def legal_ip_create():
+    """Add an IP register record. name is required; type defaults to
+    trademark and status to unfiled."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields = _legal_ip_fields(data)
+    if isinstance(fields, tuple):
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_legal_ip (name, type, status, filing_date,"
+        " registration_date, renewal_deadline, notes, created_by,"
+        " created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["name"], fields["type"], fields["status"],
+         fields["filing_date"], fields["registration_date"],
+         fields["renewal_deadline"], fields["notes"], actor, now,
+         actor, now))
+    row = conn.execute("SELECT * FROM erp_legal_ip WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=_legal_ip_dict(row)), 201
+
+
+@app.post("/api/erp/legal/ip/<int:record_id>/update")
+def legal_ip_update(record_id):
+    """Edit an IP register record (omitted fields keep their value)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_ip WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="IP record not found"), 404
+    merged = {"name": data.get("name", row["name"]),
+              "type": data.get("type", row["type"]),
+              "status": data.get("status", row["status"]),
+              "filing_date": data.get("filing_date", row["filing_date"]),
+              "registration_date": data.get("registration_date",
+                                            row["registration_date"]),
+              "renewal_deadline": data.get("renewal_deadline",
+                                           row["renewal_deadline"]),
+              "notes": data.get("notes", row["notes"])}
+    fields = _legal_ip_fields(merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_legal_ip SET name = ?, type = ?, status = ?,"
+        " filing_date = ?, registration_date = ?, renewal_deadline = ?,"
+        " notes = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+        (fields["name"], fields["type"], fields["status"],
+         fields["filing_date"], fields["registration_date"],
+         fields["renewal_deadline"], fields["notes"], actor, now,
+         record_id))
+    row = conn.execute("SELECT * FROM erp_legal_ip WHERE id = ?",
+                       (record_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=_legal_ip_dict(row))
+
+
+@app.post("/api/erp/legal/ip/<int:record_id>/delete")
+def legal_ip_delete(record_id):
+    """Delete an IP register record (correction only -- the mark
+    itself is untouched outside the ERP)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_ip WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="IP record not found"), 404
+    conn.execute("DELETE FROM erp_legal_ip WHERE id = ?", (record_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/legal/agreements")
+def legal_agreements_list():
+    """Contracts + insurance register, soonest expiry first (rows
+    with no end date last). expiring_soon / is_expired are computed
+    from end_date vs today and the renewal notice window."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_legal_agreements"
+        " ORDER BY CASE WHEN end_date = '' THEN 1 ELSE 0 END,"
+        " end_date, id").fetchall()
+    out = [_legal_agreement_dict(r) for r in rows]
+    conn.close()
+    return jsonify(agreements=out)
+
+
+@app.post("/api/erp/legal/agreements")
+def legal_agreement_create():
+    """Add a contract or insurance agreement. counterparty and title
+    are required; renewal_notice_days defaults to 30."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields = _legal_agreement_fields(data)
+    if isinstance(fields, tuple):
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_legal_agreements (counterparty, type, title,"
+        " start_date, end_date, renewal_notice_days, notes, created_by,"
+        " created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["counterparty"], fields["type"], fields["title"],
+         fields["start_date"], fields["end_date"],
+         fields["renewal_notice_days"], fields["notes"], actor, now,
+         actor, now))
+    row = conn.execute("SELECT * FROM erp_legal_agreements WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=_legal_agreement_dict(row)), 201
+
+
+@app.post("/api/erp/legal/agreements/<int:record_id>/update")
+def legal_agreement_update(record_id):
+    """Edit an agreement (omitted fields keep their value)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_agreements WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Agreement not found"), 404
+    merged = {"counterparty": data.get("counterparty", row["counterparty"]),
+              "type": data.get("type", row["type"]),
+              "title": data.get("title", row["title"]),
+              "start_date": data.get("start_date", row["start_date"]),
+              "end_date": data.get("end_date", row["end_date"]),
+              "renewal_notice_days": data.get("renewal_notice_days",
+                                              row["renewal_notice_days"]),
+              "notes": data.get("notes", row["notes"])}
+    fields = _legal_agreement_fields(merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_legal_agreements SET counterparty = ?, type = ?,"
+        " title = ?, start_date = ?, end_date = ?,"
+        " renewal_notice_days = ?, notes = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (fields["counterparty"], fields["type"], fields["title"],
+         fields["start_date"], fields["end_date"],
+         fields["renewal_notice_days"], fields["notes"], actor, now,
+         record_id))
+    row = conn.execute("SELECT * FROM erp_legal_agreements WHERE id = ?",
+                       (record_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=_legal_agreement_dict(row))
+
+
+@app.post("/api/erp/legal/agreements/<int:record_id>/delete")
+def legal_agreement_delete(record_id):
+    """Delete an agreement record (correction only -- the agreement
+    itself is untouched outside the ERP)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_agreements WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Agreement not found"), 404
+    conn.execute("DELETE FROM erp_legal_agreements WHERE id = ?",
+                 (record_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---------------- Additions Wave C: lease accounting (ASC 842) ----------------
+# Admin-only via _require_erp_admin(). A lease schedule is user-entered
+# only: agreement link, commencement, term, monthly payment, discount
+# rate, ROU asset and liability. The present value and the monthly
+# amortization table are computed from those entered inputs -- never
+# from invented ones. Monthly entries post to the ledger through the
+# existing _acct_post_entry (period locks apply, same as every other
+# accounting write): one combined entry per month, Dr amortization
+# expense / Cr ROU asset plus Dr interest expense / Cr lease liability
+# (zero-amount legs are omitted, so a 0% lease posts amortization
+# only). The entry's source is 'lease' and its source_id is
+# '<lease_id>:<month>', so a posted month is idempotent: a second
+# post for the same month is refused with 409. Nothing posts unless
+# the admin clicks "Post this month" -- no lease is ever invented and
+# no initial ROU/liability recognition entry is posted here.
+ERP_LEASE_MAX_TERM_MONTHS = 360
+
+
+def _lease_add_months(start, months):
+    """The date `months` after `start` (YYYY-MM-DD), clamped to the
+    last day of the target month (Jan 31 + 1 month -> Feb 28/29)."""
+    d = datetime.strptime(start, "%Y-%m-%d")
+    total = (d.year * 12 + (d.month - 1)) + months
+    year, month0 = divmod(total, 12)
+    month = month0 + 1
+    if month == 12:
+        nxt = datetime(year + 1, 1, 1)
+    else:
+        nxt = datetime(year, month + 1, 1)
+    last_day = (nxt - timedelta(days=1)).day
+    return datetime(year, month, min(d.day, last_day)).date().isoformat()
+
+
+def _lease_monthly_rate(discount_rate_bps):
+    return (discount_rate_bps or 0) / 10000.0 / 12.0
+
+
+def _lease_present_value_cents(monthly_payment_cents, term_months,
+                               discount_rate_bps):
+    """Present value of the payment stream at the monthly discount
+    rate, rounded to whole cents. 0% -> payment x term exactly."""
+    rate = _lease_monthly_rate(discount_rate_bps)
+    if rate == 0:
+        return int(monthly_payment_cents) * int(term_months)
+    total = 0.0
+    for t in range(1, int(term_months) + 1):
+        total += monthly_payment_cents / ((1.0 + rate) ** t)
+    return int(total + 0.5)
+
+
+def _lease_posted_months(conn, lease_id):
+    """{month_index: entry_id} for months already posted to the
+    ledger (journal source 'lease', source_id '<id>:<month>')."""
+    posted = {}
+    for r in conn.execute(
+            "SELECT source_id, id FROM erp_acct_journal WHERE source = 'lease'"
+            " AND source_id LIKE ?",
+            ("%d:%%" % lease_id,)).fetchall():
+        try:
+            month = int((r["source_id"] or "").split(":", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        posted[month] = r["id"]
+    return posted
+
+
+def _lease_schedule_months(row, posted):
+    """The month-by-month amortization table, computed from the
+    entered inputs. Amortization is straight-line over the term
+    (the last month takes the remainder so the ROU asset reaches
+    exactly zero); interest is the opening liability times the
+    monthly rate, rounded to cents; principal is payment less
+    interest. `posted` maps month -> journal entry id."""
+    term = int(row["term_months"] or 0)
+    payment = int(row["monthly_payment_cents"] or 0)
+    rate = _lease_monthly_rate(row["discount_rate_bps"])
+    rou = int(row["rou_asset_cents"] or 0)
+    balance = int(row["liability_cents"] or 0)
+    rou_balance = rou
+    base_amort = rou // term if term else 0
+    months = []
+    for m in range(1, term + 1):
+        interest = int(balance * rate + 0.5) if rate else 0
+        principal = payment - interest
+        amort = base_amort if m < term else rou - base_amort * (term - 1)
+        closing = balance - principal
+        rou_closing = rou_balance - amort
+        months.append({
+            "month": m, "date": _lease_add_months(row["commencement"], m - 1),
+            "opening_liability_cents": balance,
+            "interest_cents": interest, "principal_cents": principal,
+            "closing_liability_cents": closing,
+            "amortization_cents": amort,
+            "closing_rou_cents": rou_closing,
+            "posted": m in posted,
+            "entry_id": posted.get(m)})
+        balance = closing
+        rou_balance = rou_closing
+    return months
+
+
+def _legal_lease_dict(conn, row, with_schedule=False):
+    posted = _lease_posted_months(conn, row["id"])
+    d = {"id": row["id"], "agreement_id": row["agreement_id"],
+         "commencement": row["commencement"] or "",
+         "term_months": row["term_months"],
+         "monthly_payment_cents": row["monthly_payment_cents"],
+         "discount_rate_bps": row["discount_rate_bps"],
+         "discount_rate_pct": (row["discount_rate_bps"] or 0) / 100.0,
+         "rou_asset_cents": row["rou_asset_cents"],
+         "liability_cents": row["liability_cents"],
+         "notes": row["notes"] or "",
+         "created_by": row["created_by"] or "",
+         "created_at": row["created_at"],
+         "updated_by": row["updated_by"] or "",
+         "updated_at": row["updated_at"] or "",
+         "present_value_cents": _lease_present_value_cents(
+             row["monthly_payment_cents"], row["term_months"],
+             row["discount_rate_bps"]),
+         "monthly_amortization_cents": (
+             (row["rou_asset_cents"] or 0) // row["term_months"]
+             if row["term_months"] else 0),
+         "posted_months": sorted(posted),
+         "months_posted": len(posted)}
+    ag = conn.execute(
+        "SELECT id, counterparty, title, type FROM erp_legal_agreements"
+        " WHERE id = ?", (row["agreement_id"],)).fetchone()
+    d["agreement"] = dict(ag) if ag else None
+    if with_schedule:
+        d["schedule"] = _lease_schedule_months(row, posted)
+    return d
+
+
+def _legal_lease_fields(data, conn):
+    """Validate lease fields. Returns the cleaned dict, or
+    (error_response, status) on a bad value."""
+    try:
+        agreement_id = int(data.get("agreement_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="agreement_id must be an agreement id"), 400
+    if not conn.execute(
+            "SELECT 1 FROM erp_legal_agreements WHERE id = ?",
+            (agreement_id,)).fetchone():
+        return jsonify(error="agreement not found"), 404
+    commencement = (data.get("commencement") or "").strip()
+    if not _legal_valid_date(commencement) or not commencement:
+        return jsonify(error="commencement must be YYYY-MM-DD"), 400
+    try:
+        term = int(data.get("term_months"))
+    except (TypeError, ValueError):
+        return jsonify(error="term_months must be a whole number of months"), 400
+    if term < 1 or term > ERP_LEASE_MAX_TERM_MONTHS:
+        return jsonify(error="term_months must be between 1 and %d"
+                       % ERP_LEASE_MAX_TERM_MONTHS), 400
+    payment = _acct_int_cents(data.get("monthly_payment_cents"))
+    if payment is None or payment < 0:
+        return jsonify(error="monthly payment must be a whole number of cents, 0 or more"), 400
+    if "discount_rate_bps" in data and data.get("discount_rate_bps") is not None:
+        bps = _acct_int_cents(data.get("discount_rate_bps"))
+        if bps is None or bps < 0 or bps > 10000:
+            return jsonify(error="discount_rate_bps must be 0-10000"), 400
+    elif "discount_rate_pct" in data and data.get("discount_rate_pct") is not None:
+        try:
+            pct = float(data.get("discount_rate_pct"))
+        except (TypeError, ValueError):
+            return jsonify(error="discount_rate_pct must be a number 0-100"), 400
+        if pct != pct or pct < 0 or pct > 100:
+            return jsonify(error="discount_rate_pct must be a number 0-100"), 400
+        bps = int(round(pct * 100))
+    else:
+        bps = 0
+    rou = _acct_int_cents(data.get("rou_asset_cents"))
+    if rou is None or rou < 0:
+        return jsonify(error="ROU asset must be a whole number of cents, 0 or more"), 400
+    liability = _acct_int_cents(data.get("liability_cents"))
+    if liability is None or liability < 0:
+        return jsonify(error="liability must be a whole number of cents, 0 or more"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    return {"agreement_id": agreement_id, "commencement": commencement,
+            "term_months": term, "monthly_payment_cents": payment,
+            "discount_rate_bps": bps, "rou_asset_cents": rou,
+            "liability_cents": liability, "notes": notes}
+
+
+@app.get("/api/erp/legal/leases")
+def legal_leases_list():
+    """Lease schedules, soonest commencement first, with the computed
+    present value and posted months (no full schedule -- see detail)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_legal_lease_schedules"
+        " ORDER BY commencement, id").fetchall()
+    out = [_legal_lease_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(leases=out)
+
+
+@app.post("/api/erp/legal/leases")
+def legal_lease_create():
+    """Add a lease schedule (201). Every money/rate field is entered
+    by the user; nothing is computed into the stored row."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    fields = _legal_lease_fields(data, conn)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_legal_lease_schedules (agreement_id, commencement,"
+        " term_months, monthly_payment_cents, discount_rate_bps,"
+        " rou_asset_cents, liability_cents, notes, created_by, created_at,"
+        " updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["agreement_id"], fields["commencement"],
+         fields["term_months"], fields["monthly_payment_cents"],
+         fields["discount_rate_bps"], fields["rou_asset_cents"],
+         fields["liability_cents"], fields["notes"], actor, now,
+         actor, now))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_legal_lease_schedules WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    payload = _legal_lease_dict(conn, row, with_schedule=True)
+    conn.close()
+    return jsonify(lease=payload), 201
+
+
+@app.get("/api/erp/legal/leases/<int:lease_id>")
+def legal_lease_detail(lease_id):
+    """One lease schedule with its full computed amortization table
+    and the months already posted to the ledger."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_legal_lease_schedules WHERE id = ?",
+        (lease_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="lease schedule not found"), 404
+    payload = _legal_lease_dict(conn, row, with_schedule=True)
+    conn.close()
+    return jsonify(lease=payload)
+
+
+@app.post("/api/erp/legal/leases/<int:lease_id>/post-month")
+def legal_lease_post_month(lease_id):
+    """Post one month's amortization + interest for a lease, on an
+    explicit admin click. The posting date is the month's date
+    (commencement + month - 1). Idempotent per month (409 when the
+    month already has a journal entry); a locked period is refused
+    with 400 by _acct_post_entry, like every other accounting write."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    month = data.get("month", data.get("month_index"))
+    try:
+        month = int(month)
+    except (TypeError, ValueError):
+        return jsonify(error="month must be a month number 1..term"), 400
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_legal_lease_schedules WHERE id = ?",
+        (lease_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="lease schedule not found"), 404
+    if month < 1 or month > int(row["term_months"] or 0):
+        conn.close()
+        return jsonify(error="month must be between 1 and %d"
+                       % int(row["term_months"] or 0)), 400
+    posted = _lease_posted_months(conn, lease_id)
+    if month in posted:
+        conn.close()
+        return jsonify(error="month %d is already posted (entry #%d)"
+                       % (month, posted[month]),
+                       entry_id=posted[month]), 409
+    sched = _lease_schedule_months(row, posted)
+    mrow = sched[month - 1]
+    amort = int(mrow["amortization_cents"] or 0)
+    interest = int(mrow["interest_cents"] or 0)
+    if amort == 0 and interest == 0:
+        conn.close()
+        return jsonify(error="nothing to post for month %d" % month), 400
+    amort_id = _acct_account_id_by_code(conn, ERP_ACCT_LEASE_AMORT_CODE)
+    rou_id = _acct_account_id_by_code(conn, ERP_ACCT_ROU_ASSET_CODE)
+    int_id = _acct_account_id_by_code(conn, ERP_ACCT_LEASE_INTEREST_CODE)
+    liab_id = _acct_account_id_by_code(conn, ERP_ACCT_LEASE_LIABILITY_CODE)
+    if not amort_id or not rou_id or not int_id or not liab_id:
+        conn.close()
+        return jsonify(error="lease accounts (1400/2400/6050/6950) are not set up"), 400
+    lines = []
+    if amort:
+        lines.append({"account_id": amort_id, "debit_cents": amort,
+                      "credit_cents": 0, "memo": "lease #%d month %d amortization" % (lease_id, month)})
+        lines.append({"account_id": rou_id, "debit_cents": 0,
+                      "credit_cents": amort, "memo": "lease #%d month %d amortization" % (lease_id, month)})
+    if interest:
+        lines.append({"account_id": int_id, "debit_cents": interest,
+                      "credit_cents": 0, "memo": "lease #%d month %d interest" % (lease_id, month)})
+        lines.append({"account_id": liab_id, "debit_cents": 0,
+                      "credit_cents": interest, "memo": "lease #%d month %d interest" % (lease_id, month)})
+    entry_id, error = _acct_post_entry(
+        conn, actor, mrow["date"],
+        "Lease #%d month %d amortization + interest" % (lease_id, month),
+        "lease", "%d:%d" % (lease_id, month), lines)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    _acct_audit(conn, actor, "lease.post", "lease", lease_id,
+                "lease #%d month %d posted %s entry #%d (amortization %d,"
+                " interest %d)" % (lease_id, month, mrow["date"], entry_id,
+                                   amort, interest))
+    conn.commit()
+    conn.close()
+    return jsonify(lease_id=lease_id, month=month, date=mrow["date"],
+                   entry_id=entry_id, amortization_cents=amort,
+                   interest_cents=interest)
+
+
+@app.post("/api/erp/legal/leases/<int:lease_id>/delete")
+def legal_lease_delete(lease_id):
+    """Delete a lease schedule. Refused once any month has posted --
+    posted journal entries are permanent, so the schedule that
+    explains them stays."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_legal_lease_schedules WHERE id = ?",
+        (lease_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="lease schedule not found"), 404
+    posted = _lease_posted_months(conn, lease_id)
+    if posted:
+        conn.close()
+        return jsonify(error="lease has posted months; posted entries are permanent"), 400
+    conn.execute("DELETE FROM erp_legal_lease_schedules WHERE id = ?",
+                 (lease_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/legal/compliance")
+def legal_compliance_list():
+    """Compliance calendar, soonest due date first (rows with no due
+    date last). status is computed: open past its due date reads as
+    overdue; done stays done."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_legal_compliance"
+        " ORDER BY CASE WHEN due_date = '' THEN 1 ELSE 0 END,"
+        " due_date, id").fetchall()
+    out = [_legal_compliance_dict(r) for r in rows]
+    conn.close()
+    return jsonify(items=out)
+
+
+@app.post("/api/erp/legal/compliance")
+def legal_compliance_create():
+    """Add a compliance obligation. obligation is required; status
+    defaults to open (overdue is computed, never stored)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields = _legal_compliance_fields(data)
+    if isinstance(fields, tuple):
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_legal_compliance (obligation, authority,"
+        " due_date, status, notes, created_by, created_at, updated_by,"
+        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["obligation"], fields["authority"], fields["due_date"],
+         fields["status"], fields["notes"], actor, now, actor, now))
+    row = conn.execute("SELECT * FROM erp_legal_compliance WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=_legal_compliance_dict(row)), 201
+
+
+@app.post("/api/erp/legal/compliance/<int:record_id>/update")
+def legal_compliance_update(record_id):
+    """Edit a compliance obligation (omitted fields keep their value).
+    Marking it done is an update with status done; reopening is an
+    update with status open."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_compliance WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Compliance obligation not found"), 404
+    merged = {"obligation": data.get("obligation", row["obligation"]),
+              "authority": data.get("authority", row["authority"]),
+              "due_date": data.get("due_date", row["due_date"]),
+              "status": data.get("status", row["status"]),
+              "notes": data.get("notes", row["notes"])}
+    fields = _legal_compliance_fields(merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_legal_compliance SET obligation = ?, authority = ?,"
+        " due_date = ?, status = ?, notes = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (fields["obligation"], fields["authority"], fields["due_date"],
+         fields["status"], fields["notes"], actor, now, record_id))
+    row = conn.execute("SELECT * FROM erp_legal_compliance WHERE id = ?",
+                       (record_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=_legal_compliance_dict(row))
+
+
+@app.post("/api/erp/legal/compliance/<int:record_id>/delete")
+def legal_compliance_delete(record_id):
+    """Delete a compliance obligation (correction only)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_compliance WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Compliance obligation not found"), 404
+    conn.execute("DELETE FROM erp_legal_compliance WHERE id = ?",
+                 (record_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- Dept 14 (Stores) Wave A
+# Core stores: store locations, a request/approve/receive transfer
+# workflow on top of the existing immediate-transfer movement model,
+# and POS sales + Z-report intake. Nothing here posts to the
+# accounting ledger: transfers post stock-ledger movements only, and
+# POS sales are a separate intake feed until the user decides how
+# they post.
+
+_STORE_TYPES = ("prepackaged", "fresh-made")
+_STORE_STATUSES = ("open", "closed")
+
+
+def _stores_int(value):
+    """Strict whole-number int (cents / bag qty): bools, floats with a
+    fraction, and non-numeric strings are rejected (None)."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str):
+        txt = value.strip()
+        if re.match(r"^-?\d+$", txt):
+            return int(txt)
+    return None
+
+
+def _stores_get(conn, store_id):
+    try:
+        store_id = int(store_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute(
+        "SELECT s.*, loc.code AS location_code, loc.name AS location_name"
+        " FROM erp_stores s LEFT JOIN erp_locations loc"
+        " ON loc.id = s.location_id WHERE s.id = ?", (store_id,)).fetchone()
+
+
+def _stores_dict(row):
+    d = dict(row)
+    d["location_id"] = row["location_id"]
+    return d
+
+
+def _stores_fields(conn, data):
+    """Validate store fields. Returns the cleaned dict, or
+    (error_response, status) on a bad value."""
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    if len(name) > 200:
+        return jsonify(error="name must be 200 characters or fewer"), 400
+    address = (data.get("address") or "").strip()
+    if len(address) > 500:
+        return jsonify(error="address must be 500 characters or fewer"), 400
+    stype = (data.get("type") or "prepackaged").strip().lower()
+    if stype not in _STORE_TYPES:
+        return jsonify(error="type must be prepackaged or fresh-made"), 400
+    open_date = (data.get("open_date") or "").strip()
+    if not _legal_valid_date(open_date):
+        return jsonify(error="open_date must be YYYY-MM-DD"), 400
+    status = (data.get("status") or "open").strip().lower()
+    if status not in _STORE_STATUSES:
+        return jsonify(error="status must be open or closed"), 400
+    location_id = data.get("location_id")
+    if location_id in ("", None):
+        location_id = None
+    else:
+        try:
+            location_id = int(location_id)
+        except (TypeError, ValueError):
+            return jsonify(error="location_id must be a location id"), 400
+        loc = conn.execute(
+            "SELECT id FROM erp_locations WHERE id = ? AND active = 1",
+            (location_id,)).fetchone()
+        if not loc:
+            return jsonify(error="location not found or inactive"), 400
+    return {"name": name, "address": address, "type": stype,
+            "open_date": open_date, "status": status,
+            "location_id": location_id}
+
+
+def _stores_transfer_dict(row):
+    d = dict(row)
+    d["qty"] = float(d["qty"] or 0)
+    try:
+        d["lots"] = json.loads(d.get("lot_codes") or "") or []
+    except (TypeError, ValueError):
+        d["lots"] = []
+    d.pop("lot_codes", None)
+    return d
+
+
+def _stores_transfer_row(conn, transfer_id):
+    return conn.execute(
+        "SELECT t.*, i.name AS item_name, fl.code AS from_code,"
+        " tl.code AS to_code FROM erp_store_transfers t"
+        " LEFT JOIN erp_items i ON i.id = t.item_id"
+        " LEFT JOIN erp_locations fl ON fl.id = t.from_location_id"
+        " LEFT JOIN erp_locations tl ON tl.id = t.to_location_id"
+        " WHERE t.id = ?", (transfer_id,)).fetchone()
+
+
+def _stores_sale_dict(row):
+    d = dict(row)
+    try:
+        d["items"] = json.loads(d.get("items_json") or "[]") or []
+    except (TypeError, ValueError):
+        d["items"] = []
+    d.pop("items_json", None)
+    try:
+        d["tenders"] = json.loads(d.get("tenders_json") or "{}") or {}
+    except (TypeError, ValueError):
+        d["tenders"] = {}
+    d.pop("tenders_json", None)
+    if not d["tenders"] and (d.get("tender") or "").strip():
+        # Pre-split sales: the whole total rode on one tender string.
+        d["tenders"] = {d["tender"].strip(): int(d.get("total_cents") or 0)}
+    return d
+
+
+def _stores_zreport_dict(row):
+    d = dict(row)
+    try:
+        d["totals_by_tender"] = json.loads(d.get("totals_json") or "{}") or {}
+    except (TypeError, ValueError):
+        d["totals_by_tender"] = {}
+    d["total_cents"] = sum(
+        int(v) for v in d["totals_by_tender"].values()
+        if isinstance(v, int))
+    d.pop("totals_json", None)
+    return d
+
+
+@app.get("/api/erp/stores")
+def stores_list():
+    """All stores, open first, with their linked location (if any).
+    Starts empty -- nothing is seeded."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT s.*, loc.code AS location_code, loc.name AS location_name"
+        " FROM erp_stores s LEFT JOIN erp_locations loc"
+        " ON loc.id = s.location_id"
+        " ORDER BY (s.status != 'open'), s.name, s.id").fetchall()
+    conn.close()
+    return jsonify(stores=[_stores_dict(r) for r in rows])
+
+
+@app.post("/api/erp/stores")
+def stores_create():
+    """Add a store. name is required; type defaults to prepackaged;
+    location_id is optional and must be an active location."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    fields = _stores_fields(conn, data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_stores (name, address, type, open_date, status,"
+        " location_id, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["name"], fields["address"], fields["type"],
+         fields["open_date"], fields["status"], fields["location_id"],
+         actor, now, actor, now))
+    row = _stores_get(conn, cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify(store=_stores_dict(row)), 201
+
+
+@app.get("/api/erp/stores/<int:store_id>")
+def stores_get(store_id):
+    """One store, plus its per-location stock when it has a linked
+    location (read from the existing ledger / lot balances; empty
+    when the location holds nothing)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _stores_get(conn, store_id)
+    if not row:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    store = _stores_dict(row)
+    stock = []
+    if store["location_id"]:
+        loc_id = store["location_id"]
+        for r in conn.execute(
+                "SELECT l.item_id, COALESCE(SUM(l.qty_change), 0) AS q,"
+                " i.name, i.track_lots FROM erp_stock_ledger l"
+                " JOIN erp_items i ON i.id = l.item_id"
+                " WHERE l.location_id = ? GROUP BY l.item_id"
+                " HAVING q > 1e-9 ORDER BY i.name",
+                (loc_id,)).fetchall():
+            lots = []
+            if r["track_lots"]:
+                lots = [{"lot_code": c, "qty": q}
+                        for c, q, _f in _erp_lot_balances(
+                            conn, r["item_id"], loc_id)]
+            stock.append({"item_id": r["item_id"], "name": r["name"],
+                          "on_hand": float(r["q"] or 0),
+                          "track_lots": bool(r["track_lots"]),
+                          "lots": lots})
+    conn.close()
+    return jsonify(store=store, stock=stock)
+
+
+@app.post("/api/erp/stores/<int:store_id>/update")
+def stores_update(store_id):
+    """Edit a store (omitted fields keep their value)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _stores_get(conn, store_id)
+    if not row:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    merged = {"name": data.get("name", row["name"]),
+              "address": data.get("address", row["address"]),
+              "type": data.get("type", row["type"]),
+              "open_date": data.get("open_date", row["open_date"]),
+              "status": data.get("status", row["status"]),
+              "location_id": data.get("location_id", row["location_id"])}
+    fields = _stores_fields(conn, merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_stores SET name = ?, address = ?, type = ?,"
+        " open_date = ?, status = ?, location_id = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (fields["name"], fields["address"], fields["type"],
+         fields["open_date"], fields["status"], fields["location_id"],
+         actor, now, store_id))
+    row = _stores_get(conn, store_id)
+    conn.commit()
+    conn.close()
+    return jsonify(store=_stores_dict(row))
+
+
+@app.post("/api/erp/stores/<int:store_id>/deactivate")
+def stores_deactivate(store_id):
+    """Close a store (status open -> closed). The record and its sales
+    history stay; a closed store takes no new POS sales."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _stores_get(conn, store_id)
+    if not row:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_stores SET status = 'closed', updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (actor, now, store_id))
+    row = _stores_get(conn, store_id)
+    conn.commit()
+    conn.close()
+    return jsonify(store=_stores_dict(row))
+
+
+@app.post("/api/erp/stores/<int:store_id>/reactivate")
+def stores_reactivate(store_id):
+    """Reopen a closed store."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _stores_get(conn, store_id)
+    if not row:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_stores SET status = 'open', updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (actor, now, store_id))
+    row = _stores_get(conn, store_id)
+    conn.commit()
+    conn.close()
+    return jsonify(store=_stores_dict(row))
+
+
+@app.get("/api/erp/stores/transfers")
+def store_transfers_list():
+    """Transfer workflow rows, newest first. ?status= filters."""
+    _, err = _erp_check_perm("inventory.transfer")
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    conn = db()
+    if status in ("requested", "approved", "received", "cancelled"):
+        rows = conn.execute(
+            "SELECT t.*, i.name AS item_name, fl.code AS from_code,"
+            " tl.code AS to_code FROM erp_store_transfers t"
+            " LEFT JOIN erp_items i ON i.id = t.item_id"
+            " LEFT JOIN erp_locations fl ON fl.id = t.from_location_id"
+            " LEFT JOIN erp_locations tl ON tl.id = t.to_location_id"
+            " WHERE t.status = ? ORDER BY t.id DESC", (status,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT t.*, i.name AS item_name, fl.code AS from_code,"
+            " tl.code AS to_code FROM erp_store_transfers t"
+            " LEFT JOIN erp_items i ON i.id = t.item_id"
+            " LEFT JOIN erp_locations fl ON fl.id = t.from_location_id"
+            " LEFT JOIN erp_locations tl ON tl.id = t.to_location_id"
+            " ORDER BY t.id DESC").fetchall()
+    conn.close()
+    return jsonify(transfers=[_stores_transfer_dict(r) for r in rows])
+
+
+@app.post("/api/erp/stores/transfers")
+def store_transfer_request():
+    """Request a transfer. Validates item / locations / qty only --
+    stock is checked at receive time, when the movement posts."""
+    actor, err = _erp_check_perm("inventory.transfer")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    item = _erp_get_item(conn, data.get("item_id"))
+    if not item or not item["active"]:
+        conn.close()
+        return jsonify(error="valid item_id is required"), 400
+    src = _erp_get_location(conn, data.get("from_location_id"))
+    dst = _erp_get_location(conn, data.get("to_location_id"))
+    if not src or not src["active"] or not dst or not dst["active"]:
+        conn.close()
+        return jsonify(error="valid from_location_id and to_location_id are required"), 400
+    if src["id"] == dst["id"]:
+        conn.close()
+        return jsonify(error="source and destination must differ"), 400
+    try:
+        qty = float(data.get("qty") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="qty must be a number"), 400
+    if qty <= 0:
+        conn.close()
+        return jsonify(error="qty must be greater than zero"), 400
+    note = (data.get("note") or "").strip()
+    if len(note) > 500:
+        conn.close()
+        return jsonify(error="note must be 500 characters or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_transfers (from_location_id, to_location_id,"
+        " item_id, qty, status, note, requested_by, requested_at)"
+        " VALUES (?, ?, ?, ?, 'requested', ?, ?, ?)",
+        (src["id"], dst["id"], item["id"], qty, note, actor, now))
+    row = _stores_transfer_row(conn, cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify(transfer=_stores_transfer_dict(row)), 201
+
+
+@app.post("/api/erp/stores/transfers/<int:transfer_id>/approve")
+def store_transfer_approve(transfer_id):
+    """Approve a requested transfer."""
+    actor, err = _erp_check_perm("inventory.transfer")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_transfers WHERE id = ?",
+        (transfer_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="transfer not found"), 404
+    if row["status"] != "requested":
+        conn.close()
+        return jsonify(error="only a requested transfer can be approved"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_transfers SET status = 'approved',"
+        " approved_by = ?, approved_at = ? WHERE id = ?",
+        (actor, now, transfer_id))
+    row = _stores_transfer_row(conn, transfer_id)
+    conn.commit()
+    conn.close()
+    return jsonify(transfer=_stores_transfer_dict(row))
+
+
+@app.post("/api/erp/stores/transfers/<int:transfer_id>/receive")
+def store_transfer_receive(transfer_id):
+    """Receive an approved transfer: posts the stock movement. FEFO
+    for lot-tracked items -- source lots are consumed earliest-expiry
+    first (held lots are skipped, per _erp_lot_balances), and any
+    untracked remainder moves with no lot code; untracked items move
+    as one pair. Same mechanics as POST /api/erp/transfer:
+    transfer_out at source + transfer_in at destination, shared
+    "TR-xxxxxxxx" group ref, same avg cost. No ledger posting."""
+    actor, err = _erp_check_perm("inventory.transfer")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_transfers WHERE id = ?",
+        (transfer_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="transfer not found"), 404
+    if row["status"] != "approved":
+        conn.close()
+        return jsonify(error="only an approved transfer can be received"), 409
+    item = _erp_get_item(conn, row["item_id"])
+    src = _erp_get_location(conn, row["from_location_id"])
+    dst = _erp_get_location(conn, row["to_location_id"])
+    if not item or not src or not dst:
+        conn.close()
+        return jsonify(error="transfer item or location is gone"), 400
+    qty = float(row["qty"] or 0)
+    track = bool(item["track_lots"])
+    if track:
+        available = _erp_pickable_qty(conn, item["id"], src["id"], True)
+    else:
+        available = _erp_on_hand(conn, item["id"], src["id"])
+    if available + 1e-9 < qty:
+        conn.close()
+        return jsonify(error="insufficient stock at %s (have %s, need %s)"
+                       % (src["code"], _erp_fmt_qty(available),
+                          _erp_fmt_qty(qty))), 400
+    group = "TR-" + secrets.token_hex(4).upper()
+    avg = int(item["avg_cost_cents"] or 0)
+    note = row["note"] or ""
+    remaining = qty
+    lots_moved = []
+    if track:
+        for lot_code, lot_qty, _first in _erp_lot_balances(
+                conn, item["id"], src["id"]):
+            if remaining <= 1e-9:
+                break
+            take = min(lot_qty, remaining)
+            _erp_post_movement(conn, item["id"], src["id"], -take,
+                               "transfer_out", actor, ref_type="transfer",
+                               ref_id=group, lot_code=lot_code,
+                               unit_cost_cents=avg, note=note)
+            _erp_post_movement(conn, item["id"], dst["id"], take,
+                               "transfer_in", actor, ref_type="transfer",
+                               ref_id=group, lot_code=lot_code,
+                               unit_cost_cents=avg, note=note)
+            lots_moved.append({"lot_code": lot_code, "qty": take})
+            remaining -= take
+    if remaining > 1e-9:
+        _erp_post_movement(conn, item["id"], src["id"], -remaining,
+                           "transfer_out", actor, ref_type="transfer",
+                           ref_id=group, lot_code="",
+                           unit_cost_cents=avg, note=note)
+        _erp_post_movement(conn, item["id"], dst["id"], remaining,
+                           "transfer_in", actor, ref_type="transfer",
+                           ref_id=group, lot_code="",
+                           unit_cost_cents=avg, note=note)
+        lots_moved.append({"lot_code": "", "qty": remaining})
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_transfers SET status = 'received',"
+        " received_by = ?, received_at = ?, transfer_ref = ?,"
+        " lot_codes = ? WHERE id = ?",
+        (actor, now, group, json.dumps(lots_moved), transfer_id))
+    row = _stores_transfer_row(conn, transfer_id)
+    conn.commit()
+    conn.close()
+    return jsonify(transfer=_stores_transfer_dict(row),
+                   transfer_ref=group)
+
+
+@app.post("/api/erp/stores/transfers/<int:transfer_id>/cancel")
+def store_transfer_cancel(transfer_id):
+    """Cancel a requested or approved transfer. A received transfer
+    cannot be cancelled -- its stock already moved."""
+    actor, err = _erp_check_perm("inventory.transfer")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_transfers WHERE id = ?",
+        (transfer_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="transfer not found"), 404
+    if row["status"] not in ("requested", "approved"):
+        conn.close()
+        return jsonify(error="only a requested or approved transfer can be cancelled"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_transfers SET status = 'cancelled',"
+        " cancelled_by = ?, cancelled_at = ? WHERE id = ?",
+        (actor, now, transfer_id))
+    row = _stores_transfer_row(conn, transfer_id)
+    conn.commit()
+    conn.close()
+    return jsonify(transfer=_stores_transfer_dict(row))
+
+
+@app.post("/api/erp/stores/<int:store_id>/pos-sales")
+def stores_pos_sale(store_id):
+    """POS sales intake: one completed sale. sale_key is the
+    client-supplied idempotency key -- re-posting the same key for
+    the same store returns the original sale (duplicate: true).
+    Items carry flavor + qty + amount_cents; amounts must be whole
+    cents. An optional tenders object {cash, card, gift_card} in
+    cents records a split tender and must sum to the total; it is
+    what the Z-report totals by tender. Never touches the
+    accounting ledger."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    if store["status"] != "open":
+        conn.close()
+        return jsonify(error="store is closed"), 400
+    sale_key = (data.get("sale_key") or "").strip()
+    if not sale_key:
+        conn.close()
+        return jsonify(error="sale_key is required"), 400
+    existing = conn.execute(
+        "SELECT * FROM erp_store_sales WHERE store_id = ? AND sale_key = ?",
+        (store_id, sale_key)).fetchone()
+    if existing:
+        conn.close()
+        return jsonify(sale=_stores_sale_dict(existing), duplicate=True)
+    items = data.get("items")
+    if not isinstance(items, list) or not items:
+        conn.close()
+        return jsonify(error="items must be a non-empty list"), 400
+    cleaned = []
+    total = 0
+    for it in items:
+        if not isinstance(it, dict):
+            conn.close()
+            return jsonify(error="each item must be an object"), 400
+        flavor = (it.get("flavor") or "").strip()
+        if not flavor:
+            conn.close()
+            return jsonify(error="each item needs a flavor"), 400
+        qty = _stores_int(it.get("qty"))
+        if qty is None or qty <= 0:
+            conn.close()
+            return jsonify(error="each item qty must be a whole number greater than zero"), 400
+        amount = _stores_int(it.get("amount_cents"))
+        if amount is None or amount < 0:
+            conn.close()
+            return jsonify(error="each item amount_cents must be a whole number of cents, 0 or more"), 400
+        cleaned.append({"flavor": flavor, "qty": qty,
+                        "amount_cents": amount})
+        total += amount
+    if "total_cents" in data and data.get("total_cents") is not None:
+        stated = _stores_int(data.get("total_cents"))
+        if stated is None or stated != total:
+            conn.close()
+            return jsonify(error="total_cents must equal the sum of item amount_cents"), 400
+    tenders = {}
+    if "tenders" in data and data.get("tenders") is not None:
+        raw_tenders = data.get("tenders")
+        if not isinstance(raw_tenders, dict) or not raw_tenders:
+            conn.close()
+            return jsonify(error="tenders must be a non-empty object"), 400
+        for tender_key, tender_val in raw_tenders.items():
+            key = str(tender_key).strip()
+            if key not in ("cash", "card", "gift_card"):
+                conn.close()
+                return jsonify(
+                    error="tenders keys must be cash, card, or gift_card"), 400
+            cents = _stores_int(tender_val)
+            if cents is None or cents < 0:
+                conn.close()
+                return jsonify(
+                    error="tenders values must be whole cents, 0 or more"), 400
+            tenders[key] = cents
+        if sum(tenders.values()) != total:
+            conn.close()
+            return jsonify(
+                error="tenders must sum to the sale total"), 400
+    register = (data.get("register") or "").strip()
+    tender = (data.get("tender") or "").strip()
+    sold_at = (data.get("sold_at") or data.get("timestamp") or "").strip()
+    if not sold_at:
+        sold_at = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_sales (store_id, sale_key, register, tender,"
+        " total_cents, items_json, tenders_json, sold_at, created_by,"
+        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, sale_key, register, tender, total,
+         json.dumps(cleaned), json.dumps(tenders), sold_at, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_store_sales WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(sale=_stores_sale_dict(row)), 201
+
+
+@app.get("/api/erp/stores/<int:store_id>/sales")
+def stores_sales_list(store_id):
+    """Per-store sales, newest first, plus daily totals for the
+    store. ?date=YYYY-MM-DD filters the sale list only."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    date = (request.args.get("date") or "").strip()
+    if date and not _legal_valid_date(date):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    if date:
+        rows = conn.execute(
+            "SELECT * FROM erp_store_sales WHERE store_id = ?"
+            " AND substr(sold_at, 1, 10) = ?"
+            " ORDER BY sold_at DESC, id DESC", (store_id, date)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_store_sales WHERE store_id = ?"
+            " ORDER BY sold_at DESC, id DESC", (store_id,)).fetchall()
+    totals = conn.execute(
+        "SELECT substr(sold_at, 1, 10) AS day, COUNT(*) AS n,"
+        " COALESCE(SUM(total_cents), 0) AS total"
+        " FROM erp_store_sales WHERE store_id = ?"
+        " GROUP BY day ORDER BY day DESC", (store_id,)).fetchall()
+    conn.close()
+    return jsonify(sales=[_stores_sale_dict(r) for r in rows],
+                   daily_totals=[{"date": t["day"], "sale_count": t["n"],
+                                  "total_cents": int(t["total"] or 0)}
+                                 for t in totals])
+
+
+@app.post("/api/erp/stores/<int:store_id>/z-report")
+def stores_zreport_create(store_id):
+    """Close a register day: totals by tender, the counted cash
+    drawer, and the variance (computed here as drawer minus the cash
+    total -- never trusted from the payload). One Z-report per
+    (store, register, date)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    register = (data.get("register") or "").strip()
+    if not register:
+        conn.close()
+        return jsonify(error="register is required"), 400
+    report_date = (data.get("date") or data.get("report_date") or "").strip()
+    if not report_date or not _legal_valid_date(report_date):
+        conn.close()
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    totals = data.get("totals_by_tender")
+    if not isinstance(totals, dict) or not totals:
+        conn.close()
+        return jsonify(error="totals_by_tender must be a non-empty object"), 400
+    cleaned = {}
+    for tender, cents in totals.items():
+        value = _stores_int(cents)
+        if value is None or value < 0:
+            conn.close()
+            return jsonify(error="totals_by_tender values must be whole cents, 0 or more"), 400
+        cleaned[str(tender).strip() or "other"] = value
+    cash_count = _stores_int(data.get("cash_count_cents"))
+    if cash_count is None or cash_count < 0:
+        conn.close()
+        return jsonify(error="cash_count_cents must be a whole number of cents, 0 or more"), 400
+    variance = cash_count - int(cleaned.get("cash", 0))
+    existing = conn.execute(
+        "SELECT id FROM erp_store_zreports WHERE store_id = ?"
+        " AND register = ? AND report_date = ?",
+        (store_id, register, report_date)).fetchone()
+    if existing:
+        conn.close()
+        return jsonify(error="a Z-report already exists for this register and date"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_zreports (store_id, register, report_date,"
+        " totals_json, cash_count_cents, variance_cents, created_by,"
+        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, register, report_date, json.dumps(cleaned),
+         cash_count, variance, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_store_zreports WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(zreport=_stores_zreport_dict(row)), 201
+
+
+@app.get("/api/erp/stores/<int:store_id>/z-reports")
+def stores_zreports_list(store_id):
+    """Z-reports for a store, newest date first."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_store_zreports WHERE store_id = ?"
+        " ORDER BY report_date DESC, id DESC", (store_id,)).fetchall()
+    conn.close()
+    return jsonify(zreports=[_stores_zreport_dict(r) for r in rows])
+
+
+# ---------------------------------------------------------------- Dept 14 (Stores) Wave B
+# Per-store P&L (read-only) + recurring weekly shift templates with a
+# timeclock. Nothing here posts to the accounting ledger and nothing
+# here creates a payrun: the P&L reads posted sale entries + the POS
+# feed, and timeclock hours are only visible to payroll when a run is
+# created (follow-up). Unattributed figures are never estimated or
+# allocated to a store.
+
+_STORE_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                   "Saturday", "Sunday")
+
+
+def _stores_time_minutes(value):
+    """HH:MM -> minutes after midnight, or None when malformed."""
+    if not isinstance(value, str):
+        return None
+    m = re.match(r"^(\d{1,2}):(\d{2})$", value.strip())
+    if not m:
+        return None
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if hh > 23 or mm > 59:
+        return None
+    return hh * 60 + mm
+
+
+def _stores_parse_dt(value):
+    """ISO timestamp -> aware datetime, or None. Naive values are UTC."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _stores_shift_dict(row):
+    d = dict(row)
+    d["weekday_label"] = (_STORE_WEEKDAYS[d["weekday"]]
+                          if 0 <= int(d["weekday"] or 0) <= 6 else "")
+    return d
+
+
+def _stores_shift_row(conn, shift_id):
+    return conn.execute(
+        "SELECT s.*, e.name AS employee_name"
+        " FROM erp_store_shifts s"
+        " LEFT JOIN erp_hr_employees e ON e.id = s.employee_id"
+        " WHERE s.id = ?", (shift_id,)).fetchone()
+
+
+def _stores_timeclock_dict(row):
+    d = dict(row)
+    if d.get("hours") is not None:
+        d["hours"] = float(d["hours"])
+    return d
+
+
+def _stores_timeclock_row(conn, row_id):
+    return conn.execute(
+        "SELECT t.*, e.name AS employee_name, s.weekday AS shift_weekday,"
+        " s.start_time AS shift_start, s.end_time AS shift_end,"
+        " s.role AS shift_role, s.store_id AS shift_store_id"
+        " FROM erp_store_timeclock t"
+        " LEFT JOIN erp_hr_employees e ON e.id = t.employee_id"
+        " LEFT JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " WHERE t.id = ?", (row_id,)).fetchone()
+
+
+def _stores_validate_shift(conn, data, current=None):
+    """Validate shift fields. `current` is the existing row on update
+    (fields fall back to it). Returns the cleaned dict, or
+    (error_response, status) on a bad value."""
+    merged = dict(current) if current else {}
+    for key in ("employee_id", "weekday", "start_time", "end_time", "role"):
+        if key in data:
+            merged[key] = data[key]
+    try:
+        employee_id = int(merged.get("employee_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="employee_id is required"), 400
+    emp = conn.execute(
+        "SELECT id, active FROM erp_hr_employees WHERE id = ?",
+        (employee_id,)).fetchone()
+    if not emp:
+        return jsonify(error="employee not found"), 400
+    if not int(emp["active"] or 0):
+        return jsonify(error="employee is inactive"), 400
+    try:
+        weekday = int(merged.get("weekday"))
+    except (TypeError, ValueError):
+        return jsonify(error="weekday must be 0 (Monday) to 6 (Sunday)"), 400
+    if weekday < 0 or weekday > 6:
+        return jsonify(error="weekday must be 0 (Monday) to 6 (Sunday)"), 400
+    start = _stores_time_minutes(merged.get("start_time"))
+    end = _stores_time_minutes(merged.get("end_time"))
+    if start is None or end is None:
+        return jsonify(error="start_time and end_time must be HH:MM"), 400
+    if end <= start:
+        return jsonify(error="end_time must be after start_time"), 400
+    role = (merged.get("role") or "").strip()
+    if len(role) > 100:
+        return jsonify(error="role must be 100 characters or fewer"), 400
+    start_txt = "%02d:%02d" % (start // 60, start % 60)
+    end_txt = "%02d:%02d" % (end // 60, end % 60)
+    # No overlapping shifts for the same employee on the same weekday.
+    # A gap between two shifts is fine; an overlap is not.
+    others = conn.execute(
+        "SELECT id, start_time, end_time FROM erp_store_shifts"
+        " WHERE employee_id = ? AND weekday = ?",
+        (employee_id, weekday)).fetchall()
+    for o in others:
+        if current and int(o["id"]) == int(current["id"]):
+            continue
+        o_start = _stores_time_minutes(o["start_time"])
+        o_end = _stores_time_minutes(o["end_time"])
+        if o_start is not None and o_end is not None \
+                and start < o_end and o_start < end:
+            return jsonify(
+                error="employee already has an overlapping shift that day"), 400
+    return {"employee_id": employee_id, "weekday": weekday,
+            "start_time": start_txt, "end_time": end_txt, "role": role}
+
+
+@app.get("/api/erp/stores/<int:store_id>/pl")
+def stores_pl(store_id):
+    """Per-store P&L, read-only. Revenue = posted ledger sale entries
+    tagged to this store (none yet -- POS intake is not wired to the
+    ledger) + the POS sales feed for the store. COGS = bags sold x the
+    blended production cost per bag across completed batches (the same
+    basis as the channel-profitability report); with no completed
+    batches it is null, never guessed. Posted entries with no store
+    (online / wholesale / gift-card) are reported as unattributed and
+    never allocated to any store. ?from= / ?to= are YYYY-MM-DD."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    date_from = (request.args.get("from") or "").strip()
+    date_to = (request.args.get("to") or "").strip()
+    if (date_from and not _legal_valid_date(date_from)) \
+            or (date_to and not _legal_valid_date(date_to)):
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    _acct_ensure_sale_posts_table(conn)
+
+    def _range_where(col, params):
+        where = ""
+        if date_from:
+            where += " AND substr(%s, 1, 10) >= ?" % col
+            params.append(date_from)
+        if date_to:
+            where += " AND substr(%s, 1, 10) <= ?" % col
+            params.append(date_to)
+        return where
+
+    p_params = [store_id]
+    posted = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) AS rev, COUNT(*) AS n"
+        " FROM erp_acct_sale_posts WHERE store_id = ?"
+        + _range_where("posted_at", p_params), p_params).fetchone()
+    pos_params = [store_id]
+    pos_rows = conn.execute(
+        "SELECT * FROM erp_store_sales WHERE store_id = ?"
+        + _range_where("sold_at", pos_params), pos_params).fetchall()
+    pos_rev = sum(int(r["total_cents"] or 0) for r in pos_rows)
+    bags = 0.0
+    for r in pos_rows:
+        try:
+            items = json.loads(r["items_json"] or "[]") or []
+        except (TypeError, ValueError):
+            items = []
+        for it in items:
+            try:
+                bags += float(it.get("qty") or 0)
+            except (TypeError, ValueError):
+                pass
+    u_params = []
+    unattributed = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) AS rev, COUNT(*) AS n"
+        " FROM erp_acct_sale_posts WHERE store_id IS NULL"
+        + _range_where("posted_at", u_params), u_params).fetchone()
+    blended, n_batches, prod_bags, prod_cost = _erp_blended_cost_per_bag(conn)
+    conn.close()
+    cogs = round(bags * blended, 2) if blended is not None else None
+    revenue = int(posted["rev"] or 0) + pos_rev
+    gross = round(revenue - cogs, 2) if cogs is not None else None
+    notes = [
+        "Posted ledger revenue is $0 until POS intake is wired to the "
+        "ledger (follow-up); POS sales are a separate feed for now.",
+        ("COGS uses the blended production cost per bag across completed "
+         "batches (all-time basis); no per-flavor cost is assumed."
+         if blended is not None else
+         "No completed production batches yet, so COGS is not estimated."),
+        "Unattributed sales are online / wholesale / gift-card sales with "
+        "no store tag. They are reported, never allocated to a store, and "
+        "their COGS is not estimated.",
+    ]
+    return jsonify({
+        "store_id": store_id, "store_name": store["name"],
+        "from": date_from or None, "to": date_to or None,
+        "posted_revenue_cents": int(posted["rev"] or 0),
+        "posted_sale_count": int(posted["n"] or 0),
+        "pos_revenue_cents": pos_rev,
+        "pos_sale_count": len(pos_rows),
+        "revenue_cents": revenue,
+        "bags": bags,
+        "cogs_cents": cogs,
+        "gross_cents": gross,
+        "cost_basis": {
+            "blended_cost_per_bag_cents":
+                round(blended, 2) if blended is not None else None,
+            "completed_batches": n_batches,
+            "bags_produced": prod_bags,
+            "total_cost_cents": prod_cost},
+        "unattributed": {
+            "revenue_cents": int(unattributed["rev"] or 0),
+            "sale_count": int(unattributed["n"] or 0),
+            "cogs_cents": None,
+            "note": "unattributed \u2014 not estimated"},
+        "notes": notes})
+
+
+@app.post("/api/erp/stores/<int:store_id>/shifts")
+def stores_shift_create(store_id):
+    """Add a recurring weekly shift to a store. employee_id must be an
+    active HR employee; weekday 0=Monday..6=Sunday; end after start;
+    no overlapping shift for the same employee that day."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    fields = _stores_validate_shift(conn, data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_shifts (store_id, employee_id, weekday,"
+        " start_time, end_time, role, created_by, created_at,"
+        " updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, fields["employee_id"], fields["weekday"],
+         fields["start_time"], fields["end_time"], fields["role"],
+         actor, now, actor, now))
+    row = _stores_shift_row(conn, cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify(shift=_stores_shift_dict(row)), 201
+
+
+@app.get("/api/erp/stores/<int:store_id>/shifts")
+def stores_shifts_list(store_id):
+    """Weekly shift templates for a store, weekday then start time,
+    with the employee name on each row."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    rows = conn.execute(
+        "SELECT s.*, e.name AS employee_name"
+        " FROM erp_store_shifts s"
+        " LEFT JOIN erp_hr_employees e ON e.id = s.employee_id"
+        " WHERE s.store_id = ?"
+        " ORDER BY s.weekday, s.start_time, s.id", (store_id,)).fetchall()
+    conn.close()
+    return jsonify(shifts=[_stores_shift_dict(r) for r in rows])
+
+
+@app.post("/api/erp/stores/<int:store_id>/shifts/<int:shift_id>/update")
+def stores_shift_update(store_id, shift_id):
+    """Edit a shift template. Fields fall back to the stored row;
+    the same validation as create applies (incl. overlap)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_shifts WHERE id = ? AND store_id = ?",
+        (shift_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="shift not found"), 404
+    fields = _stores_validate_shift(conn, data, current=dict(row))
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_shifts SET employee_id = ?, weekday = ?,"
+        " start_time = ?, end_time = ?, role = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (fields["employee_id"], fields["weekday"], fields["start_time"],
+         fields["end_time"], fields["role"], actor, now, shift_id))
+    out = _stores_shift_row(conn, shift_id)
+    conn.commit()
+    conn.close()
+    return jsonify(shift=_stores_shift_dict(out))
+
+
+@app.post("/api/erp/stores/<int:store_id>/shifts/<int:shift_id>/delete")
+def stores_shift_delete(store_id, shift_id):
+    """Delete a shift template. Blocked while timeclock rows reference
+    it -- hours already worked are payroll evidence and must stay."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_shifts WHERE id = ? AND store_id = ?",
+        (shift_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="shift not found"), 404
+    used = conn.execute(
+        "SELECT COUNT(*) FROM erp_store_timeclock WHERE shift_id = ?",
+        (shift_id,)).fetchone()[0]
+    if used:
+        conn.close()
+        return jsonify(
+            error="shift has timeclock records and cannot be deleted"), 400
+    conn.execute("DELETE FROM erp_store_shifts WHERE id = ?", (shift_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/stores/<int:store_id>/roster")
+def stores_roster(store_id):
+    """Roster for one week: every shift template expanded onto its
+    weekday's date. ?week=YYYY-MM-DD is any day in the week (snapped
+    to its Monday); default is the current week. Timeclock rows for
+    the week ride along so hours show next to the shifts."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    week = (request.args.get("week") or "").strip()
+    if week:
+        if not _legal_valid_date(week):
+            return jsonify(error="week must be YYYY-MM-DD"), 400
+        any_day = datetime.strptime(week, "%Y-%m-%d").date()
+    else:
+        any_day = datetime.now(timezone.utc).date()
+    monday = any_day - timedelta(days=any_day.weekday())
+    sunday = monday + timedelta(days=6)
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    shifts = conn.execute(
+        "SELECT s.*, e.name AS employee_name"
+        " FROM erp_store_shifts s"
+        " LEFT JOIN erp_hr_employees e ON e.id = s.employee_id"
+        " WHERE s.store_id = ? ORDER BY s.weekday, s.start_time, s.id",
+        (store_id,)).fetchall()
+    tc = conn.execute(
+        "SELECT t.*, e.name AS employee_name, s.weekday AS shift_weekday,"
+        " s.start_time AS shift_start, s.end_time AS shift_end,"
+        " s.role AS shift_role, s.store_id AS shift_store_id"
+        " FROM erp_store_timeclock t"
+        " LEFT JOIN erp_hr_employees e ON e.id = t.employee_id"
+        " LEFT JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " WHERE s.store_id = ?"
+        " AND substr(t.clock_in, 1, 10) >= ?"
+        " AND substr(t.clock_in, 1, 10) <= ?"
+        " ORDER BY t.clock_in, t.id",
+        (store_id, monday.isoformat(), sunday.isoformat())).fetchall()
+    conn.close()
+    days = []
+    for i in range(7):
+        day = monday + timedelta(days=i)
+        day_shifts = [_stores_shift_dict(s) for s in shifts
+                      if int(s["weekday"]) == i]
+        for s in day_shifts:
+            s["date"] = day.isoformat()
+        days.append({"date": day.isoformat(),
+                     "weekday": i,
+                     "weekday_label": _STORE_WEEKDAYS[i],
+                     "shifts": day_shifts})
+    return jsonify(store_id=store_id, store_name=store["name"],
+                   week_start=monday.isoformat(),
+                   week_end=sunday.isoformat(), days=days,
+                   timeclock=[_stores_timeclock_dict(r) for r in tc])
+
+
+@app.post("/api/erp/stores/<int:store_id>/clock-in")
+def stores_clock_in(store_id):
+    """Clock in to a shift. The employee must be the one assigned to
+    that shift (the shift is the assignment to this store), and an
+    employee with an open clock-in cannot clock in again. clock_in is
+    optional ISO; default is now."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    try:
+        shift_id = int(data.get("shift_id"))
+        employee_id = int(data.get("employee_id"))
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="shift_id and employee_id are required"), 400
+    shift = conn.execute(
+        "SELECT * FROM erp_store_shifts WHERE id = ? AND store_id = ?",
+        (shift_id, store_id)).fetchone()
+    if not shift:
+        conn.close()
+        return jsonify(error="shift not found"), 404
+    if int(shift["employee_id"]) != employee_id:
+        conn.close()
+        return jsonify(
+            error="employee is not assigned to this shift"), 400
+    open_row = conn.execute(
+        "SELECT id FROM erp_store_timeclock"
+        " WHERE employee_id = ? AND clock_out = ''",
+        (employee_id,)).fetchone()
+    if open_row:
+        conn.close()
+        return jsonify(
+            error="employee is already clocked in"), 400
+    clock_in = _stores_parse_dt(data.get("clock_in"))
+    if data.get("clock_in") and clock_in is None:
+        conn.close()
+        return jsonify(error="clock_in must be an ISO timestamp"), 400
+    clock_in_txt = (clock_in or datetime.now(timezone.utc)).isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_timeclock (shift_id, employee_id, clock_in,"
+        " clock_out, hours, created_by, created_at, updated_by,"
+        " updated_at) VALUES (?, ?, ?, '', NULL, ?, ?, ?, ?)",
+        (shift_id, employee_id, clock_in_txt, actor, now, actor, now))
+    row = _stores_timeclock_row(conn, cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify(timeclock=_stores_timeclock_dict(row)), 201
+
+
+@app.post("/api/erp/stores/<int:store_id>/clock-out")
+def stores_clock_out(store_id):
+    """Clock out. clock_out must be after clock_in (default now);
+    hours are computed here and stored. This never creates a payrun
+    or posts payroll -- hours feed payroll when a run is created."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    try:
+        row_id = int(data.get("timeclock_id"))
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="timeclock_id is required"), 400
+    row = conn.execute(
+        "SELECT t.*, s.store_id AS shift_store_id"
+        " FROM erp_store_timeclock t"
+        " LEFT JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " WHERE t.id = ?", (row_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="timeclock record not found"), 404
+    if int(row["shift_store_id"] or 0) != store_id:
+        conn.close()
+        return jsonify(error="timeclock record not found"), 404
+    if (row["clock_out"] or "") != "":
+        conn.close()
+        return jsonify(error="already clocked out"), 409
+    clock_in = _stores_parse_dt(row["clock_in"])
+    clock_out = _stores_parse_dt(data.get("clock_out"))
+    if data.get("clock_out") and clock_out is None:
+        conn.close()
+        return jsonify(error="clock_out must be an ISO timestamp"), 400
+    clock_out = clock_out or datetime.now(timezone.utc)
+    if clock_in is None or clock_out <= clock_in:
+        conn.close()
+        return jsonify(
+            error="clock_out must be after clock_in"), 400
+    hours = round((clock_out - clock_in).total_seconds() / 3600, 2)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_timeclock SET clock_out = ?, hours = ?,"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (clock_out.isoformat(), hours, actor, now, row_id))
+    out = _stores_timeclock_row(conn, row_id)
+    conn.commit()
+    conn.close()
+    return jsonify(timeclock=_stores_timeclock_dict(out))
+
+
+@app.get("/api/erp/stores/<int:store_id>/timeclock")
+def stores_timeclock_list(store_id):
+    """Timeclock rows for a store, newest first. ?from= / ?to= filter
+    on the clock-in date (YYYY-MM-DD). Hours here feed payroll when a
+    pay run is created -- listing them creates no run."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    date_from = (request.args.get("from") or "").strip()
+    date_to = (request.args.get("to") or "").strip()
+    if (date_from and not _legal_valid_date(date_from)) \
+            or (date_to and not _legal_valid_date(date_to)):
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    params = [store_id]
+    where = ""
+    if date_from:
+        where += " AND substr(t.clock_in, 1, 10) >= ?"
+        params.append(date_from)
+    if date_to:
+        where += " AND substr(t.clock_in, 1, 10) <= ?"
+        params.append(date_to)
+    rows = conn.execute(
+        "SELECT t.*, e.name AS employee_name, s.weekday AS shift_weekday,"
+        " s.start_time AS shift_start, s.end_time AS shift_end,"
+        " s.role AS shift_role, s.store_id AS shift_store_id"
+        " FROM erp_store_timeclock t"
+        " LEFT JOIN erp_hr_employees e ON e.id = t.employee_id"
+        " LEFT JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " WHERE s.store_id = ?" + where +
+        " ORDER BY t.clock_in DESC, t.id DESC", params).fetchall()
+    conn.close()
+    return jsonify(timeclock=[_stores_timeclock_dict(r) for r in rows])
+
+
+# ---------------------------------------------------------------- Dept 14 (Stores) Wave C
+# Facilities & maintenance, loss prevention (per-store shrink view,
+# register void log, cash audits) and merchandising / planograms.
+# Nothing here posts to the accounting ledger, touches checkout or
+# labels, or creates a payrun. The shrink view is READ-ONLY and reuses
+# the Inventory shrinkage source (erp_stock_ledger adjustment rows,
+# same cost basis) filtered by the store's linked location_id -- no
+# second shrinkage model. Cash-audit variance is computed server-side
+# and never trusted from the payload.
+
+_STORE_MAINT_PRIORITIES = ("low", "medium", "high", "urgent")
+_STORE_MAINT_STATUSES = ("open", "in-progress", "done")
+
+
+def _stores_maint_dict(row):
+    d = dict(row)
+    d["auto_created"] = int(d.get("auto_created") or 0)
+    if d.get("pm_schedule_id") is not None:
+        d["pm_schedule_id"] = int(d["pm_schedule_id"])
+    d.setdefault("vendor_email", "")
+    d.setdefault("dispatched_to", "")
+    d.setdefault("dispatched_at", "")
+    return d
+
+
+def _stores_maint_row(conn, row_id):
+    return conn.execute(
+        "SELECT * FROM erp_store_maintenance WHERE id = ?",
+        (row_id,)).fetchone()
+
+
+def _stores_maint_validate(data, current=None):
+    """Validate maintenance fields. `current` is the existing row on
+    update (fields fall back to it). Returns the cleaned dict, or
+    (error_response, status) on a bad value."""
+    merged = dict(current) if current else {}
+    for key in ("equipment", "issue", "priority", "status", "reported_by",
+                "due_date", "notes"):
+        if key in data:
+            merged[key] = data[key]
+    equipment = (merged.get("equipment") or "").strip()
+    if not equipment:
+        return jsonify(error="equipment is required"), 400
+    if len(equipment) > 200:
+        return jsonify(error="equipment must be 200 characters or fewer"), 400
+    issue = (merged.get("issue") or "").strip()
+    if not issue:
+        return jsonify(error="issue is required"), 400
+    if len(issue) > 1000:
+        return jsonify(error="issue must be 1000 characters or fewer"), 400
+    priority = (merged.get("priority") or "medium").strip().lower()
+    if priority not in _STORE_MAINT_PRIORITIES:
+        return jsonify(
+            error="priority must be low, medium, high, or urgent"), 400
+    status = (merged.get("status") or "open").strip().lower()
+    if status not in _STORE_MAINT_STATUSES:
+        return jsonify(
+            error="status must be open, in-progress, or done"), 400
+    due_date = (merged.get("due_date") or "").strip()
+    if due_date and not _legal_valid_date(due_date):
+        return jsonify(error="due_date must be YYYY-MM-DD"), 400
+    reported_by = (merged.get("reported_by") or "").strip()
+    if len(reported_by) > 200:
+        return jsonify(
+            error="reported_by must be 200 characters or fewer"), 400
+    notes = (merged.get("notes") or "").strip()
+    if len(notes) > 2000:
+        return jsonify(error="notes must be 2000 characters or fewer"), 400
+    return {"equipment": equipment, "issue": issue, "priority": priority,
+            "status": status, "reported_by": reported_by,
+            "due_date": due_date, "notes": notes}
+
+
+def _stores_void_dict(row):
+    return dict(row)
+
+
+def _stores_void_row(conn, row_id):
+    return conn.execute(
+        "SELECT * FROM erp_store_voids WHERE id = ?", (row_id,)).fetchone()
+
+
+def _stores_void_validate(data, current=None):
+    """Validate void-log fields. Returns the cleaned dict, or
+    (error_response, status) on a bad value."""
+    merged = dict(current) if current else {}
+    for key in ("register", "sale_key", "amount_cents", "reason", "actor"):
+        if key in data:
+            merged[key] = data[key]
+    register = (merged.get("register") or "").strip()
+    if len(register) > 100:
+        return jsonify(error="register must be 100 characters or fewer"), 400
+    sale_key = (merged.get("sale_key") or "").strip()
+    if len(sale_key) > 200:
+        return jsonify(error="sale_key must be 200 characters or fewer"), 400
+    amount = _stores_int(merged.get("amount_cents"))
+    if amount is None or amount < 0:
+        return jsonify(
+            error="amount_cents must be a whole number of cents, 0 or more"), 400
+    reason = (merged.get("reason") or "").strip()
+    if not reason:
+        return jsonify(error="reason is required"), 400
+    if len(reason) > 1000:
+        return jsonify(error="reason must be 1000 characters or fewer"), 400
+    actor = (merged.get("actor") or "").strip()
+    if len(actor) > 200:
+        return jsonify(error="actor must be 200 characters or fewer"), 400
+    return {"register": register, "sale_key": sale_key,
+            "amount_cents": amount, "reason": reason, "actor": actor}
+
+
+def _stores_cash_audit_dict(row):
+    d = dict(row)
+    if d.get("z_report_id") is not None:
+        d["z_report_id"] = int(d["z_report_id"])
+    return d
+
+
+def _stores_cash_audit_row(conn, row_id):
+    return conn.execute(
+        "SELECT a.*, z.register AS z_register, z.report_date AS z_date"
+        " FROM erp_store_cash_audits a"
+        " LEFT JOIN erp_store_zreports z ON z.id = a.z_report_id"
+        " WHERE a.id = ?", (row_id,)).fetchone()
+
+
+def _stores_cash_audit_validate(conn, store_id, data, current=None):
+    """Validate cash-audit fields. variance_cents is computed here as
+    counted minus expected and is never read from the payload.
+    z_report_id, when given, must be a Z-report of this store."""
+    merged = dict(current) if current else {}
+    for key in ("z_report_id", "counted_cents", "expected_cents", "actor",
+                "audit_date"):
+        if key in data:
+            merged[key] = data[key]
+    counted = _stores_int(merged.get("counted_cents"))
+    if counted is None or counted < 0:
+        return jsonify(
+            error="counted_cents must be a whole number of cents, 0 or more"), 400
+    expected = _stores_int(merged.get("expected_cents"))
+    if expected is None or expected < 0:
+        return jsonify(
+            error="expected_cents must be a whole number of cents, 0 or more"), 400
+    z_report_id = merged.get("z_report_id")
+    if z_report_id in ("", None):
+        z_report_id = None
+    else:
+        try:
+            z_report_id = int(z_report_id)
+        except (TypeError, ValueError):
+            return jsonify(error="z_report_id must be a Z-report id"), 400
+        z = conn.execute(
+            "SELECT id FROM erp_store_zreports"
+            " WHERE id = ? AND store_id = ?",
+            (z_report_id, store_id)).fetchone()
+        if not z:
+            return jsonify(
+                error="z_report_id must be a Z-report of this store"), 400
+    audit_date = (merged.get("audit_date") or "").strip()
+    if audit_date and not _legal_valid_date(audit_date):
+        return jsonify(error="audit_date must be YYYY-MM-DD"), 400
+    actor = (merged.get("actor") or "").strip()
+    if len(actor) > 200:
+        return jsonify(error="actor must be 200 characters or fewer"), 400
+    return {"z_report_id": z_report_id, "counted_cents": counted,
+            "expected_cents": expected,
+            "variance_cents": counted - expected,
+            "actor": actor, "audit_date": audit_date}
+
+
+def _stores_planogram_layout_parse(raw):
+    """Parse a stored layout_json value into the shelf grid:
+    {\"shelves\": [{\"name\": str, \"feet\": number, \"flavors\": [str]}]}.
+    Anything unparseable or misshapen reads back as an empty grid --
+    never a crash on an old row."""
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return {"shelves": []}
+    if isinstance(data, list):
+        data = {"shelves": data}
+    if not isinstance(data, dict):
+        return {"shelves": []}
+    shelves = data.get("shelves")
+    if not isinstance(shelves, list):
+        return {"shelves": []}
+    out = []
+    for shelf in shelves:
+        if not isinstance(shelf, dict):
+            continue
+        name = (shelf.get("name") or "").strip()
+        try:
+            feet = float(shelf.get("feet") or 0)
+        except (TypeError, ValueError):
+            feet = 0
+        flavors = shelf.get("flavors") or []
+        if isinstance(flavors, str):
+            flavors = [f.strip() for f in flavors.split(",")]
+        if not isinstance(flavors, list):
+            flavors = []
+        flavors = [str(f).strip() for f in flavors if str(f).strip()]
+        out.append({"name": name, "feet": feet, "flavors": flavors})
+    return {"shelves": out}
+
+
+def _stores_planogram_layout_validate(data, current=None):
+    """Validate the shelf grid from the payload. Accepts \"layout\"
+    (object/list) or \"layout_json\" (object/list/JSON string); falls
+    back to the stored layout on update when neither is given.
+    Returns the cleaned {\"shelves\": [...]} dict, or
+    (error_response, status) on a bad value."""
+    raw = None
+    if "layout" in data:
+        raw = data.get("layout")
+    elif "layout_json" in data:
+        raw = data.get("layout_json")
+    if raw is None and current is not None:
+        return _stores_planogram_layout_parse(
+            current.get("layout_json") or "[]")
+    if raw is None:
+        return {"shelves": []}
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return jsonify(error="layout must be a shelf grid object"), 400
+    parsed = _stores_planogram_layout_parse(raw)
+    shelves = parsed["shelves"]
+    if len(shelves) > 50:
+        return jsonify(error="layout must have 50 shelves or fewer"), 400
+    for shelf in shelves:
+        if len(shelf["name"]) > 100:
+            return jsonify(
+                error="shelf name must be 100 characters or fewer"), 400
+        if shelf["feet"] < 0 or shelf["feet"] > 10000:
+            return jsonify(
+                error="shelf feet must be between 0 and 10000"), 400
+        if len(shelf["flavors"]) > 100:
+            return jsonify(
+                error="a shelf must have 100 flavors or fewer"), 400
+        for flavor in shelf["flavors"]:
+            if len(flavor) > 200:
+                return jsonify(
+                    error="flavor names must be 200 characters or fewer"
+                    ), 400
+    return parsed
+
+
+def _stores_planogram_dict(row):
+    d = dict(row)
+    d["active"] = int(d.get("active") or 0)
+    d["layout"] = _stores_planogram_layout_parse(
+        d.get("layout_json") or "[]")
+    d.pop("layout_json", None)
+    return d
+
+
+def _stores_planogram_row(conn, row_id):
+    return conn.execute(
+        "SELECT * FROM erp_store_planograms WHERE id = ?",
+        (row_id,)).fetchone()
+
+
+def _stores_planogram_validate(data, current=None):
+    """Validate planogram fields. Returns the cleaned dict, or
+    (error_response, status) on a bad value."""
+    merged = dict(current) if current else {}
+    for key in ("area", "layout_notes", "effective_date", "active"):
+        if key in data:
+            merged[key] = data[key]
+    area = (merged.get("area") or "").strip()
+    if not area:
+        return jsonify(error="area is required"), 400
+    if len(area) > 200:
+        return jsonify(error="area must be 200 characters or fewer"), 400
+    layout_notes = (merged.get("layout_notes") or "").strip()
+    if len(layout_notes) > 2000:
+        return jsonify(
+            error="layout_notes must be 2000 characters or fewer"), 400
+    effective_date = (merged.get("effective_date") or "").strip()
+    if effective_date and not _legal_valid_date(effective_date):
+        return jsonify(error="effective_date must be YYYY-MM-DD"), 400
+    active = merged.get("active")
+    if isinstance(active, bool):
+        active = 1 if active else 0
+    elif isinstance(active, str):
+        active = 1 if active.strip().lower() in ("1", "true", "yes") else 0
+    else:
+        try:
+            active = 1 if int(active) else 0
+        except (TypeError, ValueError):
+            active = 1
+    layout = _stores_planogram_layout_validate(data, current=current)
+    if isinstance(layout, tuple):
+        return layout
+    return {"area": area, "layout_notes": layout_notes,
+            "effective_date": effective_date, "active": active,
+            "layout": layout}
+
+
+def _stores_require_store(conn, store_id):
+    return conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+
+
+# --- Facilities & maintenance ---
+@app.post("/api/erp/stores/<int:store_id>/maintenance")
+def stores_maintenance_create(store_id):
+    """Log a maintenance issue for a store. Equipment and issue are
+    free text; nothing is seeded and no equipment catalog exists."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    fields = _stores_maint_validate(data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_maintenance (store_id, equipment, issue,"
+        " priority, status, reported_by, due_date, notes, created_by,"
+        " created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, fields["equipment"], fields["issue"],
+         fields["priority"], fields["status"], fields["reported_by"],
+         fields["due_date"], fields["notes"], actor, now, actor, now))
+    row = _stores_maint_row(conn, cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify(maintenance=_stores_maint_dict(row)), 201
+
+
+@app.get("/api/erp/stores/<int:store_id>/maintenance")
+def stores_maintenance_list(store_id):
+    """Maintenance issues for a store, open first then newest.
+    ?status=open|in-progress|done filters; ?open=1 lists open issues
+    only (in-progress counts as open)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    status_q = (request.args.get("status") or "").strip().lower()
+    if status_q and status_q not in _STORE_MAINT_STATUSES:
+        return jsonify(
+            error="status must be open, in-progress, or done"), 400
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    params = [store_id]
+    where = ""
+    if status_q:
+        where = " AND status = ?"
+        params.append(status_q)
+    elif (request.args.get("open") or "").strip() == "1":
+        where = " AND status != 'done'"
+    rows = conn.execute(
+        "SELECT m.*, s.vendor_email AS vendor_email"
+        " FROM erp_store_maintenance m"
+        " LEFT JOIN erp_store_pm_schedules s"
+        " ON s.id = m.pm_schedule_id"
+        " WHERE m.store_id = ?" + where +
+        " ORDER BY CASE m.status WHEN 'open' THEN 0 WHEN 'in-progress' THEN 1"
+        " ELSE 2 END, m.id DESC", params).fetchall()
+    conn.close()
+    return jsonify(maintenance=[_stores_maint_dict(r) for r in rows])
+
+
+@app.post("/api/erp/stores/<int:store_id>/maintenance/<int:row_id>/update")
+def stores_maintenance_update(store_id, row_id):
+    """Edit a maintenance issue, including moving its status to
+    in-progress or done. Fields fall back to the stored row."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_maintenance"
+        " WHERE id = ? AND store_id = ?", (row_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="maintenance issue not found"), 404
+    fields = _stores_maint_validate(data, current=dict(row))
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_maintenance SET equipment = ?, issue = ?,"
+        " priority = ?, status = ?, reported_by = ?, due_date = ?,"
+        " notes = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+        (fields["equipment"], fields["issue"], fields["priority"],
+         fields["status"], fields["reported_by"], fields["due_date"],
+         fields["notes"], actor, now, row_id))
+    out = _stores_maint_row(conn, row_id)
+    conn.commit()
+    conn.close()
+    return jsonify(maintenance=_stores_maint_dict(out))
+
+
+@app.post("/api/erp/stores/<int:store_id>/maintenance/<int:row_id>/delete")
+def stores_maintenance_delete(store_id, row_id):
+    """Delete a maintenance issue record."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_maintenance"
+        " WHERE id = ? AND store_id = ?", (row_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="maintenance issue not found"), 404
+    conn.execute("DELETE FROM erp_store_maintenance WHERE id = ?", (row_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# --- Loss prevention: per-store shrink (read-only) ---
+@app.get("/api/erp/stores/<int:store_id>/shrink")
+def stores_shrink(store_id):
+    """Per-store shrink, READ-ONLY. This is the Inventory shrinkage
+    summary (erp_shrinkage) filtered to the store's linked
+    location_id -- same source rows (adjustment movements with a
+    reason), same per-unit cost basis, grouped by reason and by item.
+    ?from= / ?to= are YYYY-MM-DD, ?reason= is one of the adjustment
+    reasons. A store with no linked location has no shrink data."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    date_from = (request.args.get("from") or "").strip()
+    date_to = (request.args.get("to") or "").strip()
+    for label, v in (("from", date_from), ("to", date_to)):
+        if v and not re.match(r"^\d{4}-\d{2}-\d{2}$", v):
+            return jsonify(error="%s must be YYYY-MM-DD" % label), 400
+    reason = (request.args.get("reason") or "").strip()
+    if reason and reason not in ERP_ADJUST_REASONS:
+        return jsonify(error="reason must be one of: "
+                       + ", ".join(ERP_ADJUST_REASONS)), 400
+    conn = db()
+    store = _stores_require_store(conn, store_id)
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    location_id = store["location_id"]
+    if not location_id:
+        conn.close()
+        return jsonify({
+            "store_id": store_id, "store_name": store["name"],
+            "location_id": None, "from": date_from or None,
+            "to": date_to or None, "by_reason": [], "by_item": [],
+            "total": {"lines": 0, "qty": 0, "cost_cents": 0,
+                      "shrink_qty": 0, "shrink_cost_cents": 0},
+            "note": "No inventory location linked to this store,"
+                    " so there is no shrink data."})
+    clauses = ["l.movement_type = 'adjustment'",
+               "l.ref_type = 'reason'", "l.location_id = ?"]
+    params = [location_id]
+    if date_from:
+        clauses.append("substr(l.created_at, 1, 10) >= ?")
+        params.append(date_from)
+    if date_to:
+        clauses.append("substr(l.created_at, 1, 10) <= ?")
+        params.append(date_to)
+    if reason:
+        clauses.append("l.ref_id = ?")
+        params.append(reason)
+    where = " WHERE " + " AND ".join(clauses)
+    agg = ("COUNT(*) AS lines,"
+           " COALESCE(SUM(l.qty_change), 0) AS qty,"
+           " COALESCE(SUM(l.qty_change * l.unit_cost_cents), 0) AS cost_cents,"
+           " COALESCE(SUM(CASE WHEN l.qty_change < 0 THEN l.qty_change"
+           "  ELSE 0 END), 0) AS shrink_qty,"
+           " COALESCE(SUM(CASE WHEN l.qty_change < 0"
+           "  THEN -l.qty_change * l.unit_cost_cents ELSE 0 END), 0)"
+           " AS shrink_cost_cents")
+    by_reason = conn.execute(
+        "SELECT l.ref_id AS reason, " + agg
+        + " FROM erp_stock_ledger l" + where
+        + " GROUP BY l.ref_id ORDER BY shrink_cost_cents DESC",
+        params).fetchall()
+    by_item = conn.execute(
+        "SELECT l.item_id, i.sku, i.name AS item_name, i.unit, " + agg
+        + " FROM erp_stock_ledger l"
+        " JOIN erp_items i ON i.id = l.item_id" + where
+        + " GROUP BY l.item_id ORDER BY shrink_cost_cents DESC LIMIT 10",
+        params).fetchall()
+    total = conn.execute(
+        "SELECT " + agg + " FROM erp_stock_ledger l" + where,
+        params).fetchone()
+    conn.close()
+
+    def _row(r):
+        return {"lines": int(r["lines"]), "qty": float(r["qty"]),
+                "cost_cents": int(r["cost_cents"]),
+                "shrink_qty": float(r["shrink_qty"]),
+                "shrink_cost_cents": int(r["shrink_cost_cents"])}
+    return jsonify({
+        "store_id": store_id, "store_name": store["name"],
+        "location_id": int(location_id),
+        "from": date_from or None, "to": date_to or None,
+        "by_reason": [dict({"reason": r["reason"]}, **_row(r))
+                      for r in by_reason],
+        "by_item": [dict({"item_id": r["item_id"], "sku": r["sku"],
+                          "item_name": r["item_name"],
+                          "unit": r["unit"]}, **_row(r))
+                    for r in by_item],
+        "total": _row(total)})
+
+
+# --- Loss prevention: register void log ---
+@app.post("/api/erp/stores/<int:store_id>/voids")
+def stores_void_create(store_id):
+    """Log a register void. actor defaults to the signed-in admin
+    when not supplied."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    fields = _stores_void_validate(data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_voids (store_id, register, sale_key,"
+        " amount_cents, reason, actor, created_by, created_at,"
+        " updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, fields["register"], fields["sale_key"],
+         fields["amount_cents"], fields["reason"],
+         fields["actor"] or actor, actor, now, actor, now))
+    row = _stores_void_row(conn, cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify(void=_stores_void_dict(row)), 201
+
+
+@app.get("/api/erp/stores/<int:store_id>/voids")
+def stores_voids_list(store_id):
+    """Register voids for a store, newest first."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_store_voids WHERE store_id = ?"
+        " ORDER BY id DESC", (store_id,)).fetchall()
+    conn.close()
+    return jsonify(voids=[_stores_void_dict(r) for r in rows])
+
+
+@app.post("/api/erp/stores/<int:store_id>/voids/<int:row_id>/update")
+def stores_void_update(store_id, row_id):
+    """Correct a void-log entry. Fields fall back to the stored row."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_voids WHERE id = ? AND store_id = ?",
+        (row_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="void not found"), 404
+    fields = _stores_void_validate(data, current=dict(row))
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_voids SET register = ?, sale_key = ?,"
+        " amount_cents = ?, reason = ?, actor = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (fields["register"], fields["sale_key"], fields["amount_cents"],
+         fields["reason"], fields["actor"], actor, now, row_id))
+    out = _stores_void_row(conn, row_id)
+    conn.commit()
+    conn.close()
+    return jsonify(void=_stores_void_dict(out))
+
+
+@app.post("/api/erp/stores/<int:store_id>/voids/<int:row_id>/delete")
+def stores_void_delete(store_id, row_id):
+    """Delete a void-log entry."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_voids WHERE id = ? AND store_id = ?",
+        (row_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="void not found"), 404
+    conn.execute("DELETE FROM erp_store_voids WHERE id = ?", (row_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# --- Loss prevention: cash audits ---
+@app.post("/api/erp/stores/<int:store_id>/cash-audits")
+def stores_cash_audit_create(store_id):
+    """Record a cash audit: counted vs expected drawer cash. The
+    variance is computed here as counted minus expected -- a variance
+    supplied in the payload is ignored, never trusted."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    fields = _stores_cash_audit_validate(conn, store_id, data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    if not fields["audit_date"]:
+        fields["audit_date"] = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_cash_audits (store_id, z_report_id,"
+        " counted_cents, expected_cents, variance_cents, actor,"
+        " audit_date, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, fields["z_report_id"], fields["counted_cents"],
+         fields["expected_cents"], fields["variance_cents"],
+         fields["actor"] or actor, fields["audit_date"],
+         actor, now, actor, now))
+    row = _stores_cash_audit_row(conn, cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify(cash_audit=_stores_cash_audit_dict(row)), 201
+
+
+@app.get("/api/erp/stores/<int:store_id>/cash-audits")
+def stores_cash_audits_list(store_id):
+    """Cash audits for a store, newest date first, with the linked
+    Z-report's register and date on each row."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    rows = conn.execute(
+        "SELECT a.*, z.register AS z_register, z.report_date AS z_date"
+        " FROM erp_store_cash_audits a"
+        " LEFT JOIN erp_store_zreports z ON z.id = a.z_report_id"
+        " WHERE a.store_id = ?"
+        " ORDER BY a.audit_date DESC, a.id DESC", (store_id,)).fetchall()
+    conn.close()
+    return jsonify(cash_audits=[_stores_cash_audit_dict(r) for r in rows])
+
+
+@app.post("/api/erp/stores/<int:store_id>/cash-audits/<int:row_id>/update")
+def stores_cash_audit_update(store_id, row_id):
+    """Correct a cash audit. The variance is recomputed from the new
+    counted / expected figures -- never taken from the payload."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_cash_audits"
+        " WHERE id = ? AND store_id = ?", (row_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="cash audit not found"), 404
+    fields = _stores_cash_audit_validate(conn, store_id, data,
+                                         current=dict(row))
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_cash_audits SET z_report_id = ?,"
+        " counted_cents = ?, expected_cents = ?, variance_cents = ?,"
+        " actor = ?, audit_date = ?, updated_by = ?, updated_at = ?"
+        " WHERE id = ?",
+        (fields["z_report_id"], fields["counted_cents"],
+         fields["expected_cents"], fields["variance_cents"],
+         fields["actor"], fields["audit_date"], actor, now, row_id))
+    out = _stores_cash_audit_row(conn, row_id)
+    conn.commit()
+    conn.close()
+    return jsonify(cash_audit=_stores_cash_audit_dict(out))
+
+
+@app.post("/api/erp/stores/<int:store_id>/cash-audits/<int:row_id>/delete")
+def stores_cash_audit_delete(store_id, row_id):
+    """Delete a cash audit record."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_cash_audits"
+        " WHERE id = ? AND store_id = ?", (row_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="cash audit not found"), 404
+    conn.execute("DELETE FROM erp_store_cash_audits WHERE id = ?", (row_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# --- Merchandising / planograms ---
+@app.post("/api/erp/stores/<int:store_id>/planograms")
+def stores_planogram_create(store_id):
+    """Add a planogram record for an area/section of a store. Text
+    record only: area, layout notes, effective date, active flag.
+    No images, no drag-and-drop."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    fields = _stores_planogram_validate(data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_planograms (store_id, area, layout_notes,"
+        " effective_date, active, layout_json, created_by, created_at,"
+        " updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, fields["area"], fields["layout_notes"],
+         fields["effective_date"], fields["active"],
+         json.dumps(fields["layout"]), actor, now, actor, now))
+    row = _stores_planogram_row(conn, cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify(planogram=_stores_planogram_dict(row)), 201
+
+
+@app.get("/api/erp/stores/<int:store_id>/planograms")
+def stores_planograms_list(store_id):
+    """Planograms for a store, active first then newest."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_store_planograms WHERE store_id = ?"
+        " ORDER BY active DESC, id DESC", (store_id,)).fetchall()
+    conn.close()
+    return jsonify(planograms=[_stores_planogram_dict(r) for r in rows])
+
+
+@app.post("/api/erp/stores/<int:store_id>/planograms/<int:row_id>/update")
+def stores_planogram_update(store_id, row_id):
+    """Edit a planogram record. Fields fall back to the stored row."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_planograms"
+        " WHERE id = ? AND store_id = ?", (row_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="planogram not found"), 404
+    fields = _stores_planogram_validate(data, current=dict(row))
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_planograms SET area = ?, layout_notes = ?,"
+        " effective_date = ?, active = ?, layout_json = ?,"
+        " updated_by = ?, updated_at = ?"
+        " WHERE id = ?",
+        (fields["area"], fields["layout_notes"], fields["effective_date"],
+         fields["active"], json.dumps(fields["layout"]), actor, now,
+         row_id))
+    out = _stores_planogram_row(conn, row_id)
+    conn.commit()
+    conn.close()
+    return jsonify(planogram=_stores_planogram_dict(out))
+
+
+@app.post("/api/erp/stores/<int:store_id>/planograms/<int:row_id>/delete")
+def stores_planogram_delete(store_id, row_id):
+    """Delete a planogram record."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_planograms"
+        " WHERE id = ? AND store_id = ?", (row_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="planogram not found"), 404
+    conn.execute("DELETE FROM erp_store_planograms WHERE id = ?", (row_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- Dept 14 (Stores) Additions Wave B
+# Item 3: visual planograms (the shelf grid lives on the existing
+# planogram record as layout_json) + sales per foot from POS sales.
+# Item 4: loss-prevention exception flags computed from register
+# data. Item 5: preventive-maintenance schedules + vendor dispatch.
+# Nothing here touches the ledger, checkout, or labels, and no cron
+# is added: flags are computed on read (or on an explicit admin
+# "run checks" click) and due PM jobs are created on read (or on an
+# explicit admin "check due" click).
+_LP_RULES = ("void_above_threshold", "discount_above_threshold",
+             "refund_above_threshold", "nosale_drawer_open")
+_LP_RULE_LABELS = {
+    "void_above_threshold": "Void above threshold",
+    "discount_above_threshold": "Discount above threshold",
+    "refund_above_threshold": "Refund above threshold",
+    "nosale_drawer_open": "No-sale drawer open",
+}
+# Thresholds are defaults the user sets in the UI -- they are round
+# starting numbers, not industry standards, and the UI says so.
+_LP_DEFAULTS = {"void_threshold_cents": 5000,
+                "discount_threshold_cents": 2500,
+                "refund_threshold_cents": 5000,
+                "nosale_threshold": 3}
+_LP_KEYS = ("lp_void_threshold_cents", "lp_discount_threshold_cents",
+            "lp_refund_threshold_cents", "lp_nosale_threshold")
+_LP_STATUSES = ("open", "reviewed", "dismissed")
+
+
+def _stores_lp_settings(conn):
+    """LP thresholds from erp_store_settings, falling back to the
+    defaults above. A stored value outside its range falls back to
+    its default -- never a crash, never a guess."""
+    out = dict(_LP_DEFAULTS)
+    rows = conn.execute(
+        "SELECT key, value FROM erp_store_settings"
+        " WHERE key IN (?, ?, ?, ?)", _LP_KEYS).fetchall()
+    for r in rows:
+        try:
+            v = int(r["value"])
+        except (TypeError, ValueError):
+            continue
+        if r["key"] == "lp_void_threshold_cents" \
+                and 0 <= v <= 10000000:
+            out["void_threshold_cents"] = v
+        elif r["key"] == "lp_discount_threshold_cents" \
+                and 0 <= v <= 10000000:
+            out["discount_threshold_cents"] = v
+        elif r["key"] == "lp_refund_threshold_cents" \
+                and 0 <= v <= 10000000:
+            out["refund_threshold_cents"] = v
+        elif r["key"] == "lp_nosale_threshold" and 0 <= v <= 100:
+            out["nosale_threshold"] = v
+    return out
+
+
+def _stores_lp_flag_dict(row):
+    d = dict(row)
+    d["amount_cents"] = int(d.get("amount_cents") or 0)
+    d["rule_label"] = _LP_RULE_LABELS.get(
+        d.get("rule") or "", d.get("rule") or "")
+    if d.get("z_report_id") is not None:
+        d["z_report_id"] = int(d["z_report_id"])
+    return d
+
+
+def _stores_lp_compute(conn, store_id, actor):
+    """Run the exception rules over the store's register data and
+    store any NEW flags. Dedupe is (store_id, rule, sale_key) across
+    all statuses, so a reviewed or dismissed flag never re-creates.
+    Sources, stated plainly: voids read erp_store_voids; discounts
+    and refunds read POS sales whose free-text tender starts with
+    "discount" / "refund" (the register's way of logging a comped
+    or refunded sale -- the intake has no separate discount or
+    refund field); no-sale opens read closed drawers with zero
+    sales on that register between open and close, grouped by
+    register and day. Returns the number of flags created."""
+    settings = _stores_lp_settings(conn)
+    created = 0
+
+    def _flag(rule, sale_key, amount, flag_actor, detail):
+        nonlocal created
+        existing = conn.execute(
+            "SELECT id FROM erp_store_lp_flags"
+            " WHERE store_id = ? AND rule = ? AND sale_key = ?",
+            (store_id, rule, sale_key)).fetchone()
+        if existing:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "INSERT INTO erp_store_lp_flags (store_id, rule, sale_key,"
+            " amount_cents, actor, status, detail, created_by,"
+            " created_at, updated_by, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+            (store_id, rule, sale_key, amount, flag_actor, detail,
+             actor, now, actor, now))
+        created += 1
+
+    for v in conn.execute(
+            "SELECT * FROM erp_store_voids WHERE store_id = ?"
+            " AND amount_cents > ?",
+            (store_id, settings["void_threshold_cents"])).fetchall():
+        ref = (v["sale_key"] or "").strip() or ("void:%d" % v["id"])
+        _flag("void_above_threshold", ref, int(v["amount_cents"]),
+              v["actor"] or "",
+              "Void of %s is above the %s void threshold."
+              % (erp_money_html(int(v["amount_cents"])),
+                 erp_money_html(settings["void_threshold_cents"])))
+    for s in conn.execute(
+            "SELECT * FROM erp_store_sales WHERE store_id = ?",
+            (store_id,)).fetchall():
+        tender = (s["tender"] or "").strip().lower()
+        total = int(s["total_cents"] or 0)
+        if tender.startswith("discount") \
+                and total > settings["discount_threshold_cents"]:
+            _flag("discount_above_threshold", s["sale_key"], total,
+                  s["created_by"] or "",
+                  "Sale %s logged with tender '%s' (%s) is above the"
+                  " %s discount threshold."
+                  % (s["sale_key"], s["tender"] or "",
+                     erp_money_html(total),
+                     erp_money_html(
+                         settings["discount_threshold_cents"])))
+        elif tender.startswith("refund") \
+                and total > settings["refund_threshold_cents"]:
+            _flag("refund_above_threshold", s["sale_key"], total,
+                  s["created_by"] or "",
+                  "Sale %s logged with tender '%s' (%s) is above the"
+                  " %s refund threshold."
+                  % (s["sale_key"], s["tender"] or "",
+                     erp_money_html(total),
+                     erp_money_html(
+                         settings["refund_threshold_cents"])))
+    drawers = conn.execute(
+        "SELECT * FROM erp_store_drawers WHERE store_id = ?"
+        " AND status = 'closed' AND closed_at != ''",
+        (store_id,)).fetchall()
+    candidates = []
+    for d in drawers:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM erp_store_sales"
+            " WHERE store_id = ? AND register = ?"
+            " AND sold_at >= ? AND sold_at <= ?",
+            (store_id, d["register"], d["opened_at"],
+             d["closed_at"])).fetchone()[0]
+        if n == 0:
+            candidates.append(d)
+    day_counts = {}
+    for d in candidates:
+        key = (d["register"], (d["opened_at"] or "")[:10])
+        day_counts[key] = day_counts.get(key, 0) + 1
+    for d in candidates:
+        key = (d["register"], (d["opened_at"] or "")[:10])
+        if day_counts[key] > settings["nosale_threshold"]:
+            _flag("nosale_drawer_open", "drawer:%d" % d["id"], 0,
+                  d["opened_by"] or "",
+                  "Drawer on register '%s' was opened and closed with"
+                  " no sale (%d no-sale opens on %s, above the %d"
+                  " threshold)." % (d["register"], day_counts[key],
+                                    key[1],
+                                    settings["nosale_threshold"]))
+    conn.commit()
+    return created
+
+
+def _stores_pm_next_due(schedule):
+    """next_due is always computed from last_done + interval_days;
+    '' when the schedule has never been done (so nothing
+    auto-creates until a first date is set)."""
+    last = (schedule.get("last_done") or "").strip()
+    if not last:
+        return ""
+    try:
+        due = datetime.strptime(last, "%Y-%m-%d").date() \
+            + timedelta(days=int(schedule["interval_days"]))
+    except (TypeError, ValueError):
+        return ""
+    return due.isoformat()
+
+
+def _stores_pm_dict(row):
+    d = dict(row)
+    d["interval_days"] = int(d.get("interval_days") or 0)
+    d["next_due"] = _stores_pm_next_due(d)
+    today = datetime.now(timezone.utc).date().isoformat()
+    d["due"] = bool(d["next_due"] and d["next_due"] <= today)
+    return d
+
+
+def _stores_pm_row(conn, row_id):
+    return conn.execute(
+        "SELECT * FROM erp_store_pm_schedules WHERE id = ?",
+        (row_id,)).fetchone()
+
+
+def _stores_pm_validate(data, current=None):
+    """Validate PM schedule fields. Returns the cleaned dict, or
+    (error_response, status) on a bad value."""
+    merged = dict(current) if current else {}
+    for key in ("equipment", "interval_days", "last_done",
+                "assigned_vendor", "vendor_email"):
+        if key in data:
+            merged[key] = data[key]
+    equipment = (merged.get("equipment") or "").strip()
+    if not equipment:
+        return jsonify(error="equipment is required"), 400
+    if len(equipment) > 200:
+        return jsonify(error="equipment must be 200 characters or fewer"), 400
+    interval = _stores_int(merged.get("interval_days"))
+    if interval is None or interval < 1 or interval > 3650:
+        return jsonify(
+            error="interval_days must be a whole number of days, 1 to 3650"
+            ), 400
+    last_done = (merged.get("last_done") or "").strip()
+    if last_done and not _legal_valid_date(last_done):
+        return jsonify(error="last_done must be YYYY-MM-DD"), 400
+    vendor = (merged.get("assigned_vendor") or "").strip()
+    if len(vendor) > 200:
+        return jsonify(
+            error="assigned_vendor must be 200 characters or fewer"), 400
+    email = (merged.get("vendor_email") or "").strip()
+    if email and ("@" not in email or len(email) > 200):
+        return jsonify(error="vendor_email must be a valid email"), 400
+    return {"equipment": equipment, "interval_days": interval,
+            "last_done": last_done, "assigned_vendor": vendor,
+            "vendor_email": email}
+
+
+def _stores_pm_check_due(conn, store_id, actor):
+    """Create a maintenance record for every due schedule that has
+    no open auto-created job yet. Returns (created_count,
+    [maintenance ids]). Runs on read and on the explicit admin
+    check-due click -- never on a cron."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    created = []
+    for sched in conn.execute(
+            "SELECT * FROM erp_store_pm_schedules WHERE store_id = ?",
+            (store_id,)).fetchall():
+        sd = _stores_pm_dict(sched)
+        if not sd["due"]:
+            continue
+        existing = conn.execute(
+            "SELECT id FROM erp_store_maintenance"
+            " WHERE pm_schedule_id = ? AND status != 'done'",
+            (sched["id"],)).fetchone()
+        if existing:
+            continue
+        issue = ("Recurring maintenance due: %s (every %d days;"
+                 " last done %s)"
+                 % (sched["equipment"], int(sched["interval_days"]),
+                    sched["last_done"]))
+        cur = conn.execute(
+            "INSERT INTO erp_store_maintenance (store_id, equipment,"
+            " issue, priority, status, reported_by, due_date, notes,"
+            " pm_schedule_id, auto_created, created_by, created_at,"
+            " updated_by, updated_at)"
+            " VALUES (?, ?, ?, 'medium', 'open', 'PM schedule', ?, ?,"
+            " ?, 1, ?, ?, ?, ?)",
+            (store_id, sched["equipment"], issue, sd["next_due"],
+             "Auto-created by PM schedule #%d." % sched["id"],
+             sched["id"], actor, now, actor, now))
+        created.append(cur.lastrowid)
+    conn.commit()
+    return len(created), created
+
+
+# --- Sales per foot (Item 3) ---
+@app.get("/api/erp/stores/<int:store_id>/sales-per-foot")
+def stores_sales_per_foot(store_id):
+    """Rank planogram sections by sales per foot, from POS sales.
+    Flavor sales come from erp_store_sales items_json (matched to
+    layout flavors case-insensitively); a section with no sales
+    reports has_sales False and sales_per_foot_cents null -- the UI
+    shows "no sales yet", never a measured zero. A section with
+    sales but no shelf feet reports its sales and a null per-foot
+    value. Sections are ranked only where a per-foot value exists."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    flavor_sales = {}
+    total_sales = 0
+    has_sales = False
+    for s in conn.execute(
+            "SELECT items_json, total_cents FROM erp_store_sales"
+            " WHERE store_id = ?", (store_id,)).fetchall():
+        has_sales = True
+        total_sales += int(s["total_cents"] or 0)
+        try:
+            items = json.loads(s["items_json"] or "[]")
+        except ValueError:
+            items = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            key = str(it.get("flavor") or "").strip().lower()
+            if key:
+                flavor_sales[key] = flavor_sales.get(key, 0) \
+                    + int(it.get("amount_cents") or 0)
+    sections = []
+    for g in conn.execute(
+            "SELECT * FROM erp_store_planograms WHERE store_id = ?"
+            " ORDER BY active DESC, id DESC", (store_id,)).fetchall():
+        gd = _stores_planogram_dict(g)
+        shelves_out = []
+        sec_sales = 0
+        sec_feet = 0.0
+        for shelf in gd["layout"]["shelves"]:
+            s_sales = sum(
+                flavor_sales.get(str(f).strip().lower(), 0)
+                for f in shelf["flavors"])
+            feet = float(shelf["feet"] or 0)
+            sec_sales += s_sales
+            sec_feet += feet
+            spf = None
+            if s_sales > 0 and feet > 0:
+                spf = int(round(s_sales / feet))
+            shelves_out.append({
+                "name": shelf["name"], "feet": feet,
+                "flavors": shelf["flavors"], "sales_cents": s_sales,
+                "has_sales": s_sales > 0,
+                "sales_per_foot_cents": spf})
+        sec_spf = None
+        if sec_sales > 0 and sec_feet > 0:
+            sec_spf = int(round(sec_sales / sec_feet))
+        sections.append({
+            "planogram_id": gd["id"], "area": gd["area"],
+            "active": gd["active"], "shelves": shelves_out,
+            "total_sales_cents": sec_sales, "total_feet": sec_feet,
+            "sales_per_foot_cents": sec_spf,
+            "has_sales": sec_sales > 0, "rank": None})
+    ranked = sorted(
+        [s for s in sections if s["sales_per_foot_cents"] is not None],
+        key=lambda s: -s["sales_per_foot_cents"])
+    for i, s in enumerate(ranked):
+        s["rank"] = i + 1
+    conn.close()
+    return jsonify(store_id=store_id, has_sales=has_sales,
+                   total_sales_cents=total_sales, sections=sections)
+
+
+# --- Loss prevention: thresholds + exception flags (Item 4) ---
+@app.get("/api/erp/stores/<int:store_id>/lp-thresholds")
+def stores_lp_thresholds_get(store_id):
+    """Current LP thresholds plus the defaults they fall back to.
+    Thresholds are store-wide settings (erp_store_settings) and
+    survive a wipe like the OT thresholds."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    settings = _stores_lp_settings(conn)
+    conn.close()
+    return jsonify(thresholds=settings, defaults=dict(_LP_DEFAULTS))
+
+
+@app.post("/api/erp/stores/<int:store_id>/lp-thresholds")
+def stores_lp_thresholds_set(store_id):
+    """Admin-editable LP thresholds. Money thresholds are whole
+    cents (0..10,000,000); the no-sale threshold is a count of
+    no-sale opens per register per day (0..100). At least one must
+    be supplied."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    field_map = {
+        "void_threshold_cents": ("lp_void_threshold_cents", 0, 10000000),
+        "discount_threshold_cents": ("lp_discount_threshold_cents", 0,
+                                     10000000),
+        "refund_threshold_cents": ("lp_refund_threshold_cents", 0,
+                                   10000000),
+        "nosale_threshold": ("lp_nosale_threshold", 0, 100),
+    }
+    updates = {}
+    for field, (key, lo, hi) in field_map.items():
+        if field in data and data.get(field) is not None:
+            v = _stores_int(data.get(field))
+            if v is None or v < lo or v > hi:
+                conn.close()
+                return jsonify(
+                    error="%s must be a whole number between %d and %d"
+                    % (field, lo, hi)), 400
+            updates[key] = str(v)
+    if not updates:
+        conn.close()
+        return jsonify(
+            error="at least one threshold is required"), 400
+    for k, v in updates.items():
+        conn.execute(
+            "INSERT INTO erp_store_settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (k, v))
+    conn.commit()
+    settings = _stores_lp_settings(conn)
+    conn.close()
+    return jsonify(thresholds=settings, defaults=dict(_LP_DEFAULTS))
+
+
+@app.get("/api/erp/stores/<int:store_id>/lp-flags")
+def stores_lp_flags_list(store_id):
+    """Read-only flag list. The rules are computed from the
+    register data on read (idempotent -- see _stores_lp_compute),
+    then the stored flags are returned newest first."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    created = _stores_lp_compute(conn, store_id, actor)
+    rows = conn.execute(
+        "SELECT * FROM erp_store_lp_flags WHERE store_id = ?"
+        " ORDER BY id DESC", (store_id,)).fetchall()
+    conn.close()
+    return jsonify(flags=[_stores_lp_flag_dict(r) for r in rows],
+                   created=created)
+
+
+@app.post("/api/erp/stores/<int:store_id>/lp-run")
+def stores_lp_run(store_id):
+    """Explicit admin "run checks" click: same computation as the
+    list read, returning how many new flags it created."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    created = _stores_lp_compute(conn, store_id, actor)
+    rows = conn.execute(
+        "SELECT * FROM erp_store_lp_flags WHERE store_id = ?"
+        " ORDER BY id DESC", (store_id,)).fetchall()
+    conn.close()
+    return jsonify(created=created,
+                   flags=[_stores_lp_flag_dict(r) for r in rows])
+
+
+def _stores_lp_flag_review_dismiss(store_id, flag_id, target, actor):
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_lp_flags"
+        " WHERE id = ? AND store_id = ?", (flag_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="flag not found"), 404
+    if target == "reviewed" and row["status"] != "open":
+        conn.close()
+        return jsonify(
+            error="only an open flag can be marked reviewed"), 400
+    if target == "dismissed" and row["status"] == "dismissed":
+        conn.close()
+        return jsonify(error="flag is already dismissed"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_lp_flags SET status = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (target, actor, now, flag_id))
+    out = conn.execute(
+        "SELECT * FROM erp_store_lp_flags WHERE id = ?",
+        (flag_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(flag=_stores_lp_flag_dict(out))
+
+
+@app.post("/api/erp/stores/<int:store_id>/lp-flags/<int:flag_id>/review")
+def stores_lp_flag_review(store_id, flag_id):
+    """Mark an open flag reviewed."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    return _stores_lp_flag_review_dismiss(
+        store_id, flag_id, "reviewed", actor)
+
+
+@app.post("/api/erp/stores/<int:store_id>/lp-flags/<int:flag_id>/dismiss")
+def stores_lp_flag_dismiss(store_id, flag_id):
+    """Dismiss an open or reviewed flag. Dismissed flags never
+    re-create on the next run."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    return _stores_lp_flag_review_dismiss(
+        store_id, flag_id, "dismissed", actor)
+
+
+# --- Preventive maintenance schedules + vendor dispatch (Item 5) ---
+@app.get("/api/erp/stores/<int:store_id>/pm-schedules")
+def stores_pm_list(store_id):
+    """PM schedules with computed next_due / due. Due schedules
+    create their maintenance job on read (idempotent -- see
+    _stores_pm_check_due); auto_created is how many jobs that
+    created on this read."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    created, _ = _stores_pm_check_due(conn, store_id, actor)
+    rows = conn.execute(
+        "SELECT * FROM erp_store_pm_schedules WHERE store_id = ?"
+        " ORDER BY id", (store_id,)).fetchall()
+    conn.close()
+    return jsonify(schedules=[_stores_pm_dict(r) for r in rows],
+                   auto_created=created)
+
+
+@app.post("/api/erp/stores/<int:store_id>/pm-schedules")
+def stores_pm_create(store_id):
+    """Add a recurring maintenance schedule. Starts empty -- no
+    equipment catalog, no seeded rows."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    fields = _stores_pm_validate(data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_pm_schedules (store_id, equipment,"
+        " interval_days, last_done, assigned_vendor, vendor_email,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, fields["equipment"], fields["interval_days"],
+         fields["last_done"], fields["assigned_vendor"],
+         fields["vendor_email"], actor, now, actor, now))
+    row = _stores_pm_row(conn, cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return jsonify(schedule=_stores_pm_dict(row)), 201
+
+
+@app.post("/api/erp/stores/<int:store_id>/pm-schedules/<int:schedule_id>/update")
+def stores_pm_update(store_id, schedule_id):
+    """Edit a PM schedule. Fields fall back to the stored row."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_pm_schedules"
+        " WHERE id = ? AND store_id = ?", (schedule_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="schedule not found"), 404
+    fields = _stores_pm_validate(data, current=dict(row))
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_pm_schedules SET equipment = ?,"
+        " interval_days = ?, last_done = ?, assigned_vendor = ?,"
+        " vendor_email = ?, updated_by = ?, updated_at = ?"
+        " WHERE id = ?",
+        (fields["equipment"], fields["interval_days"],
+         fields["last_done"], fields["assigned_vendor"],
+         fields["vendor_email"], actor, now, schedule_id))
+    out = _stores_pm_row(conn, schedule_id)
+    conn.commit()
+    conn.close()
+    return jsonify(schedule=_stores_pm_dict(out))
+
+
+@app.post("/api/erp/stores/<int:store_id>/pm-schedules/<int:schedule_id>/delete")
+def stores_pm_delete(store_id, schedule_id):
+    """Delete a PM schedule. Its auto-created maintenance jobs stay
+    (they are real jobs now); only the recurrence stops."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_pm_schedules"
+        " WHERE id = ? AND store_id = ?", (schedule_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="schedule not found"), 404
+    conn.execute(
+        "DELETE FROM erp_store_pm_schedules WHERE id = ?",
+        (schedule_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/stores/<int:store_id>/pm-schedules/<int:schedule_id>/complete")
+def stores_pm_complete(store_id, schedule_id):
+    """Mark a schedule done: last_done becomes the done date
+    (today by default), which pushes next_due out by the interval,
+    and any open auto-created job for the schedule is marked done
+    with it."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    done_date = (data.get("done_date") or data.get("last_done")
+                 or "").strip()
+    if not done_date:
+        done_date = datetime.now(timezone.utc).date().isoformat()
+    if not _legal_valid_date(done_date):
+        return jsonify(error="done_date must be YYYY-MM-DD"), 400
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_store_pm_schedules"
+        " WHERE id = ? AND store_id = ?", (schedule_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="schedule not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_pm_schedules SET last_done = ?,"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (done_date, actor, now, schedule_id))
+    cur = conn.execute(
+        "UPDATE erp_store_maintenance SET status = 'done',"
+        " updated_by = ?, updated_at = ?"
+        " WHERE pm_schedule_id = ? AND status != 'done'",
+        (actor, now, schedule_id))
+    closed = cur.rowcount
+    out = _stores_pm_row(conn, schedule_id)
+    conn.commit()
+    conn.close()
+    return jsonify(schedule=_stores_pm_dict(out), closed_jobs=closed)
+
+
+@app.post("/api/erp/stores/<int:store_id>/pm-schedules/check-due")
+def stores_pm_check_due(store_id):
+    """Explicit admin "check due now" click: create maintenance
+    jobs for every due schedule (same idempotent check as the list
+    read)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    created, ids = _stores_pm_check_due(conn, store_id, actor)
+    conn.close()
+    return jsonify(created=created, maintenance_ids=ids)
+
+
+@app.post("/api/erp/stores/<int:store_id>/maintenance/<int:row_id>/dispatch")
+def stores_maintenance_dispatch(store_id, row_id):
+    """Email the assigned vendor about a maintenance job, via the
+    existing send_email helper. The vendor email comes from the
+    request or, when the job was auto-created from a PM schedule,
+    from that schedule -- it is always entered by the user, never
+    invented. The job must still be open. The dispatch is recorded
+    on the job (dispatched_to / dispatched_at)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT m.*, s.vendor_email AS vendor_email"
+        " FROM erp_store_maintenance m"
+        " LEFT JOIN erp_store_pm_schedules s"
+        " ON s.id = m.pm_schedule_id"
+        " WHERE m.id = ? AND m.store_id = ?",
+        (row_id, store_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="maintenance issue not found"), 404
+    if row["status"] == "done":
+        conn.close()
+        return jsonify(
+            error="maintenance issue is done and cannot be dispatched"
+            ), 400
+    email = (data.get("vendor_email") or "").strip() \
+        or (row["vendor_email"] or "").strip()
+    if not email or "@" not in email:
+        conn.close()
+        return jsonify(
+            error="a vendor email is required to dispatch"), 400
+    store = _stores_require_store(conn, store_id)
+    html = ("<h1>Maintenance dispatch: %s</h1>"
+            "<p>Store: %s</p>"
+            "<p>Equipment: %s</p>"
+            "<p>Issue: %s</p>"
+            "<p>Priority: %s</p>"
+            "<p>Due: %s</p>"
+            "<p>Please confirm you can take this job and when.</p>"
+            % (row["equipment"], store["name"], row["equipment"],
+               row["issue"], row["priority"],
+               row["due_date"] or "no due date"))
+    try:
+        send_email(email,
+                   "Maintenance dispatch: %s — %s"
+                   % (row["equipment"], store["name"]), html)
+    except Exception as exc:
+        conn.close()
+        return jsonify(error="dispatch email failed: %s" % exc), 502
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_maintenance SET dispatched_to = ?,"
+        " dispatched_at = ?, updated_by = ?, updated_at = ?"
+        " WHERE id = ?",
+        (email, now, actor, now, row_id))
+    out = _stores_maint_row(conn, row_id)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, dispatched_to=email,
+                   maintenance=_stores_maint_dict(out))
+
+
+
+
+# ---------------------------------------------------------------- Dept 14 (Stores) Additions Wave A
+# Item 1: the ERP register -- flavor catalog from the live flavor
+# list, member attach through the shared lookup, a staff-gated
+# gift-card redeem that reuses the gift_cards / redemptions tables
+# (same balance, never a second one), and cash drawers. Sales still
+# post ONLY to the POS intake above -- nothing here touches the
+# accounting ledger, and no PIN system is invented: the register
+# lives inside the admin-only Stores tab. Item 2: workforce extras
+# -- labor forecasting (scheduled hours vs the shared Reports
+# forecast), Nevada overtime alerts, schedule-vs-actual hours, and
+# the OT thresholds. Read-only except the thresholds; nothing here
+# creates a payrun.
+# Pack pricing: the site has no separate pack price in the backend,
+# so a 3-pack is 3 x the $8 bag and a 6-pack is 6 x the $8 bag;
+# the catalog says so plainly.
+
+_STORE_OT_DEFAULTS = {"weekly_threshold_hours": 40.0,
+                      "daily_threshold_hours": 8.0}
+_STORE_OT_KEYS = ("ot_weekly_threshold_hours",
+                  "ot_daily_threshold_hours")
+
+
+def _stores_ot_settings(conn):
+    """OT thresholds from erp_store_settings, defaults 40h/week and
+    8h/day. A stored value outside 1..168 (weekly) or 1..24 (daily)
+    falls back to its default -- never a crash, never a guess."""
+    out = dict(_STORE_OT_DEFAULTS)
+    rows = conn.execute(
+        "SELECT key, value FROM erp_store_settings"
+        " WHERE key IN (?, ?)", _STORE_OT_KEYS).fetchall()
+    for r in rows:
+        try:
+            v = float(r["value"])
+        except (TypeError, ValueError):
+            continue
+        if r["key"] == "ot_weekly_threshold_hours" and 1 <= v <= 168:
+            out["weekly_threshold_hours"] = v
+        elif r["key"] == "ot_daily_threshold_hours" and 1 <= v <= 24:
+            out["daily_threshold_hours"] = v
+    return out
+
+
+def _stores_week_bounds(week):
+    """YYYY-MM-DD (any day) -> (Monday, Sunday) of its week, or None
+    on a bad date. No week given -> the current week (UTC)."""
+    if week:
+        if not _legal_valid_date(week):
+            return None
+        any_day = datetime.strptime(week, "%Y-%m-%d").date()
+    else:
+        any_day = datetime.now(timezone.utc).date()
+    monday = any_day - timedelta(days=any_day.weekday())
+    return monday, monday + timedelta(days=6)
+
+
+def _stores_nevada_ot(day_hours, weekly_threshold, daily_threshold):
+    """Nevada overtime, no pyramiding: daily OT is any hours past the
+    daily threshold on a single day; those hours are excluded before
+    the weekly test, so weekly OT is only the remainder past the
+    weekly threshold. day_hours is 7 floats (Mon..Sun)."""
+    day_hours = [round(float(h or 0), 2) for h in day_hours]
+    daily_ot = round(sum(max(0.0, h - daily_threshold)
+                         for h in day_hours), 2)
+    total = round(sum(day_hours), 2)
+    weekly_ot = round(max(0.0, total - daily_ot - weekly_threshold), 2)
+    regular = round(total - daily_ot - weekly_ot, 2)
+    return {"total_hours": total, "regular_hours": regular,
+            "daily_ot_hours": daily_ot, "weekly_ot_hours": weekly_ot,
+            "ot_hours": round(daily_ot + weekly_ot, 2)}
+
+
+def _stores_forecast_weekly(conn):
+    """Expected weekly sales from the shared Reports forecast
+    (_erp_forecast_flavors): weekly velocity summed across flavors x
+    the $8 bag price. Company-wide, not split by store -- the
+    forecast has no store dimension. Where no flavor has recent
+    sales, available is False and the UI shows 'no forecast yet'."""
+    data = _erp_forecast_flavors(conn)
+    weekly_bags = round(sum(float(f.get("velocity_4w") or 0)
+                            for f in data.get("flavors", [])), 1)
+    has_recent = any(f.get("has_recent_sales")
+                     for f in data.get("flavors", []))
+    if not has_recent or weekly_bags <= 0:
+        return {"available": False,
+                "note": "no forecast yet",
+                "generated_on": data.get("generated_on")}
+    return {"available": True,
+            "expected_weekly_bags": weekly_bags,
+            "expected_weekly_revenue_cents":
+                int(round(weekly_bags * BAG_PRICE_CENTS)),
+            "generated_on": data.get("generated_on"),
+            "note": "Company-wide forecast (online + wholesale velocity);"
+                    " not split by store."}
+
+
+def _stores_workforce_for_store(conn, store_id, monday, sunday):
+    """One store, one week: per-employee scheduled hours (shift
+    templates expanded onto the week's dates), clocked hours
+    (timeclock rows, grouped by clock-in date), and the Nevada OT
+    split on clocked hours. Open clock-ins count 0 hours and are
+    flagged -- hours are only counted once clocked out."""
+    shifts = conn.execute(
+        "SELECT s.*, e.name AS employee_name"
+        " FROM erp_store_shifts s"
+        " LEFT JOIN erp_hr_employees e ON e.id = s.employee_id"
+        " WHERE s.store_id = ?", (store_id,)).fetchall()
+    tc = conn.execute(
+        "SELECT t.*, e.name AS employee_name"
+        " FROM erp_store_timeclock t"
+        " LEFT JOIN erp_hr_employees e ON e.id = t.employee_id"
+        " LEFT JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " WHERE s.store_id = ?"
+        " AND substr(t.clock_in, 1, 10) >= ?"
+        " AND substr(t.clock_in, 1, 10) <= ?",
+        (store_id, monday.isoformat(), sunday.isoformat())).fetchall()
+    days = [monday + timedelta(days=i) for i in range(7)]
+    by_emp = {}
+
+    def _emp(employee_id, name):
+        row = by_emp.get(employee_id)
+        if row is None:
+            row = {"employee_id": employee_id,
+                   "employee_name": name or ("Employee #%d" % employee_id),
+                   "scheduled_by_day": [0.0] * 7,
+                   "clocked_by_day": [0.0] * 7,
+                   "has_open_clock_in": False}
+            by_emp[employee_id] = row
+        return row
+
+    for sh in shifts:
+        start = _stores_time_minutes(sh["start_time"])
+        end = _stores_time_minutes(sh["end_time"])
+        if start is None or end is None or end <= start:
+            continue
+        row = _emp(int(sh["employee_id"]), sh["employee_name"])
+        row["scheduled_by_day"][int(sh["weekday"])] = round(
+            row["scheduled_by_day"][int(sh["weekday"])]
+            + (end - start) / 60.0, 2)
+    for r in tc:
+        row = _emp(int(r["employee_id"]), r["employee_name"])
+        try:
+            d = datetime.strptime(
+                (r["clock_in"] or "")[:10], "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        idx = (d - monday).days
+        if idx < 0 or idx > 6:
+            continue
+        if (r["clock_out"] or "") == "" or r["hours"] is None:
+            row["has_open_clock_in"] = True
+            continue
+        row["clocked_by_day"][idx] = round(
+            row["clocked_by_day"][idx] + float(r["hours"] or 0), 2)
+    settings = _stores_ot_settings(conn)
+    weekly = settings["weekly_threshold_hours"]
+    daily = settings["daily_threshold_hours"]
+    employees = []
+    for row in sorted(by_emp.values(),
+                      key=lambda e: (e["employee_name"] or "").lower()):
+        ot = _stores_nevada_ot(row["clocked_by_day"], weekly, daily)
+        sched_total = round(sum(row["scheduled_by_day"]), 2)
+        employees.append({
+            "employee_id": row["employee_id"],
+            "employee_name": row["employee_name"],
+            "scheduled_by_day": row["scheduled_by_day"],
+            "scheduled_hours": sched_total,
+            "clocked_by_day": row["clocked_by_day"],
+            "clocked_hours": ot["total_hours"],
+            "regular_hours": ot["regular_hours"],
+            "daily_ot_hours": ot["daily_ot_hours"],
+            "weekly_ot_hours": ot["weekly_ot_hours"],
+            "ot_hours": ot["ot_hours"],
+            "scheduled_exceeds_threshold": sched_total > weekly,
+            "clocked_exceeds_threshold": ot["total_hours"] > weekly,
+            "has_open_clock_in": row["has_open_clock_in"]})
+    return {"employees": employees,
+            "totals": {
+                "scheduled_hours": round(
+                    sum(e["scheduled_hours"] for e in employees), 2),
+                "clocked_hours": round(
+                    sum(e["clocked_hours"] for e in employees), 2)},
+            "settings": settings}
+
+
+def erp_money_html(cents):
+    """Cents -> $x.xx text for the emailed receipt."""
+    return "$%.2f" % ((int(cents) or 0) / 100.0)
+
+
+def _stores_drawer_dict(row):
+    return dict(row)
+
+
+@app.get("/api/erp/stores/<int:store_id>/register-catalog")
+def stores_register_catalog(store_id):
+    """Register catalog: the 25 live flavors with their category,
+    the $8 bag price from BAG_PRICE_CENTS, and pack prices. There
+    is no separate pack price in the backend, so packs are priced
+    as 3 x $8 / 6 x $8 -- the response says so."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    cats = {r["flavor_name"]: r["category"] for r in conn.execute(
+        "SELECT flavor_name, category FROM erp_flavor_categories"
+        ).fetchall()}
+    conn.close()
+    return jsonify(store_id=store_id, store_name=store["name"],
+                   bag_price_cents=BAG_PRICE_CENTS,
+                   pack_3_cents=3 * BAG_PRICE_CENTS,
+                   pack_6_cents=6 * BAG_PRICE_CENTS,
+                   pack_pricing_note="3-packs and 6-packs are priced as"
+                   " 3 x $8 and 6 x $8 -- no separate pack price exists"
+                   " in the backend.",
+                   flavors=[{"name": f, "category": cats.get(f, "")}
+                            for f in FLAVORS])
+
+
+@app.get("/api/erp/stores/<int:store_id>/members")
+def stores_member_lookup(store_id):
+    """Member attach for the register: the shared member lookup
+    (_loyalty_member_search -- PAL: QR / phone / email / name, max
+    20) behind ERP admin auth. The staff endpoint needs a staff
+    Bearer token the ERP session does not carry, so the register
+    uses this wrapper over the same helper, never a second lookup."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    q = (request.args.get("q") or "").strip()
+    conn = db()
+    store = conn.execute(
+        "SELECT id FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    members = _loyalty_member_search(conn, q) if q else []
+    conn.close()
+    return jsonify(members=members)
+
+
+@app.post("/api/erp/stores/<int:store_id>/gift-card-redeem")
+def stores_gift_card_redeem(store_id):
+    """Staff-gated gift-card debit for the register (the public
+    /api/gift-cards/redeem has no auth). Same gift_cards balance
+    and same redemptions table -- never a second balance -- and
+    idempotent on (code, sale_key): a retry of the same sale
+    returns the first debit instead of debiting twice. The staff
+    member is not recorded: redemptions has no staff column
+    (follow-up)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    code = (data.get("code") or "").strip().upper()
+    amount = _stores_int(data.get("amount_cents"))
+    sale_key = (data.get("sale_key") or "").strip()
+    if not code or amount is None or amount <= 0 or not sale_key:
+        return jsonify(
+            error="code, a positive amount_cents, and sale_key are"
+            " required"), 400
+    conn = db()
+    store = conn.execute(
+        "SELECT id FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    prior = conn.execute(
+        "SELECT * FROM redemptions WHERE code = ? AND order_ref = ?",
+        (code, sale_key)).fetchone()
+    if prior:
+        row = conn.execute(
+            "SELECT balance_cents FROM gift_cards WHERE code = ?",
+            (code,)).fetchone()
+        conn.close()
+        return jsonify(code=code,
+                       redeemed_cents=int(prior["amount_cents"]),
+                       new_balance_cents=int(row["balance_cents"])
+                       if row else 0,
+                       duplicate=True)
+    row = conn.execute(
+        "SELECT code, balance_cents, active FROM gift_cards"
+        " WHERE code = ?", (code,)).fetchone()
+    if not row or not row["active"]:
+        conn.close()
+        return jsonify(error="gift card not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "UPDATE gift_cards SET balance_cents = balance_cents - ?"
+        " WHERE code = ? AND balance_cents >= ?",
+        (amount, code, amount))
+    if not cur.rowcount:
+        conn.close()
+        return jsonify(error="insufficient balance"), 402
+    conn.execute(
+        "INSERT INTO redemptions (code, amount_cents, order_ref,"
+        " created_at) VALUES (?, ?, ?, ?)",
+        (code, amount, sale_key, now))
+    conn.commit()
+    new_balance = int(row["balance_cents"]) - amount
+    conn.close()
+    return jsonify(code=code, redeemed_cents=amount,
+                   new_balance_cents=new_balance)
+
+
+@app.get("/api/erp/stores/<int:store_id>/drawer")
+def stores_drawer_state(store_id):
+    """Drawer state for a store: the open drawer for ?register=
+    (or any open drawer when no register is given), else the most
+    recent closed one, else none."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    register = (request.args.get("register") or "").strip()
+    conn = db()
+    store = conn.execute(
+        "SELECT id FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    if register:
+        row = conn.execute(
+            "SELECT * FROM erp_store_drawers WHERE store_id = ?"
+            " AND register = ? AND status = 'open'"
+            " ORDER BY id DESC LIMIT 1",
+            (store_id, register)).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT * FROM erp_store_drawers WHERE store_id = ?"
+                " AND register = ? ORDER BY id DESC LIMIT 1",
+                (store_id, register)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM erp_store_drawers WHERE store_id = ?"
+            " AND status = 'open' ORDER BY id DESC LIMIT 1",
+            (store_id,)).fetchone()
+        if not row:
+            row = conn.execute(
+                "SELECT * FROM erp_store_drawers WHERE store_id = ?"
+                " ORDER BY id DESC LIMIT 1", (store_id,)).fetchone()
+    conn.close()
+    return jsonify(drawer=_stores_drawer_dict(row) if row else None)
+
+
+@app.post("/api/erp/stores/<int:store_id>/drawer/open")
+def stores_drawer_open(store_id):
+    """Open a cash drawer: register + starting float in cents.
+    Blocked while that register already has an open drawer."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    register = (data.get("register") or "").strip()
+    if not register:
+        return jsonify(error="register is required"), 400
+    float_cents = _stores_int(data.get("float_cents"))
+    if float_cents is None or float_cents < 0:
+        return jsonify(
+            error="float_cents must be a whole number of cents, 0 or"
+            " more"), 400
+    conn = db()
+    store = conn.execute(
+        "SELECT id FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    open_row = conn.execute(
+        "SELECT id FROM erp_store_drawers WHERE store_id = ?"
+        " AND register = ? AND status = 'open'",
+        (store_id, register)).fetchone()
+    if open_row:
+        conn.close()
+        return jsonify(
+            error="this register already has an open drawer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_drawers (store_id, register, float_cents,"
+        " status, opened_by, opened_at, created_by, created_at)"
+        " VALUES (?, ?, ?, 'open', ?, ?, ?, ?)",
+        (store_id, register, float_cents, actor, now, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_store_drawers WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(drawer=_stores_drawer_dict(row)), 201
+
+
+@app.post("/api/erp/stores/<int:store_id>/drawer/close")
+def stores_drawer_close(store_id):
+    """Close a cash drawer. Closeout itself is the Z-report -- this
+    only records that the register stopped trading."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    register = (data.get("register") or "").strip()
+    if not register:
+        return jsonify(error="register is required"), 400
+    conn = db()
+    store = conn.execute(
+        "SELECT id FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    row = conn.execute(
+        "SELECT * FROM erp_store_drawers WHERE store_id = ?"
+        " AND register = ? AND status = 'open'",
+        (store_id, register)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(
+            error="no open drawer for this register"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_drawers SET status = 'closed', closed_by = ?,"
+        " closed_at = ? WHERE id = ?",
+        (actor, now, int(row["id"])))
+    out = conn.execute(
+        "SELECT * FROM erp_store_drawers WHERE id = ?",
+        (int(row["id"]),)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(drawer=_stores_drawer_dict(out))
+
+
+@app.get("/api/erp/stores/<int:store_id>/workforce")
+def stores_workforce(store_id):
+    """Workforce extras, read-only, per store per week
+    (?week=YYYY-MM-DD, any day in the week, default current week):
+    labor forecast (scheduled hours vs expected sales from the
+    shared forecast), overtime alerts, and schedule-vs-actual hours
+    per employee. Nevada rule: 8h/day + 40h/week, no pyramiding.
+    Nothing here creates a payrun."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    bounds = _stores_week_bounds(
+        (request.args.get("week") or "").strip())
+    if bounds is None:
+        return jsonify(error="week must be YYYY-MM-DD"), 400
+    monday, sunday = bounds
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    wf = _stores_workforce_for_store(conn, store_id, monday, sunday)
+    forecast = _stores_forecast_weekly(conn)
+    conn.close()
+    alerts = []
+    for e in wf["employees"]:
+        reasons = []
+        if e["scheduled_exceeds_threshold"]:
+            reasons.append("scheduled %.1f h exceeds the %.0f h weekly"
+                           " threshold" % (
+                               e["scheduled_hours"],
+                               wf["settings"]["weekly_threshold_hours"]))
+        if e["clocked_exceeds_threshold"]:
+            reasons.append("clocked %.1f h exceeds the %.0f h weekly"
+                           " threshold" % (
+                               e["clocked_hours"],
+                               wf["settings"]["weekly_threshold_hours"]))
+        if e["daily_ot_hours"] > 0:
+            reasons.append("%.1f h daily overtime (past %.0f h in a"
+                           " day)" % (
+                               e["daily_ot_hours"],
+                               wf["settings"]["daily_threshold_hours"]))
+        if reasons:
+            alerts.append({"employee_id": e["employee_id"],
+                           "employee_name": e["employee_name"],
+                           "reasons": reasons})
+    return jsonify(store_id=store_id, store_name=store["name"],
+                   week_start=monday.isoformat(),
+                   week_end=sunday.isoformat(),
+                   settings=wf["settings"],
+                   forecast=forecast,
+                   employees=wf["employees"],
+                   totals=wf["totals"],
+                   overtime_alerts=alerts,
+                   notes=[
+                       "Nevada overtime: past %.0f h in a day, and past"
+                       " %.0f h in a week after daily overtime is"
+                       " excluded -- no pyramiding." % (
+                           wf["settings"]["daily_threshold_hours"],
+                           wf["settings"]["weekly_threshold_hours"]),
+                       "Labor forecast compares scheduled hours with"
+                       " expected sales from the company-wide forecast;"
+                       " it is not split by store.",
+                       "This view never creates a payrun."])
+
+
+@app.get("/api/erp/stores/<int:store_id>/workforce-settings")
+def stores_workforce_settings_get(store_id):
+    """Current overtime thresholds (defaults 40h/week, 8h/day)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    store = conn.execute(
+        "SELECT id FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    settings = _stores_ot_settings(conn)
+    conn.close()
+    return jsonify(settings=settings)
+
+
+@app.post("/api/erp/stores/<int:store_id>/workforce-settings")
+def stores_workforce_settings_set(store_id):
+    """Admin-editable overtime thresholds. Weekly 1..168 hours,
+    daily 1..24 hours; at least one must be supplied."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT id FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    updates = {}
+    if "weekly_threshold_hours" in data \
+            and data.get("weekly_threshold_hours") is not None:
+        try:
+            v = float(data.get("weekly_threshold_hours"))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(
+                error="weekly_threshold_hours must be a number"), 400
+        if v < 1 or v > 168:
+            conn.close()
+            return jsonify(
+                error="weekly_threshold_hours must be between 1 and 168"
+                ), 400
+        updates["ot_weekly_threshold_hours"] = str(v)
+    if "daily_threshold_hours" in data \
+            and data.get("daily_threshold_hours") is not None:
+        try:
+            v = float(data.get("daily_threshold_hours"))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(
+                error="daily_threshold_hours must be a number"), 400
+        if v < 1 or v > 24:
+            conn.close()
+            return jsonify(
+                error="daily_threshold_hours must be between 1 and 24"
+                ), 400
+        updates["ot_daily_threshold_hours"] = str(v)
+    if not updates:
+        conn.close()
+        return jsonify(
+            error="weekly_threshold_hours or daily_threshold_hours"
+            " is required"), 400
+    for k, v in updates.items():
+        conn.execute(
+            "INSERT INTO erp_store_settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (k, v))
+    conn.commit()
+    settings = _stores_ot_settings(conn)
+    conn.close()
+    return jsonify(settings=settings)
+
+
+@app.get("/api/erp/hr/overtime-alerts")
+def hr_overtime_alerts():
+    """Cross-store overtime alerts for the HR tab: every open store,
+    current week by default (?week=YYYY-MM-DD). Same Nevada rule and
+    thresholds as the per-store workforce view. Read-only."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    bounds = _stores_week_bounds(
+        (request.args.get("week") or "").strip())
+    if bounds is None:
+        return jsonify(error="week must be YYYY-MM-DD"), 400
+    monday, sunday = bounds
+    conn = db()
+    settings = _stores_ot_settings(conn)
+    alerts = []
+    for store in conn.execute(
+            "SELECT id, name FROM erp_stores WHERE status = 'open'"
+            " ORDER BY name").fetchall():
+        wf = _stores_workforce_for_store(
+            conn, int(store["id"]), monday, sunday)
+        for e in wf["employees"]:
+            reasons = []
+            if e["scheduled_exceeds_threshold"]:
+                reasons.append("scheduled %.1f h exceeds the %.0f h"
+                               " weekly threshold" % (
+                                   e["scheduled_hours"],
+                                   settings["weekly_threshold_hours"]))
+            if e["clocked_exceeds_threshold"]:
+                reasons.append("clocked %.1f h exceeds the %.0f h"
+                               " weekly threshold" % (
+                                   e["clocked_hours"],
+                                   settings["weekly_threshold_hours"]))
+            if e["daily_ot_hours"] > 0:
+                reasons.append("%.1f h daily overtime (past %.0f h in"
+                               " a day)" % (
+                                   e["daily_ot_hours"],
+                                   settings["daily_threshold_hours"]))
+            if reasons:
+                alerts.append({"store_id": int(store["id"]),
+                               "store_name": store["name"],
+                               "employee_id": e["employee_id"],
+                               "employee_name": e["employee_name"],
+                               "reasons": reasons})
+    conn.close()
+    return jsonify(week_start=monday.isoformat(),
+                   week_end=sunday.isoformat(),
+                   settings=settings, alerts=alerts)
+
+
+@app.post("/api/erp/stores/<int:store_id>/receipt-email")
+def stores_receipt_email(store_id):
+    """Email a receipt for a completed POS sale (email-only receipts,
+    per the POS handover). Looks the sale up by sale_key; sends via
+    the existing send_email helper. No print path exists."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    sale_key = (data.get("sale_key") or "").strip()
+    email = (data.get("email") or "").strip()
+    if not sale_key:
+        return jsonify(error="sale_key is required"), 400
+    if not email or "@" not in email:
+        return jsonify(error="a valid email is required"), 400
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    sale = conn.execute(
+        "SELECT * FROM erp_store_sales WHERE store_id = ?"
+        " AND sale_key = ?", (store_id, sale_key)).fetchone()
+    if not sale:
+        conn.close()
+        return jsonify(error="sale not found"), 404
+    sale_d = _stores_sale_dict(sale)
+    conn.close()
+    lines = "".join(
+        "<li>%s &times; %s &mdash; %s</li>" % (
+            (i.get("flavor") or ""), i.get("qty"),
+            erp_money_html(int(i.get("amount_cents") or 0)))
+        for i in sale_d.get("items", []))
+    tenders = sale_d.get("tenders") or {}
+    tender_lines = "".join(
+        "<li>%s: %s</li>" % (k, erp_money_html(int(v)))
+        for k, v in sorted(tenders.items())) or "<li>Not recorded</li>"
+    html = ("<h1>Pop-A-Licious receipt</h1>"
+            "<p>%s</p>"
+            "<p>Sale %s &middot; %s &middot; register %s</p>"
+            "<ul>%s</ul>"
+            "<p>Total: %s</p>"
+            "<p>Tender:</p><ul>%s</ul>"
+            "<p>Thank you!</p>" % (
+                store["name"], sale_key,
+                (sale_d.get("sold_at") or "")[:10],
+                sale_d.get("register") or "—",
+                lines, erp_money_html(int(sale_d.get("total_cents") or 0)),
+                tender_lines))
+    try:
+        send_email(email, "Your Pop-A-Licious receipt (%s)" % sale_key,
+                   html)
+    except Exception as exc:
+        return jsonify(error="receipt email failed: %s" % exc), 502
+    return jsonify(ok=True, sale_key=sale_key, email=email)
+
 
 @app.get("/api/admin/staff/<int:staff_id>")
 def admin_staff_detail(staff_id):
@@ -8908,14 +19269,19 @@ def _notify_renewal_failure(conn, sub, renewal, reason):
 <a href="{SITE_URL}/#my-subscriptions">Manage your subscription</a></p>
 <p>We'll try again tomorrow. After 3 failed attempts your subscription will be paused.</p>
 <p>— Pop-A-Licious</p>"""
+    # Customer copy: always sent (customer-facing, never gated by alert
+    # prefs). The merchant copy goes through the failure-alert prefs.
+    # (This used _send_email -- an undefined name -- so neither copy ever
+    # sent; the NameError was swallowed by the try/except.)
     try:
         if cust_email:
-            _send_email(cust_email, subject, html)
-        _send_email(ORDER_NOTIFY_EMAIL,
-                    f"Subscription renewal FAILED (sub #{sub['id']})",
-                    f"<p>Renewal {renewal['id']} for subscription {sub['id']} ({cust_email}) failed: {reason}. Attempt {attempts}.</p>")
+            send_email(cust_email, subject, html)
     except Exception:
         pass
+    _erp_send_alert(conn, "failure",
+                    [ORDER_NOTIFY_EMAIL] if ORDER_NOTIFY_EMAIL else [],
+                    f"Subscription renewal FAILED (sub #{sub['id']})",
+                    f"<p>Renewal {renewal['id']} for subscription {sub['id']} ({cust_email}) failed: {reason}. Attempt {attempts}.</p>")
 
 def _record_subscription_renewal_payment(conn, sub, renewal, items, amount, order_ref):
     """Record an already-paid subscription renewal: Shippo label, orders
@@ -9243,7 +19609,10 @@ def _validate_subscription_checkout(data, user, full, require_payment_method=Tru
             return None, err
         discount_cents = 0
         if one_time["discount_kind"] == "promo":
-            discount_cents = one_time["merchandise_total"] * one_time["promo_percent_off"] // 100
+            if one_time.get("promo_bundle_cents"):
+                discount_cents = one_time["promo_bundle_cents"]
+            else:
+                discount_cents = one_time["merchandise_total"] * one_time["promo_percent_off"] // 100
         elif one_time["discount_kind"] == "gift_card":
             discount_cents = one_time["gift_card_discount_cents"]
         elif one_time["discount_kind"] == "reward":
@@ -9515,7 +19884,15 @@ def _sub_checkout_session_line_items(plan):
     if one_time:
         raw = [(it["name"], it["amount_cents"] * it["quantity"])
                for it in one_time["items"]]
-        if one_time["discount_kind"] == "promo":
+        if one_time["discount_kind"] == "promo" and one_time.get("promo_bundle_cents"):
+            # Bundle: fixed-amount discount, distributed like a gift card.
+            remaining = one_time["promo_bundle_cents"]
+            raws = []
+            for _, r in raw:
+                take = min(r, remaining)
+                raws.append(r - take)
+                remaining -= take
+        elif one_time["discount_kind"] == "promo":
             percent = one_time["promo_percent_off"]
             raws = [r - r * percent // 100 for _, r in raw]
             # Floor per item can leave a small shortfall vs the
@@ -10310,6 +20687,7 @@ def demo_checkout():
     total -= order["reward_discount_cents"]
     if order["promo_percent_off"]:
         total = int(round(total * (100 - order["promo_percent_off"]) / 100))
+    total -= order.get("promo_bundle_cents", 0)
     total = max(total, 0)
 
     name = (data.get("name") or "").strip()[:120]
@@ -10628,6 +21006,29 @@ def admin_demo_cleanup():
     if not _is_admin(user):
         return jsonify(error="admin required"), 403
     conn = db()
+    # Permanence rule (Phase 4, section 1.7): refuse when any demo order
+    # has a posted accounting entry. The only linkage that can exist is a
+    # manual journal entry whose source_id names the demo order id (no
+    # accounting flow creates one today; this is defense in depth -- see
+    # build notes). Scoped to source='manual': invoice/bill/payment
+    # entries reuse their own document ids as source_id, so an unscoped
+    # match would false-positive on any document whose id equals a demo
+    # order id.
+    _demo_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM orders WHERE is_demo = 1").fetchall()]
+    _demo_ids += [r["id"] for r in conn.execute(
+        "SELECT id FROM fundraiser_orders WHERE is_demo = 1").fetchall()]
+    if _demo_ids:
+        _ph = ",".join("?" for _ in _demo_ids)
+        _linked = conn.execute(
+            "SELECT source_id FROM erp_acct_journal WHERE source = 'manual'"
+            " AND source_id IN (%s)"
+            % _ph, [str(i) for i in _demo_ids]).fetchone()
+        if _linked:
+            conn.close()
+            return jsonify(
+                error="demo order #%s has a posted accounting entry and"
+                " cannot be deleted" % _linked["source_id"]), 400
     counts = {}
     counts["orders"] = conn.execute(
         "DELETE FROM orders WHERE is_demo = 1").rowcount
@@ -10742,7 +21143,7 @@ def _erp_check_perm(perm):
     """
     role = _erp_role()
     # Phase 2 CSRF guard: a cookie-authenticated write must carry either the
-    # Authorization header (Bearer <redacted>) or the X-ERP-Request marker header.
+    # Authorization header (Bearer token) or the X-ERP-Request marker header.
     # A bare cross-site cookie-only POST (plain form or no-cors fetch) has
     # neither and is rejected. Anonymous requests still get 401 below.
     if role is not None and request.method not in ("GET", "HEAD", "OPTIONS"):
@@ -10976,6 +21377,7 @@ def erp_delete_location(location_id):
     conn.execute("DELETE FROM erp_item_locations WHERE location_id = ?",
                  (location_id,))
     conn.execute("DELETE FROM erp_locations WHERE id = ?", (location_id,))
+    _erp_tombstone(conn, "location", loc["code"], actor)
     conn.commit()
     conn.close()
     return jsonify(ok=True)
@@ -11701,6 +22103,7 @@ def erp_delete_item(item_id):
         conn.close()
         return jsonify(error="item not found"), 404
     conn.execute("UPDATE erp_items SET active = 0 WHERE id = ?", (item_id,))
+    _erp_tombstone(conn, "item", item["sku"], actor)
     conn.commit()
     conn.close()
     return jsonify(ok=True)
@@ -12020,15 +22423,11 @@ def erp_complete_inventory_count(count_id):
         html = _erp_inventory_email_html(c["count_date"],
                                          loc["name"] if loc else "?",
                                          zero_lines, base_url)
-        for email in _WHOLESALE_ADMIN_EMAILS:
-            try:
-                send_email(email,
-                           "Reorder needed: %d item(s) at zero (%s)" % (
-                               len(zero_lines), c["count_date"]),
-                           html)
-                emailed += 1
-            except Exception:
-                pass
+        emailed = _erp_send_alert(
+            None, "low_stock", list(_WHOLESALE_ADMIN_EMAILS),
+            "Reorder needed: %d item(s) at zero (%s)" % (
+                len(zero_lines), c["count_date"]),
+            html)
     return jsonify(ok=True, adjusted_lines=adjusted,
                    zero_count=len(zero_lines), emailed=emailed)
 
@@ -12043,14 +22442,9 @@ def _erp_send_inventory_reminder():
         " for reorder.</p>"
         "<p><a href='%s/#/inventory'>Log in and open inventory</a></p>"
         % base_url)
-    sent = 0
-    for email in _WHOLESALE_ADMIN_EMAILS:
-        try:
-            send_email(email, "Time to do inventory — Pop-A-Licious ERP", html)
-            sent += 1
-        except Exception:
-            pass
-    return sent
+    return _erp_send_alert(None, "low_stock",
+                           list(_WHOLESALE_ADMIN_EMAILS),
+                           "Time to do inventory — Pop-A-Licious ERP", html)
 
 
 @app.post("/api/erp/inventory-reminder")
@@ -12217,6 +22611,6821 @@ def erp_deactivate_vendor(vendor_id):
     return jsonify(ok=True, vendor_id=vendor_id)
 
 
+# ---- Accounting ledger (Phase 1) ----
+# All money in integer cents. Double-entry: the backend rejects any entry
+# whose debits do not equal its credits, and any line without exactly one
+# non-zero side. Posted entries are never edited or deleted; a mistake is
+# fixed by posting a reversing entry.
+ERP_ACCT_TYPES = ("asset", "liability", "equity", "income", "expense")
+ERP_ACCT_SOURCES = ("manual", "invoice", "bill", "payment", "bank",
+                    "payroll", "tax", "migration", "credit_note", "draw")
+
+
+def _acct_audit(conn, actor, action, target_type, target_id, detail=""):
+    conn.execute(
+        "INSERT INTO erp_acct_audit (actor, action, target_type, target_id,"
+        " detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (actor or "", action, target_type, target_id, detail or "",
+         datetime.now(timezone.utc).isoformat()))
+
+
+def _acct_entry_dict(conn, entry):
+    lines = conn.execute(
+        "SELECT l.*, a.code AS account_code, a.name AS account_name"
+        " FROM erp_acct_journal_lines l"
+        " JOIN erp_acct_accounts a ON a.id = l.account_id"
+        " WHERE l.entry_id = ? ORDER BY l.id", (entry["id"],)).fetchall()
+    d = dict(entry)
+    d["lines"] = [dict(l) for l in lines]
+    d["total_debits"] = sum(l["debit_cents"] for l in lines)
+    d["total_credits"] = sum(l["credit_cents"] for l in lines)
+    return d
+
+
+def _acct_int_cents(value):
+    """Whole integer cents only; floats and non-numeric text are rejected."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if s.lstrip("-").isdigit():
+            return int(s)
+    return None
+
+
+def _acct_validate_lines(conn, raw_lines):
+    """Returns (clean, None) or (None, error). clean is a list of dicts with
+    account_id, debit_cents, credit_cents, memo. Rejects fewer than two
+    lines, unknown/inactive accounts, negative or non-integer amounts, a
+    line with both or neither side non-zero, and unbalanced totals."""
+    if not isinstance(raw_lines, list) or len(raw_lines) < 2:
+        return None, "at least two lines are required"
+    clean = []
+    for entry in raw_lines:
+        if not isinstance(entry, dict):
+            return None, "every line needs an account_id"
+        try:
+            account_id = int(entry.get("account_id") or 0)
+        except (TypeError, ValueError):
+            return None, "every line needs a valid account_id"
+        debit = _acct_int_cents(entry.get("debit_cents", 0))
+        credit = _acct_int_cents(entry.get("credit_cents", 0))
+        if debit is None or credit is None:
+            return None, "debit_cents and credit_cents must be whole cents"
+        if debit < 0 or credit < 0:
+            return None, "amounts cannot be negative"
+        if (debit == 0) == (credit == 0):
+            return None, "each line needs exactly one of debit or credit"
+        acct = conn.execute(
+            "SELECT * FROM erp_acct_accounts WHERE id = ?", (account_id,)).fetchone()
+        if not acct:
+            return None, "unknown account_id %s" % account_id
+        if not acct["active"]:
+            return None, "account %s is inactive" % (acct["code"],)
+        clean.append({"account_id": account_id, "debit_cents": debit,
+                      "credit_cents": credit,
+                      "memo": (entry.get("memo") or "").strip()})
+    if sum(l["debit_cents"] for l in clean) != sum(l["credit_cents"] for l in clean):
+        return None, "debits must equal credits"
+    return clean, None
+
+
+@app.get("/api/erp/accounting/accounts")
+def erp_acct_list_accounts():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    if request.args.get("include_inactive") == "1":
+        rows = conn.execute("SELECT * FROM erp_acct_accounts ORDER BY code").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_accounts WHERE active = 1 ORDER BY code").fetchall()
+    conn.close()
+    return jsonify(accounts=[dict(r) for r in rows])
+
+
+@app.post("/api/erp/accounting/accounts")
+def erp_acct_create_account():
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    code = (data.get("code") or "").strip()
+    name = (data.get("name") or "").strip()
+    atype = (data.get("type") or "").strip()
+    if not code:
+        return jsonify(error="code is required"), 400
+    if not name:
+        return jsonify(error="name is required"), 400
+    if atype not in ERP_ACCT_TYPES:
+        return jsonify(error="type must be one of asset, liability, equity, income, expense"), 400
+    parent_id = None
+    if data.get("parent_id") not in (None, "", 0):
+        try:
+            parent_id = int(data.get("parent_id"))
+        except (TypeError, ValueError):
+            return jsonify(error="parent_id must be a number"), 400
+    conn = db()
+    if parent_id:
+        parent = conn.execute(
+            "SELECT * FROM erp_acct_accounts WHERE id = ?", (parent_id,)).fetchone()
+        if not parent:
+            conn.close()
+            return jsonify(error="parent account not found"), 400
+    if conn.execute("SELECT 1 FROM erp_acct_accounts WHERE code = ?",
+                    (code,)).fetchone():
+        conn.close()
+        return jsonify(error="code already exists"), 400
+    cur = conn.execute(
+        "INSERT INTO erp_acct_accounts (code, name, type, parent_id, qb_id,"
+        " active, created_at) VALUES (?, ?, ?, ?, ?, 1, ?)",
+        (code, name, atype, parent_id, (data.get("qb_id") or "").strip() or None,
+         datetime.now(timezone.utc).isoformat()))
+    acct_id = cur.lastrowid
+    _acct_audit(conn, actor, "account.create", "account", acct_id,
+                "%s %s" % (code, name))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_accounts WHERE id = ?",
+                       (acct_id,)).fetchone()
+    conn.close()
+    return jsonify(account=dict(row)), 201
+
+
+@app.post("/api/erp/accounting/accounts/<int:account_id>/deactivate")
+def erp_acct_deactivate_account(account_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    acct = conn.execute(
+        "SELECT * FROM erp_acct_accounts WHERE id = ?", (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="account not found"), 404
+    used = conn.execute(
+        "SELECT 1 FROM erp_acct_journal_lines WHERE account_id = ?",
+        (account_id,)).fetchone()
+    if used:
+        conn.close()
+        return jsonify(error="account has journal entries and cannot be deactivated"), 400
+    conn.execute("UPDATE erp_acct_accounts SET active = 0 WHERE id = ?", (account_id,))
+    _acct_audit(conn, actor, "account.deactivate", "account", account_id,
+                "%s %s lines checked 0" % (acct["code"], acct["name"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, account_id=account_id)
+
+
+@app.get("/api/erp/accounting/journal")
+def erp_acct_list_journal():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    try:
+        limit = int(request.args.get("limit") or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_journal ORDER BY date DESC, id DESC LIMIT ?",
+        (max(min(limit, 500), 1),)).fetchall()
+    out = [_acct_entry_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(entries=out)
+
+
+@app.post("/api/erp/accounting/journal")
+def erp_acct_post_journal():
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    date = (data.get("date") or "").strip()
+    if not date:
+        return jsonify(error="date is required"), 400
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    source = (data.get("source") or "manual").strip()
+    if source not in ERP_ACCT_SOURCES:
+        return jsonify(error="source must be one of " + ", ".join(ERP_ACCT_SOURCES)), 400
+    conn = db()
+    error = _acct_lock_error(conn, date)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    lines, error = _acct_validate_lines(conn, data.get("lines"))
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_journal (date, memo, source, source_id,"
+        " posted_at, posted_by, reversed_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+        (date, (data.get("memo") or "").strip(), source,
+         str(data.get("source_id") or "").strip(), now, actor or "", now))
+    entry_id = cur.lastrowid
+    for line in lines:
+        conn.execute(
+            "INSERT INTO erp_acct_journal_lines (entry_id, account_id,"
+            " debit_cents, credit_cents, memo) VALUES (?, ?, ?, ?, ?)",
+            (entry_id, line["account_id"], line["debit_cents"],
+             line["credit_cents"], line["memo"]))
+    _acct_audit(conn, actor, "journal.post", "journal", entry_id,
+                "entry #%d %s debits %d credits %d" % (
+                    entry_id, date, sum(l["debit_cents"] for l in lines),
+                    sum(l["credit_cents"] for l in lines)))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_journal WHERE id = ?",
+                       (entry_id,)).fetchone()
+    out = _acct_entry_dict(conn, row)
+    conn.close()
+    return jsonify(entry=out), 201
+
+
+@app.post("/api/erp/accounting/journal/<int:entry_id>/reverse")
+def erp_acct_reverse_journal(entry_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    entry = conn.execute(
+        "SELECT * FROM erp_acct_journal WHERE id = ?", (entry_id,)).fetchone()
+    if not entry:
+        conn.close()
+        return jsonify(error="journal entry not found"), 404
+    if entry["reversed_by"]:
+        conn.close()
+        return jsonify(error="entry already reversed"), 400
+    today = datetime.now(timezone.utc).date().isoformat()
+    error = _acct_lock_error(conn, today)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    lines = conn.execute(
+        "SELECT * FROM erp_acct_journal_lines WHERE entry_id = ? ORDER BY id",
+        (entry_id,)).fetchall()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_journal (date, memo, source, source_id,"
+        " posted_at, posted_by, reversed_by, created_at)"
+        " VALUES (?, ?, 'manual', ?, ?, ?, NULL, ?)",
+        (today, "Reversal of entry #%d" % entry_id, str(entry_id), now,
+         actor or "", now))
+    new_id = cur.lastrowid
+    for line in lines:
+        conn.execute(
+            "INSERT INTO erp_acct_journal_lines (entry_id, account_id,"
+            " debit_cents, credit_cents, memo) VALUES (?, ?, ?, ?, ?)",
+            (new_id, line["account_id"], line["credit_cents"],
+             line["debit_cents"], line["memo"]))
+    conn.execute("UPDATE erp_acct_journal SET reversed_by = ? WHERE id = ?",
+                 (new_id, entry_id))
+    _acct_audit(conn, actor, "journal.reverse", "journal", entry_id,
+                "reversed by entry #%d" % new_id)
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_journal WHERE id = ?",
+                       (new_id,)).fetchone()
+    out = _acct_entry_dict(conn, row)
+    conn.close()
+    return jsonify(entry=out), 201
+
+
+def _acct_balances(conn, start=None, end=None):
+    """Per-account debits/credits, optionally restricted to journal entries
+    dated within [start, end] (either bound may be None for open-ended).
+    This is the trial-balance computation; the reports reuse it so the
+    numbers always come from one place."""
+    conds = []
+    params = []
+    if start is not None:
+        conds.append("j.date >= ?")
+        params.append(start)
+    if end is not None:
+        conds.append("j.date <= ?")
+        params.append(end)
+    where = ""
+    if conds:
+        where = " WHERE j.id IS NULL OR (" + " AND ".join(conds) + ")"
+    rows = conn.execute(
+        "SELECT a.id, a.code, a.name, a.type, a.parent_id, a.active,"
+        " COALESCE(SUM(l.debit_cents), 0) AS debits,"
+        " COALESCE(SUM(l.credit_cents), 0) AS credits"
+        " FROM erp_acct_accounts a"
+        " LEFT JOIN erp_acct_journal_lines l ON l.account_id = a.id"
+        " LEFT JOIN erp_acct_journal j ON j.id = l.entry_id"
+        + where +
+        " GROUP BY a.id ORDER BY a.code", params).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/erp/accounting/trial-balance")
+def erp_acct_trial_balance():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    rows = _acct_balances(conn)
+    accounts = []
+    total_debits = 0
+    total_credits = 0
+    for r in rows:
+        d = dict(r)
+        d["balance_cents"] = d["debits"] - d["credits"]
+        accounts.append(d)
+        total_debits += d["debits"]
+        total_credits += d["credits"]
+    conn.close()
+    return jsonify(accounts=accounts, total_debits=total_debits,
+                   total_credits=total_credits, balanced=total_debits == total_credits)
+
+
+# ---- Accounting financial statements (Phase 1, step 4) ----
+# Profit & loss, balance sheet, cash flow — all computed LIVE from
+# erp_acct_journal_lines joined to erp_acct_accounts. No stored report
+# tables. Accrual basis. All money is integer cents; CSV dollars are
+# formatted from cents, never from floats.
+def _acct_period_params():
+    """Validated (start, end) for P&L / cash flow, or (None, error)."""
+    start = (request.args.get("start") or "").strip()
+    end = (request.args.get("end") or "").strip()
+    if not start or not _acct_valid_date(start):
+        return None, jsonify(error="start is required as YYYY-MM-DD"), 400
+    if not end or not _acct_valid_date(end):
+        return None, jsonify(error="end is required as YYYY-MM-DD"), 400
+    if start > end:
+        return None, jsonify(error="start must not be after end"), 400
+    return (start, end), None, None
+
+
+def _acct_as_of_param():
+    as_of = (request.args.get("as_of") or "").strip()
+    if not as_of or not _acct_valid_date(as_of):
+        return None, jsonify(error="as_of is required as YYYY-MM-DD"), 400
+    return as_of, None, None
+
+
+def _acct_net_income(rows):
+    """Net income (credits minus debits on income, minus debits minus
+    credits on expense) for a set of _acct_balances rows."""
+    income = sum(r["credits"] - r["debits"] for r in rows if r["type"] == "income")
+    expense = sum(r["debits"] - r["credits"] for r in rows if r["type"] == "expense")
+    return income - expense
+
+
+def _acct_profit_loss(conn, start, end):
+    days = (datetime.strptime(end, "%Y-%m-%d")
+            - datetime.strptime(start, "%Y-%m-%d")).days
+    prior_end = (datetime.strptime(start, "%Y-%m-%d")
+                 - timedelta(days=1)).strftime("%Y-%m-%d")
+    prior_start = (datetime.strptime(prior_end, "%Y-%m-%d")
+                   - timedelta(days=days)).strftime("%Y-%m-%d")
+    cur = _acct_balances(conn, start, end)
+    pri = {r["id"]: r for r in _acct_balances(conn, prior_start, prior_end)}
+    income = []
+    expenses = []
+    for r in cur:
+        p = pri.get(r["id"], {"debits": 0, "credits": 0})
+        if r["type"] == "income":
+            amt, pamt = r["credits"] - r["debits"], p["credits"] - p["debits"]
+        elif r["type"] == "expense":
+            amt, pamt = r["debits"] - r["credits"], p["debits"] - p["credits"]
+        else:
+            continue
+        if amt == 0 and pamt == 0:
+            continue
+        row = {"account_id": r["id"], "code": r["code"], "name": r["name"],
+               "amount_cents": amt, "prior_cents": pamt}
+        (income if r["type"] == "income" else expenses).append(row)
+    total_income = sum(r["amount_cents"] for r in income)
+    total_expense = sum(r["amount_cents"] for r in expenses)
+    prior_income = sum(r["prior_cents"] for r in income)
+    prior_expense = sum(r["prior_cents"] for r in expenses)
+    return {"start": start, "end": end,
+            "prior_start": prior_start, "prior_end": prior_end,
+            "income": income, "expenses": expenses,
+            "total_income_cents": total_income,
+            "total_expense_cents": total_expense,
+            "net_income_cents": total_income - total_expense,
+            "prior_total_income_cents": prior_income,
+            "prior_total_expense_cents": prior_expense,
+            "prior_net_income_cents": prior_income - prior_expense}
+
+
+def _acct_balance_sheet(conn, as_of):
+    bals = _acct_balances(conn, end=as_of)
+    assets = [{"account_id": r["id"], "code": r["code"], "name": r["name"],
+               "balance_cents": r["debits"] - r["credits"]}
+              for r in bals if r["type"] == "asset"
+              and r["debits"] - r["credits"] != 0]
+    liabilities = [{"account_id": r["id"], "code": r["code"], "name": r["name"],
+                    "balance_cents": r["credits"] - r["debits"]}
+                   for r in bals if r["type"] == "liability"
+                   and r["credits"] - r["debits"] != 0]
+    equity = [{"account_id": r["id"], "code": r["code"], "name": r["name"],
+               "balance_cents": r["credits"] - r["debits"]}
+              for r in bals if r["type"] == "equity"
+              and r["credits"] - r["debits"] != 0]
+    net_all = _acct_net_income(bals)
+    year_start = as_of[:4] + "-01-01"
+    net_ytd = _acct_net_income(_acct_balances(conn, year_start, as_of))
+    retained = net_all - net_ytd
+    total_assets = sum(a["balance_cents"] for a in assets)
+    total_liabilities = sum(a["balance_cents"] for a in liabilities)
+    equity_accounts = sum(a["balance_cents"] for a in equity)
+    total_equity = equity_accounts + retained + net_ytd
+    difference = total_assets - (total_liabilities + total_equity)
+    return {"as_of": as_of,
+            "assets": assets, "total_assets_cents": total_assets,
+            "liabilities": liabilities,
+            "total_liabilities_cents": total_liabilities,
+            "equity": equity,
+            "retained_earnings_cents": retained,
+            "current_net_income_cents": net_ytd,
+            "total_equity_cents": total_equity,
+            "total_liabilities_equity_cents": total_liabilities + total_equity,
+            "balanced": difference == 0, "difference_cents": difference}
+
+
+def _acct_cash_account_ids(conn):
+    """GL accounts that hold cash: the 1000 Cash hierarchy plus any GL
+    account linked from an active bank account."""
+    accounts = conn.execute(
+        "SELECT id, code, parent_id FROM erp_acct_accounts").fetchall()
+    by_id = {a["id"]: a for a in accounts}
+    cash = set()
+    for a in accounts:
+        node = a
+        while node is not None:
+            if node["code"] == "1000":
+                cash.add(a["id"])
+                break
+            node = by_id.get(node["parent_id"]) if node["parent_id"] else None
+    for row in conn.execute(
+            "SELECT gl_account_id FROM erp_acct_bank_accounts"
+            " WHERE active = 1").fetchall():
+        if row["gl_account_id"]:
+            cash.add(row["gl_account_id"])
+    return cash
+
+
+def _acct_cf_section(account):
+    """Cash-flow section for an offset (non-cash) account."""
+    if account["type"] in ("income", "expense"):
+        return "operating"
+    if account["type"] == "equity":
+        return "financing"
+    if account["type"] == "asset":
+        return "investing" if account["code"] >= "1500" else "operating"
+    if account["type"] == "liability":
+        return "operating" if account["code"] < "2400" else "financing"
+    return "operating"
+
+
+def _acct_cash_flow(conn, start, end):
+    cash_ids = _acct_cash_account_ids(conn)
+    sections = {"operating": {}, "investing": {}, "financing": {}}
+    if cash_ids:
+        placeholders = ",".join("?" * len(cash_ids))
+        entries = conn.execute(
+            "SELECT DISTINCT j.id FROM erp_acct_journal j"
+            " JOIN erp_acct_journal_lines l ON l.entry_id = j.id"
+            " WHERE j.date >= ? AND j.date <= ? AND l.account_id IN ("
+            + placeholders + ")",
+            [start, end] + sorted(cash_ids)).fetchall()
+    else:
+        entries = []
+    for (entry_id,) in entries:
+        lines = conn.execute(
+            "SELECT l.*, a.code AS account_code, a.name AS account_name,"
+            " a.type AS account_type"
+            " FROM erp_acct_journal_lines l"
+            " JOIN erp_acct_accounts a ON a.id = l.account_id"
+            " WHERE l.entry_id = ? ORDER BY l.id", (entry_id,)).fetchall()
+        cash_net = sum(l["debit_cents"] - l["credit_cents"] for l in lines
+                       if l["account_id"] in cash_ids)
+        offsets = [l for l in lines if l["account_id"] not in cash_ids]
+        if not offsets or cash_net == 0:
+            continue
+        total = sum(l["debit_cents"] or l["credit_cents"] for l in offsets)
+        if total == 0:
+            continue
+        allocated = 0
+        for i, l in enumerate(offsets):
+            amt = l["debit_cents"] or l["credit_cents"]
+            if i < len(offsets) - 1:
+                share = (abs(cash_net) * amt) // total
+                if cash_net < 0:
+                    share = -share
+                allocated += share
+            else:
+                share = cash_net - allocated
+            section = _acct_cf_section({"code": l["account_code"],
+                                        "type": l["account_type"]})
+            slot = sections[section].setdefault(
+                l["account_id"],
+                {"account_id": l["account_id"], "code": l["account_code"],
+                 "name": l["account_name"], "amount_cents": 0})
+            slot["amount_cents"] += share
+    day_before = (datetime.strptime(start, "%Y-%m-%d")
+                  - timedelta(days=1)).strftime("%Y-%m-%d")
+    beginning = sum(r["debits"] - r["credits"]
+                    for r in _acct_balances(conn, end=day_before)
+                    if r["id"] in cash_ids)
+    ending = sum(r["debits"] - r["credits"]
+                 for r in _acct_balances(conn, end=end)
+                 if r["id"] in cash_ids)
+    out = {"start": start, "end": end,
+           "beginning_cash_cents": beginning,
+           "ending_cash_cents": ending}
+    net_change = 0
+    for section in ("operating", "investing", "financing"):
+        lines = sorted(sections[section].values(), key=lambda r: r["code"])
+        total = sum(r["amount_cents"] for r in lines)
+        out[section] = {"lines": lines, "total_cents": total}
+        net_change += total
+    cash_change = ending - beginning
+    out["net_cash_change_cents"] = net_change
+    out["cash_change_cents"] = cash_change
+    out["difference_cents"] = net_change - cash_change
+    out["check_ok"] = net_change == cash_change
+    return out
+
+
+def _acct_money_csv(cents):
+    """Dollars with two decimals, from integer cents (no floats)."""
+    sign = "-" if cents < 0 else ""
+    a = abs(cents)
+    return "%s%d.%02d" % (sign, a // 100, a % 100)
+
+
+def _acct_csv_response(filename, header, rows):
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(header)
+    for row in rows:
+        w.writerow(row)
+    resp = Response(buf.getvalue(), mimetype="text/csv")
+    resp.headers["Content-Disposition"] = (
+        'attachment; filename="%s"' % filename)
+    return resp
+
+
+@app.get("/api/erp/accounting/reports/profit-loss")
+def erp_acct_report_profit_loss():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    params, err, status = _acct_period_params()
+    if err:
+        return err, status
+    start, end = params
+    conn = db()
+    out = _acct_profit_loss(conn, start, end)
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/erp/accounting/reports/profit-loss.csv")
+def erp_acct_report_profit_loss_csv():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    params, err, status = _acct_period_params()
+    if err:
+        return err, status
+    start, end = params
+    conn = db()
+    rep = _acct_profit_loss(conn, start, end)
+    conn.close()
+    rows = []
+    for r in rep["income"]:
+        rows.append(["Income", r["code"], r["name"],
+                     _acct_money_csv(r["amount_cents"]),
+                     _acct_money_csv(r["prior_cents"])])
+    rows.append(["Income", "", "Total income",
+                 _acct_money_csv(rep["total_income_cents"]),
+                 _acct_money_csv(rep["prior_total_income_cents"])])
+    for r in rep["expenses"]:
+        rows.append(["Expense", r["code"], r["name"],
+                     _acct_money_csv(r["amount_cents"]),
+                     _acct_money_csv(r["prior_cents"])])
+    rows.append(["Expense", "", "Total expenses",
+                 _acct_money_csv(rep["total_expense_cents"]),
+                 _acct_money_csv(rep["prior_total_expense_cents"])])
+    rows.append(["", "", "Net income",
+                 _acct_money_csv(rep["net_income_cents"]),
+                 _acct_money_csv(rep["prior_net_income_cents"])])
+    return _acct_csv_response(
+        "profit-loss-%s-to-%s.csv" % (start, end),
+        ["Section", "Code", "Account", "Amount", "Prior period"], rows)
+
+
+@app.get("/api/erp/accounting/reports/balance-sheet")
+def erp_acct_report_balance_sheet():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    as_of, err, status = _acct_as_of_param()
+    if err:
+        return err, status
+    conn = db()
+    out = _acct_balance_sheet(conn, as_of)
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/erp/accounting/reports/balance-sheet.csv")
+def erp_acct_report_balance_sheet_csv():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    as_of, err, status = _acct_as_of_param()
+    if err:
+        return err, status
+    conn = db()
+    rep = _acct_balance_sheet(conn, as_of)
+    conn.close()
+    rows = []
+    for a in rep["assets"]:
+        rows.append(["Asset", a["code"], a["name"],
+                     _acct_money_csv(a["balance_cents"])])
+    rows.append(["Asset", "", "Total assets",
+                 _acct_money_csv(rep["total_assets_cents"])])
+    for a in rep["liabilities"]:
+        rows.append(["Liability", a["code"], a["name"],
+                     _acct_money_csv(a["balance_cents"])])
+    rows.append(["Liability", "", "Total liabilities",
+                 _acct_money_csv(rep["total_liabilities_cents"])])
+    for a in rep["equity"]:
+        rows.append(["Equity", a["code"], a["name"],
+                     _acct_money_csv(a["balance_cents"])])
+    rows.append(["Equity", "", "Retained earnings (prior years)",
+                 _acct_money_csv(rep["retained_earnings_cents"])])
+    rows.append(["Equity", "", "Net income (current year)",
+                 _acct_money_csv(rep["current_net_income_cents"])])
+    rows.append(["Equity", "", "Total equity",
+                 _acct_money_csv(rep["total_equity_cents"])])
+    rows.append(["", "", "Total liabilities + equity",
+                 _acct_money_csv(rep["total_liabilities_equity_cents"])])
+    rows.append(["Check", "", "Balanced" if rep["balanced"] else "OUT OF BALANCE",
+                 _acct_money_csv(rep["difference_cents"])])
+    return _acct_csv_response(
+        "balance-sheet-%s.csv" % as_of,
+        ["Section", "Code", "Account", "Balance"], rows)
+
+
+@app.get("/api/erp/accounting/reports/cash-flow")
+def erp_acct_report_cash_flow():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    params, err, status = _acct_period_params()
+    if err:
+        return err, status
+    start, end = params
+    conn = db()
+    out = _acct_cash_flow(conn, start, end)
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/erp/accounting/reports/cash-flow.csv")
+def erp_acct_report_cash_flow_csv():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    params, err, status = _acct_period_params()
+    if err:
+        return err, status
+    start, end = params
+    conn = db()
+    rep = _acct_cash_flow(conn, start, end)
+    conn.close()
+    rows = []
+    for section in ("operating", "investing", "financing"):
+        for r in rep[section]["lines"]:
+            rows.append([section.capitalize(), r["code"], r["name"],
+                         _acct_money_csv(r["amount_cents"])])
+        rows.append([section.capitalize(), "", "Total " + section,
+                     _acct_money_csv(rep[section]["total_cents"])])
+    rows.append(["", "", "Net change in cash",
+                 _acct_money_csv(rep["net_cash_change_cents"])])
+    rows.append(["", "", "Cash at start of period",
+                 _acct_money_csv(rep["beginning_cash_cents"])])
+    rows.append(["", "", "Cash at end of period",
+                 _acct_money_csv(rep["ending_cash_cents"])])
+    rows.append(["Check", "", "Net change equals cash change"
+                 if rep["check_ok"] else "CHECK FAILED",
+                 _acct_money_csv(rep["difference_cents"])])
+    return _acct_csv_response(
+        "cash-flow-%s-to-%s.csv" % (start, end),
+        ["Section", "Code", "Account", "Amount"], rows)
+
+
+
+
+# ---- Accounting receivables + payables (Phase 1, step 2) ----
+# Invoices (AR) and bills (AP) post balanced journal entries on create and
+# on payment; voiding reverses the create entry, never deletes anything.
+# All money is integer cents; every write leaves an erp_acct_audit row.
+# Customers link to existing wholesale accounts by id (display name stored
+# on the invoice); vendors link to the existing erp_vendors table by id.
+ERP_ACCT_CASH_CODE = "1010"
+ERP_ACCT_AR_CODE = "1100"
+ERP_ACCT_AP_CODE = "2000"
+ERP_ACCT_TAX_PAYABLE_CODE = "2100"
+ERP_ACCT_RETAIL_INCOME_CODE = "4000"
+ERP_ACCT_WHOLESALE_INCOME_CODE = "4100"
+ERP_ACCT_DEFAULT_EXPENSE_CODE = "6900"
+ERP_ACCT_ROU_ASSET_CODE = "1400"
+ERP_ACCT_LEASE_LIABILITY_CODE = "2400"
+ERP_ACCT_LEASE_AMORT_CODE = "6050"
+ERP_ACCT_LEASE_INTEREST_CODE = "6950"
+ERP_ACCT_DOC_STATUSES = ("open", "paid", "void")
+ERP_ACCT_AGING_BUCKETS = ("current", "d1_30", "d31_60", "d61_90", "d91_plus")
+
+
+def _acct_account_id_by_code(conn, code):
+    row = conn.execute(
+        "SELECT id FROM erp_acct_accounts WHERE code = ? AND active = 1",
+        (code,)).fetchone()
+    return row["id"] if row else None
+
+
+def _acct_valid_date(value):
+    if not isinstance(value, str):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _acct_post_entry(conn, actor, date, memo, source, source_id, raw_lines):
+    """Post a system journal entry. Returns (entry_id, None) or (None, error).
+    Audits journal.post; the caller commits. Refuses (400) any entry whose
+    date falls in a locked period -- this is the single enforcement point
+    for invoices, bills, payments, tax remittances, pay runs and migration
+    postings, which all post through here."""
+    error = _acct_lock_error(conn, date)
+    if error:
+        return None, error
+    lines, error = _acct_validate_lines(conn, raw_lines)
+    if error:
+        return None, error
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_journal (date, memo, source, source_id,"
+        " posted_at, posted_by, reversed_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+        (date, memo, source, str(source_id), now, actor or "", now))
+    entry_id = cur.lastrowid
+    for line in lines:
+        conn.execute(
+            "INSERT INTO erp_acct_journal_lines (entry_id, account_id,"
+            " debit_cents, credit_cents, memo) VALUES (?, ?, ?, ?, ?)",
+            (entry_id, line["account_id"], line["debit_cents"],
+             line["credit_cents"], line["memo"]))
+    _acct_audit(conn, actor, "journal.post", "journal", entry_id,
+                "entry #%d %s debits %d credits %d" % (
+                    entry_id, date, sum(l["debit_cents"] for l in lines),
+                    sum(l["credit_cents"] for l in lines)))
+    return entry_id, None
+
+
+def _acct_reverse_entry(conn, actor, entry, memo, source, source_id):
+    """Post the reversing entry for `entry` (a Row). Marks the original
+    reversed_by, audits journal.reverse. Returns (new_id, None) or
+    (None, error). The reversal is dated today: it is refused only when
+    today falls in a locked period, never because the original entry's
+    period is locked -- the correction lands in the open period."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    error = _acct_lock_error(conn, today)
+    if error:
+        return None, error
+    lines = conn.execute(
+        "SELECT * FROM erp_acct_journal_lines WHERE entry_id = ? ORDER BY id",
+        (entry["id"],)).fetchall()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_journal (date, memo, source, source_id,"
+        " posted_at, posted_by, reversed_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+        (today, memo, source, str(source_id), now, actor or "", now))
+    new_id = cur.lastrowid
+    for line in lines:
+        conn.execute(
+            "INSERT INTO erp_acct_journal_lines (entry_id, account_id,"
+            " debit_cents, credit_cents, memo) VALUES (?, ?, ?, ?, ?)",
+            (new_id, line["account_id"], line["credit_cents"],
+             line["debit_cents"], line["memo"]))
+    conn.execute("UPDATE erp_acct_journal SET reversed_by = ? WHERE id = ?",
+                 (new_id, entry["id"]))
+    _acct_audit(conn, actor, "journal.reverse", "journal", entry["id"],
+                "reversed by entry #%d" % new_id)
+    return new_id, None
+
+
+# ---- Ledger period lock (Phase 4, section 1.5) ----
+# A locked period refuses every new posting dated inside it. Locking
+# changes no existing row; it only gates new postings by date. Unlocking
+# deletes the lock row and audits the deletion -- there is no unlocked_at.
+_ACCT_PERIOD_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+
+def _acct_period_valid(period):
+    return isinstance(period, str) and bool(_ACCT_PERIOD_RE.match(period))
+
+
+def _acct_period_locked(conn, period):
+    return conn.execute(
+        "SELECT * FROM erp_acct_period_locks WHERE period = ?",
+        (period,)).fetchone()
+
+
+def _acct_lock_error(conn, date):
+    """'period <YYYY-MM> is locked' when date falls in a locked period,
+    else None. Dates that are not YYYY-MM-DD never match a lock."""
+    if not isinstance(date, str) or len(date) < 7:
+        return None
+    period = date[:7]
+    if not _acct_period_valid(period):
+        return None
+    if _acct_period_locked(conn, period):
+        return "period %s is locked" % period
+    return None
+
+
+def _acct_unreconciled_counts(conn, period):
+    """Unmatched bank-feed rows dated inside `period`, per bank account.
+    Returns (total, [{bank_account_id, name, count}])."""
+    rows = conn.execute(
+        "SELECT t.bank_account_id, b.name, COUNT(*) AS n"
+        " FROM erp_acct_bank_txns t"
+        " JOIN erp_acct_bank_accounts b ON b.id = t.bank_account_id"
+        " WHERE substr(t.date, 1, 7) = ? AND t.status = 'unmatched'"
+        " GROUP BY t.bank_account_id, b.name ORDER BY b.name",
+        (period,)).fetchall()
+    total = sum(r["n"] for r in rows)
+    return total, [{"bank_account_id": r["bank_account_id"],
+                    "name": r["name"], "count": r["n"]} for r in rows]
+
+
+@app.post("/api/erp/accounting/periods/<period>/lock")
+def erp_acct_lock_period(period):
+    """Lock a YYYY-MM period: admin-only. 409 when already locked.
+    Refuses when the period holds unreconciled bank activity unless the
+    caller passes {"confirm_unreconciled": true} (response lists the
+    counts). Audits period.lock with the period and the reason."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    if not _acct_period_valid(period):
+        return jsonify(error="period must be YYYY-MM"), 400
+    data = request.get_json(force=True, silent=True) or {}
+    reason = (data.get("reason") or "").strip()
+    conn = db()
+    if _acct_period_locked(conn, period):
+        conn.close()
+        return jsonify(error="period %s is already locked" % period), 409
+    if not data.get("confirm_unreconciled") is True:
+        total, by_bank = _acct_unreconciled_counts(conn, period)
+        if total:
+            conn.close()
+            return jsonify(
+                error="period %s has %d unreconciled bank transaction(s);"
+                " pass confirm_unreconciled=true to lock anyway" % (period, total),
+                period=period, unmatched_count=total,
+                unmatched_by_bank=by_bank), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO erp_acct_period_locks (period, locked_at, locked_by,"
+        " reason, created_at) VALUES (?, ?, ?, ?, ?)",
+        (period, now, actor or "", reason, now))
+    _acct_audit(conn, actor, "period.lock", "period", 0,
+                "period %s locked by %s%s" % (
+                    period, actor or "",
+                    " reason: " + reason if reason else ""))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_acct_period_locks WHERE period = ?",
+        (period,)).fetchone()
+    conn.close()
+    return jsonify(lock=dict(row)), 201
+
+
+@app.post("/api/erp/accounting/periods/<period>/unlock")
+def erp_acct_unlock_period(period):
+    """Unlock a YYYY-MM period: admin-only, requires a non-empty reason.
+    Deletes the lock row and audits period.unlock with the reason."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    if not _acct_period_valid(period):
+        return jsonify(error="period must be YYYY-MM"), 400
+    data = request.get_json(force=True, silent=True) or {}
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        return jsonify(error="a reason is required to unlock a period"), 400
+    conn = db()
+    if not _acct_period_locked(conn, period):
+        conn.close()
+        return jsonify(error="period %s is not locked" % period), 404
+    _acct_audit(conn, actor, "period.unlock", "period", 0,
+                "period %s unlocked by %s reason: %s" % (
+                    period, actor or "", reason))
+    conn.execute("DELETE FROM erp_acct_period_locks WHERE period = ?",
+                 (period,))
+    conn.commit()
+    conn.close()
+    return jsonify(unlocked=True, period=period)
+
+
+
+def _acct_audit_bound(value, end):
+    """Normalize a from/to filter to a UTC ISO string for lexicographic
+    comparison against erp_acct_audit.created_at. A bare YYYY-MM-DD
+    means the start (from) or end (to) of that UTC day."""
+    if len(value) == 10:
+        dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if end:
+            dt = dt + timedelta(days=1) - timedelta(microseconds=1)
+        return dt.isoformat()
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+@app.get("/api/erp/accounting/audit")
+def erp_acct_list_audit():
+    """Read the audit log, newest first. Perm accounting.read. Filters:
+    action (exact), target_type (exact), target_id (exact int), actor
+    (exact), from/to (UTC date range, inclusive). limit defaults to 100,
+    max 500. Read-only: no write, and no filter bypasses the permission
+    check."""
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    where = []
+    params = []
+    action = (request.args.get("action") or "").strip()
+    if action:
+        where.append("action = ?")
+        params.append(action)
+    target_type = (request.args.get("target_type") or "").strip()
+    if target_type:
+        where.append("target_type = ?")
+        params.append(target_type)
+    target_id = (request.args.get("target_id") or "").strip()
+    if target_id:
+        try:
+            params.append(int(target_id))
+        except (TypeError, ValueError):
+            return jsonify(error="target_id must be a number"), 400
+        where.append("target_id = ?")
+    actor_q = (request.args.get("actor") or "").strip()
+    if actor_q:
+        where.append("actor = ?")
+        params.append(actor_q)
+    try:
+        if (request.args.get("from") or "").strip():
+            where.append("created_at >= ?")
+            params.append(_acct_audit_bound(
+                (request.args.get("from") or "").strip(), end=False))
+        if (request.args.get("to") or "").strip():
+            where.append("created_at <= ?")
+            params.append(_acct_audit_bound(
+                (request.args.get("to") or "").strip(), end=True))
+    except ValueError:
+        return jsonify(error="from and to must be YYYY-MM-DD or ISO dates"), 400
+    try:
+        limit = int(request.args.get("limit") or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(min(limit, 500), 1)
+    try:
+        offset = int(request.args.get("offset") or 0)
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(offset, 0)
+    conn = db()
+    sql = "SELECT * FROM erp_acct_audit"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    rows = conn.execute(sql, params + [limit, offset]).fetchall()
+    conn.close()
+    return jsonify(audit=[dict(r) for r in rows], limit=limit, offset=offset)
+
+
+
+# ---- Accounting backups (Phase 4, section 3) ----
+# Nightly accounting-only SQLite snapshot, produced by the backend
+# (export endpoint, cron-secret gated), pulled by a VM job, stored in
+# two failure domains (VM + Google Drive), verified weekly by a drill.
+# Snapshot format (3.3): acct-backup.db holds ONLY the 20 erp_acct_*
+# tables below (including erp_acct_period_locks: a lock is a gate, not
+# ledger data, but a restore that drops locks silently reopens locked
+# periods -- user-approved Nov 9, the locks are in the set);
+# manifest.json carries per-table row counts + SHA-256 over rows ordered
+# by rowid (== id for id-keyed tables; the lock table is keyed by
+# period), serialized as col|col|... per row, the
+# trial balance, AR/AP/tax-payable totals, the latest journal entry id
+# and the snapshot SHA-256. All money is integer cents. Posted entries
+# are permanent: restore is additive (INSERT OR IGNORE) and never
+# overwrites a live row -- a same-id row with different content aborts
+# the whole restore with 409.
+class _AcctBackupError(Exception):
+    """Export/restore failure carrying the HTTP status to return."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+# The 24 accounting tables, in restore dependency order (spec 3.6):
+# (Dept 9 wave C adds erp_acct_credit_notes after invoices and
+# erp_acct_bill_po_links after bills; wave D adds erp_acct_draws.)
+# accounts -> journal -> journal_lines -> invoices -> bills -> payments
+# -> bank_* -> tax_* -> reconciliations -> employees -> payruns ->
+# payrun_lines -> payroll_* -> migration_links -> audit.
+_ACCT_BACKUP_TABLES = (
+    "erp_acct_accounts", "erp_acct_journal", "erp_acct_journal_lines",
+    "erp_acct_invoices", "erp_acct_credit_notes",
+    "erp_acct_bills", "erp_acct_bill_po_links", "erp_acct_payments",
+    "erp_acct_bank_accounts", "erp_acct_bank_txns",
+    "erp_acct_tax_rates", "erp_acct_tax_filings",
+    "erp_acct_tax_remittances", "erp_acct_reconciliations",
+    "erp_acct_employees", "erp_acct_payruns", "erp_acct_payrun_lines",
+    "erp_acct_payroll_tax_tables", "erp_acct_payroll_filings",
+    "erp_acct_migration_links", "erp_acct_audit",
+    "erp_acct_period_locks", "erp_acct_sale_posts",
+    "erp_acct_draws",
+)
+_ACCT_BACKUP_RATE_LIMIT_SECONDS = 300
+_ACCT_BACKUP_LAST_EXPORT_TS = 0.0
+
+
+def _acct_backup_table_hash(conn, table):
+    """(row count, SHA-256) over rows ordered by rowid, serialized as
+    col|col|... per row. Deterministic; recomputable by the VM job
+    and the weekly drill without the backend. Rowid == id for the
+    id-keyed tables (their hashes are unchanged); the lock table is
+    keyed by period and has no id column, so ORDER BY id cannot be
+    used here."""
+    rows = conn.execute(
+        "SELECT * FROM %s ORDER BY rowid" % table).fetchall()
+    parts = ["|".join("" if v is None else str(v) for v in tuple(row))
+             for row in rows]
+    digest = hashlib.sha256("\n".join(parts).encode("utf-8")).hexdigest()
+    return len(rows), digest
+
+
+def _acct_backup_totals(conn):
+    """Trial-balance totals + AR/AP/tax-payable + latest journal id,
+    all in integer cents, from one connection."""
+    debits, credits = conn.execute(
+        "SELECT COALESCE(SUM(debit_cents), 0),"
+        " COALESCE(SUM(credit_cents), 0)"
+        " FROM erp_acct_journal_lines").fetchone()
+    ar = conn.execute(
+        "SELECT COALESCE(SUM(balance_cents), 0)"
+        " FROM erp_acct_invoices").fetchone()[0]
+    ap = conn.execute(
+        "SELECT COALESCE(SUM(balance_cents), 0)"
+        " FROM erp_acct_bills").fetchone()[0]
+    tax = conn.execute(
+        "SELECT COALESCE(SUM(tax_collected_cents - tax_remitted_cents), 0)"
+        " FROM erp_acct_tax_filings").fetchone()[0]
+    latest = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM erp_acct_journal").fetchone()[0]
+    return {"total_debits_cents": debits, "total_credits_cents": credits,
+            "ar_total_cents": ar, "ap_total_cents": ap,
+            "tax_payable_cents": tax, "latest_journal_entry_id": latest}
+
+
+def _acct_backup_manifest(conn, snapshot_sha256, manifest_id,
+                          created_at_utc):
+    """Build manifest.json for the snapshot in `conn` (already the
+    finalized accounting-only DB). Returns (manifest, total_rows)."""
+    tables = {}
+    total_rows = 0
+    for table in _ACCT_BACKUP_TABLES:
+        n, digest = _acct_backup_table_hash(conn, table)
+        tables[table] = {"rows": n, "sha256": digest}
+        total_rows += n
+    totals = _acct_backup_totals(conn)
+    manifest = {
+        "manifest_id": manifest_id,
+        "created_at_utc": created_at_utc,
+        "source": "erp.pop-a-licious.com",
+        "tables": tables,
+        "trial_balance": {
+            "total_debits_cents": totals["total_debits_cents"],
+            "total_credits_cents": totals["total_credits_cents"],
+            "balanced": totals["total_debits_cents"]
+                         == totals["total_credits_cents"],
+        },
+        "ar_total_cents": totals["ar_total_cents"],
+        "ap_total_cents": totals["ap_total_cents"],
+        "tax_payable_cents": totals["tax_payable_cents"],
+        "latest_journal_entry_id": totals["latest_journal_entry_id"],
+        "snapshot_sha256": snapshot_sha256,
+    }
+    return manifest, total_rows
+
+
+def _acct_verify_snapshot_file(db_path, manifest):
+    """Recompute a manifest from scratch for the snapshot file at
+    `db_path` and compare every field to `manifest`. Returns
+    (True, "") or (False, first-mismatch description). Same checks as
+    the weekly drill (spec 3.6); never opens the live DB."""
+    try:
+        with open(db_path, "rb") as f:
+            actual_sha = hashlib.sha256(f.read()).hexdigest()
+    except OSError as exc:
+        return False, "snapshot file unreadable: %s" % exc
+    if manifest.get("snapshot_sha256") != actual_sha:
+        return False, "snapshot_sha256 mismatch"
+    conn = sqlite3.connect(db_path)
+    try:
+        have = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for table in _ACCT_BACKUP_TABLES:
+            if table not in have:
+                return False, "missing table %s" % table
+        extra = sorted(t for t in have if t not in _ACCT_BACKUP_TABLES
+                       and not t.startswith("sqlite_"))
+        if extra:
+            return False, "unexpected table %s" % extra[0]
+        tables = manifest.get("tables") or {}
+        if set(tables) != set(_ACCT_BACKUP_TABLES):
+            return False, ("manifest tables do not list exactly the %d"
+                           " accounting tables"
+                           % len(_ACCT_BACKUP_TABLES))
+        for table in _ACCT_BACKUP_TABLES:
+            n, digest = _acct_backup_table_hash(conn, table)
+            entry = tables.get(table) or {}
+            if entry.get("rows") != n:
+                return False, ("%s rows mismatch: manifest %s, snapshot %s"
+                               % (table, entry.get("rows"), n))
+            if entry.get("sha256") != digest:
+                return False, "%s sha256 mismatch" % table
+        totals = _acct_backup_totals(conn)
+        if totals["total_debits_cents"] != totals["total_credits_cents"]:
+            return False, "trial balance does not balance"
+        tb = manifest.get("trial_balance") or {}
+        if tb.get("total_debits_cents") != totals["total_debits_cents"]:
+            return False, "trial_balance total_debits_cents mismatch"
+        if tb.get("total_credits_cents") != totals["total_credits_cents"]:
+            return False, "trial_balance total_credits_cents mismatch"
+        if tb.get("balanced") is not True:
+            return False, "trial_balance balanced is not true"
+        if manifest.get("ar_total_cents") != totals["ar_total_cents"]:
+            return False, "ar_total_cents mismatch"
+        if manifest.get("ap_total_cents") != totals["ap_total_cents"]:
+            return False, "ap_total_cents mismatch"
+        if manifest.get("tax_payable_cents") != totals["tax_payable_cents"]:
+            return False, "tax_payable_cents mismatch"
+        if manifest.get("latest_journal_entry_id") != \
+                totals["latest_journal_entry_id"]:
+            return False, "latest_journal_entry_id mismatch"
+        return True, ""
+    finally:
+        conn.close()
+
+
+def _acct_build_export(db_path=None):
+    """Build a snapshot of the live accounting tables.
+
+    Returns (manifest, zip_bytes, filename, total_rows). Raises
+    _AcctBackupError: trial balance unbalanced -> 500 with the exact
+    error "trial balance does not balance"; any table missing -> 500;
+    backup API busy after retries -> 503. Uses SQLite's online backup
+    API from a second connection (transactionally consistent, no
+    backend stop); the endpoint never writes to the live DB. Temp
+    files are deleted before this returns."""
+    src_path = db_path or DATABASE_PATH
+    if not os.path.exists(src_path):
+        raise _AcctBackupError(500, "database file not found")
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    tmp = tempfile.NamedTemporaryFile(suffix=".db",
+                                      prefix="acct-backup-", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        src = sqlite3.connect(src_path)
+        try:
+            have = {r[0] for r in src.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            for table in _ACCT_BACKUP_TABLES:
+                if table not in have:
+                    raise _AcctBackupError(
+                        500, "accounting table %s is missing" % table)
+            dst = sqlite3.connect(tmp_path)
+            try:
+                last_err = None
+                for _attempt in range(6):
+                    try:
+                        src.backup(dst)
+                        last_err = None
+                        break
+                    except sqlite3.OperationalError as exc:
+                        last_err = exc
+                        if ("locked" in str(exc).lower()
+                                or "busy" in str(exc).lower()):
+                            time.sleep(0.3)
+                            continue
+                        raise
+                if last_err is not None:
+                    raise _AcctBackupError(
+                        503, "backup is busy, retry later")
+            finally:
+                dst.close()
+        finally:
+            src.close()
+        snap = sqlite3.connect(tmp_path)
+        try:
+            drop = [r[0] for r in snap.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+                " AND name NOT LIKE 'sqlite_%'").fetchall()]
+            for name in drop:
+                if name not in _ACCT_BACKUP_TABLES:
+                    snap.execute("DROP TABLE \"%s\"" % name)
+            snap.execute("VACUUM")
+            snap.commit()
+        finally:
+            snap.close()
+        with open(tmp_path, "rb") as f:
+            db_bytes = f.read()
+        snapshot_sha = hashlib.sha256(db_bytes).hexdigest()
+        manifest_id = "%s-%s" % (stamp, snapshot_sha[:8])
+        snap_conn = sqlite3.connect(tmp_path)
+        try:
+            manifest, total_rows = _acct_backup_manifest(
+                snap_conn, snapshot_sha, manifest_id,
+                datetime.now(timezone.utc).isoformat())
+        finally:
+            snap_conn.close()
+        if not manifest["trial_balance"]["balanced"]:
+            app.logger.error(
+                "backup export %s failed: trial balance does not balance",
+                manifest_id)
+            raise _AcctBackupError(500, "trial balance does not balance")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("acct-backup.db", db_bytes)
+            zf.writestr("manifest.json",
+                        json.dumps(manifest, indent=2))
+        return manifest, buf.getvalue(), "acct-backup-%s.zip" % stamp, \
+            total_rows
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _acct_audit_backup_export(manifest, actor, note=""):
+    """Audit a backup.export: the audit row is the only write, committed
+    on its own connection (the sanctioned exception to section 2.2:
+    an export is a read, there is no business write to pair it with).
+    A failed audit insert is logged, never fails the export."""
+    total_rows = sum(t["rows"] for t in manifest["tables"].values())
+    detail = ("manifest %s tables %d rows %d snapshot %s"
+              % (manifest["manifest_id"], len(manifest["tables"]),
+                 total_rows, manifest["snapshot_sha256"]))
+    if note:
+        detail = note + " " + detail
+    try:
+        conn = db()
+        try:
+            _acct_audit(conn, actor, "backup.export", "backup", 0, detail)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        app.logger.error("backup.export audit failed for manifest %s",
+                         manifest["manifest_id"])
+
+
+@app.get("/api/erp/accounting/backup/export")
+def erp_acct_backup_export():
+    """Cron-secret export (spec 3.4). X-Cron-Secret must equal the
+    CRON_SECRET env var (same pattern as the marketing cron endpoints):
+    503 when CRON_SECRET is not configured, 403 on a wrong or missing
+    secret. No user session is accepted. Rate limit: at most one export
+    per 5 minutes per secret (second call inside the window -> 429).
+    Streams acct-backup-<timestamp>.zip (acct-backup.db + manifest.json).
+    The endpoint never writes to the live DB except the backup.export
+    audit row, committed on its own."""
+    if not CRON_SECRET:
+        return jsonify(error="cron is not configured"), 503
+    if request.headers.get("X-Cron-Secret", "") != CRON_SECRET:
+        return jsonify(error="forbidden"), 403
+    global _ACCT_BACKUP_LAST_EXPORT_TS
+    now = time.time()
+    if now - _ACCT_BACKUP_LAST_EXPORT_TS < _ACCT_BACKUP_RATE_LIMIT_SECONDS:
+        return jsonify(
+            error="backup export rate limit: at most one export per"
+                  " 5 minutes"), 429
+    try:
+        manifest, zip_bytes, filename, _rows = _acct_build_export()
+    except _AcctBackupError as exc:
+        app.logger.error("backup export failed: %s", exc.message)
+        return jsonify(error=exc.message), exc.status
+    _ACCT_BACKUP_LAST_EXPORT_TS = now
+    _acct_audit_backup_export(manifest, "cron")
+    resp = Response(zip_bytes, mimetype="application/zip")
+    resp.headers["Content-Disposition"] = (
+        'attachment; filename="%s"' % filename)
+    return resp
+
+
+@app.get("/api/erp/accounting/backup/status")
+def erp_acct_backup_status():
+    """Backup status card data (spec 3.7), perm accounting.read. Reads
+    the latest backup.export audit rows only -- it does not read backup
+    files. latest_drill_result/latest_drill_at are null: the weekly
+    drill never touches the live backend, so its result lives in the
+    VM backup index (hidden_files/acct-backups/index.json), not in the
+    audit log; the card says so instead of inventing a drill result."""
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    latest = conn.execute(
+        "SELECT * FROM erp_acct_audit WHERE action = 'backup.export'"
+        " ORDER BY id DESC LIMIT 1").fetchone()
+    oldest = conn.execute(
+        "SELECT * FROM erp_acct_audit WHERE action = 'backup.export'"
+        " ORDER BY id ASC LIMIT 1").fetchone()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM erp_acct_audit"
+        " WHERE action = 'backup.export'").fetchone()[0]
+    restore = conn.execute(
+        "SELECT * FROM erp_acct_audit WHERE action = 'backup.restore'"
+        " ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+
+    def _field(row, pattern):
+        if not row:
+            return None
+        m = re.search(pattern, row["detail"] or "")
+        return m.group(1) if m else None
+
+    manifest_id = _field(latest, r"manifest (\S+)")
+    rows_backed = _field(latest, r"rows (\d+)")
+    tables = _field(latest, r"tables (\d+)")
+    return jsonify(
+        has_backup=bool(latest),
+        last_backup_utc=latest["created_at"] if latest else None,
+        manifest_id=manifest_id,
+        tables=int(tables) if tables else None,
+        rows_backed_up=int(rows_backed) if rows_backed else None,
+        total_backups=total,
+        oldest_backup_utc=oldest["created_at"] if oldest else None,
+        latest_drill_result=None,
+        latest_drill_at=None,
+        latest_restore_utc=restore["created_at"] if restore else None,
+        latest_restore_manifest_id=_field(restore, r"manifest (\S+)"))
+
+
+def _acct_apply_snapshot(conn, snap_conn):
+    """Apply a verified snapshot additively to the live connection.
+
+    Phase 1 checks every table for conflicts (a live row with the same
+    primary key but different content); phase 2 INSERT OR IGNOREs every
+    row by primary key, in dependency order. Returns (inserted_dict,
+    None) or ({}, (table, key)) on the first conflict. The caller owns the
+    transaction and must roll back on conflict. Nothing is ever
+    overwritten."""
+    snap_rows = {}
+    for table in _ACCT_BACKUP_TABLES:
+        cols = [r[1] for r in snap_conn.execute(
+            "PRAGMA table_info(%s)" % table).fetchall()]
+        rows = snap_conn.execute(
+            "SELECT * FROM %s ORDER BY rowid" % table).fetchall()
+        live = {r[0]: tuple(r) for r in conn.execute(
+            "SELECT * FROM %s" % table).fetchall()}
+        for row in rows:
+            tup = tuple(row)
+            if tup[0] in live and live[tup[0]] != tup:
+                return {}, (table, tup[0])
+        snap_rows[table] = (cols, rows)
+    inserted = {}
+    for table in _ACCT_BACKUP_TABLES:
+        cols, rows = snap_rows[table]
+        placeholders = ",".join("?" * len(cols))
+        collist = ",".join('"%s"' % c for c in cols)
+        n = 0
+        for row in rows:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO %s (%s) VALUES (%s)"
+                % (table, collist, placeholders), tuple(row))
+            if cur.rowcount == 1:
+                n += 1
+        inserted[table] = n
+    return inserted, None
+
+
+@app.post("/api/erp/accounting/backup/restore")
+def erp_acct_backup_restore():
+    """Admin-only live restore (spec 3.6), session-gated (NOT cron
+    secret -- a human decides a restore). Multipart upload of the zip
+    + form field confirm = "RESTORE ACCOUNTING FROM BACKUP
+    <manifest_id>". In order: (1) a fresh export of the CURRENT live
+    accounting state is stored as a pre-restore backup next to the DB
+    file (acct-backups-pre-restore/); if that export fails the restore
+    is refused. (2) The uploaded snapshot is verified against its
+    manifest in a scratch DB; any mismatch is refused. (3) The snapshot
+    is applied additively in ONE transaction, INSERT OR IGNORE per row
+    by primary key. (4) A live row with the same primary key but
+    different content aborts
+    the whole restore (rollback, 409, first conflicting table/key).
+    (5) Success audits backup.restore and returns per-table inserted
+    counts. There is NO frontend restore button."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    up = request.files.get("file")
+    if up is None and request.files:
+        up = next(iter(request.files.values()))
+    if up is None:
+        return jsonify(error="backup zip file is required"), 400
+    confirm = (request.form.get("confirm") or "").strip()
+    prefix = "RESTORE ACCOUNTING FROM BACKUP "
+    if not confirm.startswith(prefix) or not confirm[len(prefix):].strip():
+        return jsonify(
+            error="confirm must be RESTORE ACCOUNTING FROM BACKUP"
+                  " <manifest_id>"), 400
+    manifest_id = confirm[len(prefix):].strip()
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(up.read()))
+    except zipfile.BadZipFile:
+        return jsonify(error="uploaded file is not a valid zip"), 400
+    try:
+        names = zf.namelist()
+        if "acct-backup.db" not in names or "manifest.json" not in names:
+            return jsonify(
+                error="zip must contain acct-backup.db and manifest.json"), 400
+        manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+    except (ValueError, KeyError):
+        return jsonify(error="manifest.json is not valid JSON"), 400
+    if manifest.get("manifest_id") != manifest_id:
+        return jsonify(
+            error="confirm manifest id does not match the backup manifest"), 400
+    try:
+        pre_manifest, pre_zip, pre_filename, _r = _acct_build_export()
+    except _AcctBackupError as exc:
+        app.logger.error("restore refused: pre-restore export failed: %s",
+                         exc.message)
+        return jsonify(error="pre-restore backup failed: " + exc.message), \
+            exc.status
+    pre_dir = os.path.join(
+        os.path.dirname(os.path.abspath(DATABASE_PATH)),
+        "acct-backups-pre-restore")
+    # Stored under the manifest id, not the bare second-stamp
+    # filename: two restores inside the same second must not overwrite
+    # each other's pre-restore backup.
+    pre_store_name = "acct-backup-%s.zip" % pre_manifest["manifest_id"]
+    try:
+        os.makedirs(pre_dir, exist_ok=True)
+        with open(os.path.join(pre_dir, pre_store_name), "wb") as f:
+            f.write(pre_zip)
+    except OSError as exc:
+        app.logger.error(
+            "restore refused: cannot store pre-restore backup: %s", exc)
+        return jsonify(error="pre-restore backup could not be stored"), 500
+    _acct_audit_backup_export(pre_manifest, actor, note="pre-restore backup")
+    tmp = tempfile.NamedTemporaryFile(suffix=".db",
+                                      prefix="acct-restore-", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(zf.read("acct-backup.db"))
+        ok, mismatch = _acct_verify_snapshot_file(tmp_path, manifest)
+        if not ok:
+            return jsonify(
+                error="backup manifest mismatch: " + mismatch), 400
+        conn = db()
+        try:
+            snap_conn = sqlite3.connect(tmp_path)
+            try:
+                inserted, conflict = _acct_apply_snapshot(conn, snap_conn)
+                if conflict is not None:
+                    conn.rollback()
+                    return jsonify(
+                        error="backup conflicts with live row in %s id %s"
+                              % conflict,
+                        table=conflict[0], id=conflict[1]), 409
+                total = sum(inserted.values())
+                _acct_audit(
+                    conn, actor, "backup.restore", "backup", 0,
+                    "manifest %s restored rows %d pre-restore %s inserted %s"
+                    % (manifest_id, total, pre_manifest["manifest_id"],
+                       json.dumps(inserted, sort_keys=True)))
+                conn.commit()
+            finally:
+                snap_conn.close()
+        finally:
+            conn.close()
+        return jsonify(ok=True, manifest_id=manifest_id,
+                       pre_restore_manifest_id=pre_manifest["manifest_id"],
+                       inserted=inserted, rows_inserted=total)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def _acct_invoice_dict(row):
+    d = dict(row)
+    try:
+        d["lines"] = json.loads(row["lines"] or "[]")
+    except (ValueError, TypeError):
+        d["lines"] = []
+    return d
+
+
+def _acct_bill_dict(row):
+    d = dict(row)
+    try:
+        d["lines"] = json.loads(row["lines"] or "[]")
+    except (ValueError, TypeError):
+        d["lines"] = []
+    return d
+
+
+def _acct_validate_invoice_lines(raw, default_taxable=True):
+    """Returns (clean, subtotal, None) or (None, 0, error). Clean lines carry
+    description, qty, rate_cents, amount_cents, taxable. A line's own
+    taxable flag wins; otherwise it inherits default_taxable (retail sales
+    are taxable, wholesale/resale-exempt sales are not)."""
+    if not isinstance(raw, list) or not raw:
+        return None, 0, "at least one line is required"
+    clean = []
+    subtotal = 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return None, 0, "every line needs a description, qty and rate"
+        desc = (entry.get("description") or entry.get("item") or "").strip()
+        if not desc:
+            return None, 0, "every line needs a description"
+        qty = _acct_int_cents(entry.get("qty"))
+        if qty is None or qty < 1:
+            return None, 0, "qty must be a whole number of at least 1"
+        rate = _acct_int_cents(entry.get("rate_cents", 0))
+        if rate is None or rate < 0:
+            return None, 0, "rate_cents must be whole cents"
+        amount = qty * rate
+        subtotal += amount
+        taxable = entry.get("taxable")
+        if not isinstance(taxable, bool):
+            taxable = default_taxable
+        clean.append({"description": desc, "qty": qty,
+                      "rate_cents": rate, "amount_cents": amount,
+                      "taxable": taxable})
+    return clean, subtotal, None
+
+
+def _acct_validate_bill_lines(conn, raw):
+    """Returns (clean, total, None) or (None, 0, error). Clean lines carry
+    description, amount_cents, account_id. A line without an account posts
+    to the default expense account (6900 Other Expenses)."""
+    if not isinstance(raw, list) or not raw:
+        return None, 0, "at least one line is required"
+    default_id = _acct_account_id_by_code(conn, ERP_ACCT_DEFAULT_EXPENSE_CODE)
+    clean = []
+    total = 0
+    for entry in raw:
+        if not isinstance(entry, dict):
+            return None, 0, "every line needs a description and amount"
+        desc = (entry.get("description") or "").strip()
+        if not desc:
+            return None, 0, "every line needs a description"
+        amount = _acct_int_cents(entry.get("amount_cents", 0))
+        if amount is None or amount < 1:
+            return None, 0, "each line amount must be greater than zero"
+        account_id = default_id
+        if entry.get("account_id") not in (None, "", 0):
+            try:
+                account_id = int(entry.get("account_id"))
+            except (TypeError, ValueError):
+                return None, 0, "account_id must be a number"
+            acct = conn.execute(
+                "SELECT * FROM erp_acct_accounts WHERE id = ?",
+                (account_id,)).fetchone()
+            if not acct:
+                return None, 0, "unknown account_id %s" % account_id
+            if not acct["active"]:
+                return None, 0, "account %s is inactive" % (acct["code"],)
+            if acct["type"] not in ("expense", "asset"):
+                return None, 0, "bill lines must post to an expense or asset account"
+        if account_id is None:
+            return None, 0, "default expense account is missing"
+        total += amount
+        clean.append({"description": desc, "amount_cents": amount,
+                      "account_id": account_id})
+    return clean, total, None
+
+
+def _acct_aging_bucket(as_of, due):
+    days = (as_of - due).days
+    if days <= 0:
+        return "current"
+    if days <= 30:
+        return "d1_30"
+    if days <= 60:
+        return "d31_60"
+    if days <= 90:
+        return "d61_90"
+    return "d91_plus"
+
+
+@app.get("/api/erp/accounting/invoices")
+def erp_acct_list_invoices():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    conn = db()
+    if status and status in ERP_ACCT_DOC_STATUSES:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_invoices WHERE status = ?"
+            " ORDER BY date DESC, id DESC", (status,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_invoices ORDER BY date DESC, id DESC").fetchall()
+    # Dept 10 Wave A (item 1): invoices carry the company profile so the
+    # header is the profile, not a hard-coded address.
+    company = _erp_company_profile(conn)
+    conn.close()
+    return jsonify(invoices=[_acct_invoice_dict(r) for r in rows],
+                   company=company)
+
+
+def _acct_create_invoice_record(conn, actor, customer_name, customer_id,
+                                customer_type, date, due_date, lines,
+                                tax_cents, tax_jurisdiction, qb_id):
+    """Shared invoice creation: validate lines, compute tax when
+    tax_cents is None (wholesale auto-post passes 0 explicitly),
+    insert the invoice row, post Dr AR / Cr income (+ Cr 2100) via
+    _acct_post_entry, audit invoice.create. No commit -- the caller
+    commits. Returns (invoice_dict, None, None) or (None, error, status).
+    On a posting failure a savepoint rolls the just-inserted invoice row
+    back (no DELETE: the Phase 4 static checks allow exactly one DELETE
+    FROM an erp_acct_ table, the period-lock unlock), so a caller that
+    keeps working in the same transaction (backfill) never commits a
+    half-created invoice."""
+    lines, subtotal, error = _acct_validate_invoice_lines(
+        lines, default_taxable=(customer_type == "retail"))
+    if error:
+        return None, error, 400
+    if subtotal <= 0:
+        return None, "invoice lines must total more than zero", 400
+    tax = tax_cents
+    if tax is None:
+        taxable_base = sum(l["amount_cents"] for l in lines if l["taxable"])
+        if taxable_base > 0:
+            rate_bps = _acct_tax_rate_bps(conn, tax_jurisdiction, date)
+            if rate_bps is None:
+                return None, ("no tax rate in effect for %s on %s"
+                              % (tax_jurisdiction, date)), 400
+            tax = _acct_compute_tax_cents(taxable_base, rate_bps)
+        else:
+            tax = 0
+    total = subtotal + tax
+    ar_id = _acct_account_id_by_code(conn, ERP_ACCT_AR_CODE)
+    income_code = (ERP_ACCT_WHOLESALE_INCOME_CODE
+                   if customer_type == "wholesale"
+                   else ERP_ACCT_RETAIL_INCOME_CODE)
+    income_id = _acct_account_id_by_code(conn, income_code)
+    tax_id = _acct_account_id_by_code(conn, ERP_ACCT_TAX_PAYABLE_CODE) if tax else None
+    if not ar_id or not income_id or (tax and not tax_id):
+        return None, "chart of accounts is missing a required account", 500
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("SAVEPOINT acct_invoice_create")
+    cur = conn.execute(
+        "INSERT INTO erp_acct_invoices (customer_name, customer_id,"
+        " customer_type, date, due_date, lines, subtotal_cents, tax_cents,"
+        " total_cents, balance_cents, status, journal_entry_id, qb_id, tax_jurisdiction, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?, ?)",
+        (customer_name, customer_id, customer_type, date, due_date,
+         json.dumps(lines), subtotal, tax, total, total,
+         (qb_id or "").strip() or None, tax_jurisdiction, now))
+    inv_id = cur.lastrowid
+    raw = [{"account_id": ar_id, "debit_cents": total, "credit_cents": 0,
+            "memo": "Invoice #%d" % inv_id},
+           {"account_id": income_id, "debit_cents": 0, "credit_cents": subtotal,
+            "memo": "Invoice #%d" % inv_id}]
+    if tax:
+        raw.append({"account_id": tax_id, "debit_cents": 0,
+                    "credit_cents": tax,
+                    "memo": "Sales tax on invoice #%d" % inv_id})
+    entry_id, error = _acct_post_entry(
+        conn, actor, date, "Invoice #%d — %s" % (inv_id, customer_name),
+        "invoice", inv_id, raw)
+    if error:
+        conn.execute("ROLLBACK TO SAVEPOINT acct_invoice_create")
+        conn.execute("RELEASE SAVEPOINT acct_invoice_create")
+        return None, error, 400
+    conn.execute("UPDATE erp_acct_invoices SET journal_entry_id = ? WHERE id = ?",
+                 (entry_id, inv_id))
+    _acct_audit(conn, actor, "invoice.create", "invoice", inv_id,
+                "#%d %s total %d entry #%d"
+                % (inv_id, customer_name, total, entry_id))
+    conn.execute("RELEASE SAVEPOINT acct_invoice_create")
+    row = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (inv_id,)).fetchone()
+    return _acct_invoice_dict(row), None, None
+
+
+@app.post("/api/erp/accounting/invoices")
+def erp_acct_create_invoice():
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    date = (data.get("date") or "").strip()
+    due_date = (data.get("due_date") or "").strip()
+    if not _acct_valid_date(date):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    if not _acct_valid_date(due_date):
+        return jsonify(error="due_date must be YYYY-MM-DD"), 400
+    tax_supplied = "tax_cents" in data and data.get("tax_cents") is not None
+    tax = None
+    if tax_supplied:
+        tax = _acct_int_cents(data.get("tax_cents"))
+        if tax is None or tax < 0:
+            return jsonify(error="tax_cents must be whole cents"), 400
+    conn = db()
+    customer_name = ""
+    customer_id = None
+    customer_type = (data.get("customer_type") or "").strip() or "retail"
+    if customer_type not in ("wholesale", "retail"):
+        conn.close()
+        return jsonify(error="customer_type must be wholesale or retail"), 400
+    ws_id = data.get("wholesale_account_id")
+    if ws_id not in (None, "", 0):
+        try:
+            ws_id = int(ws_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="wholesale_account_id must be a number"), 400
+        ws = conn.execute(
+            "SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+            (ws_id,)).fetchone()
+        if not ws:
+            conn.close()
+            return jsonify(error="wholesale account not found"), 400
+        customer_name = ws["name"]
+        customer_id = ws["id"]
+        customer_type = "wholesale"
+    else:
+        customer_name = (data.get("customer_name") or "").strip()
+        if not customer_name:
+            conn.close()
+            return jsonify(error="customer_name is required"), 400
+    tax_jurisdiction = (data.get("tax_jurisdiction") or "").strip() or ERP_ACCT_TAX_DEFAULT_JURISDICTION
+    inv, error, status = _acct_create_invoice_record(
+        conn, actor, customer_name, customer_id, customer_type, date,
+        due_date, data.get("lines"), tax, tax_jurisdiction,
+        data.get("qb_id"))
+    if error:
+        conn.close()
+        return jsonify(error=error), status
+    conn.commit()
+    conn.close()
+    return jsonify(invoice=inv), 201
+@app.get("/api/erp/accounting/invoices/<int:invoice_id>")
+def erp_acct_get_invoice(invoice_id):
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="invoice not found"), 404
+    payments = conn.execute(
+        "SELECT * FROM erp_acct_payments WHERE invoice_id = ? ORDER BY date, id",
+        (invoice_id,)).fetchall()
+    credit_notes = _acct_credit_notes_for_invoice(conn, invoice_id)
+    company = _erp_company_profile(conn)
+    conn.close()
+    out = _acct_invoice_dict(row)
+    out["payments"] = [dict(p) for p in payments]
+    out["credit_notes"] = credit_notes
+    return jsonify(invoice=out, company=company)
+
+
+@app.post("/api/erp/accounting/invoices/<int:invoice_id>/pay")
+def erp_acct_pay_invoice(invoice_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    amount = _acct_int_cents(data.get("amount_cents"))
+    if amount is None or amount < 1:
+        return jsonify(error="amount_cents must be whole cents greater than zero"), 400
+    date = (data.get("date") or "").strip() or datetime.now(timezone.utc).date().isoformat()
+    if not _acct_valid_date(date):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    method = (data.get("method") or "cash").strip() or "cash"
+    bank_account_id = None
+    if data.get("bank_account_id") not in (None, "", 0):
+        try:
+            bank_account_id = int(data.get("bank_account_id"))
+        except (TypeError, ValueError):
+            return jsonify(error="bank_account_id must be a number"), 400
+    conn = db()
+    inv = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    if not inv:
+        conn.close()
+        return jsonify(error="invoice not found"), 404
+    if inv["status"] != "open":
+        conn.close()
+        return jsonify(error="only an open invoice can be paid"), 400
+    if amount > inv["balance_cents"]:
+        conn.close()
+        return jsonify(error="payment exceeds the invoice balance"), 400
+    cash_id, bank_err = _acct_cash_account_id(conn, bank_account_id)
+    if bank_err:
+        conn.close()
+        return jsonify(error=bank_err), 400
+    ar_id = _acct_account_id_by_code(conn, ERP_ACCT_AR_CODE)
+    if not cash_id or not ar_id:
+        conn.close()
+        return jsonify(error="chart of accounts is missing a required account"), 500
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_payments (invoice_id, bill_id, date,"
+        " amount_cents, method, bank_account_id, journal_entry_id,"
+        " approval_note, qb_id, created_at)"
+        " VALUES (?, NULL, ?, ?, ?, ?, NULL, '', ?, ?)",
+        (invoice_id, date, amount, method, bank_account_id,
+         (data.get("qb_id") or "").strip() or None, now))
+    pay_id = cur.lastrowid
+    entry_id, error = _acct_post_entry(
+        conn, actor, date, "Payment on invoice #%d" % invoice_id,
+        "payment", invoice_id,
+        [{"account_id": cash_id, "debit_cents": amount, "credit_cents": 0,
+          "memo": "Payment on invoice #%d" % invoice_id},
+         {"account_id": ar_id, "debit_cents": 0, "credit_cents": amount,
+          "memo": "Payment on invoice #%d" % invoice_id}])
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    conn.execute("UPDATE erp_acct_payments SET journal_entry_id = ? WHERE id = ?",
+                 (entry_id, pay_id))
+    new_balance = inv["balance_cents"] - amount
+    new_status = "paid" if new_balance == 0 else "open"
+    conn.execute("UPDATE erp_acct_invoices SET balance_cents = ?, status = ?"
+                 " WHERE id = ?", (new_balance, new_status, invoice_id))
+    _acct_audit(conn, actor, "invoice.pay", "invoice", invoice_id,
+                "payment #%d %d cents via %s new balance %d entry #%d"
+                % (pay_id, amount, method, new_balance, entry_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    pay = conn.execute("SELECT * FROM erp_acct_payments WHERE id = ?",
+                       (pay_id,)).fetchone()
+    conn.close()
+    return jsonify(invoice=_acct_invoice_dict(row), payment=dict(pay))
+
+
+@app.post("/api/erp/accounting/invoices/<int:invoice_id>/void")
+def erp_acct_void_invoice(invoice_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    inv = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    if not inv:
+        conn.close()
+        return jsonify(error="invoice not found"), 404
+    if inv["status"] != "open":
+        conn.close()
+        return jsonify(error="only an open invoice can be voided"), 400
+    if inv["balance_cents"] != inv["total_cents"]:
+        conn.close()
+        return jsonify(error="invoice has payments applied and cannot be voided"), 400
+    entry = conn.execute("SELECT * FROM erp_acct_journal WHERE id = ?",
+                         (inv["journal_entry_id"],)).fetchone()
+    if not entry:
+        conn.close()
+        return jsonify(error="invoice has no journal entry to reverse"), 500
+    if entry["reversed_by"]:
+        conn.close()
+        return jsonify(error="invoice entry was already reversed"), 400
+    _rev_id, _rev_error = _acct_reverse_entry(
+        conn, actor, entry, "Void of invoice #%d" % invoice_id,
+        "invoice", invoice_id)
+    if _rev_error:
+        conn.close()
+        return jsonify(error=_rev_error), 400
+    conn.execute("UPDATE erp_acct_invoices SET status = 'void', balance_cents = 0"
+                 " WHERE id = ?", (invoice_id,))
+    _acct_audit(conn, actor, "invoice.void", "invoice", invoice_id,
+                "#%d %s total %d reversing entry #%d"
+                % (invoice_id, inv["customer_name"], inv["total_cents"], _rev_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    conn.close()
+    return jsonify(invoice=_acct_invoice_dict(row))
+
+
+
+# ---- Dept 9, item 1: sales auto-posting to the ledger (Nov 10, 2026) ----
+# PER-ORDER posting (not daily summary): one journal entry per completed
+# sale, traceable to the sale via journal source='sale' and
+# source_id=<source_key>, so a single sale can be reversed on its own and
+# a re-run posts nothing twice. Idempotency lives in erp_acct_sale_posts
+# (source_key UNIQUE); a re-run is a no-op. All money is integer cents;
+# every write leaves an erp_acct_audit row (journal.post from
+# _acct_post_entry, plus sale.post / sale.backfill / sale.post_failed).
+#
+# Sources, exactly once each:
+#   online_stripe -- orders rows, stripe_session_id NOT LIKE 'paypal:%'
+#   online_paypal -- paypal_orders rows, status='captured' ONLY. A captured
+#     PayPal order ALSO has an orders copy (stripe_session_id 'paypal:<id>');
+#     the orders copy is never a source, so it posts once, from paypal_orders.
+#   wholesale     -- erp_wholesale_orders with status shipped/picked_up,
+#     posted by creating the Phase 1 AR invoice (Dr 1100 / Cr 4100, tax 0).
+#     An order that already has a matching non-void Phase 1 invoice, or a
+#     QuickBooks invoice link, is skipped, never re-posted.
+#   gift_card     -- gift_cards rows bought through Stripe checkout
+#     (stripe_session_id set): Dr Cash / Cr Gift Card Liability (2350).
+#     A gift-card purchase is NOT income; it becomes income only when
+#     redeemed, as the discount part of a retail sale entry.
+# Excluded deliberately: uncaptured PayPal orders (not a sale), demo rows
+# (is_demo=1), fundraiser orders (separate channel, no ledger mapping
+# decided), subscription-only first deliveries (no orders row exists for
+# them -- only renewals write orders rows, and those ARE posted), $0 rows.
+#
+# Tax: checkout collects no separate sales-tax line, so amount_total_cents
+# carries no tax component. Retail sales are taxable (Clark County rate in
+# effect on the sale date), so the tax is extracted TAX-INCLUSIVELY from
+# the gross amount paid (amount_total + gift-card discount): tax =
+# round-half-up(base * rate / (100000 + rate)), income = base - tax.
+# Wholesale is resale-exempt: no tax. If checkout ever collects tax as a
+# separate line, this must change to tax-exclusive (tax added on top).
+# Shipping collected is not stored on orders, so the full retail amount
+# posts to 4000 (4200 Shipping Income is unused by auto-posting).
+# Dept 9 wave B fixed the Sales Tax liability view for auto-posted
+# retail tax (source='sale' entries, Clark County), and Dept 9 wave C
+# fixed the same gap in tax FILING creation: filings now snapshot
+# collected/taxable from _acct_tax_liability, the same computation the
+# liability view reports.
+ERP_ACCT_GIFT_CARD_LIABILITY_CODE = "2350"
+ERP_ACCT_SALE_POST_KINDS = ("online_stripe", "online_paypal", "wholesale",
+                            "gift_card")
+
+
+def _acct_ensure_sale_posts_table(conn):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS erp_acct_sale_posts ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " source_key TEXT NOT NULL UNIQUE,"
+        " kind TEXT NOT NULL,"
+        " ref_id INTEGER NOT NULL DEFAULT 0,"
+        " journal_entry_id INTEGER,"
+        " invoice_id INTEGER,"
+        " store_id INTEGER,"
+        " status TEXT NOT NULL DEFAULT 'posted',"
+        " amount_cents INTEGER NOT NULL DEFAULT 0,"
+        " tax_cents INTEGER NOT NULL DEFAULT 0,"
+        " note TEXT NOT NULL DEFAULT '',"
+        " posted_at TEXT NOT NULL,"
+        " posted_by TEXT NOT NULL DEFAULT '',"
+        " created_at TEXT NOT NULL)")
+    # Stores Wave B: nullable store tag on the auto-posting path.
+    # Databases created before this column existed get it via
+    # ALTER -- CREATE TABLE IF NOT EXISTS never adds a column.
+    # store_id stays NULL for online/wholesale sales; POS sales set
+    # it only when the intake is wired to the ledger (follow-up,
+    # not this build), so NULL here means "unattributed", never
+    # "online".
+    _sp_cols = [r[1] for r in conn.execute(
+        "PRAGMA table_info(erp_acct_sale_posts)").fetchall()]
+    if "store_id" not in _sp_cols:
+        conn.execute("ALTER TABLE erp_acct_sale_posts"
+                     " ADD COLUMN store_id INTEGER")
+
+
+def _acct_sale_date(value):
+    """YYYY-MM-DD posting date from an ISO timestamp (or ''), else today."""
+    if isinstance(value, str) and len(value) >= 10:
+        cand = value[:10]
+        if _acct_valid_date(cand):
+            return cand
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _acct_sale_posted(conn, source_key):
+    return conn.execute(
+        "SELECT * FROM erp_acct_sale_posts WHERE source_key = ?",
+        (source_key,)).fetchone()
+
+
+def _acct_record_sale_post(conn, actor, source_key, kind, ref_id, entry_id,
+                           invoice_id, status, amount_cents, tax_cents, note,
+                           store_id=None):
+    """store_id is NULL for online/wholesale sales (no store). POS sales
+    will pass their store id here only when the intake is wired to the
+    ledger (follow-up, not this build) -- nothing in this build sets it."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO erp_acct_sale_posts (source_key, kind, ref_id,"
+        " journal_entry_id, invoice_id, store_id, status, amount_cents,"
+        " tax_cents, note, posted_at, posted_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (source_key, kind, ref_id, entry_id, invoice_id, store_id, status,
+         amount_cents, tax_cents, note or "", now, actor or "", now))
+
+
+def _acct_post_online_sale(conn, actor, kind, row):
+    """Post one completed online sale. `row` is an orders row (kind
+    online_stripe) or a paypal_orders row (kind online_paypal).
+    Returns (entry_id, 'posted'|'already_posted'|'skipped_demo', None)
+    or (None, None, error). The caller commits. No sale_posts row is
+    written on failure, so a later backfill retries the sale."""
+    _acct_ensure_sale_posts_table(conn)
+    if kind == "online_stripe":
+        source_key = "stripe:%d" % row["id"]
+        memo = "Online sale (Stripe) #%d" % (1000 + row["id"])
+    elif kind == "online_paypal":
+        source_key = "paypal:%d" % row["id"]
+        memo = "Online sale (PayPal) #%d" % (1000 + row["id"])
+    else:
+        return None, None, "unknown online sale kind %s" % kind
+    if _acct_sale_posted(conn, source_key):
+        return None, "already_posted", None
+    if "is_demo" in row.keys() and row["is_demo"]:
+        return None, "skipped_demo", None
+    amount = int(row["amount_total_cents"] or 0)
+    discount = int(row["gift_card_discount_cents"] or 0)
+    if amount < 0 or discount < 0:
+        return None, None, "negative sale amount"
+    base = amount + discount
+    if base <= 0:
+        return None, None, "sale total is zero"
+    date = _acct_sale_date(row["created_at"])
+    rate_bps = _acct_tax_rate_bps(conn, ERP_ACCT_TAX_DEFAULT_JURISDICTION, date)
+    if rate_bps is None:
+        return None, None, ("no tax rate in effect for %s on %s"
+                            % (ERP_ACCT_TAX_DEFAULT_JURISDICTION, date))
+    tax = _acct_compute_tax_inclusive_cents(base, rate_bps)
+    income = base - tax
+    cash_id = _acct_account_id_by_code(conn, ERP_ACCT_CASH_CODE)
+    gc_id = _acct_account_id_by_code(conn, ERP_ACCT_GIFT_CARD_LIABILITY_CODE)
+    income_id = _acct_account_id_by_code(conn, ERP_ACCT_RETAIL_INCOME_CODE)
+    tax_id = _acct_account_id_by_code(conn, ERP_ACCT_TAX_PAYABLE_CODE) if tax else None
+    if not cash_id or not gc_id or not income_id or (tax and not tax_id):
+        return None, None, "chart of accounts is missing a required account"
+    raw = []
+    if amount > 0:
+        raw.append({"account_id": cash_id, "debit_cents": amount,
+                    "credit_cents": 0, "memo": memo})
+    if discount > 0:
+        raw.append({"account_id": gc_id, "debit_cents": discount,
+                    "credit_cents": 0,
+                    "memo": "Gift card redemption on " + memo})
+    raw.append({"account_id": income_id, "debit_cents": 0,
+                "credit_cents": income, "memo": memo})
+    if tax:
+        raw.append({"account_id": tax_id, "debit_cents": 0,
+                    "credit_cents": tax, "memo": "Sales tax on " + memo})
+    entry_id, error = _acct_post_entry(conn, actor, date, memo, "sale",
+                                       source_key, raw)
+    if error:
+        return None, None, error
+    _acct_record_sale_post(conn, actor, source_key, kind, row["id"], entry_id,
+                           None, "posted", base, tax, "")
+    _acct_audit(conn, actor, "sale.post", "sale_post", entry_id,
+                "%s %s entry #%d amount %d tax %d"
+                % (kind, source_key, entry_id, base, tax))
+    return entry_id, "posted", None
+
+
+def _acct_post_gift_card_purchase(conn, actor, row):
+    """Post a gift-card purchase: Dr Cash / Cr Gift Card Liability.
+    Not income. Returns (entry_id, status, error) like
+    _acct_post_online_sale."""
+    _acct_ensure_sale_posts_table(conn)
+    source_key = "giftcard:%s" % (row["code"] or "")
+    if _acct_sale_posted(conn, source_key):
+        return None, "already_posted", None
+    if "is_demo" in row.keys() and row["is_demo"]:
+        return None, "skipped_demo", None
+    amount = int(row["amount_cents"] or 0)
+    if amount <= 0:
+        return None, None, "gift card amount is zero"
+    date = _acct_sale_date(row["created_at"])
+    cash_id = _acct_account_id_by_code(conn, ERP_ACCT_CASH_CODE)
+    gc_id = _acct_account_id_by_code(conn, ERP_ACCT_GIFT_CARD_LIABILITY_CODE)
+    if not cash_id or not gc_id:
+        return None, None, "chart of accounts is missing a required account"
+    memo = "Gift card %s purchased" % (row["code"] or "")
+    entry_id, error = _acct_post_entry(
+        conn, actor, date, memo, "sale", source_key,
+        [{"account_id": cash_id, "debit_cents": amount, "credit_cents": 0,
+          "memo": memo},
+         {"account_id": gc_id, "debit_cents": 0, "credit_cents": amount,
+          "memo": memo}])
+    if error:
+        return None, None, error
+    _acct_record_sale_post(conn, actor, source_key, "gift_card", 0, entry_id,
+                           None, "posted", amount, 0, "")
+    _acct_audit(conn, actor, "sale.post", "sale_post", entry_id,
+                "gift_card %s entry #%d amount %d"
+                % (source_key, entry_id, amount))
+    return entry_id, "posted", None
+
+
+def _acct_find_wholesale_invoice(conn, account_id, total_cents, date):
+    """A pre-existing Phase 1 AR invoice for this wholesale order: same
+    wholesale account, same total, same date, not void. Phase 1 invoices
+    carry no order link, so this is an exact-match heuristic; it only
+    ever skips, never posts."""
+    return conn.execute(
+        "SELECT * FROM erp_acct_invoices WHERE customer_id = ?"
+        " AND customer_type = 'wholesale' AND status != 'void'"
+        " AND total_cents = ? AND date = ? ORDER BY id LIMIT 1",
+        (account_id, total_cents, date)).fetchone()
+
+
+def _acct_post_wholesale_sale(conn, actor, order_id):
+    """Post a shipped/picked-up wholesale order by creating its Phase 1
+    AR invoice (Dr AR / Cr wholesale income, tax 0, resale-exempt).
+    Returns (invoice_id, status, None) or (None, None, error), where
+    status is posted / already_posted / skipped_invoiced / skipped_qb.
+    The caller commits. On failure nothing is written, so a later
+    backfill retries."""
+    _acct_ensure_sale_posts_table(conn)
+    source_key = "wholesale:%d" % order_id
+    existing = _acct_sale_posted(conn, source_key)
+    if existing:
+        return existing["invoice_id"], "already_posted", None
+    w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                     (order_id,)).fetchone()
+    if not w:
+        return None, None, "wholesale order not found"
+    if w["status"] not in ("shipped", "picked_up"):
+        return None, None, ("wholesale order is not shipped (status: %s)"
+                            % w["status"])
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (w["account_id"],)).fetchone()
+    if not acct:
+        return None, None, "wholesale account not found"
+    _qty, total = _erp_wholesale_order_totals(conn, order_id)
+    if total <= 0:
+        return None, None, "wholesale order total is zero"
+    date = (w["order_date"] if _acct_valid_date(w["order_date"] or "")
+            else _acct_sale_date(w["created_at"]))
+    inv = _acct_find_wholesale_invoice(conn, acct["id"], total, date)
+    if inv:
+        _acct_record_sale_post(conn, actor, source_key, "wholesale",
+                               order_id, None, inv["id"], "skipped_invoiced",
+                               total, 0, "already invoiced as #%d" % inv["id"])
+        _acct_audit(conn, actor, "sale.post", "sale_post", 0,
+                    "wholesale:%d skipped: already invoiced as #%d"
+                    % (order_id, inv["id"]))
+        return inv["id"], "skipped_invoiced", None
+    if _qb_pushed(conn, "wholesale_order", order_id, "invoice"):
+        _acct_record_sale_post(conn, actor, source_key, "wholesale",
+                               order_id, None, None, "skipped_qb",
+                               total, 0, "already pushed to QuickBooks as an invoice")
+        _acct_audit(conn, actor, "sale.post", "sale_post", 0,
+                    "wholesale:%d skipped: already pushed to QuickBooks"
+                    % order_id)
+        return None, "skipped_qb", None
+    order_lines = conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
+        (order_id,)).fetchall()
+    if not order_lines:
+        return None, None, "wholesale order has no lines"
+    lines = [{"description": "%s — %s bags" % (l["flavor_name"],
+                                               _erp_fmt_qty(l["qty_bags"])),
+              "qty": 1, "rate_cents": int(l["line_total_cents"])}
+             for l in order_lines]
+    try:
+        due = (datetime.strptime(date, "%Y-%m-%d").date()
+               + timedelta(days=30)).isoformat()
+    except ValueError:
+        due = date
+    inv_row, error, _status = _acct_create_invoice_record(
+        conn, actor, acct["name"], acct["id"], "wholesale", date, due,
+        lines, 0, ERP_ACCT_TAX_DEFAULT_JURISDICTION, None)
+    if error:
+        return None, None, error
+    _acct_record_sale_post(conn, actor, source_key, "wholesale", order_id,
+                           inv_row["journal_entry_id"], inv_row["id"],
+                           "posted", total, 0, "")
+    _acct_audit(conn, actor, "sale.post", "sale_post",
+                inv_row["journal_entry_id"],
+                "wholesale wholesale:%d invoice #%d entry #%d amount %d"
+                % (order_id, inv_row["id"], inv_row["journal_entry_id"], total))
+    return inv_row["id"], "posted", None
+
+
+def _acct_sales_backfill(conn, actor):
+    """Post every unposted completed sale, idempotently. Returns a counts
+    dict; per-sale failures are counted, never abort the run. The caller
+    commits. Audits one sale.backfill row with the counts."""
+    _acct_ensure_sale_posts_table(conn)
+    counts = {"posted": 0, "already_posted": 0, "skipped_invoiced": 0,
+              "skipped_qb": 0, "skipped_zero": 0, "skipped_demo": 0,
+              "failed": 0, "posted_by_kind": {}, "failures": []}
+
+    def _tally(status, kind, source_key, error=None):
+        if status == "posted":
+            counts["posted"] += 1
+            counts["posted_by_kind"][kind] = counts["posted_by_kind"].get(kind, 0) + 1
+        elif status in counts:
+            counts[status] += 1
+        if error:
+            counts["failed"] += 1
+            counts["failures"].append({"source_key": source_key, "error": error})
+
+    for r in conn.execute(
+            "SELECT * FROM orders WHERE stripe_session_id NOT LIKE 'paypal:%'"
+            " AND is_demo = 0 ORDER BY id").fetchall():
+        key = "stripe:%d" % r["id"]
+        if _acct_sale_posted(conn, key):
+            counts["already_posted"] += 1
+            continue
+        if (int(r["amount_total_cents"] or 0)
+                + int(r["gift_card_discount_cents"] or 0)) <= 0:
+            counts["skipped_zero"] += 1
+            continue
+        _eid, status, error = _acct_post_online_sale(conn, actor, "online_stripe", r)
+        _tally(status, "online_stripe", key, error)
+    for r in conn.execute(
+            "SELECT * FROM paypal_orders WHERE status = 'captured'"
+            " ORDER BY id").fetchall():
+        key = "paypal:%d" % r["id"]
+        if _acct_sale_posted(conn, key):
+            counts["already_posted"] += 1
+            continue
+        if (int(r["amount_total_cents"] or 0)
+                + int(r["gift_card_discount_cents"] or 0)) <= 0:
+            counts["skipped_zero"] += 1
+            continue
+        _eid, status, error = _acct_post_online_sale(conn, actor, "online_paypal", r)
+        _tally(status, "online_paypal", key, error)
+    for r in conn.execute(
+            "SELECT * FROM erp_wholesale_orders"
+            " WHERE status IN ('shipped', 'picked_up') ORDER BY id").fetchall():
+        key = "wholesale:%d" % r["id"]
+        _iid, status, error = _acct_post_wholesale_sale(conn, actor, r["id"])
+        _tally(status, "wholesale", key, error)
+    for r in conn.execute(
+            "SELECT * FROM gift_cards WHERE stripe_session_id IS NOT NULL"
+            " AND stripe_session_id != '' AND is_demo = 0 ORDER BY code").fetchall():
+        key = "giftcard:%s" % (r["code"] or "")
+        if _acct_sale_posted(conn, key):
+            counts["already_posted"] += 1
+            continue
+        if int(r["amount_cents"] or 0) <= 0:
+            counts["skipped_zero"] += 1
+            continue
+        _eid, status, error = _acct_post_gift_card_purchase(conn, actor, r)
+        _tally(status, "gift_card", key, error)
+    _acct_audit(conn, actor, "sale.backfill", "sale_post", 0,
+                "posted %d already_posted %d skipped_invoiced %d skipped_qb %d"
+                " skipped_zero %d skipped_demo %d failed %d"
+                % (counts["posted"], counts["already_posted"],
+                   counts["skipped_invoiced"], counts["skipped_qb"],
+                   counts["skipped_zero"], counts["skipped_demo"],
+                   counts["failed"]))
+    return counts
+
+
+def _acct_sales_status(conn):
+    """Posting status for the Accounting UI: posted/pending per source,
+    skipped counts, recent failures (sale.post_failed audit rows) and
+    the last backfill run."""
+    _acct_ensure_sale_posts_table(conn)
+    posted = {k: 0 for k in ERP_ACCT_SALE_POST_KINDS}
+    for r in conn.execute(
+            "SELECT kind, COUNT(*) AS n FROM erp_acct_sale_posts"
+            " WHERE status = 'posted' GROUP BY kind").fetchall():
+        posted[r["kind"]] = r["n"]
+    pending = {
+        "online_stripe": conn.execute(
+            "SELECT COUNT(*) FROM orders o"
+            " WHERE o.stripe_session_id NOT LIKE 'paypal:%' AND o.is_demo = 0"
+            " AND COALESCE(o.amount_total_cents, 0)"
+            " + COALESCE(o.gift_card_discount_cents, 0) > 0"
+            " AND NOT EXISTS (SELECT 1 FROM erp_acct_sale_posts s"
+            " WHERE s.source_key = 'stripe:' || o.id)").fetchone()[0],
+        "online_paypal": conn.execute(
+            "SELECT COUNT(*) FROM paypal_orders p WHERE p.status = 'captured'"
+            " AND COALESCE(p.amount_total_cents, 0)"
+            " + COALESCE(p.gift_card_discount_cents, 0) > 0"
+            " AND NOT EXISTS (SELECT 1 FROM erp_acct_sale_posts s"
+            " WHERE s.source_key = 'paypal:' || p.id)").fetchone()[0],
+        "wholesale": conn.execute(
+            "SELECT COUNT(*) FROM erp_wholesale_orders w"
+            " WHERE w.status IN ('shipped', 'picked_up')"
+            " AND (SELECT COALESCE(SUM(line_total_cents), 0)"
+            " FROM erp_wholesale_order_lines l WHERE l.order_id = w.id) > 0"
+            " AND NOT EXISTS (SELECT 1 FROM erp_acct_sale_posts s"
+            " WHERE s.source_key = 'wholesale:' || w.id)").fetchone()[0],
+        "gift_card": conn.execute(
+            "SELECT COUNT(*) FROM gift_cards g"
+            " WHERE g.stripe_session_id IS NOT NULL AND g.stripe_session_id != ''"
+            " AND g.is_demo = 0 AND COALESCE(g.amount_cents, 0) > 0"
+            " AND NOT EXISTS (SELECT 1 FROM erp_acct_sale_posts s"
+            " WHERE s.source_key = 'giftcard:' || g.code)").fetchone()[0],
+    }
+    skipped = {
+        "skipped_invoiced": conn.execute(
+            "SELECT COUNT(*) FROM erp_acct_sale_posts"
+            " WHERE status = 'skipped_invoiced'").fetchone()[0],
+        "skipped_qb": conn.execute(
+            "SELECT COUNT(*) FROM erp_acct_sale_posts"
+            " WHERE status = 'skipped_qb'").fetchone()[0],
+    }
+    failed = [dict(r) for r in conn.execute(
+        "SELECT actor, detail, created_at FROM erp_acct_audit"
+        " WHERE action = 'sale.post_failed'"
+        " ORDER BY id DESC LIMIT 10").fetchall()]
+    last = conn.execute(
+        "SELECT actor, detail, created_at FROM erp_acct_audit"
+        " WHERE action = 'sale.backfill' ORDER BY id DESC LIMIT 1").fetchone()
+    recent = [dict(r) for r in conn.execute(
+        "SELECT * FROM erp_acct_sale_posts ORDER BY id DESC LIMIT 20").fetchall()]
+    return {"posted": posted,
+            "posted_total": sum(posted.values()),
+            "pending": pending,
+            "pending_total": sum(pending.values()),
+            "skipped": skipped,
+            "failed": failed,
+            "last_backfill": dict(last) if last else None,
+            "recent": recent}
+
+
+@app.get("/api/erp/accounting/sales/status")
+def erp_acct_sales_status():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    out = _acct_sales_status(conn)
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/accounting/sales/backfill")
+def erp_acct_sales_backfill():
+    """Admin-only repair control: post every unposted completed sale.
+    Idempotent and audited (sale.backfill); safe to run repeatedly.
+    Also accepts the cron secret (same pattern as the subscription
+    renewal cron) so a nightly job can call it without an admin token."""
+    actor = None
+    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+        actor = "cron"
+    else:
+        actor, err = _erp_check_perm("accounting.write")
+        if err:
+            return err
+    conn = db()
+    counts = _acct_sales_backfill(conn, actor)
+    conn.commit()
+    conn.close()
+    return jsonify(counts)
+
+
+def _acct_try_auto_post_online(kind, session_ref):
+    """Best-effort auto-post from a capture hook. Never raises: a posting
+    failure must not break checkout. Failures are audited sale.post_failed
+    and left for the backfill control."""
+    try:
+        conn = db()
+    except Exception:
+        return
+    key = kind
+    try:
+        if kind == "online_stripe":
+            row = conn.execute(
+                "SELECT * FROM orders WHERE stripe_session_id = ?",
+                (session_ref,)).fetchone()
+            if not row:
+                return
+            if "is_demo" in row.keys() and row["is_demo"]:
+                return
+            key = "stripe:%d" % row["id"]
+            _eid, _status, error = _acct_post_online_sale(
+                conn, "system", "online_stripe", row)
+        else:
+            row = conn.execute(
+                "SELECT * FROM paypal_orders WHERE paypal_order_id = ?",
+                (session_ref,)).fetchone()
+            if not row or row["status"] != "captured":
+                return
+            key = "paypal:%d" % row["id"]
+            _eid, _status, error = _acct_post_online_sale(
+                conn, "system", "online_paypal", row)
+        if error:
+            _acct_audit(conn, "system", "sale.post_failed", "sale_post", 0,
+                        "%s %s" % (key, error))
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            _acct_audit(conn, "system", "sale.post_failed", "sale_post", 0,
+                        "%s %s" % (key, e))
+            conn.commit()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def _acct_try_auto_post_gift_card(session_id):
+    """Best-effort auto-post of a gift-card purchase from fulfill_gift_card.
+    Never raises."""
+    try:
+        conn = db()
+    except Exception:
+        return
+    key = "giftcard:%s" % session_id
+    try:
+        row = conn.execute(
+            "SELECT * FROM gift_cards WHERE stripe_session_id = ?",
+            (session_id,)).fetchone()
+        if not row:
+            return
+        if "is_demo" in row.keys() and row["is_demo"]:
+            return
+        key = "giftcard:%s" % (row["code"] or "")
+        _eid, _status, error = _acct_post_gift_card_purchase(
+            conn, "system", row)
+        if error:
+            _acct_audit(conn, "system", "sale.post_failed", "sale_post", 0,
+                        "%s %s" % (key, error))
+        conn.commit()
+    except Exception as e:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        try:
+            _acct_audit(conn, "system", "sale.post_failed", "sale_post", 0,
+                        "%s %s" % (key, e))
+            conn.commit()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+@app.get("/api/erp/accounting/bills")
+def erp_acct_list_bills():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    conn = db()
+    if status and status in ERP_ACCT_DOC_STATUSES:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_bills WHERE status = ?"
+            " ORDER BY date DESC, id DESC", (status,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_bills ORDER BY date DESC, id DESC").fetchall()
+    conn.close()
+    return jsonify(bills=[_acct_bill_dict(r) for r in rows])
+
+
+@app.post("/api/erp/accounting/bills")
+def erp_acct_create_bill():
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    date = (data.get("date") or "").strip()
+    due_date = (data.get("due_date") or "").strip()
+    if not _acct_valid_date(date):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    if not _acct_valid_date(due_date):
+        return jsonify(error="due_date must be YYYY-MM-DD"), 400
+    vendor_id = data.get("vendor_id")
+    if vendor_id in (None, "", 0):
+        return jsonify(error="vendor_id is required"), 400
+    try:
+        vendor_id = int(vendor_id)
+    except (TypeError, ValueError):
+        return jsonify(error="vendor_id must be a number"), 400
+    conn = db()
+    vendor = conn.execute("SELECT * FROM erp_vendors WHERE id = ?",
+                          (vendor_id,)).fetchone()
+    if not vendor:
+        conn.close()
+        return jsonify(error="vendor not found"), 404
+    lines, total, error = _acct_validate_bill_lines(conn, data.get("lines"))
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    ap_id = _acct_account_id_by_code(conn, ERP_ACCT_AP_CODE)
+    if not ap_id:
+        conn.close()
+        return jsonify(error="chart of accounts is missing a required account"), 500
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_bills (vendor_id, vendor_name, date, due_date,"
+        " lines, total_cents, balance_cents, status, journal_entry_id, qb_id,"
+        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'open', NULL, ?, ?)",
+        (vendor_id, vendor["name"], date, due_date, json.dumps(lines),
+         total, total, (data.get("qb_id") or "").strip() or None, now))
+    bill_id = cur.lastrowid
+    raw = [{"account_id": l["account_id"], "debit_cents": l["amount_cents"],
+            "credit_cents": 0, "memo": l["description"]} for l in lines]
+    raw.append({"account_id": ap_id, "debit_cents": 0, "credit_cents": total,
+                "memo": "Bill #%d" % bill_id})
+    entry_id, error = _acct_post_entry(
+        conn, actor, date, "Bill #%d — %s" % (bill_id, vendor["name"]),
+        "bill", bill_id, raw)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    conn.execute("UPDATE erp_acct_bills SET journal_entry_id = ? WHERE id = ?",
+                 (entry_id, bill_id))
+    _acct_audit(conn, actor, "bill.create", "bill", bill_id,
+                "#%d %s total %d entry #%d"
+                % (bill_id, vendor["name"], total, entry_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                       (bill_id,)).fetchone()
+    conn.close()
+    return jsonify(bill=_acct_bill_dict(row)), 201
+
+
+@app.get("/api/erp/accounting/bills/<int:bill_id>")
+def erp_acct_get_bill(bill_id):
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                       (bill_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="bill not found"), 404
+    payments = conn.execute(
+        "SELECT * FROM erp_acct_payments WHERE bill_id = ? ORDER BY date, id",
+        (bill_id,)).fetchall()
+    match = _acct_bill_match(conn, bill_id)
+    conn.close()
+    out = _acct_bill_dict(row)
+    out["payments"] = [dict(p) for p in payments]
+    out["match"] = match
+    return jsonify(bill=out)
+
+
+@app.post("/api/erp/accounting/bills/<int:bill_id>/pay")
+def erp_acct_pay_bill(bill_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    amount = _acct_int_cents(data.get("amount_cents"))
+    if amount is None or amount < 1:
+        return jsonify(error="amount_cents must be whole cents greater than zero"), 400
+    date = (data.get("date") or "").strip() or datetime.now(timezone.utc).date().isoformat()
+    if not _acct_valid_date(date):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    method = (data.get("method") or "cash").strip() or "cash"
+    bank_account_id = None
+    if data.get("bank_account_id") not in (None, "", 0):
+        try:
+            bank_account_id = int(data.get("bank_account_id"))
+        except (TypeError, ValueError):
+            return jsonify(error="bank_account_id must be a number"), 400
+    conn = db()
+    bill = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                        (bill_id,)).fetchone()
+    if not bill:
+        conn.close()
+        return jsonify(error="bill not found"), 404
+    if bill["status"] != "open":
+        conn.close()
+        return jsonify(error="only an open bill can be paid"), 400
+    if amount > bill["balance_cents"]:
+        conn.close()
+        return jsonify(error="payment exceeds the bill balance"), 400
+    cash_id, bank_err = _acct_cash_account_id(conn, bank_account_id)
+    if bank_err:
+        conn.close()
+        return jsonify(error=bank_err), 400
+    ap_id = _acct_account_id_by_code(conn, ERP_ACCT_AP_CODE)
+    if not cash_id or not ap_id:
+        conn.close()
+        return jsonify(error="chart of accounts is missing a required account"), 500
+    now = datetime.now(timezone.utc).isoformat()
+    approval_note = "Approved by %s at %s" % (actor or "", now)
+    cur = conn.execute(
+        "INSERT INTO erp_acct_payments (invoice_id, bill_id, date,"
+        " amount_cents, method, bank_account_id, journal_entry_id,"
+        " approval_note, qb_id, created_at)"
+        " VALUES (NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+        (bill_id, date, amount, method, bank_account_id, approval_note,
+         (data.get("qb_id") or "").strip() or None, now))
+    pay_id = cur.lastrowid
+    entry_id, error = _acct_post_entry(
+        conn, actor, date, "Payment on bill #%d" % bill_id,
+        "payment", bill_id,
+        [{"account_id": ap_id, "debit_cents": amount, "credit_cents": 0,
+          "memo": "Payment on bill #%d" % bill_id},
+         {"account_id": cash_id, "debit_cents": 0, "credit_cents": amount,
+          "memo": "Payment on bill #%d" % bill_id}])
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    conn.execute("UPDATE erp_acct_payments SET journal_entry_id = ? WHERE id = ?",
+                 (entry_id, pay_id))
+    new_balance = bill["balance_cents"] - amount
+    new_status = "paid" if new_balance == 0 else "open"
+    conn.execute("UPDATE erp_acct_bills SET balance_cents = ?, status = ?"
+                 " WHERE id = ?", (new_balance, new_status, bill_id))
+    _acct_audit(conn, actor, "bill.pay", "bill", bill_id,
+                "payment #%d %d cents via %s new balance %d entry #%d; %s"
+                % (pay_id, amount, method, new_balance, entry_id, approval_note))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                       (bill_id,)).fetchone()
+    pay = conn.execute("SELECT * FROM erp_acct_payments WHERE id = ?",
+                       (pay_id,)).fetchone()
+    conn.close()
+    return jsonify(bill=_acct_bill_dict(row), payment=dict(pay))
+
+
+@app.post("/api/erp/accounting/bills/<int:bill_id>/void")
+def erp_acct_void_bill(bill_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    bill = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                        (bill_id,)).fetchone()
+    if not bill:
+        conn.close()
+        return jsonify(error="bill not found"), 404
+    if bill["status"] != "open":
+        conn.close()
+        return jsonify(error="only an open bill can be voided"), 400
+    if bill["balance_cents"] != bill["total_cents"]:
+        conn.close()
+        return jsonify(error="bill has payments applied and cannot be voided"), 400
+    entry = conn.execute("SELECT * FROM erp_acct_journal WHERE id = ?",
+                         (bill["journal_entry_id"],)).fetchone()
+    if not entry:
+        conn.close()
+        return jsonify(error="bill has no journal entry to reverse"), 500
+    if entry["reversed_by"]:
+        conn.close()
+        return jsonify(error="bill entry was already reversed"), 400
+    _rev_id, _rev_error = _acct_reverse_entry(
+        conn, actor, entry, "Void of bill #%d" % bill_id,
+        "bill", bill_id)
+    if _rev_error:
+        conn.close()
+        return jsonify(error=_rev_error), 400
+    conn.execute("UPDATE erp_acct_bills SET status = 'void', balance_cents = 0"
+                 " WHERE id = ?", (bill_id,))
+    _acct_audit(conn, actor, "bill.void", "bill", bill_id,
+                "#%d %s total %d reversing entry #%d"
+                % (bill_id, bill["vendor_name"], bill["total_cents"], _rev_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                       (bill_id,)).fetchone()
+    conn.close()
+    return jsonify(bill=_acct_bill_dict(row))
+
+
+@app.get("/api/erp/accounting/aging")
+def erp_acct_aging():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    as_of_raw = (request.args.get("as_of") or "").strip()
+    if as_of_raw:
+        if not _acct_valid_date(as_of_raw):
+            return jsonify(error="as_of must be YYYY-MM-DD"), 400
+        as_of = datetime.strptime(as_of_raw, "%Y-%m-%d").date()
+    else:
+        as_of = datetime.now(timezone.utc).date()
+    conn = db()
+    ar_rows = conn.execute(
+        "SELECT * FROM erp_acct_invoices WHERE status = 'open'"
+        " AND balance_cents > 0 ORDER BY due_date").fetchall()
+    ap_rows = conn.execute(
+        "SELECT * FROM erp_acct_bills WHERE status = 'open'"
+        " AND balance_cents > 0 ORDER BY due_date").fetchall()
+    conn.close()
+
+    def bucketize(rows, key):
+        groups = {}
+        for r in rows:
+            due = datetime.strptime(r["due_date"], "%Y-%m-%d").date()
+            bucket = _acct_aging_bucket(as_of, due)
+            name = r[key]
+            g = groups.setdefault(name, {"name": name, "total_cents": 0,
+                                         "current": 0, "d1_30": 0, "d31_60": 0,
+                                         "d61_90": 0, "d91_plus": 0})
+            g[bucket] += r["balance_cents"]
+            g["total_cents"] += r["balance_cents"]
+        out = sorted(groups.values(), key=lambda g: -g["total_cents"])
+        totals = {"total_cents": 0, "current": 0, "d1_30": 0, "d31_60": 0,
+                  "d61_90": 0, "d91_plus": 0}
+        for g in out:
+            for bk in ERP_ACCT_AGING_BUCKETS:
+                totals[bk] += g[bk]
+            totals["total_cents"] += g["total_cents"]
+        return {"rows": out, "totals": totals}
+
+    return jsonify(as_of=as_of.isoformat(),
+                   ar=bucketize(ar_rows, "customer_name"),
+                   ap=bucketize(ap_rows, "vendor_name"))
+
+
+# ---- PO -> bill 3-way matching + credit notes (Dept 9, items 4+5) ----
+# Item 4 design (see the erp_acct_bill_po_links table comment): billed
+# quantities/prices are STORED links (bill rows carry no qty/rate/item),
+# ordered/received are COMPUTED on read from erp_po_lines, and every
+# match verdict is computed live from those two sources -- no stored
+# verdict to go stale. Flags, per PO line:
+#   short_receipt       0 < received < ordered (nothing received yet
+#                       is not short, it is just unreceived)
+#   over_received       received > ordered (cannot happen via /receive,
+#                       computed anyway so a data fix still surfaces)
+#   price_variance      any linked billed unit price != the PO unit cost
+#   billed_not_received billed qty > received qty
+#   over_billed         billed qty > ordered qty
+#   not_billed          received > 0 and nothing billed yet
+# A bill/PO is "matched" when it has links and no flags, "variance"
+# when any flag is set, "unmatched" when it has no links at all.
+# Unmatched bills and POs with no bill are listed by the overview
+# endpoint, never hidden. No receipt upload/OCR: explicitly out of
+# scope, not built. Linking posts no journal entry and carries no date,
+# so period locks do not gate it; it is audited (bill_po.link).
+def _acct_match_line_flags(ordered, received, billed_qty, billed_amount,
+                           po_unit_cost, link_prices):
+    flags = []
+    # A PO with nothing received yet is not short, it is just unreceived
+    # (sent, awaiting delivery); short means a partial receipt landed.
+    if received > 1e-9 and received < ordered - 1e-9:
+        flags.append("short_receipt")
+    if received > ordered + 1e-9:
+        flags.append("over_received")
+    if billed_qty > received + 1e-9:
+        flags.append("billed_not_received")
+    if billed_qty > ordered + 1e-9:
+        flags.append("over_billed")
+    if billed_qty > 0 and any(p != po_unit_cost for p in link_prices):
+        flags.append("price_variance")
+    if received > 0 and billed_qty <= 1e-9:
+        flags.append("not_billed")
+    return flags
+
+
+def _acct_po_match(conn, po_id):
+    """Computed 3-way match for one PO (or None when unknown). Ordered
+    and received come from erp_po_lines; billed comes from the stored
+    bill links summed across ALL bills for each PO line."""
+    po = conn.execute("SELECT * FROM erp_purchase_orders WHERE id = ?",
+                      (po_id,)).fetchone()
+    if not po:
+        return None
+    vendor = conn.execute("SELECT name FROM erp_vendors WHERE id = ?",
+                          (po["vendor_id"],)).fetchone()
+    lines = []
+    flags_all = []
+    ordered_total = 0
+    received_total = 0
+    billed_total = 0
+    has_link = False
+    for line in conn.execute(
+            "SELECT l.*, i.sku, i.name AS item_name"
+            " FROM erp_po_lines l JOIN erp_items i ON i.id = l.item_id"
+            " WHERE l.po_id = ? ORDER BY l.id", (po_id,)).fetchall():
+        links = conn.execute(
+            "SELECT * FROM erp_acct_bill_po_links WHERE po_line_id = ?"
+            " ORDER BY id", (line["id"],)).fetchall()
+        billed_qty = sum(float(l["qty_billed"]) for l in links)
+        billed_amount = sum(float(l["qty_billed"]) * int(l["unit_price_cents"])
+                            for l in links)
+        if links:
+            has_link = True
+        ordered = float(line["qty_ordered"])
+        received = float(line["qty_received"])
+        unit = int(line["unit_cost_cents"])
+        flags = _acct_match_line_flags(
+            ordered, received, billed_qty, billed_amount, unit,
+            [int(l["unit_price_cents"]) for l in links])
+        flags_all.extend(flags)
+        ordered_total += int(round(ordered * unit))
+        received_total += int(round(received * unit))
+        billed_total += int(round(billed_amount))
+        lines.append({
+            "po_line_id": line["id"], "item_id": line["item_id"],
+            "sku": line["sku"], "item_name": line["item_name"],
+            "qty_ordered": ordered, "qty_received": received,
+            "qty_billed": billed_qty,
+            "po_unit_cost_cents": unit,
+            "billed_unit_price_cents": (
+                int(round(billed_amount / billed_qty))
+                if billed_qty > 0 else None),
+            "billed_amount_cents": int(round(billed_amount)),
+            "bill_ids": [l["bill_id"] for l in links],
+            "flags": flags})
+    if not has_link:
+        status = "unmatched"
+    elif flags_all:
+        status = "variance"
+    else:
+        status = "matched"
+    return {"po_id": po["id"], "po_number": po["po_number"],
+            "vendor_id": po["vendor_id"],
+            "vendor_name": vendor["name"] if vendor else "",
+            "po_status": po["status"],
+            "last_receipt_date": _erp_po_last_receipt_date(
+                conn, po["po_number"]),
+            "ordered_total_cents": ordered_total,
+            "received_total_cents": received_total,
+            "billed_total_cents": billed_total,
+            "has_bill": has_link, "status": status,
+            "flags": sorted(set(flags_all)), "lines": lines}
+
+
+def _acct_bill_match(conn, bill_id):
+    """Computed 3-way match for one bill (or None when unknown): every
+    stored link, each with its PO line's ordered/received/billed
+    figures and flags. unlinked_amount_cents is the part of the bill
+    total no link covers (freight, tax and other bill lines are billed
+    without a PO line by design) -- informational, never a flag."""
+    bill = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                        (bill_id,)).fetchone()
+    if not bill:
+        return None
+    links = conn.execute(
+        "SELECT l.*, p.po_number, p.vendor_id AS po_vendor_id,"
+        " pl.qty_ordered, pl.qty_received, pl.unit_cost_cents,"
+        " i.sku, i.name AS item_name"
+        " FROM erp_acct_bill_po_links l"
+        " JOIN erp_purchase_orders p ON p.id = l.po_id"
+        " JOIN erp_po_lines pl ON pl.id = l.po_line_id"
+        " JOIN erp_items i ON i.id = l.item_id"
+        " WHERE l.bill_id = ? ORDER BY l.id", (bill_id,)).fetchall()
+    out_lines = []
+    flags_all = []
+    linked_total = 0
+    for link in links:
+        ordered = float(link["qty_ordered"])
+        received = float(link["qty_received"])
+        billed_qty = float(link["qty_billed"])
+        unit = int(link["unit_cost_cents"])
+        billed_price = int(link["unit_price_cents"])
+        amount = int(round(billed_qty * billed_price))
+        linked_total += amount
+        flags = _acct_match_line_flags(
+            ordered, received, billed_qty, amount, unit, [billed_price])
+        flags_all.extend(flags)
+        out_lines.append({
+            "link_id": link["id"], "po_id": link["po_id"],
+            "po_number": link["po_number"],
+            "po_line_id": link["po_line_id"], "item_id": link["item_id"],
+            "sku": link["sku"], "item_name": link["item_name"],
+            "qty_ordered": ordered, "qty_received": received,
+            "qty_billed": billed_qty,
+            "po_unit_cost_cents": unit,
+            "billed_unit_price_cents": billed_price,
+            "billed_amount_cents": amount, "flags": flags})
+    if not links:
+        status = "unmatched"
+    elif flags_all:
+        status = "variance"
+    else:
+        status = "matched"
+    return {"bill_id": bill["id"], "vendor_id": bill["vendor_id"],
+            "vendor_name": bill["vendor_name"],
+            "bill_status": bill["status"],
+            "bill_total_cents": bill["total_cents"],
+            "linked_total_cents": linked_total,
+            "unlinked_amount_cents": bill["total_cents"] - linked_total,
+            "status": status, "flags": sorted(set(flags_all)),
+            "lines": out_lines}
+
+
+def _acct_matching_overview(conn):
+    """Every PO with its match summary, plus the unmatched bills and
+    the ordered POs with no bill -- the two lists the task requires to
+    stay visible, not hidden. Draft/cancelled POs are listed too (a
+    draft has no receipt yet, so it is 'unmatched' until it is sent
+    and linked); pos_without_bill covers sent/partial/received/closed
+    POs only."""
+    pos = []
+    for po in conn.execute(
+            "SELECT * FROM erp_purchase_orders ORDER BY id DESC").fetchall():
+        pos.append(_acct_po_match(conn, po["id"]))
+    linked_bill_ids = {r[0] for r in conn.execute(
+        "SELECT DISTINCT bill_id FROM erp_acct_bill_po_links").fetchall()}
+    unmatched_bills = []
+    for bill in conn.execute(
+            "SELECT * FROM erp_acct_bills WHERE status != 'void'"
+            " ORDER BY date DESC, id DESC").fetchall():
+        if bill["id"] not in linked_bill_ids:
+            unmatched_bills.append(_acct_bill_dict(bill))
+    pos_without_bill = [p for p in pos
+                        if not p["has_bill"]
+                        and p["po_status"] in ("sent", "partial",
+                                               "received", "closed")]
+    return {"purchase_orders": pos,
+            "unmatched_bills": unmatched_bills,
+            "pos_without_bill": pos_without_bill,
+            "counts": {"purchase_orders": len(pos),
+                       "unmatched_bills": len(unmatched_bills),
+                       "pos_without_bill": len(pos_without_bill),
+                       "matched": sum(1 for p in pos
+                                      if p["status"] == "matched"),
+                       "variance": sum(1 for p in pos
+                                       if p["status"] == "variance"),
+                       "unmatched": sum(1 for p in pos
+                                        if p["status"] == "unmatched")}}
+
+
+@app.get("/api/erp/accounting/matching")
+def erp_acct_matching_overview():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    out = _acct_matching_overview(conn)
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/erp/accounting/bills/<int:bill_id>/match")
+def erp_acct_bill_match_view(bill_id):
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    match = _acct_bill_match(conn, bill_id)
+    conn.close()
+    if match is None:
+        return jsonify(error="bill not found"), 404
+    return jsonify(match=match)
+
+
+@app.post("/api/erp/accounting/bills/<int:bill_id>/link-po")
+def erp_acct_bill_link_po(bill_id):
+    """Link a bill to a PO (by po_id or po_number) with billed
+    quantities and unit prices per PO line. Vendor must match the
+    bill's vendor. Re-posting a line upserts it (same bill + PO line
+    is one link); there is no delete -- a wrong link is corrected by
+    re-linking the line. Billed qty above received/ordered is NOT
+    rejected: that is exactly the billed-not-received / over-billed
+    variance the match view flags."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    bill = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                        (bill_id,)).fetchone()
+    if not bill:
+        conn.close()
+        return jsonify(error="bill not found"), 404
+    if bill["status"] == "void":
+        conn.close()
+        return jsonify(error="a void bill cannot be linked to a PO"), 400
+    po = None
+    if data.get("po_id") not in (None, "", 0):
+        try:
+            po_id = int(data.get("po_id"))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="po_id must be a number"), 400
+        po = conn.execute("SELECT * FROM erp_purchase_orders WHERE id = ?",
+                          (po_id,)).fetchone()
+    elif (data.get("po_number") or "").strip():
+        po = conn.execute(
+            "SELECT * FROM erp_purchase_orders WHERE po_number = ?",
+            ((data.get("po_number") or "").strip(),)).fetchone()
+    if not po:
+        conn.close()
+        return jsonify(error="purchase order not found"), 404
+    if po["vendor_id"] != bill["vendor_id"]:
+        conn.close()
+        return jsonify(
+            error="purchase order vendor does not match the bill vendor"), 400
+    raw_lines = data.get("lines")
+    if not isinstance(raw_lines, list) or not raw_lines:
+        conn.close()
+        return jsonify(error="at least one line is required"), 400
+    po_lines = {l["id"]: l for l in conn.execute(
+        "SELECT * FROM erp_po_lines WHERE po_id = ?", (po["id"],)).fetchall()}
+    clean = []
+    for entry in raw_lines:
+        if not isinstance(entry, dict):
+            conn.close()
+            return jsonify(error="every line needs a po_line_id, qty_billed"
+                           " and unit_price_cents"), 400
+        try:
+            line_id = int(entry.get("po_line_id") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="po_line_id must be a number"), 400
+        line = po_lines.get(line_id)
+        if not line:
+            conn.close()
+            return jsonify(error="PO line %s is not on this purchase order"
+                           % (entry.get("po_line_id"),)), 400
+        try:
+            qty = float(entry.get("qty_billed"))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="qty_billed must be a number"), 400
+        if qty <= 0:
+            conn.close()
+            return jsonify(error="qty_billed must be greater than zero"), 400
+        price = _acct_int_cents(entry.get("unit_price_cents"))
+        if price is None or price < 0:
+            conn.close()
+            return jsonify(error="unit_price_cents must be whole cents"), 400
+        clean.append((line, qty, price))
+    now = datetime.now(timezone.utc).isoformat()
+    for line, qty, price in clean:
+        conn.execute(
+            "INSERT INTO erp_acct_bill_po_links (bill_id, po_id, po_line_id,"
+            " item_id, qty_billed, unit_price_cents, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(bill_id, po_line_id) DO UPDATE SET"
+            " qty_billed = excluded.qty_billed,"
+            " unit_price_cents = excluded.unit_price_cents,"
+            " created_by = excluded.created_by",
+            (bill_id, po["id"], line["id"], line["item_id"], qty, price,
+             actor or "", now))
+    _acct_audit(conn, actor, "bill_po.link", "bill", bill_id,
+                "#%d linked to %s (%d line(s))" % (
+                    bill_id, po["po_number"], len(clean)))
+    conn.commit()
+    match = _acct_bill_match(conn, bill_id)
+    conn.close()
+    return jsonify(match=match), 201
+
+
+# ---- Credit notes (Dept 9, item 5) ----
+# A partial (or full) correction against an OPEN invoice. The original
+# invoice row is never edited in place except for its balance/status
+# (the same two fields a payment updates); the credit itself is a new
+# row in erp_acct_credit_notes plus a new journal entry that reverses
+# the credited part of the original posting proportionally: tax is
+# split out by the invoice's tax/total ratio (round half up), so a
+# full credit reverses exactly the original tax and income. Void stays
+# all-or-nothing and unchanged: void still requires balance == total,
+# so any credit (or payment) blocks a void. A fully credited invoice
+# becomes status 'paid' (settled, like a fully paid one -- the status
+# set is open/paid/void only); its balance is 0 either way, so aging,
+# snapshot AR and statements all treat it as settled.
+def _acct_credit_note_dict(row):
+    return dict(row)
+
+
+def _acct_credit_notes_for_invoice(conn, invoice_id):
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_credit_notes WHERE invoice_id = ?"
+        " ORDER BY date, id", (invoice_id,)).fetchall()
+    return [_acct_credit_note_dict(r) for r in rows]
+
+
+@app.get("/api/erp/accounting/credit-notes")
+def erp_acct_list_credit_notes():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    invoice_id = request.args.get("invoice_id")
+    status = (request.args.get("status") or "").strip()
+    conn = db()
+    sql = "SELECT * FROM erp_acct_credit_notes"
+    clauses = []
+    params = []
+    if invoice_id not in (None, "", 0):
+        try:
+            invoice_id = int(invoice_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="invoice_id must be a number"), 400
+        clauses.append("invoice_id = ?")
+        params.append(invoice_id)
+    if status:
+        clauses.append("status = ?")
+        params.append(status)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY date DESC, id DESC"
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    return jsonify(credit_notes=[_acct_credit_note_dict(r) for r in rows])
+
+
+@app.get("/api/erp/accounting/invoices/<int:invoice_id>/credit-notes")
+def erp_acct_list_invoice_credit_notes(invoice_id):
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    inv = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    if not inv:
+        conn.close()
+        return jsonify(error="invoice not found"), 404
+    out = _acct_credit_notes_for_invoice(conn, invoice_id)
+    conn.close()
+    return jsonify(credit_notes=out)
+
+
+@app.post("/api/erp/accounting/invoices/<int:invoice_id>/credit-notes")
+def erp_acct_create_credit_note(invoice_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    amount = _acct_int_cents(data.get("amount_cents"))
+    if amount is None or amount < 1:
+        return jsonify(error="amount_cents must be whole cents greater than zero"), 400
+    date = (data.get("date") or "").strip() or datetime.now(timezone.utc).date().isoformat()
+    if not _acct_valid_date(date):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    reason = (data.get("reason") or "").strip()
+    conn = db()
+    inv = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    if not inv:
+        conn.close()
+        return jsonify(error="invoice not found"), 404
+    if inv["status"] != "open":
+        conn.close()
+        return jsonify(
+            error="only an open invoice can be credited (status: %s)"
+            % inv["status"]), 400
+    if amount > inv["balance_cents"]:
+        conn.close()
+        return jsonify(error="credit exceeds the invoice balance"), 400
+    lock_error = _acct_lock_error(conn, date)
+    if lock_error:
+        conn.close()
+        return jsonify(error=lock_error), 400
+    tax_portion = 0
+    if inv["tax_cents"] and inv["total_cents"]:
+        tax_portion = (amount * inv["tax_cents"] + inv["total_cents"] // 2) \
+            // inv["total_cents"]
+    income_portion = amount - tax_portion
+    ar_id = _acct_account_id_by_code(conn, ERP_ACCT_AR_CODE)
+    income_code = (ERP_ACCT_WHOLESALE_INCOME_CODE
+                   if inv["customer_type"] == "wholesale"
+                   else ERP_ACCT_RETAIL_INCOME_CODE)
+    income_id = _acct_account_id_by_code(conn, income_code)
+    tax_id = _acct_account_id_by_code(conn, ERP_ACCT_TAX_PAYABLE_CODE) \
+        if tax_portion else None
+    if not ar_id or not income_id or (tax_portion and not tax_id):
+        conn.close()
+        return jsonify(error="chart of accounts is missing a required account"), 500
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("SAVEPOINT acct_credit_note_create")
+    cur = conn.execute(
+        "INSERT INTO erp_acct_credit_notes (invoice_id, date, amount_cents,"
+        " reason, status, journal_entry_id, created_by, created_at)"
+        " VALUES (?, ?, ?, ?, 'issued', NULL, ?, ?)",
+        (invoice_id, date, amount, reason, actor or "", now))
+    note_id = cur.lastrowid
+    raw = [{"account_id": income_id, "debit_cents": income_portion,
+            "credit_cents": 0,
+            "memo": "Credit note #%d on invoice #%d" % (note_id, invoice_id)}]
+    if tax_portion:
+        raw.append({"account_id": tax_id, "debit_cents": tax_portion,
+                    "credit_cents": 0,
+                    "memo": "Sales tax reversed by credit note #%d"
+                    % note_id})
+    raw.append({"account_id": ar_id, "debit_cents": 0,
+                "credit_cents": amount,
+                "memo": "Credit note #%d on invoice #%d"
+                % (note_id, invoice_id)})
+    entry_id, error = _acct_post_entry(
+        conn, actor, date, "Credit note #%d on invoice #%d"
+        % (note_id, invoice_id), "credit_note", note_id, raw)
+    if error:
+        conn.execute("ROLLBACK TO SAVEPOINT acct_credit_note_create")
+        conn.execute("RELEASE SAVEPOINT acct_credit_note_create")
+        conn.close()
+        return jsonify(error=error), 400
+    conn.execute("UPDATE erp_acct_credit_notes SET journal_entry_id = ?"
+                 " WHERE id = ?", (entry_id, note_id))
+    new_balance = inv["balance_cents"] - amount
+    new_status = "paid" if new_balance == 0 else "open"
+    conn.execute("UPDATE erp_acct_invoices SET balance_cents = ?, status = ?"
+                 " WHERE id = ?", (new_balance, new_status, invoice_id))
+    _acct_audit(conn, actor, "credit_note.create", "credit_note", note_id,
+                "#%d invoice #%d %d cents new balance %d entry #%d%s"
+                % (note_id, invoice_id, amount, new_balance, entry_id,
+                   " reason: " + reason if reason else ""))
+    conn.execute("RELEASE SAVEPOINT acct_credit_note_create")
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_credit_notes WHERE id = ?",
+                       (note_id,)).fetchone()
+    inv_row = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                           (invoice_id,)).fetchone()
+    conn.close()
+    return jsonify(credit_note=_acct_credit_note_dict(row),
+                   invoice=_acct_invoice_dict(inv_row)), 201
+
+
+# ---- Customer statements + accounting dashboard snapshot (Dept 9) ----
+# Items 2 and 3. Both are read-only computations over the ledger,
+# invoices, bills and payments -- no new tables, no writes, no audit
+# rows, no new permissions (accounting.read, like the other reports).
+# All money is integer cents; balances come from invoice/payment
+# records, never estimated. Aging buckets reuse _acct_aging_bucket,
+# the same buckets as the AR aging endpoint.
+def _acct_statement_credits(conn, invoice_ids):
+    """Credit notes flowing into a statement (Dept 9 item 5, wave C).
+
+    Contract for wave C: table erp_acct_credit_notes with columns
+    invoice_id (the invoice the credit reduces), date, amount_cents,
+    and status when one exists (void rows excluded). Until that table
+    exists this returns [] and statements are invoices + payments only.
+    A credit-note table with different column names does NOT flow in
+    silently -- this checks the columns and returns [] unless the
+    contract columns are present."""
+    if not invoice_ids:
+        return []
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()}
+    if "erp_acct_credit_notes" not in tables:
+        return []
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA table_info(erp_acct_credit_notes)").fetchall()}
+    if not {"invoice_id", "date", "amount_cents"} <= cols:
+        return []
+    where = ("invoice_id IN (%s)"
+             % ", ".join("?" * len(invoice_ids)))
+    params = list(invoice_ids)
+    if "status" in cols:
+        where += " AND status != 'void'"
+    rows = conn.execute(
+        "SELECT id, invoice_id, date, amount_cents"
+        " FROM erp_acct_credit_notes WHERE " + where
+        + " ORDER BY date, id", params).fetchall()
+    return [{"credit_note_id": r["id"], "invoice_id": r["invoice_id"],
+             "date": r["date"], "amount_cents": r["amount_cents"]}
+            for r in rows]
+
+
+def _acct_resolve_statement_customer(conn):
+    """Resolve the statement customer from the query string. Returns
+    (customer, None) or (None, (resp, code)). Resolution, in order:
+      wholesale_account_id -- the wholesale account by id (404 unknown);
+      email -- wholesale account by normalized lowercase email, else a
+        retail customer keyed by that email (invoices carry no email
+        column; staff enter the email as the invoice customer name);
+      customer_name -- a wholesale account of that name wins, else
+        retail invoices whose customer_name matches case-insensitively.
+    This mirrors the Reports customers keying (retail by normalized
+    lowercase email, wholesale by account) as far as the invoice
+    records allow: invoices key wholesale by customer_id and retail
+    by customer_name only."""
+    ws_id = request.args.get("wholesale_account_id")
+    email = (request.args.get("email") or "").strip().lower()
+    name = (request.args.get("customer_name") or "").strip()
+    if ws_id not in (None, "", 0):
+        try:
+            ws_id = int(ws_id)
+        except (TypeError, ValueError):
+            return None, (jsonify(
+                error="wholesale_account_id must be a number"), 400)
+        ws = conn.execute(
+            "SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+            (ws_id,)).fetchone()
+        if not ws:
+            return None, (jsonify(error="wholesale account not found"), 404)
+        return {"customer_type": "wholesale", "customer_id": ws["id"],
+                "customer_name": ws["name"], "email": ws["email"] or "",
+                "key": "wholesale:%d" % ws["id"]}, None
+    if email:
+        ws = conn.execute(
+            "SELECT * FROM erp_wholesale_accounts WHERE lower(email) = ?",
+            (email,)).fetchone()
+        if ws:
+            return {"customer_type": "wholesale", "customer_id": ws["id"],
+                    "customer_name": ws["name"], "email": ws["email"] or "",
+                    "key": "wholesale:%d" % ws["id"]}, None
+        return {"customer_type": "retail", "customer_id": None,
+                "customer_name": email, "email": email,
+                "key": "email:" + email}, None
+    if name:
+        ws = conn.execute(
+            "SELECT * FROM erp_wholesale_accounts WHERE lower(name) = ?",
+            (name.lower(),)).fetchone()
+        if ws:
+            return {"customer_type": "wholesale", "customer_id": ws["id"],
+                    "customer_name": ws["name"], "email": ws["email"] or "",
+                    "key": "wholesale:%d" % ws["id"]}, None
+        return {"customer_type": "retail", "customer_id": None,
+                "customer_name": name, "email": "",
+                "key": "name:" + name.lower()}, None
+    return None, (jsonify(
+        error="wholesale_account_id, email or customer_name is required"),
+        400)
+
+
+def _acct_customer_statement(conn, customer, start, end):
+    """Statement for one customer over [start, end] (as_of = end).
+    Opening balance = what the customer owed before start; activity =
+    invoices, payments and credit notes dated in the period; closing
+    balance = opening + invoiced - payments - credits, which equals the
+    sum of the as-of balances of the open invoices (paid invoices
+    contribute 0). Aging buckets the as-of open balances by due date.
+    Void invoices are excluded entirely (a void requires no payments,
+    so nothing is owed on one)."""
+    as_of = datetime.strptime(end, "%Y-%m-%d").date()
+    if customer["customer_type"] == "wholesale":
+        inv_rows = conn.execute(
+            "SELECT * FROM erp_acct_invoices WHERE customer_type = 'wholesale'"
+            " AND customer_id = ? AND status != 'void' AND date <= ?"
+            " ORDER BY date, id", (customer["customer_id"], end)).fetchall()
+    else:
+        inv_rows = conn.execute(
+            "SELECT * FROM erp_acct_invoices WHERE customer_type = 'retail'"
+            " AND lower(customer_name) = ? AND status != 'void' AND date <= ?"
+            " ORDER BY date, id",
+            (customer["customer_name"].lower(), end)).fetchall()
+    inv_ids = [r["id"] for r in inv_rows]
+    payments = {}
+    if inv_ids:
+        for p in conn.execute(
+                "SELECT * FROM erp_acct_payments WHERE invoice_id IN (%s)"
+                " ORDER BY date, id"
+                % ", ".join("?" * len(inv_ids)), inv_ids).fetchall():
+            payments.setdefault(p["invoice_id"], []).append(dict(p))
+    credits = _acct_statement_credits(conn, inv_ids)
+    credits_by_inv = {}
+    for c in credits:
+        credits_by_inv.setdefault(c["invoice_id"], []).append(c)
+
+    def _paid_before(inv_id, day):
+        return sum(p["amount_cents"] for p in payments.get(inv_id, [])
+                   if p["date"] < day)
+
+    def _paid_through(inv_id, day):
+        return sum(p["amount_cents"] for p in payments.get(inv_id, [])
+                   if p["date"] <= day)
+
+    def _credited_before(inv_id, day):
+        return sum(c["amount_cents"]
+                   for c in credits_by_inv.get(inv_id, [])
+                   if c["date"] < day)
+
+    def _credited_through(inv_id, day):
+        return sum(c["amount_cents"]
+                   for c in credits_by_inv.get(inv_id, [])
+                   if c["date"] <= day)
+
+    opening = 0
+    invoiced = 0
+    paid = 0
+    credited = 0
+    lines = []
+    open_invoices = []
+    aging = {b: 0 for b in ERP_ACCT_AGING_BUCKETS}
+    aging["total_cents"] = 0
+    for inv in inv_rows:
+        asof_bal = (inv["total_cents"] - _paid_through(inv["id"], end)
+                    - _credited_through(inv["id"], end))
+        if inv["date"] < start:
+            opening += (inv["total_cents"] - _paid_before(inv["id"], start)
+                        - _credited_before(inv["id"], start))
+        else:
+            invoiced += inv["total_cents"]
+            lines.append({"kind": "invoice", "date": inv["date"],
+                          "invoice_id": inv["id"],
+                          "description": "Invoice #%d" % inv["id"],
+                          "amount_cents": inv["total_cents"],
+                          "balance_cents": asof_bal})
+        if asof_bal > 0:
+            due = datetime.strptime(inv["due_date"], "%Y-%m-%d").date()
+            bucket = _acct_aging_bucket(as_of, due)
+            aging[bucket] += asof_bal
+            aging["total_cents"] += asof_bal
+            open_invoices.append({
+                "invoice_id": inv["id"], "date": inv["date"],
+                "due_date": inv["due_date"], "total_cents": inv["total_cents"],
+                "balance_cents": asof_bal, "bucket": bucket,
+                "status": inv["status"]})
+    for inv_id, plist in payments.items():
+        for p in plist:
+            if start <= p["date"] <= end:
+                paid += p["amount_cents"]
+                lines.append({"kind": "payment", "date": p["date"],
+                              "invoice_id": inv_id,
+                              "description": "Payment on invoice #%d (%s)"
+                              % (inv_id, p["method"] or "cash"),
+                              "amount_cents": -p["amount_cents"],
+                              "balance_cents": None})
+    for c in credits:
+        if start <= c["date"] <= end:
+            credited += c["amount_cents"]
+            lines.append({"kind": "credit", "date": c["date"],
+                          "invoice_id": c["invoice_id"],
+                          "description": "Credit note #%d on invoice #%d"
+                          % (c["credit_note_id"], c["invoice_id"]),
+                          "amount_cents": -c["amount_cents"],
+                          "balance_cents": None})
+    lines.sort(key=lambda l: (l["date"], l["kind"], l["invoice_id"] or 0))
+    closing = opening + invoiced - paid - credited
+    return {"customer": customer, "start": start, "end": end,
+            "as_of": end,
+            "opening_balance_cents": opening,
+            "invoiced_cents": invoiced,
+            "payments_cents": paid,
+            "credits_cents": credited,
+            "credits": [c for c in credits
+                        if start <= c["date"] <= end],
+            "balance_cents": closing,
+            "aging": aging,
+            "open_invoices": open_invoices,
+            "lines": lines}
+
+
+def _acct_statement_params():
+    """Validated (start, end) for a statement; defaults to the
+    month-to-date of `end` (or today). Returns ((start, end), None)
+    or (None, (resp, code))."""
+    start = (request.args.get("start") or "").strip()
+    end = (request.args.get("end") or "").strip() \
+        or datetime.now(timezone.utc).date().isoformat()
+    if not _acct_valid_date(end):
+        return None, (jsonify(error="end must be YYYY-MM-DD"), 400)
+    if start and not _acct_valid_date(start):
+        return None, (jsonify(error="start must be YYYY-MM-DD"), 400)
+    if not start:
+        start = end[:8] + "01"
+    if start > end:
+        return None, (jsonify(error="start must not be after end"), 400)
+    return (start, end), None
+
+
+def _acct_doc_asof_balance(conn, doc, as_of, kind):
+    """Balance of one invoice/bill as of a date: total minus payments
+    (and, for invoices, credit notes) dated on or before it. Void
+    documents owe nothing."""
+    if doc["status"] == "void":
+        return 0
+    col = "invoice_id" if kind == "invoice" else "bill_id"
+    paid = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) AS s FROM erp_acct_payments"
+        " WHERE %s = ? AND date <= ?" % col,
+        (doc["id"], as_of)).fetchone()["s"]
+    bal = doc["total_cents"] - paid
+    if kind == "invoice":
+        for c in _acct_statement_credits(conn, [doc["id"]]):
+            if c["date"] <= as_of:
+                bal -= c["amount_cents"]
+    return bal
+
+
+def _acct_snapshot(conn, as_of, start, end):
+    """Accounting dashboard snapshot, all figures live from the ledger.
+    Cash = bank-account book balances (GL balances of the linked
+    accounts, as of `as_of`) plus the GL cash total for cross-check;
+    receivables/payables = open-document balances as of `as_of` with
+    aging summaries; P&L reuses _acct_profit_loss (no duplicated math).
+    `empty` is true when the ledger holds no journal entries at all --
+    the UI shows an em dash instead of $0.00 figures then."""
+    as_of_d = datetime.strptime(as_of, "%Y-%m-%d").date()
+    banks = []
+    cash_total = 0
+    for b in conn.execute(
+            "SELECT * FROM erp_acct_bank_accounts WHERE active = 1"
+            " ORDER BY name").fetchall():
+        row = conn.execute(
+            "SELECT COALESCE(SUM(l.debit_cents), 0) AS d,"
+            " COALESCE(SUM(l.credit_cents), 0) AS c"
+            " FROM erp_acct_journal_lines l"
+            " JOIN erp_acct_journal j ON j.id = l.entry_id"
+            " WHERE l.account_id = ? AND j.date <= ?",
+            (b["gl_account_id"], as_of)).fetchone()
+        gl = conn.execute(
+            "SELECT type FROM erp_acct_accounts WHERE id = ?",
+            (b["gl_account_id"],)).fetchone()
+        book = (row["c"] - row["d"] if gl and gl["type"] == "liability"
+                else row["d"] - row["c"])
+        cash_total += book
+        d = dict(b)
+        d["book_balance_cents"] = book
+        d["bank_balance_cents"] = _acct_bank_bank_balance(conn, b)
+        banks.append(d)
+    cash_ids = _acct_cash_account_ids(conn)
+    cash_gl = 0
+    for r in _acct_balances(conn, end=as_of):
+        if r["id"] in cash_ids:
+            cash_gl += r["debits"] - r["credits"]
+
+    def _aging_summary(rows, key, kind):
+        totals = {b: 0 for b in ERP_ACCT_AGING_BUCKETS}
+        totals["total_cents"] = 0
+        count = 0
+        for r in rows:
+            bal = _acct_doc_asof_balance(conn, r, as_of, kind)
+            if bal <= 0:
+                continue
+            count += 1
+            due = datetime.strptime(r["due_date"], "%Y-%m-%d").date()
+            bucket = _acct_aging_bucket(as_of_d, due)
+            totals[bucket] += bal
+            totals["total_cents"] += bal
+        return totals, count
+
+    ar_rows = conn.execute(
+        "SELECT * FROM erp_acct_invoices WHERE status = 'open'"
+        " AND date <= ? ORDER BY due_date", (as_of,)).fetchall()
+    ap_rows = conn.execute(
+        "SELECT * FROM erp_acct_bills WHERE status = 'open'"
+        " AND date <= ? ORDER BY due_date", (as_of,)).fetchall()
+    ar_aging, ar_count = _aging_summary(ar_rows, "customer_name", "invoice")
+    ap_aging, ap_count = _aging_summary(ap_rows, "vendor_name", "bill")
+    pl = _acct_profit_loss(conn, start, end)
+    empty = conn.execute(
+        "SELECT COUNT(*) FROM erp_acct_journal").fetchone()[0] == 0
+    return {"as_of": as_of, "start": start, "end": end, "empty": empty,
+            "cash": {"bank_accounts": banks,
+                     "total_cents": cash_total,
+                     "gl_total_cents": cash_gl},
+            "receivables": {"total_cents": ar_aging["total_cents"],
+                            "aging": ar_aging,
+                            "open_invoice_count": ar_count},
+            "payables": {"total_cents": ap_aging["total_cents"],
+                         "aging": ap_aging,
+                         "open_bill_count": ap_count},
+            "profit_loss": pl,
+            "revenue_cents": pl["total_income_cents"],
+            "expenses_cents": pl["total_expense_cents"],
+            "net_income_cents": pl["net_income_cents"]}
+
+
+@app.get("/api/erp/accounting/statements/customers")
+def erp_acct_statement_customers():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    out = {}
+    for inv in conn.execute(
+            "SELECT * FROM erp_acct_invoices WHERE status != 'void'"
+            " ORDER BY customer_name, id").fetchall():
+        if inv["customer_type"] == "wholesale" and inv["customer_id"]:
+            key = "wholesale:%d" % inv["customer_id"]
+            ws = conn.execute(
+                "SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                (inv["customer_id"],)).fetchone()
+            name = ws["name"] if ws else inv["customer_name"]
+            email = (ws["email"] or "") if ws else ""
+            cid = inv["customer_id"]
+        else:
+            key = "name:" + inv["customer_name"].lower()
+            name, email, cid = inv["customer_name"], "", None
+        c = out.get(key)
+        if c is None:
+            c = {"key": key, "customer_type": inv["customer_type"],
+                 "customer_id": cid, "customer_name": name, "email": email,
+                 "open_balance_cents": 0, "invoice_count": 0}
+            out[key] = c
+        c["invoice_count"] += 1
+        if inv["status"] == "open":
+            c["open_balance_cents"] += inv["balance_cents"]
+    conn.close()
+    rows = sorted(out.values(),
+                  key=lambda c: -c["open_balance_cents"])
+    return jsonify(customers=rows)
+
+
+@app.get("/api/erp/accounting/statements")
+def erp_acct_statement():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    customer, err = _acct_resolve_statement_customer(conn)
+    if err:
+        conn.close()
+        return err
+    params, err = _acct_statement_params()
+    if err:
+        conn.close()
+        return err
+    start, end = params
+    out = _acct_customer_statement(conn, customer, start, end)
+    # Dept 10 Wave A (item 1): statements carry the company profile.
+    out["company"] = _erp_company_profile(conn)
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/erp/accounting/statements.csv")
+def erp_acct_statement_csv():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    customer, err = _acct_resolve_statement_customer(conn)
+    if err:
+        conn.close()
+        return err
+    params, err = _acct_statement_params()
+    if err:
+        conn.close()
+        return err
+    start, end = params
+    st = _acct_customer_statement(conn, customer, start, end)
+    # Dept 10 Wave A (item 1): the CSV names the company from the profile.
+    company = _erp_company_profile(conn)
+    conn.close()
+    rows = [["Company", company["legal_name"]],
+            ["Office address", company["office_address"]],
+            ["Customer", st["customer"]["customer_name"]],
+            ["Period", "%s to %s" % (start, end)],
+            ["Opening balance", _acct_money_csv(st["opening_balance_cents"])],
+            [],
+            ["Date", "Type", "Reference", "Description", "Amount",
+             "Balance"]]
+    running = st["opening_balance_cents"]
+    for line in st["lines"]:
+        running += line["amount_cents"]
+        rows.append([line["date"], line["kind"],
+                     ("Invoice #%d" % line["invoice_id"]
+                      if line["invoice_id"] else ""),
+                     line["description"],
+                     _acct_money_csv(line["amount_cents"]),
+                     _acct_money_csv(running)])
+    rows.append([])
+    rows.append(["", "", "", "Invoiced",
+                 _acct_money_csv(st["invoiced_cents"]), ""])
+    rows.append(["", "", "", "Payments",
+                 _acct_money_csv(-st["payments_cents"]), ""])
+    rows.append(["", "", "", "Credits",
+                 _acct_money_csv(-st["credits_cents"]), ""])
+    rows.append(["", "", "", "Closing balance",
+                 _acct_money_csv(st["balance_cents"]), ""])
+    rows.append([])
+    for b, label in (("current", "Current"), ("d1_30", "1-30 days"),
+                     ("d31_60", "31-60 days"), ("d61_90", "61-90 days"),
+                     ("d91_plus", "91+ days")):
+        rows.append(["Aging", label, "",
+                     _acct_money_csv(st["aging"][b]), "", ""])
+    safe = "".join(ch if ch.isalnum() else "_" for ch in
+                   st["customer"]["customer_name"])[:40] or "customer"
+    return _acct_csv_response(
+        "statement-%s-%s-to-%s.csv" % (safe, start, end),
+        ["Customer statement"], rows)
+
+
+@app.get("/api/erp/accounting/snapshot")
+def erp_acct_snapshot():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    as_of = (request.args.get("as_of") or "").strip() \
+        or datetime.now(timezone.utc).date().isoformat()
+    start = (request.args.get("start") or "").strip()
+    end = (request.args.get("end") or "").strip() or as_of
+    if not _acct_valid_date(as_of) or not _acct_valid_date(end):
+        return jsonify(error="as_of and end must be YYYY-MM-DD"), 400
+    if start and not _acct_valid_date(start):
+        return jsonify(error="start must be YYYY-MM-DD"), 400
+    if not start:
+        start = end[:8] + "01"
+    if start > end or end > as_of:
+        return jsonify(
+            error="start must not be after end, and end must not be after as_of"), 400
+    conn = db()
+    out = _acct_snapshot(conn, as_of, start, end)
+    conn.close()
+    return jsonify(out)
+
+
+# ---- Accounting banking + reconciliation (Phase 1 step 3) ----
+# Plaid amounts are stored as Plaid reports them: positive = money OUT,
+# negative = money IN. The bank balance is opening balance minus the sum
+# of feed amounts. Posted journal entries are never edited; matching only
+# links a feed transaction to an entry.
+ERP_ACCT_BANK_TYPES = ("checking", "savings", "credit_card", "loan", "other")
+ERP_ACCT_TXN_STATUSES = ("unmatched", "matched", "review")
+
+
+def _acct_bank_book_balance(conn, bank):
+    """GL balance of the bank account's linked account. Asset-linked
+    accounts read debit-minus-credit; liability-linked accounts
+    (credit cards) read credit-minus-debit, i.e. the balance owed."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(debit_cents), 0) AS d,"
+        " COALESCE(SUM(credit_cents), 0) AS c"
+        " FROM erp_acct_journal_lines WHERE account_id = ?",
+        (bank["gl_account_id"],)).fetchone()
+    gl = conn.execute(
+        "SELECT type FROM erp_acct_accounts WHERE id = ?",
+        (bank["gl_account_id"],)).fetchone()
+    if gl and gl["type"] == "liability":
+        return row["c"] - row["d"]
+    return row["d"] - row["c"]
+
+
+def _acct_bank_bank_balance(conn, bank):
+    """Bank balance from the feed: opening balance minus net outflows."""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) AS s"
+        " FROM erp_acct_bank_txns WHERE bank_account_id = ?",
+        (bank["id"],)).fetchone()
+    return bank["opening_balance_cents"] - row["s"]
+
+
+def _acct_bank_dict(conn, bank):
+    d = dict(bank)
+    gl = conn.execute(
+        "SELECT id, code, name, type FROM erp_acct_accounts WHERE id = ?",
+        (bank["gl_account_id"],)).fetchone()
+    d["gl_account"] = dict(gl) if gl else None
+    d["book_balance_cents"] = _acct_bank_book_balance(conn, bank)
+    d["bank_balance_cents"] = _acct_bank_bank_balance(conn, bank)
+    return d
+
+
+def _acct_cash_account_id(conn, bank_account_id):
+    """Resolve the GL account a payment's cash leg posts to.
+    Returns (gl_account_id, None) or (None, error). No bank account
+    given means the seeded Checking — Operating (1010)."""
+    if bank_account_id in (None, "", 0):
+        return _acct_account_id_by_code(conn, ERP_ACCT_CASH_CODE), None
+    bank = conn.execute(
+        "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+        (bank_account_id,)).fetchone()
+    if not bank:
+        return None, "unknown bank account"
+    if not bank["active"]:
+        return None, "bank account is inactive"
+    gl = conn.execute(
+        "SELECT * FROM erp_acct_accounts WHERE id = ?",
+        (bank["gl_account_id"],)).fetchone()
+    if not gl:
+        return None, "bank account has no linked GL account"
+    if not gl["active"]:
+        return None, "linked GL account is inactive"
+    return gl["id"], None
+
+
+def _acct_auto_match(conn, bank, txn):
+    """Exact amount+date auto-match (spec 2.4): an entry posted to the
+    linked GL account on the same date whose net on that account equals
+    the feed amount's mirror image (Plaid positive = outflow = a credit
+    to the cash account). Skips reversed entries and entries already
+    matched to another feed transaction. Returns the entry id or None."""
+    net = -txn["amount_cents"]
+    rows = conn.execute(
+        "SELECT j.id FROM erp_acct_journal j"
+        " JOIN erp_acct_journal_lines l ON l.entry_id = j.id"
+        " WHERE l.account_id = ? AND j.date = ? AND j.reversed_by IS NULL"
+        " GROUP BY j.id"
+        " HAVING SUM(l.debit_cents - l.credit_cents) = ?",
+        (bank["gl_account_id"], txn["date"], net)).fetchall()
+    for r in rows:
+        taken = conn.execute(
+            "SELECT 1 FROM erp_acct_bank_txns WHERE matched_entry_id = ?",
+            (r["id"],)).fetchone()
+        if not taken:
+            return r["id"]
+    return None
+
+
+def _acct_bank_txn_dict(row):
+    return dict(row)
+
+
+@app.get("/api/erp/accounting/bank-accounts")
+def erp_acct_list_bank_accounts():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_bank_accounts ORDER BY name").fetchall()
+    out = [_acct_bank_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(bank_accounts=out)
+
+
+@app.post("/api/erp/accounting/bank-accounts")
+def erp_acct_create_bank_account():
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    btype = (data.get("type") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    if btype not in ERP_ACCT_BANK_TYPES:
+        return jsonify(
+            error="type must be one of " + ", ".join(ERP_ACCT_BANK_TYPES)), 400
+    gl_account_id = data.get("gl_account_id")
+    if gl_account_id in (None, "", 0):
+        return jsonify(error="gl_account_id is required"), 400
+    try:
+        gl_account_id = int(gl_account_id)
+    except (TypeError, ValueError):
+        return jsonify(error="gl_account_id must be a number"), 400
+    opening = _acct_int_cents(data.get("opening_balance_cents", 0))
+    if opening is None:
+        return jsonify(error="opening_balance_cents must be whole cents"), 400
+    plaid_account_id = (data.get("plaid_account_id") or "").strip() or None
+    conn = db()
+    gl = conn.execute(
+        "SELECT * FROM erp_acct_accounts WHERE id = ?",
+        (gl_account_id,)).fetchone()
+    if not gl:
+        conn.close()
+        return jsonify(error="unknown gl_account_id"), 400
+    if not gl["active"]:
+        conn.close()
+        return jsonify(error="linked GL account is inactive"), 400
+    if gl["type"] not in ("asset", "liability"):
+        conn.close()
+        return jsonify(
+            error="linked GL account must be an asset or liability account"), 400
+    if plaid_account_id and conn.execute(
+            "SELECT 1 FROM erp_acct_bank_accounts WHERE plaid_account_id = ?",
+            (plaid_account_id,)).fetchone():
+        conn.close()
+        return jsonify(error="plaid_account_id is already linked"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_bank_accounts (name, type, plaid_account_id,"
+        " gl_account_id, qb_id, opening_balance_cents, active,"
+        " last_reconciled_at, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, 1, NULL, ?)",
+        (name, btype, plaid_account_id, gl_account_id,
+         (data.get("qb_id") or "").strip() or None, opening, now))
+    bank_id = cur.lastrowid
+    _acct_audit(conn, actor, "bank.create", "bank_account", bank_id,
+                "%s %s -> GL %s" % (name, btype, gl["code"]))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+        (bank_id,)).fetchone()
+    out = _acct_bank_dict(conn, row)
+    conn.close()
+    return jsonify(bank_account=out), 201
+
+
+@app.get("/api/erp/accounting/bank-accounts/<int:bank_id>/transactions")
+def erp_acct_list_bank_txns(bank_id):
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    if status and status not in ERP_ACCT_TXN_STATUSES:
+        return jsonify(error="status must be one of " + ", ".join(
+            ERP_ACCT_TXN_STATUSES)), 400
+    conn = db()
+    bank = conn.execute(
+        "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+        (bank_id,)).fetchone()
+    if not bank:
+        conn.close()
+        return jsonify(error="bank account not found"), 404
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_bank_txns"
+            " WHERE bank_account_id = ? AND status = ?"
+            " ORDER BY date DESC, id DESC",
+            (bank_id, status)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_bank_txns WHERE bank_account_id = ?"
+            " ORDER BY date DESC, id DESC",
+            (bank_id,)).fetchall()
+    conn.close()
+    return jsonify(bank_account_id=bank_id,
+                   transactions=[_acct_bank_txn_dict(r) for r in rows])
+
+
+def _acct_ingest_bank_txns(conn, actor, rows):
+    """Ingest bank-feed rows into erp_acct_bank_txns. Shared by the
+    /bank-sync receiver and the Plaid sync path: idempotent on
+    plaid_txn_id (a row already in the feed is skipped, never
+    duplicated), exact amount+date auto-match against the linked GL
+    account. Returns (inserted, skipped, auto_matched, errors). The
+    caller commits and audits the sync summary; per-txn auto-matches
+    are audited here. Does NOT post journal entries."""
+    inserted = skipped = auto_matched = 0
+    errors = []
+    now = datetime.now(timezone.utc).isoformat()
+    for i, raw in enumerate(rows):
+        label = "row %d" % (i + 1)
+        if not isinstance(raw, dict):
+            errors.append("%s: not an object" % label)
+            continue
+        plaid_txn_id = (raw.get("plaid_txn_id") or "").strip()
+        if not plaid_txn_id:
+            errors.append("%s: plaid_txn_id is required" % label)
+            continue
+        bank = None
+        if raw.get("bank_account_id") not in (None, "", 0):
+            try:
+                bank = conn.execute(
+                    "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+                    (int(raw.get("bank_account_id")),)).fetchone()
+            except (TypeError, ValueError):
+                bank = None
+            if not bank:
+                errors.append("%s: unknown bank_account_id" % label)
+                continue
+        elif (raw.get("plaid_account_id") or "").strip():
+            bank = conn.execute(
+                "SELECT * FROM erp_acct_bank_accounts"
+                " WHERE plaid_account_id = ?",
+                ((raw.get("plaid_account_id") or "").strip(),)).fetchone()
+            if not bank:
+                errors.append(
+                    "%s: no bank account linked to that Plaid account" % label)
+                continue
+        else:
+            errors.append(
+                "%s: bank_account_id or plaid_account_id is required" % label)
+            continue
+        date = (raw.get("date") or "").strip()
+        if not _acct_valid_date(date):
+            errors.append("%s: date must be YYYY-MM-DD" % label)
+            continue
+        amount = _acct_int_cents(raw.get("amount_cents"))
+        if amount is None:
+            errors.append("%s: amount_cents must be whole cents" % label)
+            continue
+        existing = conn.execute(
+            "SELECT id FROM erp_acct_bank_txns WHERE plaid_txn_id = ?",
+            (plaid_txn_id,)).fetchone()
+        if existing:
+            skipped += 1
+            continue
+        cur = conn.execute(
+            "INSERT INTO erp_acct_bank_txns (bank_account_id, date,"
+            " description, amount_cents, plaid_txn_id, matched_entry_id,"
+            " status, created_at) VALUES (?, ?, ?, ?, ?, NULL, 'unmatched', ?)",
+            (bank["id"], date, (raw.get("description") or "").strip(),
+             amount, plaid_txn_id, now))
+        txn_id = cur.lastrowid
+        txn = conn.execute(
+            "SELECT * FROM erp_acct_bank_txns WHERE id = ?",
+            (txn_id,)).fetchone()
+        inserted += 1
+        entry_id = _acct_auto_match(conn, bank, txn)
+        if entry_id:
+            conn.execute(
+                "UPDATE erp_acct_bank_txns SET matched_entry_id = ?,"
+                " status = 'matched' WHERE id = ?",
+                (entry_id, txn_id))
+            auto_matched += 1
+            _acct_audit(conn, actor, "bank.auto_match", "bank_txn", txn_id,
+                        "txn #%d %s amount %d date %s auto-matched to entry #%d"
+                        % (txn_id, plaid_txn_id, txn["amount_cents"],
+                           txn["date"], entry_id))
+    return inserted, skipped, auto_matched, errors
+
+
+
+@app.post("/api/erp/accounting/bank-sync")
+def erp_acct_bank_sync():
+    """Ingest bank-feed transactions. The Railway backend holds no Plaid
+    credentials and Plaid is not linked yet, so the feed arrives as
+    transactions supplied in the request body — the path a Plaid-CLI sync
+    job uses (plaid transactions-get, then POST here). Idempotent on
+    plaid_txn_id: a row already in the feed is skipped, never duplicated.
+    Exact amount+date matches against the linked GL account auto-match.
+    Called with no transactions, the sync reports feed=not_configured."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    rows = data.get("transactions")
+    if not isinstance(rows, list) or not rows:
+        return jsonify(ok=True, feed="not_configured", inserted=0, skipped=0,
+                       auto_matched=0, errors=[],
+                       message="No bank feed is linked yet. Link a bank"
+                       " account in Plaid, then run a sync to pull"
+                       " transactions into the feed.")
+    conn = db()
+    inserted, skipped, auto_matched, errors = _acct_ingest_bank_txns(
+        conn, actor, rows)
+    _acct_audit(conn, actor, "bank.sync", "bank_sync", 0,
+                "inserted %d skipped %d auto_matched %d errors %d" % (
+                    inserted, skipped, auto_matched, len(errors)))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, feed="ingested", inserted=inserted,
+                   skipped=skipped, auto_matched=auto_matched, errors=errors)
+
+
+# ---- ERP-vs-QuickBooks diff report + owner draws + Plaid sync ----
+# (Dept 9, items 6+7+8, wave D)
+# Item 6 reads the QuickBooks migration snapshot AT REQUEST TIME (never
+# imported into the ledger) and compares it to the live ERP ledger to
+# the cent. The snapshot is incomplete -- 58 of 83 monthly invoice
+# windows, no vendor/bill/payment/journal-entry data at all -- so the
+# report leads with coverage and marks everything it cannot compare as
+# uncompared, never estimated and never zero.
+# Item 7 records owner draws (DJ Nailing / Matt Wolberd) as
+# request -> approve -> post Dr 3000 / Cr bank, audited at every step.
+# Item 8 pulls Plaid transactions through the documented connector CLI
+# and ingests them via the bank-sync receiver's own helper.
+ERP_ACCT_OWNER_NAMES = ("DJ Nailing", "Matt Wolberd")
+ERP_ACCT_EQUITY_CODE = "3000"
+ERP_QB_SNAPSHOT_ENV = "ERP_QB_SNAPSHOT_PATH"
+ERP_PLAID_CLI_ENV = "ERP_PLAID_CLI"
+ERP_PLAID_CLI_DEFAULT = "/opt/hatch/bin/plaid"
+
+
+def _acct_qb_snapshot_path():
+    """Where the QB migration snapshot is read from at request time:
+    ERP_QB_SNAPSHOT_PATH wins (tests point it at a fixture), else the
+    goal's hidden_files copy next to build/, else one next to app.py.
+    Returns the first existing path, or None."""
+    env = (os.environ.get(ERP_QB_SNAPSHOT_ENV) or "").strip()
+    if env:
+        return env if os.path.isfile(env) else None
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "..", "hidden_files",
+                              "qb-migration-snapshot.json"),
+                 os.path.join(here, "qb-migration-snapshot.json")):
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+
+def _acct_qb_norm_name(name):
+    """Match a QuickBooks account name to an ERP chart name: lowercase,
+    drop parentheticals (\"Accounts Receivable (A/R)\" -> accounts
+    receivable), drop punctuation, collapse whitespace."""
+    n = (name or "").lower()
+    n = re.sub(r"\([^)]*\)", " ", n)
+    n = re.sub(r"[^a-z0-9]+", " ", n)
+    return " ".join(n.split())
+
+
+def _acct_qb_months(first_month, last_month):
+    """YYYY-MM strings from first_month through last_month inclusive."""
+    out = []
+    y, m = int(first_month[:4]), int(first_month[5:7])
+    ey, em = int(last_month[:4]), int(last_month[5:7])
+    while (y, m) <= (ey, em):
+        out.append("%04d-%02d" % (y, m))
+        m += 1
+        if m == 13:
+            y, m = y + 1, 1
+    return out
+
+
+def _acct_qb_normal_balance(row):
+    """ERP ledger balance in the account's normal direction, cents:
+    assets/expenses debit-minus-credit, liabilities/equity/income
+    credit-minus-debit. Matches how QuickBooks reports balances."""
+    if row["type"] in ("asset", "expense"):
+        return row["debits"] - row["credits"]
+    return row["credits"] - row["debits"]
+
+
+def _acct_qb_diff(conn, snap):
+    """Build the diff report from the live ledger + a parsed snapshot.
+    All money integer cents; a difference is erp minus qb. Anything
+    the snapshot does not contain is status 'uncompared' (AP) or
+    'not_available_in_snapshot', with qb values None -- never 0,
+    never estimated."""
+    meta = snap.get("meta") or {}
+    ver = meta.get("verification") or {}
+    types = meta.get("types") or {}
+    windows_done = meta.get("invoice_windows_done") or []
+    done_months = sorted({str(w[0])[:7] for w in windows_done
+                          if isinstance(w, (list, tuple)) and w})
+    as_of = (meta.get("as_of") or "").strip()
+    if done_months and as_of and len(as_of) >= 7:
+        expected = _acct_qb_months(done_months[0], as_of[:7])
+    else:
+        expected = list(done_months)
+    missing_months = [m for m in expected if m not in set(done_months)]
+    complete = bool(meta.get("complete"))
+    coverage = {"windows_done": len(done_months),
+                "windows_total": len(expected),
+                "windows_missing": missing_months,
+                "coverage_pct": (round(100.0 * len(done_months)
+                                       / len(expected), 1)
+                                 if expected else 0.0),
+                "first_window": done_months[0] if done_months else None,
+                "last_window": done_months[-1] if done_months else None,
+                "as_of": as_of or None,
+                "pulled_at": meta.get("pulled_at"),
+                "company": meta.get("company"),
+                "complete": complete,
+                "invoice_count": len(snap.get("invoices") or []),
+                "invoice_total_count": meta.get("invoice_total_count"),
+                "types": {k: (v or {}).get("status")
+                          for k, v in types.items()}}
+
+    # --- chart of accounts: match by normalized name ---
+    erp_rows = _acct_balances(conn)
+    erp_by_norm = {}
+    for r in erp_rows:
+        erp_by_norm.setdefault(_acct_qb_norm_name(r["name"]), r)
+    qb_accounts = snap.get("accounts") or []
+    acct_rows = []
+    used_erp = set()
+    omitted_zero = 0
+    for qa in qb_accounts:
+        qname = qa.get("name") or ""
+        qbal = qa.get("balance_cents")
+        norm = _acct_qb_norm_name(qname)
+        er = erp_by_norm.get(norm)
+        if qbal is None:
+            acct_rows.append(
+                {"qb_name": qname, "qb_type": qa.get("type"),
+                 "qb_balance_cents": None, "erp_code": er["code"] if er else None,
+                 "erp_name": er["name"] if er else None,
+                 "erp_balance_cents": (_acct_qb_normal_balance(er)
+                                       if er else None),
+                 "difference_cents": None, "status": "uncompared",
+                 "note": "no balance in the snapshot (subtotal row)"})
+            if er:
+                used_erp.add(er["id"])
+            continue
+        if er:
+            used_erp.add(er["id"])
+            ebal = _acct_qb_normal_balance(er)
+            acct_rows.append(
+                {"qb_name": qname, "qb_type": qa.get("type"),
+                 "qb_balance_cents": qbal, "erp_code": er["code"],
+                 "erp_name": er["name"], "erp_balance_cents": ebal,
+                 "difference_cents": ebal - qbal,
+                 "status": "match" if ebal == qbal else "difference",
+                 "note": ""})
+        else:
+            acct_rows.append(
+                {"qb_name": qname, "qb_type": qa.get("type"),
+                 "qb_balance_cents": qbal, "erp_code": None,
+                 "erp_name": None, "erp_balance_cents": None,
+                 "difference_cents": None, "status": "qb_only",
+                 "note": "no ERP chart account with this name"})
+    for r in erp_rows:
+        if r["id"] in used_erp:
+            continue
+        if _acct_qb_normal_balance(r) == 0:
+            omitted_zero += 1
+            continue
+        acct_rows.append(
+            {"qb_name": None, "qb_type": None, "qb_balance_cents": None,
+             "erp_code": r["code"], "erp_name": r["name"],
+             "erp_balance_cents": _acct_qb_normal_balance(r),
+             "difference_cents": None, "status": "erp_only",
+             "note": "no QuickBooks account with this name"})
+    acct_rows.sort(key=lambda a: (a["qb_name"] or a["erp_name"] or ""))
+
+    # --- AR: open-invoice balances per customer, ERP vs QB ---
+    erp_ar = {}
+    for inv in conn.execute(
+            "SELECT customer_name, COALESCE(SUM(balance_cents), 0) AS bal"
+            " FROM erp_acct_invoices WHERE status = 'open'"
+            " GROUP BY customer_name").fetchall():
+        if inv["bal"]:
+            erp_ar[inv["customer_name"]] = inv["bal"]
+    qb_ar = dict((ver.get("ar_customers") or {}))
+    qb_ar_total = ver.get("ar_total_cents")
+    erp_ar_total = sum(erp_ar.values())
+    ar_rows = []
+    for name in sorted(set(erp_ar) | set(qb_ar)):
+        e, q = erp_ar.get(name), qb_ar.get(name)
+        if e is not None and q is not None:
+            status = "match" if e == q else "difference"
+            diff = e - q
+        elif e is not None:
+            status, diff = "erp_only", None
+        else:
+            status, diff = "qb_only", None
+        ar_rows.append({"customer_name": name, "erp_cents": e,
+                        "qb_cents": q, "difference_cents": diff,
+                        "status": status})
+    ar = {"erp_total_cents": erp_ar_total,
+          "qb_total_cents": qb_ar_total,
+          "difference_cents": (erp_ar_total - qb_ar_total
+                               if qb_ar_total is not None else None),
+          "customers": ar_rows}
+
+    # --- AP: the snapshot has no AP data (types.bills not_available,
+    # ap_total_cents null) -- ERP vendors are listed uncompared, never
+    # as a zero difference. ---
+    erp_ap = {}
+    for bill in conn.execute(
+            "SELECT vendor_name, COALESCE(SUM(balance_cents), 0) AS bal"
+            " FROM erp_acct_bills WHERE status = 'open'"
+            " GROUP BY vendor_name").fetchall():
+        if bill["bal"]:
+            erp_ap[bill["vendor_name"]] = bill["bal"]
+    ap_available = (types.get("bills", {}) or {}).get("status") == "pulled" \
+        or (ver.get("ap_total_cents") is not None)
+    ap = {"erp_total_cents": sum(erp_ap.values()),
+          "qb_total_cents": ver.get("ap_total_cents"),
+          "difference_cents": None,
+          "status": ("compared" if ap_available
+                     else "not_available_in_snapshot"),
+          "vendors": [{"vendor_name": n, "erp_cents": v,
+                       "qb_cents": None, "difference_cents": None,
+                       "status": "uncompared"}
+                      for n, v in sorted(erp_ap.items())]}
+
+    # --- trial balance totals ---
+    total_debits = sum(r["debits"] for r in erp_rows)
+    total_credits = sum(r["credits"] for r in erp_rows)
+    bs = ver.get("balance_sheet") or {}
+    qb_assets = bs.get("total_assets_cents")
+    qb_liab = bs.get("total_liabilities_cents")
+    qb_equity = bs.get("total_equity_cents")
+    qb_balanced = (qb_assets is not None and qb_liab is not None
+                   and qb_equity is not None
+                   and qb_assets == qb_liab + qb_equity)
+    trial = {"erp_total_debits_cents": total_debits,
+             "erp_total_credits_cents": total_credits,
+             "erp_balanced": total_debits == total_credits,
+             "erp_difference_cents": total_debits - total_credits,
+             "qb_total_assets_cents": qb_assets,
+             "qb_total_liabilities_cents": qb_liab,
+             "qb_total_equity_cents": qb_equity,
+             "qb_balanced": qb_balanced,
+             "note": "QuickBooks journal entries are not in the"
+                     " snapshot, so no QuickBooks trial-balance detail"
+                     " can be compared; only the balance-sheet totals"
+                     " above are shown."}
+
+    uncompared = []
+    if missing_months:
+        uncompared.append(
+            "%d monthly invoice windows were not pulled (%s through"
+            " %s); invoices, AR and balances from those months are"
+            " uncompared" % (len(missing_months), missing_months[0],
+                             missing_months[-1]))
+    for key in ("vendors", "bills", "payments", "bank_transactions",
+                "journal_entries"):
+        st = (types.get(key, {}) or {}).get("status")
+        if st != "pulled":
+            uncompared.append(
+                "QuickBooks %s: %s -- not compared"
+                % (key, st or "missing from the snapshot"))
+    if (types.get("payroll", {}) or {}).get("status") != "pulled":
+        uncompared.append("QuickBooks payroll: not pulled -- not compared")
+    if not ap_available:
+        uncompared.append(
+            "QuickBooks AP total is not in the snapshot -- AP is"
+            " uncompared, not zero")
+
+    compared = [a for a in acct_rows if a["status"] in ("match", "difference")]
+    ar_compared = [c for c in ar_rows
+                   if c["status"] in ("match", "difference")]
+    all_match = (complete
+                 and all(a["status"] == "match" for a in compared)
+                 and all(c["status"] == "match" for c in ar_compared)
+                 and ar["difference_cents"] == 0
+                 and trial["erp_balanced"] and qb_balanced)
+    return {"snapshot": coverage,
+            "accounts": acct_rows,
+            "accounts_erp_zero_balance_unmatched_omitted": omitted_zero,
+            "receivables": ar,
+            "payables": ap,
+            "trial_balance": trial,
+            "uncompared": uncompared,
+            "status": "match" if all_match else (
+                "incomplete" if not complete else "differences"),
+            "match": all_match}
+
+
+@app.get("/api/erp/accounting/qb-diff")
+def erp_acct_qb_diff():
+    """ERP-vs-QuickBooks diff report for the parallel run. Reads the
+    migration snapshot at request time (see _acct_qb_snapshot_path);
+    nothing is imported into the ledger. 404 when no snapshot file
+    exists; the report itself states how partial the snapshot is."""
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    path = _acct_qb_snapshot_path()
+    if not path:
+        return jsonify(error="QuickBooks migration snapshot not found",
+                       snapshot_status="missing"), 404
+    try:
+        with open(path, encoding="utf-8") as fh:
+            snap = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return jsonify(error="QuickBooks migration snapshot unreadable: %s"
+                       % exc, snapshot_status="unreadable"), 500
+    if not isinstance(snap, dict):
+        return jsonify(error="QuickBooks migration snapshot is not an object",
+                       snapshot_status="unreadable"), 500
+    conn = db()
+    out = _acct_qb_diff(conn, snap)
+    conn.close()
+    return jsonify(out)
+
+
+# ---- Owner draws (item 7) ----
+def _acct_draw_dict(row):
+    d = dict(row)
+    return d
+
+
+@app.get("/api/erp/accounting/draws")
+def erp_acct_list_draws():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    conn = db()
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_draws WHERE status = ?"
+            " ORDER BY id DESC", (status,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_draws ORDER BY id DESC").fetchall()
+    conn.close()
+    return jsonify(draws=[_acct_draw_dict(r) for r in rows])
+
+
+@app.post("/api/erp/accounting/draws")
+def erp_acct_request_draw():
+    """Request an owner draw. Records the request only -- no money
+    moves until the other founder approves it."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    owner_raw = (data.get("owner_name") or "").strip()
+    owner = next((n for n in ERP_ACCT_OWNER_NAMES
+                  if n.lower() == owner_raw.lower()), None)
+    if not owner:
+        return jsonify(error="owner_name must be one of "
+                       + ", ".join(ERP_ACCT_OWNER_NAMES)), 400
+    amount = _acct_int_cents(data.get("amount_cents"))
+    if amount is None or amount < 1:
+        return jsonify(error="amount_cents must be whole cents greater than zero"), 400
+    date = (data.get("date") or "").strip() \
+        or datetime.now(timezone.utc).date().isoformat()
+    if not _acct_valid_date(date):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    memo = (data.get("memo") or "").strip()
+    bank_account_id = data.get("bank_account_id")
+    conn = db()
+    if bank_account_id not in (None, "", 0):
+        try:
+            bank_account_id = int(bank_account_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="bank_account_id must be a number"), 400
+        bank = conn.execute(
+            "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+            (bank_account_id,)).fetchone()
+        if not bank:
+            conn.close()
+            return jsonify(error="bank account not found"), 404
+        if not bank["active"]:
+            conn.close()
+            return jsonify(error="bank account is inactive"), 400
+    else:
+        bank_account_id = None
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_draws (owner_name, date, amount_cents, memo,"
+        " bank_account_id, status, requested_by, decided_by,"
+        " journal_entry_id, created_at, decided_at)"
+        " VALUES (?, ?, ?, ?, ?, 'requested', ?, '', NULL, ?, NULL)",
+        (owner, date, amount, memo, bank_account_id, actor or "", now))
+    draw_id = cur.lastrowid
+    _acct_audit(conn, actor, "draw.request", "draw", draw_id,
+                "#%d %s %d cents on %s" % (draw_id, owner, amount, date))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_draws WHERE id = ?",
+                       (draw_id,)).fetchone()
+    conn.close()
+    return jsonify(draw=_acct_draw_dict(row)), 201
+
+
+def _acct_draw_get(conn, draw_id):
+    return conn.execute("SELECT * FROM erp_acct_draws WHERE id = ?",
+                        (draw_id,)).fetchone()
+
+
+@app.post("/api/erp/accounting/draws/<int:draw_id>/approve")
+def erp_acct_approve_draw(draw_id):
+    """Approve a requested draw and post it: Dr 3000 Owner's Equity /
+    Cr bank (1010 Checking -- Operating by default, or the selected
+    bank account's GL account). The approver must differ from the
+    requester; _acct_post_entry enforces period locks."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    draw = _acct_draw_get(conn, draw_id)
+    if not draw:
+        conn.close()
+        return jsonify(error="draw not found"), 404
+    if draw["status"] != "requested":
+        conn.close()
+        return jsonify(error="only a requested draw can be approved"
+                       " (status: %s)" % draw["status"]), 400
+    if (actor or "") == (draw["requested_by"] or ""):
+        conn.close()
+        return jsonify(error="you cannot approve your own draw;"
+                       " the other founder must approve it"), 403
+    equity_id = _acct_account_id_by_code(conn, ERP_ACCT_EQUITY_CODE)
+    bank_gl_id, bank_err = _acct_cash_account_id(conn, draw["bank_account_id"])
+    if not equity_id or bank_err or not bank_gl_id:
+        conn.close()
+        return jsonify(error=bank_err or
+                       "chart of accounts is missing a required account"), 500
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("SAVEPOINT acct_draw_approve")
+    raw = [{"account_id": equity_id, "debit_cents": draw["amount_cents"],
+            "credit_cents": 0,
+            "memo": "Owner draw #%d -- %s" % (draw_id, draw["owner_name"])},
+           {"account_id": bank_gl_id, "debit_cents": 0,
+            "credit_cents": draw["amount_cents"],
+            "memo": "Owner draw #%d -- %s" % (draw_id, draw["owner_name"])}]
+    entry_id, error = _acct_post_entry(
+        conn, actor, draw["date"],
+        "Owner draw #%d -- %s" % (draw_id, draw["owner_name"]),
+        "draw", draw_id, raw)
+    if error:
+        conn.execute("ROLLBACK TO SAVEPOINT acct_draw_approve")
+        conn.execute("RELEASE SAVEPOINT acct_draw_approve")
+        conn.close()
+        return jsonify(error=error), 400
+    conn.execute("UPDATE erp_acct_draws SET status = 'approved',"
+                 " decided_by = ?, journal_entry_id = ?, decided_at = ?"
+                 " WHERE id = ?",
+                 (actor or "", entry_id, now, draw_id))
+    _acct_audit(conn, actor, "draw.approve", "draw", draw_id,
+                "#%d %s %d cents entry #%d approved by %s (requested by %s)"
+                % (draw_id, draw["owner_name"], draw["amount_cents"],
+                   entry_id, actor or "", draw["requested_by"]))
+    conn.execute("RELEASE SAVEPOINT acct_draw_approve")
+    conn.commit()
+    row = _acct_draw_get(conn, draw_id)
+    conn.close()
+    return jsonify(draw=_acct_draw_dict(row), journal_entry_id=entry_id)
+
+
+@app.post("/api/erp/accounting/draws/<int:draw_id>/reject")
+def erp_acct_reject_draw(draw_id):
+    """Reject a requested draw. Posts nothing; the decision is by the
+    other founder, like approval."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    draw = _acct_draw_get(conn, draw_id)
+    if not draw:
+        conn.close()
+        return jsonify(error="draw not found"), 404
+    if draw["status"] != "requested":
+        conn.close()
+        return jsonify(error="only a requested draw can be rejected"
+                       " (status: %s)" % draw["status"]), 400
+    if (actor or "") == (draw["requested_by"] or ""):
+        conn.close()
+        return jsonify(error="you cannot reject your own draw;"
+                       " the other founder must decide it"), 403
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_acct_draws SET status = 'rejected',"
+                 " decided_by = ?, decided_at = ? WHERE id = ?",
+                 (actor or "", now, draw_id))
+    _acct_audit(conn, actor, "draw.reject", "draw", draw_id,
+                "#%d %s %d cents rejected by %s (requested by %s)"
+                % (draw_id, draw["owner_name"], draw["amount_cents"],
+                   actor or "", draw["requested_by"]))
+    conn.commit()
+    row = _acct_draw_get(conn, draw_id)
+    conn.close()
+    return jsonify(draw=_acct_draw_dict(row))
+
+
+@app.post("/api/erp/accounting/draws/<int:draw_id>/cancel")
+def erp_acct_cancel_draw(draw_id):
+    """Withdraw your own requested draw. Posts nothing. Only the
+    requester can cancel; the other founder rejects instead."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    draw = _acct_draw_get(conn, draw_id)
+    if not draw:
+        conn.close()
+        return jsonify(error="draw not found"), 404
+    if draw["status"] != "requested":
+        conn.close()
+        return jsonify(error="only a requested draw can be cancelled"
+                       " (status: %s)" % draw["status"]), 400
+    if (actor or "") != (draw["requested_by"] or ""):
+        conn.close()
+        return jsonify(error="only the requester can cancel this draw;"
+                       " the other founder can reject it"), 403
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_acct_draws SET status = 'cancelled',"
+                 " decided_by = ?, decided_at = ? WHERE id = ?",
+                 (actor or "", now, draw_id))
+    _acct_audit(conn, actor, "draw.cancel", "draw", draw_id,
+                "#%d %s %d cents cancelled by requester"
+                % (draw_id, draw["owner_name"], draw["amount_cents"]))
+    conn.commit()
+    row = _acct_draw_get(conn, draw_id)
+    conn.close()
+    return jsonify(draw=_acct_draw_dict(row))
+
+
+# ---- Plaid bank-feed sync path (item 8) ----
+def _acct_plaid_cli():
+    return (os.environ.get(ERP_PLAID_CLI_ENV) or "").strip() \
+        or ERP_PLAID_CLI_DEFAULT
+
+
+def _acct_plaid_run(args, timeout=60):
+    """Run the Plaid connector CLI and parse its JSON stdout. Returns
+    the parsed object, or None when the CLI is missing, times out, or
+    returns non-JSON. Never raises; never logs credentials (the CLI
+    holds the link, the ERP holds none)."""
+    try:
+        res = subprocess.run([_acct_plaid_cli()] + list(args),
+                             capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    try:
+        return json.loads(res.stdout or "")
+    except ValueError:
+        return None
+
+
+def _acct_plaid_status():
+    """Linked-institution status from `plaid status`: connected flag,
+    institution names + masked account numbers only, and the exact
+    connect / add-account URLs the CLI returns (never invented).
+    With no bank linked: connected False, linked_institutions 0."""
+    out = _acct_plaid_run(["status"], timeout=30)
+    if not isinstance(out, dict):
+        return {"connected": False, "linked_institutions": 0,
+                "institutions": [], "status": "unavailable",
+                "message": "Plaid status could not be read."}
+    institutions = []
+    for inst in (out.get("institutions") or []):
+        if not isinstance(inst, dict):
+            continue
+        accts = []
+        for a in (inst.get("accounts") or []):
+            if isinstance(a, dict):
+                accts.append({"name": a.get("name"),
+                              "type": a.get("type"),
+                              "mask": a.get("mask")})
+        institutions.append({"name": inst.get("name") or inst.get("institution_name"),
+                             "accounts": accts,
+                             "needs_reauth": bool(inst.get("needs_reauth"))})
+    # The CLI also reports accounts flat in `accounts`; fall back to it
+    # when no institutions array is present.
+    if not institutions and out.get("accounts"):
+        names = {}
+        for a in out.get("accounts") or []:
+            if isinstance(a, dict):
+                names.setdefault(a.get("institution_name") or "Linked bank",
+                                 []).append(
+                    {"name": a.get("name"), "type": a.get("type"),
+                     "mask": a.get("mask")})
+        institutions = [{"name": k, "accounts": v, "needs_reauth": False}
+                        for k, v in names.items()]
+    linked = out.get("linked_institutions")
+    if linked is None:
+        linked = len(institutions)
+    connected = bool(out.get("connected")) and linked > 0
+    return {"connected": connected,
+            "linked_institutions": int(linked or 0),
+            "institutions": institutions,
+            "status": out.get("status") or ("connected" if connected
+                                            else "not_connected"),
+            "connect_url": out.get("connect_url"),
+            "add_account_url": out.get("add_account_url"),
+            "message": out.get("reason") or (
+                "No bank is linked in Plaid yet." if not connected else "")}
+
+
+def _acct_plaid_map_transactions(body):
+    """Map `plaid transactions-get` body.transactions to bank-sync
+    receiver rows. Plaid amounts are dollars (positive = outflow,
+    negative = inflow) -- the receiver stores Plaid amounts as-is.
+    Cents via Decimal so $12.34 is exactly 1234. Rows missing an id,
+    date or amount are skipped and counted, never guessed."""
+    rows = []
+    skipped = 0
+    for txn in (body.get("transactions") or []):
+        if not isinstance(txn, dict):
+            skipped += 1
+            continue
+        txn_id = (txn.get("transaction_id") or "").strip()
+        date = (txn.get("date") or "").strip()
+        amount = txn.get("amount")
+        if not txn_id or not _acct_valid_date(date) or amount is None:
+            skipped += 1
+            continue
+        try:
+            cents = int((Decimal(str(amount)) * 100).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP))
+        except Exception:
+            skipped += 1
+            continue
+        desc = (txn.get("merchant_name") or txn.get("name") or "").strip()
+        rows.append({"plaid_txn_id": txn_id,
+                     "plaid_account_id": (txn.get("account_id") or "").strip(),
+                     "date": date, "description": desc,
+                     "amount_cents": cents})
+    return rows, skipped
+
+
+@app.get("/api/erp/accounting/plaid-status")
+def erp_acct_plaid_status():
+    """Plaid link status for the Banking view: whether any bank is
+    linked, which institutions (names + masks only), and the exact
+    connect/add-account URLs from the CLI. No credentials, no balances
+    beyond what the CLI reports, no claim of a live feed."""
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    return jsonify(_acct_plaid_status())
+
+
+@app.post("/api/erp/accounting/plaid-sync")
+def erp_acct_plaid_sync():
+    """Pull transactions from the linked Plaid bank(s) into the
+    bank-feed receiver. With no bank linked: reports status
+    'no_bank_linked' and does nothing. With a bank linked: runs
+    `plaid transactions-get` over [start, end] (body, else the last
+    30 days), maps to receiver rows, and ingests through the shared
+    helper -- run it twice and the second run inserts nothing
+    (plaid_txn_id idempotency)."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    status = _acct_plaid_status()
+    if not status.get("connected"):
+        return jsonify(ok=True, status="no_bank_linked",
+                       feed="not_configured", inserted=0, skipped=0,
+                       auto_matched=0, errors=[],
+                       message="No bank is linked in Plaid yet. Link a"
+                       " bank account in Plaid, then run a sync to pull"
+                       " transactions into the feed.")
+    data = request.get_json(force=True) or {}
+    today = datetime.now(timezone.utc).date()
+    end = (data.get("end") or "").strip() or today.isoformat()
+    start = (data.get("start") or "").strip() or \
+        (today - timedelta(days=30)).isoformat()
+    if not _acct_valid_date(start) or not _acct_valid_date(end) \
+            or start > end:
+        return jsonify(error="start and end must be YYYY-MM-DD with start <= end"), 400
+    out = _acct_plaid_run(["transactions-get", "--start-date", start,
+                           "--end-date", end], timeout=120)
+    if not isinstance(out, dict):
+        return jsonify(ok=True, status="plaid_read_failed",
+                       feed="not_configured", inserted=0, skipped=0,
+                       auto_matched=0,
+                       errors=["Plaid transactions could not be read"],
+                       message="Plaid did not return transactions for"
+                       " this period."), 502
+    body = out.get("body") or out
+    rows, map_skipped = _acct_plaid_map_transactions(body)
+    conn = db()
+    inserted, skipped, auto_matched, errors = _acct_ingest_bank_txns(
+        conn, actor, rows)
+    skipped += map_skipped
+    _acct_audit(conn, actor, "bank.sync", "bank_sync", 0,
+                "plaid sync %s to %s inserted %d skipped %d auto_matched"
+                " %d errors %d" % (start, end, inserted, skipped,
+                                   auto_matched, len(errors)))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, status="synced", feed="ingested",
+                   start=start, end=end, inserted=inserted,
+                   skipped=skipped, auto_matched=auto_matched,
+                   errors=errors)
+
+
+@app.post("/api/erp/accounting/bank-accounts/<int:bank_id>/match")
+def erp_acct_match_bank_txn(bank_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    txn_id = data.get("txn_id")
+    entry_id = data.get("entry_id")
+    try:
+        txn_id = int(txn_id)
+        entry_id = int(entry_id)
+    except (TypeError, ValueError):
+        return jsonify(error="txn_id and entry_id are required numbers"), 400
+    conn = db()
+    bank = conn.execute(
+        "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+        (bank_id,)).fetchone()
+    if not bank:
+        conn.close()
+        return jsonify(error="bank account not found"), 404
+    txn = conn.execute(
+        "SELECT * FROM erp_acct_bank_txns"
+        " WHERE id = ? AND bank_account_id = ?",
+        (txn_id, bank_id)).fetchone()
+    if not txn:
+        conn.close()
+        return jsonify(error="transaction not found for this bank account"), 404
+    if txn["status"] == "matched":
+        conn.close()
+        return jsonify(
+            error="transaction is already matched; unmatch it first"), 400
+    entry = conn.execute(
+        "SELECT * FROM erp_acct_journal WHERE id = ?", (entry_id,)).fetchone()
+    if not entry:
+        conn.close()
+        return jsonify(error="journal entry not found"), 404
+    if entry["reversed_by"]:
+        conn.close()
+        return jsonify(error="journal entry was reversed"), 400
+    taken = conn.execute(
+        "SELECT 1 FROM erp_acct_bank_txns WHERE matched_entry_id = ?",
+        (entry_id,)).fetchone()
+    if taken:
+        conn.close()
+        return jsonify(
+            error="journal entry is already matched to another transaction"), 400
+    conn.execute(
+        "UPDATE erp_acct_bank_txns SET matched_entry_id = ?,"
+        " status = 'matched' WHERE id = ?",
+        (entry_id, txn_id))
+    _acct_audit(conn, actor, "bank.match", "bank_txn", txn_id,
+                "txn #%d amount %d date %s matched to entry #%d"
+                % (txn_id, txn["amount_cents"], txn["date"], entry_id))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_acct_bank_txns WHERE id = ?", (txn_id,)).fetchone()
+    conn.close()
+    return jsonify(transaction=_acct_bank_txn_dict(row))
+
+
+@app.post("/api/erp/accounting/bank-accounts/<int:bank_id>/unmatch")
+def erp_acct_unmatch_bank_txn(bank_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    try:
+        txn_id = int(data.get("txn_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="txn_id is required"), 400
+    conn = db()
+    bank = conn.execute(
+        "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+        (bank_id,)).fetchone()
+    if not bank:
+        conn.close()
+        return jsonify(error="bank account not found"), 404
+    txn = conn.execute(
+        "SELECT * FROM erp_acct_bank_txns"
+        " WHERE id = ? AND bank_account_id = ?",
+        (txn_id, bank_id)).fetchone()
+    if not txn:
+        conn.close()
+        return jsonify(error="transaction not found for this bank account"), 404
+    if txn["status"] != "matched":
+        conn.close()
+        return jsonify(error="transaction is not matched"), 400
+    conn.execute(
+        "UPDATE erp_acct_bank_txns SET matched_entry_id = NULL,"
+        " status = 'unmatched' WHERE id = ?",
+        (txn_id,))
+    _acct_audit(conn, actor, "bank.unmatch", "bank_txn", txn_id,
+                "txn #%d unmatched from entry #%d" % (
+                    txn_id, txn["matched_entry_id"] or 0))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_acct_bank_txns WHERE id = ?", (txn_id,)).fetchone()
+    conn.close()
+    return jsonify(transaction=_acct_bank_txn_dict(row))
+
+
+@app.get("/api/erp/accounting/reconciliation/<int:bank_id>")
+def erp_acct_reconciliation(bank_id):
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    bank = conn.execute(
+        "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+        (bank_id,)).fetchone()
+    if not bank:
+        conn.close()
+        return jsonify(error="bank account not found"), 404
+    book = _acct_bank_book_balance(conn, bank)
+    bank_bal = _acct_bank_bank_balance(conn, bank)
+    counts = {}
+    for st in ERP_ACCT_TXN_STATUSES:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(amount_cents), 0) AS s"
+            " FROM erp_acct_bank_txns"
+            " WHERE bank_account_id = ? AND status = ?",
+            (bank_id, st)).fetchone()
+        counts[st] = {"count": row["n"], "total_cents": row["s"]}
+    unmatched = conn.execute(
+        "SELECT * FROM erp_acct_bank_txns"
+        " WHERE bank_account_id = ? AND status = 'unmatched'"
+        " ORDER BY date, id",
+        (bank_id,)).fetchall()
+    snap = conn.execute(
+        "SELECT * FROM erp_acct_reconciliations WHERE bank_account_id = ?"
+        " ORDER BY id DESC LIMIT 1",
+        (bank_id,)).fetchone()
+    out = _acct_bank_dict(conn, bank)
+    conn.close()
+    return jsonify(bank_account=out, book_balance_cents=book,
+                   bank_balance_cents=bank_bal,
+                   difference_cents=book - bank_bal, counts=counts,
+                   unmatched=[_acct_bank_txn_dict(r) for r in unmatched],
+                   last_snapshot=dict(snap) if snap else None)
+
+
+@app.post("/api/erp/accounting/bank-accounts/<int:bank_id>/close-period")
+def erp_acct_close_period(bank_id):
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    force = data.get("force") is True
+    reason = (data.get("reason") or "").strip()
+    conn = db()
+    bank = conn.execute(
+        "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+        (bank_id,)).fetchone()
+    if not bank:
+        conn.close()
+        return jsonify(error="bank account not found"), 404
+    unmatched = conn.execute(
+        "SELECT COUNT(*) AS n FROM erp_acct_bank_txns"
+        " WHERE bank_account_id = ? AND status = 'unmatched'",
+        (bank_id,)).fetchone()["n"]
+    if unmatched > 0 and not force:
+        conn.close()
+        return jsonify(
+            error="%d unmatched transactions remain; match or review them"
+            " before closing, or force-close with a reason" % unmatched,
+            unmatched_count=unmatched), 400
+    if force and not reason:
+        conn.close()
+        return jsonify(
+            error="a reason is required to force-close with unmatched items"), 400
+    book = _acct_bank_book_balance(conn, bank)
+    bank_bal = _acct_bank_bank_balance(conn, bank)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_reconciliations (bank_account_id, closed_at,"
+        " closed_by, book_balance_cents, bank_balance_cents,"
+        " difference_cents, unmatched_count, forced, reason, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (bank_id, now, actor or "", book, bank_bal, book - bank_bal,
+         unmatched, 1 if force else 0, reason if force else "", now))
+    snap_id = cur.lastrowid
+    conn.execute(
+        "UPDATE erp_acct_bank_accounts SET last_reconciled_at = ? WHERE id = ?",
+        (now, bank_id))
+    _acct_audit(conn, actor, "bank.close", "bank_account", bank_id,
+                "closed at %s book %d bank %d diff %d unmatched %d%s" % (
+                    now, book, bank_bal, book - bank_bal, unmatched,
+                    " FORCED: " + reason if force else ""))
+    conn.commit()
+    snap = conn.execute(
+        "SELECT * FROM erp_acct_reconciliations WHERE id = ?",
+        (snap_id,)).fetchone()
+    out = _acct_bank_dict(conn, conn.execute(
+        "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+        (bank_id,)).fetchone())
+    conn.close()
+    return jsonify(reconciliation=dict(snap), bank_account=out)
+
+
+
+
+# ---- Accounting sales tax, Nevada only (Phase 1, step 5) ----
+# Rates are data in erp_acct_tax_rates, never hardcoded. The stored value
+# is percent x 1000 (8375 = 8.375%) per the spec. Tax is computed per
+# invoice on the taxable subtotal, round half up. Retail sales are taxable;
+# wholesale/resale-exempt sales are not. Nevada returns are due by the
+# 20th of the month after the reporting period.
+ERP_ACCT_TAX_DEFAULT_JURISDICTION = "Clark County"
+
+
+def _acct_tax_rate_bps(conn, jurisdiction, on_date):
+    """Rate in effect for `jurisdiction` on `on_date` (YYYY-MM-DD), or
+    None when no rate covers that date."""
+    row = conn.execute(
+        "SELECT rate_bps FROM erp_acct_tax_rates WHERE jurisdiction = ?"
+        " AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?)"
+        " ORDER BY effective_from DESC LIMIT 1",
+        (jurisdiction, on_date, on_date)).fetchone()
+    return row["rate_bps"] if row else None
+
+
+def _acct_compute_tax_cents(amount_cents, rate_bps):
+    """Sales tax in cents for a taxable amount, round half up. Returns
+    None for negative inputs (amounts are validated non-negative first)."""
+    if amount_cents < 0 or rate_bps < 0:
+        return None
+    return (amount_cents * rate_bps + 50000) // 100000
+
+
+def _acct_compute_tax_inclusive_cents(amount_cents, rate_bps):
+    """Tax portion of a tax-INCLUSIVE amount, round half up. Used for
+    auto-posted retail sales: checkout collects no separate tax line, so
+    the amount the customer paid already includes the tax owed.
+    Returns None for negative inputs."""
+    if amount_cents < 0 or rate_bps < 0:
+        return None
+    denom = 100000 + rate_bps
+    return (amount_cents * rate_bps + denom // 2) // denom
+
+
+def _acct_tax_filing_dict(row):
+    d = dict(row)
+    d["outstanding_cents"] = d["tax_collected_cents"] - d["tax_remitted_cents"]
+    return d
+
+
+def _acct_tax_next_due():
+    """(due_date, period_label) for the most recently completed calendar
+    month. Nevada returns are due by the 20th of the month after the
+    reporting period."""
+    today = datetime.now(timezone.utc).date()
+    last_month_end = today.replace(day=1) - timedelta(days=1)
+    return today.replace(day=20).isoformat(), last_month_end.strftime("%B %Y")
+
+
+def _acct_tax_liability(conn, start, end, jurisdiction=None):
+    """Collected/remitted/outstanding for a period. Collected and remitted
+    come from invoices and remittances (a voided invoice's reversal is not
+    a remittance, so raw 2100 debits would overstate what was remitted),
+    PLUS tax auto-posted by retail sales (source='sale' journal entries,
+    Clark County only -- those sales never create an invoice); the overall
+    outstanding is the 2100 ledger balance, and the per-jurisdiction split
+    comes from invoices (which carry a jurisdiction) and remittances (which
+    carry their filing's jurisdiction)."""
+    balance = conn.execute(
+        "SELECT COALESCE(SUM(credit_cents - debit_cents), 0) AS b"
+        " FROM erp_acct_journal_lines l"
+        " JOIN erp_acct_accounts a ON a.id = l.account_id"
+        " WHERE a.code = ?", (ERP_ACCT_TAX_PAYABLE_CODE,)).fetchone()["b"]
+    jurs = [r[0] for r in conn.execute(
+        "SELECT DISTINCT jurisdiction FROM erp_acct_tax_rates"
+        " UNION SELECT DISTINCT tax_jurisdiction FROM erp_acct_invoices"
+        " UNION SELECT DISTINCT jurisdiction FROM erp_acct_tax_filings"
+        " ORDER BY 1").fetchall()]
+    # Dept 9 wave B: auto-posted retail sales credit 2100 through
+    # source='sale' journal entries and never create an invoice, so the
+    # invoice-only sums above miss them. Fold them into the Clark County
+    # bucket (the default jurisdiction for every auto-posted sale).
+    _sale_tax = {"period": 0, "period_taxable": 0, "all": 0}
+    _tax_id = _acct_account_id_by_code(conn, ERP_ACCT_TAX_PAYABLE_CODE)
+    _inc_id = _acct_account_id_by_code(conn, ERP_ACCT_RETAIL_INCOME_CODE)
+    if _tax_id and _inc_id:
+        for _row in conn.execute(
+                "SELECT j.date AS d,"
+                " COALESCE(SUM(CASE WHEN l.account_id = ?"
+                " THEN l.credit_cents - l.debit_cents ELSE 0 END), 0) AS tax,"
+                " COALESCE(SUM(CASE WHEN l.account_id = ?"
+                " THEN l.credit_cents - l.debit_cents ELSE 0 END), 0) AS taxable"
+                " FROM erp_acct_journal j"
+                " JOIN erp_acct_journal_lines l ON l.entry_id = j.id"
+                " WHERE j.source = 'sale' AND j.reversed_by IS NULL"
+                " GROUP BY j.id",
+                (_tax_id, _inc_id)).fetchall():
+            if _row["tax"]:
+                _sale_tax["all"] += _row["tax"]
+                if start <= _row["d"] <= end:
+                    _sale_tax["period"] += _row["tax"]
+                    _sale_tax["period_taxable"] += _row["taxable"]
+    by_jur = []
+    for jur in jurs:
+        if jurisdiction and jur != jurisdiction:
+            continue
+        c = conn.execute(
+            "SELECT COALESCE(SUM(tax_cents), 0) AS c,"
+            " COALESCE(SUM(CASE WHEN tax_cents > 0 THEN subtotal_cents ELSE 0 END), 0) AS s"
+            " FROM erp_acct_invoices"
+            " WHERE status != 'void' AND date >= ? AND date <= ? AND tax_jurisdiction = ?",
+            (start, end, jur)).fetchone()
+        r = conn.execute(
+            "SELECT COALESCE(SUM(rm.amount_cents), 0) AS r"
+            " FROM erp_acct_tax_remittances rm"
+            " JOIN erp_acct_tax_filings f ON f.id = rm.filing_id"
+            " WHERE rm.date >= ? AND rm.date <= ? AND f.jurisdiction = ?",
+            (start, end, jur)).fetchone()
+        call = conn.execute(
+            "SELECT COALESCE(SUM(tax_cents), 0) AS c"
+            " FROM erp_acct_invoices WHERE status != 'void' AND tax_jurisdiction = ?",
+            (jur,)).fetchone()["c"]
+        rall = conn.execute(
+            "SELECT COALESCE(SUM(rm.amount_cents), 0) AS r"
+            " FROM erp_acct_tax_remittances rm"
+            " JOIN erp_acct_tax_filings f ON f.id = rm.filing_id"
+            " WHERE f.jurisdiction = ?", (jur,)).fetchone()["r"]
+        if jur == ERP_ACCT_TAX_DEFAULT_JURISDICTION:
+            c = {"c": c["c"] + _sale_tax["period"],
+                 "s": c["s"] + _sale_tax["period_taxable"]}
+            call = call + _sale_tax["all"]
+        by_jur.append({"jurisdiction": jur, "collected_cents": c["c"],
+                       "taxable_sales_cents": c["s"], "remitted_cents": r["r"],
+                       "outstanding_cents": call - rall})
+    taxable_sales = sum(b["taxable_sales_cents"] for b in by_jur)
+    collected = sum(b["collected_cents"] for b in by_jur)
+    remitted = sum(b["remitted_cents"] for b in by_jur)
+    # Outstanding is the 2100 ledger balance overall; with a jurisdiction
+    # filter it is that jurisdiction's collected-minus-remitted, since the
+    # ledger balance cannot be split by jurisdiction.
+    outstanding = (by_jur[0]["outstanding_cents"] if jurisdiction and by_jur
+                   else balance)
+    return {"start": start, "end": end, "jurisdiction": jurisdiction,
+            "collected_cents": collected, "remitted_cents": remitted,
+            "outstanding_cents": outstanding,
+            "taxable_sales_cents": taxable_sales,
+            "account_balance_cents": balance, "by_jurisdiction": by_jur}
+
+
+@app.get("/api/erp/accounting/tax/rates")
+def erp_acct_list_tax_rates():
+    actor, err = _erp_check_perm("tax.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_tax_rates ORDER BY jurisdiction, effective_from DESC").fetchall()
+    conn.close()
+    return jsonify(rates=[dict(r) for r in rows])
+
+
+@app.post("/api/erp/accounting/tax/rates")
+def erp_acct_add_tax_rate():
+    actor, err = _erp_check_perm("tax.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    jurisdiction = (data.get("jurisdiction") or "").strip()
+    if not jurisdiction:
+        return jsonify(error="jurisdiction is required"), 400
+    rate_bps = None
+    if data.get("rate_bps") is not None:
+        rate_bps = _acct_int_cents(data.get("rate_bps"))
+    elif data.get("rate_percent") is not None:
+        try:
+            rate_bps = int(round(float(data.get("rate_percent")) * 1000))
+        except (TypeError, ValueError):
+            rate_bps = None
+    if rate_bps is None or rate_bps < 1 or rate_bps > 20000:
+        return jsonify(error="rate must be between 0.001% and 20%"), 400
+    eff_from = (data.get("effective_from") or "").strip()
+    if not _acct_valid_date(eff_from):
+        return jsonify(error="effective_from must be YYYY-MM-DD"), 400
+    eff_to = (data.get("effective_to") or "").strip() or None
+    if eff_to and (not _acct_valid_date(eff_to) or eff_to < eff_from):
+        return jsonify(error="effective_to must be YYYY-MM-DD on or after effective_from"), 400
+    conn = db()
+    existing = conn.execute(
+        "SELECT * FROM erp_acct_tax_rates WHERE jurisdiction = ?"
+        " ORDER BY effective_from", (jurisdiction,)).fetchall()
+    expire_id = None
+    prev_rate = None
+    for r in existing:
+        if r["effective_from"] >= eff_from:
+            conn.close()
+            return jsonify(error="a rate already takes effect on or after that date for this jurisdiction"), 400
+        if r["effective_to"] is None:
+            expire_id = r["id"]
+            prev_rate = r
+        elif r["effective_from"] <= eff_from <= r["effective_to"]:
+            conn.close()
+            return jsonify(error="that date is already covered by a rate for this jurisdiction"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    if expire_id is not None:
+        prev_day = (datetime.strptime(eff_from, "%Y-%m-%d")
+                    - timedelta(days=1)).strftime("%Y-%m-%d")
+        conn.execute("UPDATE erp_acct_tax_rates SET effective_to = ? WHERE id = ?",
+                     (prev_day, expire_id))
+    cur = conn.execute(
+        "INSERT INTO erp_acct_tax_rates (jurisdiction, rate_bps,"
+        " effective_from, effective_to, source, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (jurisdiction, rate_bps, eff_from, eff_to,
+         (data.get("source") or "").strip(), now))
+    rate_id = cur.lastrowid
+    _acct_audit(conn, actor, "tax.rate.add", "tax_rate", rate_id,
+                "%s %d (%.3f%%) from %s%s" % (jurisdiction, rate_bps,
+                    rate_bps / 1000.0, eff_from,
+                    "; previous open rate %d bps from %s expires %s"
+                    % (prev_rate["rate_bps"], prev_rate["effective_from"],
+                       prev_day) if prev_rate is not None
+                    else "; no previous open rate"))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_tax_rates WHERE id = ?",
+                       (rate_id,)).fetchone()
+    conn.close()
+    return jsonify(rate=dict(row)), 201
+
+
+@app.get("/api/erp/accounting/tax/liability")
+def erp_acct_tax_liability_view():
+    actor, err = _erp_check_perm("tax.read")
+    if err:
+        return err
+    start = (request.args.get("start") or "").strip()
+    end = (request.args.get("end") or "").strip()
+    jurisdiction = (request.args.get("jurisdiction") or "").strip() or None
+    if (start and not end) or (end and not start):
+        return jsonify(error="start and end must be given together"), 400
+    if start and end:
+        if not _acct_valid_date(start) or not _acct_valid_date(end) or start > end:
+            return jsonify(error="start and end must be YYYY-MM-DD with start on or before end"), 400
+    else:
+        today = datetime.now(timezone.utc).date()
+        start = today.replace(day=1).isoformat()
+        end = today.isoformat()
+    conn = db()
+    out = _acct_tax_liability(conn, start, end, jurisdiction)
+    due, period_label = _acct_tax_next_due()
+    out["next_due_date"] = due
+    out["next_due_period"] = period_label
+    # Dept 10 Wave A (item 1): the liability view carries the profile.
+    out["company"] = _erp_company_profile(conn)
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/erp/accounting/tax/filings")
+def erp_acct_list_tax_filings():
+    actor, err = _erp_check_perm("tax.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_tax_filings ORDER BY period_start DESC, id DESC").fetchall()
+    out = [_acct_tax_filing_dict(r) for r in rows]
+    # Dept 10 Wave A (item 1): filings carry the company profile.
+    company = _erp_company_profile(conn)
+    conn.close()
+    return jsonify(filings=out, company=company)
+
+
+@app.post("/api/erp/accounting/tax/filings")
+def erp_acct_create_tax_filing():
+    actor, err = _erp_check_perm("tax.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    start = (data.get("period_start") or "").strip()
+    end = (data.get("period_end") or "").strip()
+    if not _acct_valid_date(start) or not _acct_valid_date(end) or start > end:
+        return jsonify(error="period_start and period_end must be YYYY-MM-DD with start on or before end"), 400
+    if start > datetime.now(timezone.utc).date().isoformat():
+        return jsonify(error="period_start cannot be in the future"), 400
+    jurisdiction = (data.get("jurisdiction") or "").strip() or ERP_ACCT_TAX_DEFAULT_JURISDICTION
+    conn = db()
+    clash = conn.execute(
+        "SELECT 1 FROM erp_acct_tax_filings WHERE jurisdiction = ?"
+        " AND period_start <= ? AND period_end >= ? LIMIT 1",
+        (jurisdiction, end, start)).fetchone()
+    if clash:
+        conn.close()
+        return jsonify(error="a filing already exists for an overlapping period in this jurisdiction"), 400
+    # Dept 9 wave C fixed the wave-B follow-up: the snapshot now comes
+    # from _acct_tax_liability (invoice tax PLUS auto-posted retail tax,
+    # Clark County), the same computation the liability view reports --
+    # instead of the old invoice-only sums, which understated collected
+    # whenever retail sales had auto-posted. A jurisdiction with no
+    # rate/invoice/filing rows snapshots 0/0, exactly as before.
+    _liab = _acct_tax_liability(conn, start, end, jurisdiction)
+    _row = next((b for b in _liab["by_jurisdiction"]
+                 if b["jurisdiction"] == jurisdiction), None)
+    _taxable = _row["taxable_sales_cents"] if _row else 0
+    _collected = _row["collected_cents"] if _row else 0
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_tax_filings (period_start, period_end,"
+        " jurisdiction, taxable_sales_cents, tax_collected_cents,"
+        " tax_remitted_cents, status, filed_at, filed_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, 0, 'open', NULL, '', ?)",
+        (start, end, jurisdiction, _taxable, _collected, now))
+    filing_id = cur.lastrowid
+    _acct_audit(conn, actor, "tax.filing.create", "tax_filing", filing_id,
+                "%s %s to %s taxable %d collected %d" % (
+                    jurisdiction, start, end, _taxable, _collected))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_tax_filings WHERE id = ?",
+                       (filing_id,)).fetchone()
+    conn.close()
+    return jsonify(filing=_acct_tax_filing_dict(row)), 201
+
+
+@app.post("/api/erp/accounting/tax/filings/<int:filing_id>/remit")
+def erp_acct_remit_tax_filing(filing_id):
+    actor, err = _erp_check_perm("tax.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    amount = _acct_int_cents(data.get("amount_cents", 0))
+    if amount is None or amount < 1:
+        return jsonify(error="amount_cents must be whole cents greater than zero"), 400
+    date = (data.get("date") or "").strip()
+    if not _acct_valid_date(date):
+        return jsonify(error="date must be YYYY-MM-DD"), 400
+    reference = (data.get("reference") or "").strip()
+    conn = db()
+    filing = conn.execute(
+        "SELECT * FROM erp_acct_tax_filings WHERE id = ?",
+        (filing_id,)).fetchone()
+    if not filing:
+        conn.close()
+        return jsonify(error="filing not found"), 404
+    if filing["status"] == "filed":
+        conn.close()
+        return jsonify(error="filing is already filed"), 400
+    outstanding = filing["tax_collected_cents"] - filing["tax_remitted_cents"]
+    if amount > outstanding:
+        conn.close()
+        return jsonify(error="amount exceeds the outstanding balance of %d cents" % outstanding), 400
+    tax_id = _acct_account_id_by_code(conn, ERP_ACCT_TAX_PAYABLE_CODE)
+    cash_id = _acct_account_id_by_code(conn, ERP_ACCT_CASH_CODE)
+    if not tax_id or not cash_id:
+        conn.close()
+        return jsonify(error="chart of accounts is missing a required account"), 500
+    memo = "Sales tax remittance — %s %s to %s" % (
+        filing["jurisdiction"], filing["period_start"], filing["period_end"])
+    entry_id, error = _acct_post_entry(
+        conn, actor, date, memo, "tax", filing_id,
+        [{"account_id": tax_id, "debit_cents": amount, "credit_cents": 0,
+          "memo": memo},
+         {"account_id": cash_id, "debit_cents": 0, "credit_cents": amount,
+          "memo": memo}])
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_tax_remittances (filing_id, date, amount_cents,"
+        " reference, journal_entry_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (filing_id, date, amount, reference, entry_id, now))
+    remit_id = cur.lastrowid
+    conn.execute(
+        "UPDATE erp_acct_tax_filings SET tax_remitted_cents = tax_remitted_cents + ?"
+        " WHERE id = ?", (amount, filing_id))
+    _acct_audit(conn, actor, "tax.remit", "tax_filing", filing_id,
+                "remitted %d on %s ref %s entry #%d" % (
+                    amount, date, reference or "—", entry_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_tax_filings WHERE id = ?",
+                       (filing_id,)).fetchone()
+    conn.close()
+    return jsonify(filing=_acct_tax_filing_dict(row),
+                   remittance_id=remit_id, journal_entry_id=entry_id)
+
+
+@app.post("/api/erp/accounting/tax/filings/<int:filing_id>/file")
+def erp_acct_file_tax_filing(filing_id):
+    actor, err = _erp_check_perm("tax.write")
+    if err:
+        return err
+    conn = db()
+    filing = conn.execute(
+        "SELECT * FROM erp_acct_tax_filings WHERE id = ?",
+        (filing_id,)).fetchone()
+    if not filing:
+        conn.close()
+        return jsonify(error="filing not found"), 404
+    if filing["status"] == "filed":
+        conn.close()
+        return jsonify(error="filing is already filed"), 400
+    outstanding = filing["tax_collected_cents"] - filing["tax_remitted_cents"]
+    if outstanding != 0:
+        conn.close()
+        return jsonify(error="outstanding balance must be zero before filing (%d cents remain)" % outstanding), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_acct_tax_filings SET status = 'filed', filed_at = ?, filed_by = ?"
+        " WHERE id = ?", (now, actor or "", filing_id))
+    _acct_audit(conn, actor, "tax.file", "tax_filing", filing_id,
+                "%s %s to %s filed" % (filing["jurisdiction"],
+                                       filing["period_start"], filing["period_end"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_tax_filings WHERE id = ?",
+                       (filing_id,)).fetchone()
+    conn.close()
+    return jsonify(filing=_acct_tax_filing_dict(row))
+
+
+
+# ---- Payroll (Phase 1 step 6) ----
+# Nobody is paid yet: no payroll history exists and none migrates. The
+# structure is built now so it switches on the day pay starts. All
+# withholding is computed server-side from the seeded tables; the client
+# never supplies tax amounts. All money is integer cents.
+ERP_ACCT_PAYROLL_EXP_CODE = "6500"
+ERP_ACCT_PAYROLL_TAX_EXP_CODE = "6600"
+ERP_ACCT_PAYROLL_LIAB_CODE = "2200"
+ERP_PAYROLL_SCHEDULES = {"weekly": 52, "biweekly": 26, "monthly": 12}
+ERP_PAYROLL_PAY_TYPES = ("salary", "hourly")
+ERP_PAYROLL_FILING_STATUSES = ("single", "married_jointly",
+                               "married_separately", "head_of_household")
+
+
+def _acct_round_div(n, d):
+    """Round n/d to the nearest integer, halves up. n >= 0, d > 0."""
+    return (2 * n + d) // (2 * d)
+
+
+def _acct_payroll_fica(conn, tax_year):
+    row = conn.execute(
+        "SELECT brackets FROM erp_acct_payroll_tax_tables"
+        " WHERE tax_year = ? AND table_name = 'fica'",
+        (tax_year,)).fetchone()
+    if not row:
+        return None
+    try:
+        params = json.loads(row["brackets"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(params, dict):
+        return None
+    return params
+
+
+def _acct_payroll_withholding_table(conn, tax_year, filing_status, step2):
+    name = "federal-%s-%s" % (filing_status, "step2" if step2 else "standard")
+    row = conn.execute(
+        "SELECT brackets FROM erp_acct_payroll_tax_tables"
+        " WHERE tax_year = ? AND table_name = ?",
+        (tax_year, name)).fetchone()
+    if not row:
+        return None
+    try:
+        brackets = json.loads(row["brackets"])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(brackets, list) or not brackets:
+        return None
+    return brackets
+
+
+def _acct_federal_withholding_cents(conn, tax_year, filing_status, step2,
+                                    periods, adjusted_annual_cents,
+                                    step3_credit_cents, step4c_cents):
+    """IRS Publication 15-T percentage method (Worksheet 1A): look the
+    adjusted annual wage up in the seeded table, divide the annual
+    tentative withholding by the pay periods, subtract the Step 3 credit
+    per period, add the Step 4(c) additional withholding. Returns
+    (cents, None) or (None, error)."""
+    brackets = _acct_payroll_withholding_table(conn, tax_year, filing_status,
+                                              step2)
+    if brackets is None:
+        return None, "no federal withholding table for tax year %d" % tax_year
+    wage = max(0, adjusted_annual_cents)
+    bracket = brackets[0]
+    for b in brackets:
+        if wage >= b["min_cents"]:
+            bracket = b
+        else:
+            break
+    annual = bracket["base_cents"] + _acct_round_div(
+        (wage - bracket["min_cents"]) * bracket["rate_bps"], 10000)
+    per_period = _acct_round_div(annual, periods)
+    credit = _acct_round_div(step3_credit_cents, periods)
+    return max(0, per_period - credit) + step4c_cents, None
+
+
+def _acct_payroll_compute_line(conn, emp, gross_cents, ytd_before_cents,
+                               tax_year):
+    """Withholding for one pay line. Social Security 6.2% up to the wage
+    base (year-to-date from approved/paid runs in the same calendar year);
+    Medicare 1.45% on all wages plus 0.9% additional Medicare on wages
+    over $200,000 year-to-date (employee only — the employer never matches
+    it); federal income tax from the seeded Pub 15-T table. Returns
+    (line_dict, None) or (None, error)."""
+    periods = ERP_PAYROLL_SCHEDULES[emp["pay_schedule"]]
+    fica = _acct_payroll_fica(conn, tax_year)
+    if fica is None:
+        return None, "no FICA table for tax year %d" % tax_year
+    ss_taxable = max(0, min(gross_cents,
+                            fica["ss_wage_base_cents"] - ytd_before_cents))
+    ss_emp = _acct_round_div(ss_taxable * fica["ss_rate_bps"], 10000)
+    ss_er = ss_emp
+    med_base = _acct_round_div(gross_cents * fica["medicare_rate_bps"], 10000)
+    addl_excess = max(0, ytd_before_cents + gross_cents
+                      - fica["addl_medicare_threshold_cents"])
+    addl = _acct_round_div(
+        min(gross_cents, addl_excess) * fica["addl_medicare_rate_bps"], 10000)
+    med_emp = med_base + addl
+    med_er = med_base
+    if emp["exempt"]:
+        federal = 0
+    else:
+        adjusted_annual = max(
+            0, gross_cents * periods + emp["step4a_cents"] - emp["step4b_cents"])
+        federal, error = _acct_federal_withholding_cents(
+            conn, tax_year, emp["filing_status"], bool(emp["step2_checkbox"]),
+            periods, adjusted_annual, emp["step3_credit_cents"],
+            emp["step4c_cents"])
+        if error:
+            return None, error
+    net = gross_cents - federal - ss_emp - med_emp
+    return {
+        "gross_cents": gross_cents, "federal_cents": federal,
+        "ss_cents": ss_emp, "medicare_cents": med_emp, "net_cents": net,
+        "employer_ss_cents": ss_er, "employer_medicare_cents": med_er,
+        "employer_tax_cents": ss_er + med_er,
+    }, None
+
+
+def _acct_employee_dict(row):
+    d = dict(row)
+    for k in ("step2_checkbox", "exempt", "active"):
+        d[k] = bool(d[k])
+    return d
+
+
+def _acct_payroll_bool(value, default=None):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _acct_payroll_employee_fields(data, partial=False):
+    """Validate an employee pay profile. Returns (fields, None) or
+    (None, error). rate_cents is the ANNUAL salary in cents for salary
+    employees and cents per HOUR for hourly employees."""
+    fields = {}
+    if not partial or "first_name" in data:
+        v = (data.get("first_name") or "").strip()
+        if not v:
+            return None, "first_name is required"
+        fields["first_name"] = v
+    if not partial or "last_name" in data:
+        v = (data.get("last_name") or "").strip()
+        if not v:
+            return None, "last_name is required"
+        fields["last_name"] = v
+    if not partial or "pay_type" in data:
+        v = (data.get("pay_type") or "").strip()
+        if v not in ERP_PAYROLL_PAY_TYPES:
+            return None, "pay_type must be salary or hourly"
+        fields["pay_type"] = v
+    if not partial or "rate_cents" in data:
+        v = _acct_int_cents(data.get("rate_cents"))
+        if v is None or v < 1:
+            return None, "rate_cents must be whole cents greater than zero"
+        fields["rate_cents"] = v
+    if not partial or "pay_schedule" in data:
+        v = (data.get("pay_schedule") or "").strip()
+        if v not in ERP_PAYROLL_SCHEDULES:
+            return None, "pay_schedule must be weekly, biweekly, or monthly"
+        fields["pay_schedule"] = v
+    if "filing_status" in data:
+        v = (data.get("filing_status") or "").strip()
+        if v not in ERP_PAYROLL_FILING_STATUSES:
+            return None, "filing_status must be single, married_jointly, married_separately, or head_of_household"
+        fields["filing_status"] = v
+    elif not partial:
+        fields["filing_status"] = "single"
+    for key in ("step2_checkbox", "exempt"):
+        if key in data:
+            v = _acct_payroll_bool(data.get(key))
+            if v is None:
+                return None, key + " must be true or false"
+            fields[key] = 1 if v else 0
+        elif not partial:
+            fields[key] = 0
+    for key in ("step3_credit_cents", "step4a_cents", "step4b_cents",
+                "step4c_cents"):
+        if key in data:
+            v = _acct_int_cents(data.get(key))
+            if v is None or v < 0:
+                return None, key + " must be whole cents of zero or more"
+            fields[key] = v
+        elif not partial:
+            fields[key] = 0
+    return fields, None
+
+
+def _acct_payrun_dict(conn, run):
+    d = dict(run)
+    lines = conn.execute(
+        "SELECT * FROM erp_acct_payrun_lines WHERE payrun_id = ? ORDER BY id",
+        (run["id"],)).fetchall()
+    out = []
+    for line in lines:
+        ld = dict(line)
+        try:
+            ld["pay_stub"] = json.loads(line["pay_stub_json"] or "{}")
+        except (ValueError, TypeError):
+            ld["pay_stub"] = {}
+        emp = conn.execute(
+            "SELECT first_name, last_name FROM erp_acct_employees"
+            " WHERE id = ?", (line["employee_id"],)).fetchone()
+        ld["employee_name"] = (
+            (emp["first_name"] + " " + emp["last_name"]) if emp else "")
+        out.append(ld)
+    d["lines"] = out
+    return d
+
+
+def _acct_payroll_ytd_cents(conn, employee_id, tax_year):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(l.gross_cents), 0) AS ytd"
+        " FROM erp_acct_payrun_lines l"
+        " JOIN erp_acct_payruns r ON r.id = l.payrun_id"
+        " WHERE l.employee_id = ? AND r.status IN ('approved', 'paid')"
+        " AND substr(r.period_start, 1, 4) = ?",
+        (employee_id, str(tax_year))).fetchone()
+    return row["ytd"]
+
+
+@app.get("/api/erp/accounting/payroll/employees")
+def erp_acct_list_payroll_employees():
+    actor, err = _erp_check_perm("payroll.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_employees ORDER BY last_name, first_name"
+        ).fetchall()
+    conn.close()
+    return jsonify(employees=[_acct_employee_dict(r) for r in rows])
+
+
+@app.post("/api/erp/accounting/payroll/employees")
+def erp_acct_create_payroll_employee():
+    actor, err = _erp_check_perm("payroll.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields, error = _acct_payroll_employee_fields(data)
+    if error:
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_employees (first_name, last_name, pay_type,"
+        " rate_cents, pay_schedule, filing_status, step2_checkbox,"
+        " step3_credit_cents, step4a_cents, step4b_cents, step4c_cents,"
+        " exempt, active, qb_id, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?)",
+        (fields["first_name"], fields["last_name"], fields["pay_type"],
+         fields["rate_cents"], fields["pay_schedule"], fields["filing_status"],
+         fields["step2_checkbox"], fields["step3_credit_cents"],
+         fields["step4a_cents"], fields["step4b_cents"], fields["step4c_cents"],
+         fields["exempt"], now))
+    emp_id = cur.lastrowid
+    _acct_audit(conn, actor, "payroll.employee.create", "payroll_employee",
+                emp_id, "#%d %s %s %s %d" % (emp_id, fields["first_name"],
+                                         fields["last_name"],
+                                         fields["pay_type"],
+                                         fields["rate_cents"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_employees WHERE id = ?",
+                       (emp_id,)).fetchone()
+    conn.close()
+    return jsonify(employee=_acct_employee_dict(row)), 201
+
+
+@app.get("/api/erp/accounting/payroll/employees/<int:employee_id>")
+def erp_acct_get_payroll_employee(employee_id):
+    actor, err = _erp_check_perm("payroll.read")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_acct_employees WHERE id = ?",
+                       (employee_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify(error="employee not found"), 404
+    return jsonify(employee=_acct_employee_dict(row))
+
+
+@app.post("/api/erp/accounting/payroll/employees/<int:employee_id>")
+def erp_acct_update_payroll_employee(employee_id):
+    actor, err = _erp_check_perm("payroll.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields, error = _acct_payroll_employee_fields(data, partial=True)
+    if error:
+        return jsonify(error=error), 400
+    if not fields:
+        return jsonify(error="no fields to update"), 400
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_acct_employees WHERE id = ?",
+                       (employee_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    sets = ", ".join("%s = ?" % k for k in fields)
+    conn.execute("UPDATE erp_acct_employees SET %s WHERE id = ?" % sets,
+                 tuple(fields.values()) + (employee_id,))
+    changes = []
+    for key in sorted(fields):
+        if row[key] != fields[key]:
+            changes.append("%s: %s \u2192 %s" % (key, row[key], fields[key]))
+    _acct_audit(conn, actor, "payroll.employee.update", "payroll_employee",
+                employee_id, "; ".join(changes) if changes else "no changes")
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_employees WHERE id = ?",
+                       (employee_id,)).fetchone()
+    conn.close()
+    return jsonify(employee=_acct_employee_dict(row))
+
+
+@app.post("/api/erp/accounting/payroll/employees/<int:employee_id>/deactivate")
+def erp_acct_deactivate_payroll_employee(employee_id):
+    actor, err = _erp_check_perm("payroll.write")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_acct_employees WHERE id = ?",
+                       (employee_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    if not row["active"]:
+        conn.close()
+        return jsonify(error="employee is already inactive"), 400
+    conn.execute("UPDATE erp_acct_employees SET active = 0 WHERE id = ?",
+                 (employee_id,))
+    _acct_audit(conn, actor, "payroll.employee.deactivate", "payroll_employee",
+                employee_id, "%s %s" % (row["first_name"], row["last_name"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_employees WHERE id = ?",
+                       (employee_id,)).fetchone()
+    conn.close()
+    return jsonify(employee=_acct_employee_dict(row))
+
+
+@app.get("/api/erp/accounting/payroll/runs")
+def erp_acct_list_payroll_runs():
+    actor, err = _erp_check_perm("payroll.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_payruns ORDER BY period_start DESC, id DESC"
+        ).fetchall()
+    conn.close()
+    return jsonify(runs=[dict(r) for r in rows])
+
+
+@app.post("/api/erp/accounting/payroll/runs")
+def erp_acct_create_payroll_run():
+    actor, err = _erp_check_perm("payroll.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    start = (data.get("period_start") or "").strip()
+    end = (data.get("period_end") or "").strip()
+    pay_date = (data.get("pay_date") or "").strip()
+    if not _acct_valid_date(start) or not _acct_valid_date(end) or start > end:
+        return jsonify(error="period_start and period_end must be YYYY-MM-DD with start on or before end"), 400
+    if not _acct_valid_date(pay_date):
+        return jsonify(error="pay_date must be YYYY-MM-DD"), 400
+    if pay_date < end:
+        return jsonify(error="pay_date must be on or after period_end"), 400
+    raw_lines = data.get("lines")
+    if not isinstance(raw_lines, list) or not raw_lines:
+        return jsonify(error="at least one employee line is required"), 400
+    tax_year = int(start[:4])
+    conn = db()
+    prepared = []
+    seen = set()
+    for entry in raw_lines:
+        if not isinstance(entry, dict):
+            conn.close()
+            return jsonify(error="every line needs an employee_id"), 400
+        try:
+            employee_id = int(entry.get("employee_id") or 0)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="every line needs a valid employee_id"), 400
+        if employee_id in seen:
+            conn.close()
+            return jsonify(error="employee %d appears twice in this pay run" % employee_id), 400
+        seen.add(employee_id)
+        emp = conn.execute(
+            "SELECT * FROM erp_acct_employees WHERE id = ?",
+            (employee_id,)).fetchone()
+        if not emp:
+            conn.close()
+            return jsonify(error="unknown employee_id %d" % employee_id), 400
+        if not emp["active"]:
+            conn.close()
+            return jsonify(error="employee %s %s is inactive" % (
+                emp["first_name"], emp["last_name"])), 400
+        periods = ERP_PAYROLL_SCHEDULES[emp["pay_schedule"]]
+        hours = None
+        if emp["pay_type"] == "hourly":
+            raw_hours = entry.get("hours")
+            if isinstance(raw_hours, bool) or not isinstance(raw_hours, (int, float)):
+                conn.close()
+                return jsonify(error="hours are required for hourly employees"), 400
+            if raw_hours <= 0:
+                conn.close()
+                return jsonify(error="hours must be greater than zero"), 400
+            hours = float(raw_hours)
+            gross = int(hours * emp["rate_cents"] + 0.5)
+        else:
+            gross = _acct_round_div(emp["rate_cents"], periods)
+        clash = conn.execute(
+            "SELECT 1 FROM erp_acct_payrun_lines l"
+            " JOIN erp_acct_payruns r ON r.id = l.payrun_id"
+            " WHERE l.employee_id = ? AND r.period_start <= ?"
+            " AND r.period_end >= ? LIMIT 1",
+            (employee_id, end, start)).fetchone()
+        if clash:
+            conn.close()
+            return jsonify(error="employee %s %s already has a pay run overlapping this period" % (
+                emp["first_name"], emp["last_name"])), 400
+        ytd_before = _acct_payroll_ytd_cents(conn, employee_id, tax_year)
+        calc, error = _acct_payroll_compute_line(
+            conn, emp, gross, ytd_before, tax_year)
+        if error:
+            conn.close()
+            return jsonify(error=error), 400
+        prepared.append((emp, hours, gross, ytd_before, calc))
+    now = datetime.now(timezone.utc).isoformat()
+    totals = {k: sum(p[4][k] for p in prepared)
+              for k in ("gross_cents", "federal_cents", "ss_cents",
+                        "medicare_cents", "employer_tax_cents",
+                        "employer_ss_cents", "employer_medicare_cents",
+                        "net_cents")}
+    cur = conn.execute(
+        "INSERT INTO erp_acct_payruns (period_start, period_end, pay_date,"
+        " status, gross_cents, federal_withheld_cents, ss_cents,"
+        " medicare_cents, employer_tax_cents, employer_ss_cents,"
+        " employer_medicare_cents, net_cents, journal_entry_id, approved_by,"
+        " approved_at, paid_at, created_at)"
+        " VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', NULL,"
+        " NULL, ?)",
+        (start, end, pay_date, totals["gross_cents"],
+         totals["federal_cents"], totals["ss_cents"],
+         totals["medicare_cents"], totals["employer_tax_cents"],
+         totals["employer_ss_cents"], totals["employer_medicare_cents"],
+         totals["net_cents"], now))
+    run_id = cur.lastrowid
+    for emp, hours, gross, ytd_before, calc in prepared:
+        stub = {
+            "employee_name": emp["first_name"] + " " + emp["last_name"],
+            "pay_type": emp["pay_type"],
+            "pay_schedule": emp["pay_schedule"],
+            "filing_status": emp["filing_status"],
+            "period_start": start, "period_end": end, "pay_date": pay_date,
+            "hours": hours, "rate_cents": emp["rate_cents"],
+            "gross_cents": calc["gross_cents"],
+            "federal_cents": calc["federal_cents"],
+            "ss_cents": calc["ss_cents"],
+            "medicare_cents": calc["medicare_cents"],
+            "net_cents": calc["net_cents"],
+            "ytd_gross_cents": ytd_before + gross,
+        }
+        conn.execute(
+            "INSERT INTO erp_acct_payrun_lines (payrun_id, employee_id,"
+            " hours, gross_cents, federal_cents, ss_cents, medicare_cents,"
+            " net_cents, pay_stub_json, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (run_id, emp["id"], hours, calc["gross_cents"],
+             calc["federal_cents"], calc["ss_cents"], calc["medicare_cents"],
+             calc["net_cents"], json.dumps(stub), now))
+    _acct_audit(conn, actor, "payroll.run.create", "payroll_run", run_id,
+                "%s to %s gross %d net %d (%d lines)" % (
+                    start, end, totals["gross_cents"], totals["net_cents"],
+                    len(prepared)))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    out = _acct_payrun_dict(conn, row)
+    conn.close()
+    return jsonify(run=out), 201
+
+
+@app.get("/api/erp/accounting/payroll/runs/<int:run_id>")
+def erp_acct_get_payroll_run(run_id):
+    actor, err = _erp_check_perm("payroll.read")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="pay run not found"), 404
+    out = _acct_payrun_dict(conn, row)
+    conn.close()
+    return jsonify(run=out)
+
+
+@app.post("/api/erp/accounting/payroll/runs/<int:run_id>/approve")
+def erp_acct_approve_payroll_run(run_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="pay run not found"), 404
+    if row["status"] != "draft":
+        conn.close()
+        return jsonify(error="only a draft pay run can be approved"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_acct_payruns SET status = 'approved', approved_by = ?,"
+        " approved_at = ? WHERE id = ?", (actor or "", now, run_id))
+    _acct_audit(conn, actor, "payroll.run.approve", "payroll_run", run_id,
+                "run #%d %s to %s gross %d net %d approved by %s"
+                % (run_id, row["period_start"], row["period_end"],
+                   row["gross_cents"], row["net_cents"], actor or ""))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    out = _acct_payrun_dict(conn, row)
+    conn.close()
+    return jsonify(run=out)
+
+
+@app.post("/api/erp/accounting/payroll/runs/<int:run_id>/pay")
+def erp_acct_pay_payroll_run(run_id):
+    actor, err = _erp_check_perm("payroll.write")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="pay run not found"), 404
+    if row["status"] != "approved":
+        conn.close()
+        return jsonify(error="only an approved pay run can be paid"), 400
+    if row["gross_cents"] <= 0:
+        conn.close()
+        return jsonify(error="pay run has no gross pay to post"), 400
+    cash_id = _acct_account_id_by_code(conn, ERP_ACCT_CASH_CODE)
+    liab_id = _acct_account_id_by_code(conn, ERP_ACCT_PAYROLL_LIAB_CODE)
+    exp_id = _acct_account_id_by_code(conn, ERP_ACCT_PAYROLL_EXP_CODE)
+    taxexp_id = _acct_account_id_by_code(conn, ERP_ACCT_PAYROLL_TAX_EXP_CODE)
+    if not cash_id or not liab_id or not exp_id or not taxexp_id:
+        conn.close()
+        return jsonify(error="chart of accounts is missing a required account"), 500
+    withheld = (row["federal_withheld_cents"] + row["ss_cents"]
+                + row["medicare_cents"])
+    memo = "Payroll — %s to %s, pay date %s" % (
+        row["period_start"], row["period_end"], row["pay_date"])
+    lines = [{"account_id": exp_id, "debit_cents": row["gross_cents"],
+              "credit_cents": 0, "memo": memo}]
+    if row["employer_tax_cents"] > 0:
+        lines.append({"account_id": taxexp_id,
+                      "debit_cents": row["employer_tax_cents"],
+                      "credit_cents": 0, "memo": memo})
+    if row["net_cents"] > 0:
+        lines.append({"account_id": cash_id, "debit_cents": 0,
+                      "credit_cents": row["net_cents"], "memo": memo})
+    if withheld + row["employer_tax_cents"] > 0:
+        lines.append({"account_id": liab_id, "debit_cents": 0,
+                      "credit_cents": withheld + row["employer_tax_cents"],
+                      "memo": memo})
+    entry_id, error = _acct_post_entry(conn, actor, row["pay_date"], memo,
+                                       "payroll", run_id, lines)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_acct_payruns SET status = 'paid', paid_at = ?,"
+        " journal_entry_id = ? WHERE id = ?", (now, entry_id, run_id))
+    _acct_audit(conn, actor, "payroll.run.pay", "payroll_run", run_id,
+                "run #%d paid %s entry #%d gross %d net %d" % (
+                    run_id, row["pay_date"], entry_id,
+                    row["gross_cents"], row["net_cents"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    out = _acct_payrun_dict(conn, row)
+    conn.close()
+    return jsonify(run=out, journal_entry_id=entry_id)
+
+
+@app.get("/api/erp/accounting/payroll/tax-filings")
+def erp_acct_payroll_tax_filings():
+    actor, err = _erp_check_perm("payroll.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_payruns WHERE status = 'paid'"
+        " ORDER BY pay_date").fetchall()
+    by_quarter = {}
+    for r in rows:
+        year = int(r["pay_date"][:4])
+        month = int(r["pay_date"][5:7])
+        quarter = "%d-Q%d" % (year, (month - 1) // 3 + 1)
+        q = by_quarter.setdefault(quarter, {
+            "quarter": quarter, "gross_cents": 0, "federal_cents": 0,
+            "ss_cents": 0, "medicare_cents": 0, "employer_tax_cents": 0,
+            "net_cents": 0, "run_count": 0})
+        q["gross_cents"] += r["gross_cents"]
+        q["federal_cents"] += r["federal_withheld_cents"]
+        q["ss_cents"] += r["ss_cents"] + r["employer_ss_cents"]
+        q["medicare_cents"] += r["medicare_cents"] + r["employer_medicare_cents"]
+        q["employer_tax_cents"] += r["employer_tax_cents"]
+        q["net_cents"] += r["net_cents"]
+        q["run_count"] += 1
+    filed = {r["quarter"]: dict(r) for r in conn.execute(
+        "SELECT * FROM erp_acct_payroll_filings").fetchall()}
+    conn.close()
+    out = []
+    for quarter in sorted(by_quarter, reverse=True):
+        q = by_quarter[quarter]
+        f = filed.get(quarter)
+        q["status"] = "filed" if f else "owed"
+        q["filed_at"] = f["filed_at"] if f else None
+        q["filed_by"] = f["filed_by"] if f else ""
+        out.append(q)
+    return jsonify(quarters=out)
+
+
+@app.post("/api/erp/accounting/payroll/tax-filings")
+def erp_acct_file_payroll_quarter():
+    actor, err = _erp_check_perm("payroll.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    quarter = (data.get("quarter") or "").strip()
+    try:
+        year, qnum = quarter.split("-Q")
+        year = int(year)
+        qnum = int(qnum)
+        if qnum < 1 or qnum > 4:
+            raise ValueError
+    except (ValueError, AttributeError):
+        return jsonify(error="quarter must look like 2026-Q4"), 400
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_payruns WHERE status = 'paid'").fetchall()
+    totals = {"federal_cents": 0, "ss_cents": 0, "medicare_cents": 0,
+              "employer_tax_cents": 0}
+    for r in rows:
+        ryear = int(r["pay_date"][:4])
+        rmonth = int(r["pay_date"][5:7])
+        rquarter = "%d-Q%d" % (ryear, (rmonth - 1) // 3 + 1)
+        if rquarter != quarter:
+            continue
+        totals["federal_cents"] += r["federal_withheld_cents"]
+        totals["ss_cents"] += r["ss_cents"] + r["employer_ss_cents"]
+        totals["medicare_cents"] += r["medicare_cents"] + r["employer_medicare_cents"]
+        totals["employer_tax_cents"] += r["employer_tax_cents"]
+    if not any(totals.values()):
+        conn.close()
+        return jsonify(error="no paid pay runs in that quarter"), 400
+    existing = conn.execute(
+        "SELECT 1 FROM erp_acct_payroll_filings WHERE quarter = ?",
+        (quarter,)).fetchone()
+    if existing:
+        conn.close()
+        return jsonify(error="quarter %s is already filed" % quarter), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_payroll_filings (quarter, federal_cents,"
+        " ss_cents, medicare_cents, employer_tax_cents, filed_at, filed_by,"
+        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (quarter, totals["federal_cents"], totals["ss_cents"],
+         totals["medicare_cents"], totals["employer_tax_cents"], now,
+         actor or "", now))
+    filing_id = cur.lastrowid
+    _acct_audit(conn, actor, "payroll.tax.file", "payroll_filing", filing_id,
+                "%s federal %d ss %d medicare %d employer tax %d" % (
+                    quarter, totals["federal_cents"], totals["ss_cents"],
+                    totals["medicare_cents"], totals["employer_tax_cents"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_payroll_filings WHERE id = ?",
+                       (filing_id,)).fetchone()
+    conn.close()
+    return jsonify(filing=dict(row)), 201
+
+# ---- Accounting migration import (Phase 1) ----
+# One-shot admin import of a QuickBooks migration snapshot (produced by
+# hidden_files/acct_migrate.py). Read-only on QuickBooks; everything here
+# writes the ERP only. Idempotent via erp_acct_migration_links: a record
+# whose QuickBooks id is already mapped is skipped, never duplicated.
+# Paid/void documents are imported as records only -- their GL effect
+# lives in the opening balances. The opening-balance entry is posted
+# last: balance-sheet targets minus what the imported documents already
+# posted. If it cannot balance, the whole import fails (no commit).
+ERP_ACCT_MIGRATION_TYPES = ("account", "customer", "vendor", "item",
+                            "bank_account", "bank_transaction", "invoice",
+                            "bill", "payment", "journal_entry")
+ERP_ACCT_MIGRATION_CODE_RANGES = {
+    "asset": (1000, 1999), "liability": (2000, 2999),
+    "equity": (3000, 3999), "income": (4000, 4999),
+    "expense": (5000, 9999),
+}
+
+
+class _AcctMigrateFail(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def _acct_migrate_norm_name(name):
+    s = " ".join((name or "").strip().lower().split())
+    for suffix in (" (a/r)", " (a/p)"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    return s
+
+
+def _acct_migrate_link(conn, qb_type, qb_id):
+    return conn.execute(
+        "SELECT * FROM erp_acct_migration_links"
+        " WHERE qb_type = ? AND qb_id = ?",
+        (qb_type, qb_id)).fetchone()
+
+
+def _acct_migrate_record_link(conn, qb_type, qb_id, erp_type, erp_id):
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_acct_migration_links"
+        " (qb_type, qb_id, erp_type, erp_id, imported_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (qb_type, qb_id, erp_type, erp_id,
+         datetime.now(timezone.utc).isoformat()))
+
+
+def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
+    """Import one snapshot. Returns the summary dict. Raises
+    _AcctMigrateFail on any fatal problem; the caller rolls back."""
+    now = datetime.now(timezone.utc).isoformat()
+    inserted = {t: 0 for t in ERP_ACCT_MIGRATION_TYPES}
+    skipped = {t: 0 for t in ERP_ACCT_MIGRATION_TYPES}
+    skipped_reasons = []
+    omitted = [0]
+
+    def skip(qb_type, reason):
+        skipped[qb_type] += 1
+        if len(skipped_reasons) < 50:
+            skipped_reasons.append(reason)
+        else:
+            omitted[0] += 1
+
+    def qb_key(rec, name):
+        qb_id = rec.get("qb_id")
+        if qb_id not in (None, ""):
+            return str(qb_id)
+        return "name:" + _acct_migrate_norm_name(name or "")
+
+    posted = {}   # erp account id -> net debit-credit cents posted here
+    targets = {}  # erp account id -> target debit-credit cents (balance sheet)
+
+    def track(account_id, net_dc):
+        if account_id:
+            posted[account_id] = posted.get(account_id, 0) + net_dc
+
+    acct_by_norm = {}
+    acct_by_id = {}
+    for r in conn.execute("SELECT * FROM erp_acct_accounts").fetchall():
+        acct_by_norm[_acct_migrate_norm_name(r["name"])] = dict(r)
+        acct_by_id[r["id"]] = dict(r)
+    used_codes = {r["code"] for r in conn.execute(
+        "SELECT code FROM erp_acct_accounts").fetchall()}
+
+    # --- chart merge: match by normalized name, create missing accounts ---
+    pending_parents = []
+    for rec in lists["accounts"]:
+        name = (rec.get("name") or "").strip()
+        atype = (rec.get("type") or "").strip()
+        if not name:
+            skip("account", "account with no name")
+            continue
+        if atype not in ERP_ACCT_TYPES:
+            skip("account", "%s: unknown type %r" % (name, atype))
+            continue
+        key = _acct_migrate_norm_name(name)
+        if _acct_migrate_link(conn, "account", qb_key(rec, name)):
+            skipped["account"] += 1
+            continue
+        existing = acct_by_norm.get(key)
+        if existing:
+            erp_id = existing["id"]
+            if not existing["qb_id"] and rec.get("qb_id"):
+                conn.execute(
+                    "UPDATE erp_acct_accounts SET qb_id = ? WHERE id = ?",
+                    (str(rec["qb_id"]), erp_id))
+                existing["qb_id"] = str(rec["qb_id"])
+        else:
+            lo, hi = ERP_ACCT_MIGRATION_CODE_RANGES[atype]
+            code = None
+            n = lo
+            while n <= hi:
+                if str(n) not in used_codes:
+                    code = str(n)
+                    break
+                n += 10
+            if code is None:
+                skip("account", "%s: no free code in %s range" % (name, atype))
+                continue
+            cur = conn.execute(
+                "INSERT INTO erp_acct_accounts (code, name, type, parent_id,"
+                " qb_id, active, created_at) VALUES (?, ?, ?, NULL, ?, 1, ?)",
+                (code, name, atype,
+                 (str(rec["qb_id"]) if rec.get("qb_id") else None), now))
+            erp_id = cur.lastrowid
+            used_codes.add(code)
+            row = {"id": erp_id, "code": code, "name": name, "type": atype,
+                   "parent_id": None, "active": 1}
+            acct_by_norm[key] = row
+            acct_by_id[erp_id] = row
+            _acct_audit(conn, actor, "account.create", "account", erp_id,
+                        "%s %s (migration)" % (code, name))
+        parent_name = (rec.get("parent_name") or "").strip()
+        if parent_name:
+            pending_parents.append((erp_id, parent_name))
+        if (rec.get("source") == "balance_sheet"
+                and rec.get("balance_cents") is not None):
+            bal = _acct_int_cents(rec.get("balance_cents"))
+            if bal is None:
+                raise _AcctMigrateFail(
+                    "account %s has a non-integer balance" % name, 400)
+            targets[erp_id] = bal if atype in ("asset", "expense") else -bal
+        _acct_migrate_record_link(conn, "account", qb_key(rec, name),
+                                  "account", erp_id)
+        inserted["account"] += 1
+    for erp_id, parent_name in pending_parents:
+        parent = acct_by_norm.get(_acct_migrate_norm_name(parent_name))
+        if parent and parent["id"] != erp_id:
+            conn.execute(
+                "UPDATE erp_acct_accounts SET parent_id = ? WHERE id = ?",
+                (parent["id"], erp_id))
+            acct_by_id[erp_id]["parent_id"] = parent["id"]
+
+    # --- customers -> wholesale accounts ---
+    ws_by_norm = {}
+    for r in conn.execute("SELECT * FROM erp_wholesale_accounts").fetchall():
+        ws_by_norm[_acct_migrate_norm_name(r["name"])] = dict(r)
+    for rec in lists["customers"]:
+        name = ((rec.get("display_name") or rec.get("name") or "").strip())
+        if not name:
+            skip("customer", "customer with no name")
+            continue
+        if _acct_migrate_link(conn, "customer", qb_key(rec, name)):
+            skipped["customer"] += 1
+            continue
+        existing = ws_by_norm.get(_acct_migrate_norm_name(name))
+        if existing:
+            erp_id = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO erp_wholesale_accounts (name, contact_name,"
+                " email, phone, address, price_per_bag_cents, payment_terms,"
+                " notes, active, created_by, created_at, contact_person,"
+                " savory_price_cents, sweet_price_cents, default_po,"
+                " pricing_mode, staff_managed, account_status)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'active')",
+                (name, (rec.get("contact_name") or "").strip(),
+                 (rec.get("email") or "").strip(),
+                 (rec.get("phone") or "").strip(), "", 400, "", "", actor, now,
+                 "", 400, 400, "", "bag", 0))
+            erp_id = cur.lastrowid
+            ws_by_norm[_acct_migrate_norm_name(name)] = {
+                "id": erp_id, "name": name}
+        _acct_migrate_record_link(conn, "customer", qb_key(rec, name),
+                                  "wholesale_account", erp_id)
+        inserted["customer"] += 1
+
+    # --- vendors ---
+    vendor_by_norm = {}
+    for r in conn.execute("SELECT * FROM erp_vendors").fetchall():
+        vendor_by_norm[_acct_migrate_norm_name(r["name"])] = dict(r)
+    for rec in lists["vendors"]:
+        name = (rec.get("name") or "").strip()
+        if not name:
+            skip("vendor", "vendor with no name")
+            continue
+        if _acct_migrate_link(conn, "vendor", qb_key(rec, name)):
+            skipped["vendor"] += 1
+            continue
+        existing = vendor_by_norm.get(_acct_migrate_norm_name(name))
+        if existing:
+            erp_id = existing["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO erp_vendors (name, contact_name, email, phone,"
+                " payment_terms, lead_time_days, notes, active, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)",
+                (name, (rec.get("contact_name") or "").strip(),
+                 (rec.get("email") or "").strip(),
+                 (rec.get("phone") or "").strip(),
+                 (rec.get("payment_terms") or "").strip(), 0,
+                 (rec.get("notes") or "").strip(), now))
+            erp_id = cur.lastrowid
+            vendor_by_norm[_acct_migrate_norm_name(name)] = {
+                "id": erp_id, "name": name}
+        _acct_migrate_record_link(conn, "vendor", qb_key(rec, name),
+                                  "vendor", erp_id)
+        inserted["vendor"] += 1
+
+    # --- items: no ERP inventory home; invoice lines carry descriptions ---
+    for rec in lists["items"]:
+        skip("item", "%s: no ERP inventory home for QuickBooks items"
+             % ((rec.get("name") or "item").strip() or "item"))
+
+    # --- bank accounts ---
+    bank_by_qb = {}
+    bank_by_norm = {}
+    for r in conn.execute("SELECT * FROM erp_acct_bank_accounts").fetchall():
+        bank_by_norm[_acct_migrate_norm_name(r["name"])] = dict(r)
+        if r["qb_id"]:
+            bank_by_qb[str(r["qb_id"])] = r["id"]
+    for rec in lists["bank_accounts"]:
+        name = (rec.get("name") or "").strip()
+        if not name:
+            skip("bank_account", "bank account with no name")
+            continue
+        if _acct_migrate_link(conn, "bank_account", qb_key(rec, name)):
+            skipped["bank_account"] += 1
+            continue
+        gl_name = (rec.get("gl_account_name") or name)
+        gl = acct_by_norm.get(_acct_migrate_norm_name(gl_name))
+        if not gl:
+            skip("bank_account", "%s: no GL account %r" % (name, gl_name))
+            continue
+        existing = bank_by_norm.get(_acct_migrate_norm_name(name))
+        if existing:
+            erp_id = existing["id"]
+        else:
+            btype = (rec.get("type") or "checking").strip()
+            if btype not in ERP_ACCT_BANK_TYPES:
+                btype = "checking"
+            opening = _acct_int_cents(rec.get("balance_cents"))
+            if opening is None:
+                opening = 0
+            cur = conn.execute(
+                "INSERT INTO erp_acct_bank_accounts (name, type,"
+                " plaid_account_id, gl_account_id, qb_id,"
+                " opening_balance_cents, active, last_reconciled_at,"
+                " created_at) VALUES (?, ?, NULL, ?, ?, ?, 1, NULL, ?)",
+                (name, btype, gl["id"],
+                 (str(rec["qb_id"]) if rec.get("qb_id") else None),
+                 opening, now))
+            erp_id = cur.lastrowid
+            bank_by_norm[_acct_migrate_norm_name(name)] = {
+                "id": erp_id, "name": name}
+            _acct_audit(conn, actor, "bank.create", "bank_account", erp_id,
+                        "%s %s -> GL %s (migration)"
+                        % (name, btype, gl["code"]))
+        if rec.get("qb_id"):
+            bank_by_qb[str(rec["qb_id"])] = erp_id
+        _acct_migrate_record_link(conn, "bank_account", qb_key(rec, name),
+                                  "bank_account", erp_id)
+        inserted["bank_account"] += 1
+
+    ar_id = _acct_account_id_by_code(conn, ERP_ACCT_AR_CODE)
+    ap_id = _acct_account_id_by_code(conn, ERP_ACCT_AP_CODE)
+    tax_id = _acct_account_id_by_code(conn, ERP_ACCT_TAX_PAYABLE_CODE)
+    if not ar_id or not ap_id:
+        raise _AcctMigrateFail(
+            "chart of accounts is missing a required account", 500)
+
+    # --- invoices (open invoices post; paid/void are records only) ---
+    for rec in lists["invoices"]:
+        qb_id = rec.get("qb_id")
+        if qb_id in (None, ""):
+            skip("invoice", "invoice with no QuickBooks id")
+            continue
+        qb_id = str(qb_id)
+        if _acct_migrate_link(conn, "invoice", qb_id):
+            skipped["invoice"] += 1
+            continue
+        date = (rec.get("date") or "").strip()
+        if not _acct_valid_date(date):
+            skip("invoice", "%s: bad date %r" % (qb_id, date))
+            continue
+        due_date = (rec.get("due_date") or "").strip()
+        if not _acct_valid_date(due_date):
+            due_date = date
+        customer_type = (rec.get("customer_type") or "wholesale").strip()
+        if customer_type not in ("wholesale", "retail"):
+            customer_type = "wholesale"
+        lines, subtotal, error = _acct_validate_invoice_lines(
+            rec.get("lines"), default_taxable=(customer_type == "retail"))
+        if error:
+            skip("invoice", "%s: %s" % (qb_id, error))
+            continue
+        snap_subtotal = _acct_int_cents(rec.get("subtotal_cents"))
+        if snap_subtotal is None or subtotal != snap_subtotal:
+            skip("invoice", "%s: lines do not foot to QuickBooks subtotal"
+                 % qb_id)
+            continue
+        tax = _acct_int_cents(rec.get("tax_cents"))
+        if tax is None or tax < 0:
+            skip("invoice", "%s: bad tax_cents" % qb_id)
+            continue
+        total = subtotal + tax
+        snap_total = _acct_int_cents(rec.get("total_cents"))
+        if snap_total is None or total != snap_total:
+            skip("invoice", "%s: total != subtotal + tax" % qb_id)
+            continue
+        balance = _acct_int_cents(rec.get("balance_cents"))
+        if balance is None or balance < 0 or balance > total:
+            skip("invoice", "%s: bad balance_cents" % qb_id)
+            continue
+        status = (rec.get("status") or "").strip()
+        if status not in ERP_ACCT_DOC_STATUSES:
+            status = "open" if balance > 0 else "paid"
+        customer_id = None
+        customer_name = (rec.get("customer_name") or "").strip()
+        cust_qb = rec.get("customer_qb_id")
+        if cust_qb not in (None, ""):
+            link = _acct_migrate_link(conn, "customer", str(cust_qb))
+            if link:
+                customer_id = link["erp_id"]
+        if customer_id is None and customer_name:
+            ws = ws_by_norm.get(_acct_migrate_norm_name(customer_name))
+            if ws:
+                customer_id = ws["id"]
+                customer_name = ws["name"]
+        if not customer_name:
+            customer_name = "QuickBooks customer %s" % qb_id
+        income_code = (ERP_ACCT_WHOLESALE_INCOME_CODE
+                       if customer_type == "wholesale"
+                       else ERP_ACCT_RETAIL_INCOME_CODE)
+        income_id = _acct_account_id_by_code(conn, income_code)
+        if not income_id or (tax and not tax_id):
+            raise _AcctMigrateFail(
+                "chart of accounts is missing a required account", 500)
+        cur = conn.execute(
+            "INSERT INTO erp_acct_invoices (customer_name, customer_id,"
+            " customer_type, date, due_date, lines, subtotal_cents,"
+            " tax_cents, total_cents, balance_cents, status,"
+            " journal_entry_id, qb_id, tax_jurisdiction, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+            (customer_name, customer_id, customer_type, date, due_date,
+             json.dumps(lines), subtotal, tax, total, balance, status,
+             qb_id, ERP_ACCT_TAX_DEFAULT_JURISDICTION, now))
+        inv_id = cur.lastrowid
+        if status == "open":
+            raw = [{"account_id": ar_id, "debit_cents": total,
+                    "credit_cents": 0, "memo": "Invoice #%d" % inv_id},
+                   {"account_id": income_id, "debit_cents": 0,
+                    "credit_cents": subtotal,
+                    "memo": "Invoice #%d" % inv_id}]
+            if tax:
+                raw.append({"account_id": tax_id, "debit_cents": 0,
+                            "credit_cents": tax,
+                            "memo": "Sales tax on invoice #%d" % inv_id})
+            entry_id, error = _acct_post_entry(
+                conn, actor, date, "Invoice #%d — %s (migration)"
+                % (inv_id, customer_name), "invoice", inv_id, raw)
+            if error:
+                raise _AcctMigrateFail(error, 400)
+            conn.execute(
+                "UPDATE erp_acct_invoices SET journal_entry_id = ?"
+                " WHERE id = ?", (entry_id, inv_id))
+            track(ar_id, total)
+            track(income_id, -subtotal)
+            if tax:
+                track(tax_id, -tax)
+        _acct_audit(conn, actor, "invoice.create", "invoice", inv_id,
+                    "#%d %s total %d (migration)"
+                    % (inv_id, customer_name, total))
+        _acct_migrate_record_link(conn, "invoice", qb_id, "invoice", inv_id)
+        inserted["invoice"] += 1
+
+    # --- bills (open bills post; paid/void are records only) ---
+    for rec in lists["bills"]:
+        qb_id = rec.get("qb_id")
+        if qb_id in (None, ""):
+            skip("bill", "bill with no QuickBooks id")
+            continue
+        qb_id = str(qb_id)
+        if _acct_migrate_link(conn, "bill", qb_id):
+            skipped["bill"] += 1
+            continue
+        date = (rec.get("date") or "").strip()
+        if not _acct_valid_date(date):
+            skip("bill", "%s: bad date %r" % (qb_id, date))
+            continue
+        due_date = (rec.get("due_date") or "").strip()
+        if not _acct_valid_date(due_date):
+            due_date = date
+        vendor_id = None
+        vendor_name = (rec.get("vendor_name") or "").strip()
+        vend_qb = rec.get("vendor_qb_id")
+        if vend_qb not in (None, ""):
+            link = _acct_migrate_link(conn, "vendor", str(vend_qb))
+            if link:
+                vendor_id = link["erp_id"]
+        if vendor_id is None and vendor_name:
+            vend = vendor_by_norm.get(_acct_migrate_norm_name(vendor_name))
+            if vend:
+                vendor_id = vend["id"]
+                vendor_name = vend["name"]
+        if vendor_id is None:
+            skip("bill", "%s: vendor %r was not imported"
+                 % (qb_id, vendor_name))
+            continue
+        raw_lines = []
+        for ln in (rec.get("lines") or []):
+            if not isinstance(ln, dict):
+                continue
+            entry = {"description": (ln.get("description") or "").strip(),
+                     "amount_cents": ln.get("amount_cents")}
+            acct_name = (ln.get("account_name") or "").strip()
+            if acct_name:
+                acct = acct_by_norm.get(_acct_migrate_norm_name(acct_name))
+                if acct:
+                    if acct["type"] not in ("expense", "asset"):
+                        skip("bill", "%s: line account %r is not expense/asset"
+                             % (qb_id, acct_name))
+                        raw_lines = None
+                        break
+                    entry["account_id"] = acct["id"]
+            raw_lines.append(entry)
+        if raw_lines is None:
+            continue
+        lines, total, error = _acct_validate_bill_lines(conn, raw_lines)
+        if error:
+            skip("bill", "%s: %s" % (qb_id, error))
+            continue
+        snap_total = _acct_int_cents(rec.get("total_cents"))
+        if snap_total is None or total != snap_total:
+            skip("bill", "%s: lines do not foot to QuickBooks total" % qb_id)
+            continue
+        balance = _acct_int_cents(rec.get("balance_cents"))
+        if balance is None or balance < 0 or balance > total:
+            skip("bill", "%s: bad balance_cents" % qb_id)
+            continue
+        status = (rec.get("status") or "").strip()
+        if status not in ERP_ACCT_DOC_STATUSES:
+            status = "open" if balance > 0 else "paid"
+        cur = conn.execute(
+            "INSERT INTO erp_acct_bills (vendor_id, vendor_name, date,"
+            " due_date, lines, total_cents, balance_cents, status,"
+            " journal_entry_id, qb_id, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
+            (vendor_id, vendor_name, date, due_date, json.dumps(lines),
+             total, balance, status, qb_id, now))
+        bill_id = cur.lastrowid
+        if status == "open":
+            raw = [{"account_id": l["account_id"],
+                    "debit_cents": l["amount_cents"], "credit_cents": 0,
+                    "memo": l["description"]} for l in lines]
+            raw.append({"account_id": ap_id, "debit_cents": 0,
+                        "credit_cents": total,
+                        "memo": "Bill #%d" % bill_id})
+            entry_id, error = _acct_post_entry(
+                conn, actor, date, "Bill #%d — %s (migration)"
+                % (bill_id, vendor_name), "bill", bill_id, raw)
+            if error:
+                raise _AcctMigrateFail(error, 400)
+            conn.execute(
+                "UPDATE erp_acct_bills SET journal_entry_id = ? WHERE id = ?",
+                (entry_id, bill_id))
+            for l in lines:
+                track(l["account_id"], l["amount_cents"])
+            track(ap_id, -total)
+        _acct_audit(conn, actor, "bill.create", "bill", bill_id,
+                    "#%d %s total %d (migration)"
+                    % (bill_id, vendor_name, total))
+        _acct_migrate_record_link(conn, "bill", qb_id, "bill", bill_id)
+        inserted["bill"] += 1
+
+    # --- payments (applied to imported invoices/bills only) ---
+    for rec in lists["payments"]:
+        qb_id = rec.get("qb_id")
+        if qb_id in (None, ""):
+            skip("payment", "payment with no QuickBooks id")
+            continue
+        qb_id = str(qb_id)
+        if _acct_migrate_link(conn, "payment", qb_id):
+            skipped["payment"] += 1
+            continue
+        date = (rec.get("date") or "").strip()
+        if not _acct_valid_date(date):
+            skip("payment", "%s: bad date %r" % (qb_id, date))
+            continue
+        amount = _acct_int_cents(rec.get("amount_cents"))
+        if amount is None or amount < 1:
+            skip("payment", "%s: bad amount_cents" % qb_id)
+            continue
+        inv_id = None
+        bill_id = None
+        inv_qb = rec.get("invoice_qb_id")
+        bill_qb = rec.get("bill_qb_id")
+        if inv_qb not in (None, ""):
+            link = _acct_migrate_link(conn, "invoice", str(inv_qb))
+            if link:
+                inv_id = link["erp_id"]
+        elif bill_qb not in (None, ""):
+            link = _acct_migrate_link(conn, "bill", str(bill_qb))
+            if link:
+                bill_id = link["erp_id"]
+        if inv_id is None and bill_id is None:
+            skip("payment", "%s: linked invoice/bill was not imported"
+                 % qb_id)
+            continue
+        if inv_id is not None:
+            inv = conn.execute(
+                "SELECT * FROM erp_acct_invoices WHERE id = ?",
+                (inv_id,)).fetchone()
+            if not inv or inv["status"] != "open" \
+                    or amount > inv["balance_cents"]:
+                skip("payment", "%s: invoice is not open or amount exceeds"
+                     " its balance" % qb_id)
+                continue
+        else:
+            bill = conn.execute(
+                "SELECT * FROM erp_acct_bills WHERE id = ?", (bill_id,)).fetchone()
+            if not bill or bill["status"] != "open" \
+                    or amount > bill["balance_cents"]:
+                skip("payment", "%s: bill is not open or amount exceeds"
+                     " its balance" % qb_id)
+                continue
+        bank_id = None
+        bank_qb = rec.get("bank_account_qb_id")
+        if bank_qb not in (None, ""):
+            bank_id = bank_by_qb.get(str(bank_qb))
+        cash_id, bank_err = _acct_cash_account_id(conn, bank_id)
+        if bank_err or not cash_id:
+            skip("payment", "%s: %s" % (qb_id, bank_err or "no cash account"))
+            continue
+        method = (rec.get("method") or "cash").strip() or "cash"
+        note = "Migrated from QuickBooks payment %s" % qb_id
+        if inv_id is not None:
+            cur = conn.execute(
+                "INSERT INTO erp_acct_payments (invoice_id, bill_id, date,"
+                " amount_cents, method, bank_account_id, journal_entry_id,"
+                " approval_note, qb_id, created_at)"
+                " VALUES (?, NULL, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (inv_id, date, amount, method, bank_id, note, qb_id, now))
+            pay_id = cur.lastrowid
+            entry_id, error = _acct_post_entry(
+                conn, actor, date, "Payment on invoice #%d (migration)"
+                % inv_id, "payment", inv_id,
+                [{"account_id": cash_id, "debit_cents": amount,
+                  "credit_cents": 0,
+                  "memo": "Payment on invoice #%d" % inv_id},
+                 {"account_id": ar_id, "debit_cents": 0,
+                  "credit_cents": amount,
+                  "memo": "Payment on invoice #%d" % inv_id}])
+            if error:
+                raise _AcctMigrateFail(error, 400)
+            conn.execute(
+                "UPDATE erp_acct_payments SET journal_entry_id = ?"
+                " WHERE id = ?", (entry_id, pay_id))
+            new_balance = inv["balance_cents"] - amount
+            conn.execute(
+                "UPDATE erp_acct_invoices SET balance_cents = ?, status = ?"
+                " WHERE id = ?",
+                (new_balance, "paid" if new_balance == 0 else "open", inv_id))
+            track(cash_id, amount)
+            track(ar_id, -amount)
+            _acct_audit(conn, actor, "invoice.pay", "invoice", inv_id,
+                        "payment #%d %d cents (migration)" % (pay_id, amount))
+        else:
+            cur = conn.execute(
+                "INSERT INTO erp_acct_payments (invoice_id, bill_id, date,"
+                " amount_cents, method, bank_account_id, journal_entry_id,"
+                " approval_note, qb_id, created_at)"
+                " VALUES (NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+                (bill_id, date, amount, method, bank_id, note, qb_id, now))
+            pay_id = cur.lastrowid
+            entry_id, error = _acct_post_entry(
+                conn, actor, date, "Payment on bill #%d (migration)"
+                % bill_id, "payment", bill_id,
+                [{"account_id": ap_id, "debit_cents": amount,
+                  "credit_cents": 0,
+                  "memo": "Payment on bill #%d" % bill_id},
+                 {"account_id": cash_id, "debit_cents": 0,
+                  "credit_cents": amount,
+                  "memo": "Payment on bill #%d" % bill_id}])
+            if error:
+                raise _AcctMigrateFail(error, 400)
+            conn.execute(
+                "UPDATE erp_acct_payments SET journal_entry_id = ?"
+                " WHERE id = ?", (entry_id, pay_id))
+            new_balance = bill["balance_cents"] - amount
+            conn.execute(
+                "UPDATE erp_acct_bills SET balance_cents = ?, status = ?"
+                " WHERE id = ?",
+                (new_balance, "paid" if new_balance == 0 else "open", bill_id))
+            track(ap_id, amount)
+            track(cash_id, -amount)
+            _acct_audit(conn, actor, "bill.pay", "bill", bill_id,
+                        "payment #%d %d cents (migration)" % (pay_id, amount))
+        _acct_migrate_record_link(conn, "payment", qb_id, "payment", pay_id)
+        inserted["payment"] += 1
+
+    # --- journal entries (already posted in QuickBooks; insert directly) ---
+    for rec in lists["journal_entries"]:
+        qb_id = rec.get("qb_id")
+        if qb_id in (None, ""):
+            skip("journal_entry", "journal entry with no QuickBooks id")
+            continue
+        qb_id = str(qb_id)
+        if _acct_migrate_link(conn, "journal_entry", qb_id):
+            skipped["journal_entry"] += 1
+            continue
+        date = (rec.get("date") or "").strip()
+        if not _acct_valid_date(date):
+            skip("journal_entry", "%s: bad date %r" % (qb_id, date))
+            continue
+        raw = []
+        bad = None
+        for ln in (rec.get("lines") or []):
+            if not isinstance(ln, dict):
+                bad = "line is not an object"
+                break
+            account_id = ln.get("account_id")
+            if account_id in (None, "", 0):
+                acct_name = (ln.get("account_name") or "").strip()
+                acct = acct_by_norm.get(_acct_migrate_norm_name(acct_name)) \
+                    if acct_name else None
+                if not acct:
+                    bad = "unknown account %r" % acct_name
+                    break
+                account_id = acct["id"]
+            debit = _acct_int_cents(ln.get("debit_cents", 0))
+            credit = _acct_int_cents(ln.get("credit_cents", 0))
+            if debit is None or credit is None:
+                bad = "line amounts must be whole cents"
+                break
+            raw.append({"account_id": account_id, "debit_cents": debit,
+                        "credit_cents": credit,
+                        "memo": (ln.get("memo") or "").strip()})
+        if bad:
+            skip("journal_entry", "%s: %s" % (qb_id, bad))
+            continue
+        memo = (rec.get("memo") or "").strip() or "QuickBooks journal entry %s" % qb_id
+        entry_id, error = _acct_post_entry(
+            conn, actor, date, memo + " (migration)", "migration", qb_id, raw)
+        if error:
+            skip("journal_entry", "%s: %s" % (qb_id, error))
+            continue
+        for line in raw:
+            track(line["account_id"],
+                  line["debit_cents"] - line["credit_cents"])
+        _acct_migrate_record_link(conn, "journal_entry", qb_id,
+                                  "journal_entry", entry_id)
+        inserted["journal_entry"] += 1
+
+    # --- bank transactions: not imported (no QuickBooks feed in snapshot) ---
+    for rec in lists["bank_transactions"]:
+        skip("bank_transaction", "bank transaction: not imported (no feed)")
+
+    # --- opening-balance entry, posted last ---
+    # QuickBooks' "Net Income" row already contains the income and
+    # expenses the imported documents re-post, so its residual subtracts
+    # the net income/expense postings of this import instead of its own.
+    ni_id = None
+    for erp_id in targets:
+        if _acct_migrate_norm_name(acct_by_id[erp_id]["name"]) == "net income":
+            ni_id = erp_id
+            break
+    raw = []
+    for erp_id, target_dc in targets.items():
+        if erp_id == ni_id:
+            continue
+        residual = target_dc - posted.get(erp_id, 0)
+        if residual == 0:
+            continue
+        raw.append({"account_id": erp_id,
+                    "debit_cents": residual if residual > 0 else 0,
+                    "credit_cents": -residual if residual < 0 else 0,
+                    "memo": "Opening balance — QuickBooks migration"})
+    if ni_id is not None:
+        ni_posted = sum(posted.get(aid, 0) for aid, a in acct_by_id.items()
+                        if a["type"] in ("income", "expense"))
+        residual = targets[ni_id] - ni_posted
+        if residual != 0:
+            raw.append({"account_id": ni_id,
+                        "debit_cents": residual if residual > 0 else 0,
+                        "credit_cents": -residual if residual < 0 else 0,
+                        "memo": "Opening balance — QuickBooks migration"})
+    opening_entry_id = None
+    if raw:
+        entry_id, error = _acct_post_entry(
+            conn, actor, as_of,
+            "Opening balances — QuickBooks migration (as of %s)" % as_of,
+            "migration", "opening-balances", raw)
+        if error:
+            raise _AcctMigrateFail(
+                "opening entry would not balance: %s" % error, 400)
+        opening_entry_id = entry_id
+    _acct_audit(conn, actor, "migration.import", "migration", 0,
+                "as of %s snapshot %s inserted %s skipped %s opening entry %s"
+                % (as_of, snapshot_id or "none",
+                   {k: v for k, v in inserted.items() if v},
+                   {k: v for k, v in skipped.items() if v},
+                   opening_entry_id))
+    return {"snapshot_id": snapshot_id, "inserted": inserted, "skipped": skipped,
+            "skipped_reasons": skipped_reasons,
+            "skipped_reasons_omitted": omitted[0],
+            "opening_entry_id": opening_entry_id, "as_of": as_of}
+
+
+@app.post("/api/erp/accounting/migrate/import")
+def erp_acct_migrate_import():
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error="snapshot must be a JSON object"), 400
+    lists = {}
+    for key in ("accounts", "customers", "vendors", "items", "invoices",
+                "bills", "payments", "bank_accounts", "bank_transactions",
+                "journal_entries"):
+        val = data.get(key, [])
+        if not isinstance(val, list):
+            return jsonify(error="%s must be a list" % key), 400
+        for rec in val:
+            if not isinstance(rec, dict):
+                return jsonify(error="%s entries must be objects" % key), 400
+        lists[key] = val
+    meta = data.get("meta") or {}
+    if not isinstance(meta, dict):
+        return jsonify(error="meta must be an object"), 400
+    as_of = (meta.get("as_of") or "").strip()
+    if as_of and not _acct_valid_date(as_of):
+        return jsonify(error="meta.as_of must be YYYY-MM-DD"), 400
+    if not as_of:
+        as_of = datetime.now(timezone.utc).date().isoformat()
+    # The snapshot format carries no id of its own: prefer an explicit
+    # meta.snapshot_id, else the source + pulled_at stamp identifies it.
+    snapshot_id = (meta.get("snapshot_id") or "").strip()
+    if not snapshot_id:
+        snapshot_id = (meta.get("source") or "quickbooks-mcp").strip()
+        pulled_at = (meta.get("pulled_at") or "").strip()
+        if pulled_at:
+            snapshot_id = "%s@%s" % (snapshot_id, pulled_at)
+    conn = db()
+    try:
+        result = _acct_migrate_import_run(conn, actor, lists, as_of,
+                                        snapshot_id)
+    except _AcctMigrateFail as exc:
+        conn.close()
+        return jsonify(error=str(exc)), exc.status
+    except Exception as exc:  # noqa: BLE001 - import must never half-commit
+        conn.close()
+        return jsonify(error="migration failed: %s" % exc), 500
+    conn.commit()
+    conn.close()
+    return jsonify(result), 201
+
+
 @app.get("/api/erp/purchase-orders")
 def erp_list_pos():
     actor, err = _erp_check_perm("purchasing.read")
@@ -12333,9 +29542,23 @@ def erp_get_po(po_id):
         " FROM erp_po_lines l JOIN erp_items i ON i.id = l.item_id"
         " WHERE l.po_id = ? ORDER BY l.id", (po_id,)).fetchall()
     summary = _erp_po_summary(conn, po)
+    match = _acct_po_match(conn, po_id)
     conn.close()
     return jsonify(purchase_order=summary, vendor=dict(vendor) if vendor else None,
-                   lines=[dict(l) for l in lines])
+                   lines=[dict(l) for l in lines], match=match)
+
+
+@app.get("/api/erp/purchase-orders/<int:po_id>/match")
+def erp_get_po_match(po_id):
+    actor, err = _erp_check_perm("purchasing.read")
+    if err:
+        return err
+    conn = db()
+    match = _acct_po_match(conn, po_id)
+    conn.close()
+    if match is None:
+        return jsonify(error="purchase order not found"), 404
+    return jsonify(match=match)
 
 
 @app.post("/api/erp/purchase-orders/<int:po_id>/receive")
@@ -12831,6 +30054,7 @@ def erp_vendor_price_history(vendor_id):
 
 @app.get("/api/erp/reorder-rules")
 def erp_list_reorder_rules():
+    
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -13335,6 +30559,114 @@ def _erp_recipe_cost(lines, batch_size_bags):
     return out, total, per_bag, unknown
 
 
+_ERP_FDA_VITAMIN_MINERAL_KEYS = ("nut_vit_d_mcg", "nut_calcium_mg",
+                                  "nut_iron_mg", "nut_potassium_mg")
+
+
+def _erp_round_inc(value, increment):
+    """Round `value` to the nearest multiple of `increment`, halves up.
+
+    FDA rounding: a value exactly halfway between two permitted
+    declarations rounds up. Python's round() is banker's rounding and
+    float division can sit a hair under a .5 boundary (e.g. 0.15/0.1),
+    so this goes through Decimal on the decimal spelling of the value.
+    Returns an int when the result is whole, else a float."""
+    q = (Decimal(str(value)) / Decimal(str(increment))).quantize(
+        Decimal("1"), rounding=ROUND_HALF_UP)
+    out = float(q * Decimal(str(increment)))
+    return int(out) if out == int(out) else out
+
+
+def _erp_fda_round(key, value):
+    """FDA-declared per-serving amount for one nutrient (21 CFR 101.9(c)).
+
+    Returns (declared_numeric_value, display_text_or_None). The numeric
+    value is the declared amount (the "less than" bands still carry a
+    numeric anchor: 5 for cholesterol 2-5 mg, 1 for 0.5-<1 g carbs etc.,
+    which is also what %DV is computed from). display_text is the label
+    wording for those bands ("less than 5 mg" / "less than 1 g"), else
+    None. None in -> (None, None)."""
+    if value is None:
+        return None, None
+    v = float(value)
+    if key == "nut_calories":  # (c)(1)
+        if v < 5:
+            return 0, None
+        if v <= 50:
+            return _erp_round_inc(v, 5), None
+        return _erp_round_inc(v, 10), None
+    if key in ("nut_fat_g", "nut_sat_fat_g", "nut_trans_fat_g"):  # (c)(2)
+        if v < 0.5:
+            return 0, None
+        if v < 5:
+            return _erp_round_inc(v, 0.5), None
+        return _erp_round_inc(v, 1), None
+    if key == "nut_chol_mg":  # (c)(3)
+        if v < 2:
+            return 0, None
+        if v <= 5:
+            return 5, "less than 5 mg"
+        return _erp_round_inc(v, 5), None
+    if key == "nut_sodium_mg":  # (c)(4)
+        if v < 5:
+            return 0, None
+        if v <= 140:
+            return _erp_round_inc(v, 5), None
+        return _erp_round_inc(v, 10), None
+    if key in ("nut_carb_g", "nut_fiber_g", "nut_sugars_g",
+               "nut_added_sugars_g", "nut_protein_g"):  # (c)(6)/(c)(7)
+        if v < 0.5:
+            return 0, None
+        if v < 1:
+            return 1, "less than 1 g"
+        return _erp_round_inc(v, 1), None
+    # (c)(8): quantitative amounts of the four mandatory vitamins/minerals.
+    # Increments are the FDA guidance increments (Food Labeling Guide
+    # App. H / FDA 2018 Q&A guidance); the regulation's (c)(8)(iv) table
+    # gives RDI + unit only. Potassium has no sub-threshold zero band in
+    # that table: nearest 10 mg throughout (values <5 mg round to 0 by
+    # the increment itself).
+    if key == "nut_vit_d_mcg":
+        return _erp_round_inc(v, 0.1), None
+    if key == "nut_calcium_mg":
+        return _erp_round_inc(v, 10), None
+    if key == "nut_iron_mg":
+        return _erp_round_inc(v, 0.1), None
+    if key == "nut_potassium_mg":
+        return _erp_round_inc(v, 10), None
+    return v, None
+
+
+def _erp_fda_dv_pct(key, declared):
+    """%DV from the DECLARED (FDA-rounded) amount for one nutrient.
+
+    DRV nutrients (fat, sat fat, cholesterol, sodium, carbohydrate,
+    fiber, added sugars, protein): nearest whole percent, 21 CFR
+    101.9(d)(7)(ii) -- which permits the percent to be calculated from
+    either the declared or the actual amount; this build uses declared.
+    Vitamins/minerals (vitamin D, calcium, iron, potassium): tiered
+    increments, 21 CFR 101.9(c)(8)(iii): <1% -> 0; up to and including
+    10% -> nearest 2%; above 10% up to and including 50% -> nearest 5%;
+    above 50% -> nearest 10%. Sodium is not in the tiered group
+    ((d)(8) excepts sodium). Returns None for nutrients with no DV
+    (trans fat, total sugars) or a None amount."""
+    if declared is None:
+        return None
+    dv = _ERP_DAILY_VALUES.get(key)
+    if not dv:
+        return None
+    pct = float(declared) / dv * 100
+    if key in _ERP_FDA_VITAMIN_MINERAL_KEYS:
+        if pct < 1:
+            return 0
+        if pct <= 10:
+            return _erp_round_inc(pct, 2)
+        if pct <= 50:
+            return _erp_round_inc(pct, 5)
+        return _erp_round_inc(pct, 10)
+    return int(_erp_round_inc(pct, 1))
+
+
 def _erp_recipe_nutrition(conn, recipe_id):
     """Nutrition for a recipe, from its ingredient lines' nutrition facts.
 
@@ -13343,6 +30675,15 @@ def _erp_recipe_nutrition(conn, recipe_id):
     each/bag lines count as one serving per unit), and the per-serving
     nutrients scale up. Totals are divided by batch_size_bags for the
     per-bag (per serving of finished product) figures, with FDA %DV.
+    Prod9 Wave 4 (item 7): `per_bag` holds the FDA-DECLARED values
+    (21 CFR 101.9(c) rounding ladders -- see _erp_fda_round), and
+    `per_bag_dv` is computed FROM those declared values ((d)(7)(ii)
+    whole percent for DRV nutrients, (c)(8)(iii) tiered increments
+    for vitamins/minerals). The exact unrounded per-bag figures are
+    kept in `per_bag_exact` for costing/audit, and `per_bag_display`
+    carries the "less than" label wording where the CFR uses it.
+    Rounding is applied once, to the final per-serving figure --
+    never to the batch totals and never twice.
     Lines that can't be converted — no nutrition facts on the item, no
     serving grams for a weight/volume line — are listed in `missing`
     instead of silently counted as zero. Packaging lines (bags, front
@@ -13409,12 +30750,20 @@ def _erp_recipe_nutrition(conn, recipe_id):
         detail.append(d)
     bags = float(recipe["batch_size_bags"] or 0)
     per_bag = {}
+    per_bag_exact = {}
+    per_bag_display = {}
     per_bag_dv = {}
     for k in _ERP_NUTRIENT_KEYS:
-        per_bag[k] = (totals[k] / bags) if bags > 0 else None
-        dv = _ERP_DAILY_VALUES.get(k)
-        per_bag_dv[k] = (int(round(per_bag[k] / dv * 100))
-                         if per_bag[k] is not None and dv else None)
+        # Exact per-bag figure first (unrounded totals / bags); the
+        # declared value is the FDA rounding of that exact figure.
+        exact = (totals[k] / bags) if bags > 0 else None
+        per_bag_exact[k] = exact
+        declared, display = (_erp_fda_round(k, exact)
+                             if exact is not None else (None, None))
+        per_bag[k] = declared
+        per_bag_display[k] = display
+        per_bag_dv[k] = (_erp_fda_dv_pct(k, declared)
+                         if declared is not None else None)
     ingredients = "; ".join(
         (ln["ingredients_text"] or "").strip()
         for ln in detail if ln.get("ingredients_text"))
@@ -13425,6 +30774,8 @@ def _erp_recipe_nutrition(conn, recipe_id):
             "version": version, "batch_size_bags": bags,
             "batch_grams": batch_grams,
             "totals_per_batch": totals, "per_bag": per_bag,
+            "per_bag_exact": per_bag_exact,
+            "per_bag_display": per_bag_display,
             "per_bag_dv": per_bag_dv, "missing": missing,
             "lines": detail, "ingredients_text": ingredients,
             "allergens_text": allergens}
@@ -13490,6 +30841,14 @@ def _erp_lot_rows(conn, today_s):
         " JOIN erp_items i ON i.id = lo.item_id"
         " LEFT JOIN erp_locations loc ON loc.id = lo.location_id"
         " ORDER BY (lo.expiry_date = ''), lo.expiry_date, i.name").fetchall()
+    # Prod9 Wave 2: active QC holds, keyed by (lot_code, location_id),
+    # so the lots view (and expiry alerts, which reuse this) can flag held
+    # lots with reason + who/when. Held lots still list here — they still
+    # exist physically; only FEFO picking skips them.
+    holds = {}
+    for h in conn.execute(
+            "SELECT * FROM erp_qc_holds WHERE released_at = ''").fetchall():
+        holds[(h["lot_code"], h["location_id"])] = h
     out = []
     for r in rows:
         d = dict(r)
@@ -13497,6 +30856,11 @@ def _erp_lot_rows(conn, today_s):
         band, days = _erp_expiry_band(d["expiry_date"], today_s)
         d["band"] = band
         d["days_to_expiry"] = days
+        hold = holds.get((d["lot_code"], d["location_id"]))
+        d["is_held"] = hold is not None
+        d["hold_reason"] = hold["reason"] if hold else ""
+        d["hold_held_by"] = hold["held_by"] if hold else ""
+        d["hold_held_at"] = hold["held_at"] if hold else ""
         if d["qty_remaining"] > 1e-9:
             out.append(d)
     return out
@@ -13518,10 +30882,50 @@ def _erp_lot_balances(conn, item_id, location_id):
         " LEFT JOIN erp_lots e ON e.lot_code = l.lot_code"
         "  AND e.location_id = l.location_id"
         " WHERE l.item_id = ? AND l.location_id = ? AND l.lot_code != ''"
+        " AND NOT EXISTS (SELECT 1 FROM erp_qc_holds h"
+        "  WHERE h.lot_code = l.lot_code AND h.location_id = l.location_id"
+        "  AND h.released_at = '')"
         " GROUP BY l.lot_code HAVING q > 1e-9"
         " ORDER BY (expiry_date = ''), expiry_date, first_seen",
         (item_id, location_id)).fetchall()
     return [(r["lot_code"], float(r["q"]), r["first_seen"]) for r in rows]
+
+
+def _erp_active_qc_hold(conn, lot_code, location_id):
+    """The active (unreleased) QC hold for a lot at a location, or None."""
+    return conn.execute(
+        "SELECT * FROM erp_qc_holds WHERE lot_code = ? AND location_id = ?"
+        " AND released_at = '' ORDER BY id DESC LIMIT 1",
+        (lot_code, location_id)).fetchone()
+
+
+def _erp_pickable_qty(conn, item_id, location_id, track_lots):
+    """Stock that FEFO picking can actually draw on: for lot-tracked items
+    the unheld lot balances plus any untracked (lot_code = '') stock; for
+    untracked items the plain on-hand qty. Held stock is excluded."""
+    if not track_lots:
+        return _erp_on_hand(conn, item_id, location_id)
+    pickable = sum(q for _c, q, _f in
+                   _erp_lot_balances(conn, item_id, location_id))
+    untracked = conn.execute(
+        "SELECT COALESCE(SUM(qty_change), 0) AS q FROM erp_stock_ledger"
+        " WHERE item_id = ? AND location_id = ? AND lot_code = ''",
+        (item_id, location_id)).fetchone()["q"]
+    return pickable + float(untracked or 0)
+
+
+def _erp_batch_yield_pct(batch):
+    """Yield % for a batch = actual_qty_bags / planned_qty_bags * 100
+    (Wave 2 definition). Only defined for completed batches with a
+    positive plan; otherwise None. Rounded to 1 decimal."""
+    try:
+        planned = float(batch["planned_qty_bags"] or 0)
+        actual = float(batch["actual_qty_bags"] or 0)
+    except (TypeError, ValueError):
+        return None
+    if batch["status"] != "completed" or planned <= 0:
+        return None
+    return round(actual / planned * 100, 1)
 
 
 def _erp_expiry_plus_months(date_str, months):
@@ -13602,6 +31006,41 @@ def _erp_validate_recipe_lines(conn, lines):
     return clean, None
 
 
+def _erp_recipe_flavor_name(recipe_name):
+    """Flavor for a recipe name: strip a trailing version (' v2')
+    then a trailing ' Popcorn'. 'Bacon Popcorn v2' -> 'Bacon'."""
+    name = (recipe_name or "").strip()
+    name = re.sub(r"\s+v\d+$", "", name, flags=re.IGNORECASE).strip()
+    return _erp_flavor_display(name)
+
+
+def _erp_recipe_finished_item(conn, recipe):
+    """The finished-goods POP-* item a recipe produces, or None.
+
+    Finished popcorn items are seeded one per flavor (name
+    '<Flavor> Popcorn', type 'popcorn'). Match by that name first,
+    then by flavor key over all popcorn items. Never invents a SKU:
+    a recipe whose flavor has no POP-* item returns None and its
+    completion receipts nothing."""
+    if not recipe:
+        return None
+    flavor = _erp_recipe_flavor_name(recipe["name"])
+    if not flavor:
+        return None
+    row = conn.execute(
+        "SELECT * FROM erp_items WHERE type = 'popcorn' AND active = 1"
+        " AND name = ?", (flavor + " Popcorn",)).fetchone()
+    if row:
+        return row
+    key = _erp_flavor_key(flavor)
+    for it in conn.execute(
+            "SELECT * FROM erp_items WHERE type = 'popcorn' AND active = 1"
+            " ORDER BY name").fetchall():
+        if _erp_flavor_key(it["name"]) == key:
+            return it
+    return None
+
+
 def _erp_batch_shortfalls(conn, lines, planned_qty, batch_size, location_id):
     """Check ingredient availability for a planned batch.
 
@@ -13613,7 +31052,10 @@ def _erp_batch_shortfalls(conn, lines, planned_qty, batch_size, location_id):
     scale = float(planned_qty) / float(batch_size)
     for ln in lines:
         required = float(ln["qty_per_batch"]) * scale
-        on_hand = _erp_on_hand(conn, ln["item_id"], location_id)
+        _item = _erp_get_item(conn, ln["item_id"])
+        on_hand = _erp_pickable_qty(
+            conn, ln["item_id"], location_id,
+            bool(_item and _item["track_lots"]))
         if on_hand + 1e-9 < required:
             item = _erp_get_item(conn, ln["item_id"])
             short.append({"item_id": ln["item_id"], "sku": item["sku"],
@@ -13903,6 +31345,7 @@ def erp_delete_recipe(recipe_id):
         conn.close()
         return jsonify(error="recipe not found"), 404
     conn.execute("UPDATE erp_recipes SET active = 0 WHERE id = ?", (recipe_id,))
+    _erp_tombstone(conn, "recipe", recipe["name"], actor)
     conn.commit()
     conn.close()
     return jsonify(deleted=True)
@@ -13981,9 +31424,71 @@ def erp_import_recipes():
                 " qty_per_batch, unit, notes) VALUES (?, 1, ?, ?, ?, ?)",
                 (rid, ln["item_id"], ln["qty_per_batch"], ln["unit"], ln["notes"]))
         created += 1
+    _erp_settings_audit(conn, actor, "import.recipes", "recipes", 0,
+                        "Imported %d recipe(s) from CSV" % created)
     conn.commit()
     conn.close()
     return jsonify(ok=True, imported=created)
+
+
+# ---- Production Wave 1: labor + overhead in batch cost ----
+# RULE REVERSAL (Nov 2026 approval, supersedes the Oct rule): the Oct rule
+# was recipe cost = ingredients + packaging lines only. That still holds
+# for RECIPE (BOM) cost -- the planning figure, via _erp_recipe_cost, which
+# is unchanged. BATCH cost (the actual, at completion) now also adds labor
+# and overhead: total = ingredient cost + labor + overhead.
+#   labor cost = labor_minutes / 60 x labor_rate_cents_per_hour
+#   overhead   = overhead_pct % of (ingredient cost + labor cost)
+# Defaults: $20/hr labor (2000 cents/hr), 0 minutes, and 0% overhead.
+# Overhead is OPT-IN at the stored level: a batch completed without
+# overhead fields keeps its previous ingredient-only total, so existing
+# batches and reports are unchanged unless overhead is entered. The batch
+# forms in the UI prefill 10% as the suggested value instead.
+ERP_DEFAULT_LABOR_RATE_CENTS_PER_HOUR = 2000
+ERP_DEFAULT_OVERHEAD_PCT = 0.0
+
+
+def _erp_batch_labor_overhead(ingredient_cents, labor_minutes,
+                              labor_rate_cents_per_hour, overhead_pct):
+    """Labor + overhead for a batch. Returns
+    (labor_cost_cents, overhead_cents, total_cost_cents) with
+    total = ingredient + labor + overhead. All inputs clamped to >= 0;
+    overhead_pct is a percent of (ingredient + labor)."""
+    ingredient_cents = int(ingredient_cents or 0)
+    minutes = max(0.0, float(labor_minutes or 0))
+    rate = max(0, int(labor_rate_cents_per_hour or 0))
+    pct = max(0.0, float(overhead_pct or 0))
+    labor_cents = int(round(minutes / 60.0 * rate))
+    overhead_cents = int(round((ingredient_cents + labor_cents) * pct / 100.0))
+    return labor_cents, overhead_cents, ingredient_cents + labor_cents + overhead_cents
+
+
+def _erp_parse_batch_labor(data, batch=None):
+    """Parse labor/overhead inputs from a create/complete payload.
+    Missing keys fall back to the existing batch values (complete) or the
+    defaults (create). Returns ((minutes, rate_cents_per_hour, pct), None)
+    or (None, error_string)."""
+    if batch is not None:
+        d_minutes = batch["labor_minutes"]
+        d_rate = batch["labor_rate_cents_per_hour"]
+        d_pct = batch["overhead_pct"]
+    else:
+        d_minutes = 0
+        d_rate = ERP_DEFAULT_LABOR_RATE_CENTS_PER_HOUR
+        d_pct = ERP_DEFAULT_OVERHEAD_PCT
+    try:
+        minutes = float(data.get("labor_minutes", d_minutes))
+        rate = int(data.get("labor_rate_cents_per_hour", d_rate))
+        pct = float(data.get("overhead_pct", d_pct))
+    except (TypeError, ValueError):
+        return None, ("labor_minutes, labor_rate_cents_per_hour and overhead_pct"
+                      " must be numbers")
+    if minutes < 0 or rate < 0 or pct < 0:
+        return None, ("labor_minutes, labor_rate_cents_per_hour and overhead_pct"
+                      " cannot be negative")
+    if pct > 100:
+        return None, "overhead_pct cannot exceed 100"
+    return (minutes, rate, pct), None
 
 
 def _erp_batch_dict(conn, batch):
@@ -13997,6 +31502,31 @@ def _erp_batch_dict(conn, batch):
             float(batch["total_cost_cents"]) / float(batch["actual_qty_bags"])))
     else:
         d["cost_per_bag_cents"] = None
+    d["yield_pct"] = _erp_batch_yield_pct(batch)
+    # Prod9 Wave 3: finished-goods mapping + make-to-stock purpose.
+    # A batch with no order ref is stock production (shelf stock for
+    # finished popcorn); one with an order ref is made to order.
+    _fg = _erp_recipe_finished_item(conn, recipe)
+    d["finished_goods_item_id"] = _fg["id"] if _fg else None
+    d["finished_goods_sku"] = _fg["sku"] if _fg else ""
+    d["has_finished_goods_item"] = _fg is not None
+    d["production_purpose"] = ("stock" if not (batch["order_ref"] or "").strip()
+                              else "order")
+    if batch["status"] == "completed":
+        ing = int(batch["ingredient_cost_cents"] or 0)
+        lab = int(batch["labor_cost_cents"] or 0)
+        ovh = int(batch["overhead_cents"] or 0)
+        tot = int(batch["total_cost_cents"] or 0)
+        if ing + lab + ovh == 0 and tot:
+            # Legacy batch completed before labor/overhead tracking: the
+            # whole stored total was ingredients.
+            ing = tot
+        d["cost_breakdown"] = {
+            "ingredient_cost_cents": ing,
+            "labor_cost_cents": lab,
+            "overhead_cents": ovh,
+            "total_cost_cents": tot,
+        }
     return d
 
 
@@ -14052,16 +31582,33 @@ def erp_create_batch():
         conn, [{"item_id": l["item_id"], "qty_per_batch": float(l["qty_per_batch"]),
                 "unit": l["unit"]} for l in lines],
         planned, float(recipe["batch_size_bags"]), loc["id"])
+    labor, labor_err = _erp_parse_batch_labor(data)
+    if labor_err:
+        conn.close()
+        return jsonify(error=labor_err), 400
+    labor_minutes, labor_rate, overhead_pct = labor
+    # Prod9 Wave 3: scheduled date. Omitted = today; explicit '' =
+    # unscheduled; anything else must be YYYY-MM-DD.
+    if "scheduled_date" in data:
+        scheduled_date = _erp_parse_sched_date(data.get("scheduled_date"))
+        if scheduled_date is None:
+            conn.close()
+            return jsonify(error="scheduled_date must be YYYY-MM-DD"), 400
+    else:
+        scheduled_date = datetime.now(timezone.utc).date().isoformat()
     count = conn.execute("SELECT COUNT(*) AS c FROM erp_production_batches").fetchone()["c"]
     batch_number = "B-%d" % (1001 + int(count))
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO erp_production_batches (batch_number, recipe_id, recipe_version,"
-        " planned_qty_bags, status, location_id, order_ref, produced_by, notes,"
-        " created_at) VALUES (?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?)",
+        " planned_qty_bags, status, location_id, order_ref, scheduled_date,"
+        " produced_by, notes,"
+        " labor_minutes, labor_rate_cents_per_hour, overhead_pct,"
+        " created_at) VALUES (?, ?, ?, ?, 'planned', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (batch_number, recipe["id"], recipe["version"], planned, loc["id"],
-         (data.get("order_ref") or "").strip(), actor,
-         (data.get("notes") or "").strip(), now))
+         (data.get("order_ref") or "").strip(), scheduled_date, actor,
+         (data.get("notes") or "").strip(), labor_minutes, labor_rate,
+         overhead_pct, now))
     batch_id = cur.lastrowid
     conn.commit()
     batch = conn.execute("SELECT * FROM erp_production_batches WHERE id = ?",
@@ -14099,10 +31646,23 @@ def erp_get_batch(batch_id):
         "SELECT bi.*, i.sku, i.name AS item_name FROM erp_batch_ingredients bi"
         " JOIN erp_items i ON i.id = bi.item_id"
         " WHERE bi.batch_id = ? ORDER BY bi.id", (batch_id,)).fetchall()]
+    _fg_rows = conn.execute(
+        "SELECT m.*, i.sku, i.name AS item_name FROM erp_stock_ledger m"
+        " JOIN erp_items i ON i.id = m.item_id"
+        " WHERE m.movement_type = 'production_in' AND m.ref_type = 'batch'"
+        " AND m.ref_id = ?", (batch["batch_number"],)).fetchall()
+    _fg_receipt = None
+    if _fg_rows:
+        _fg_receipt = {"item_id": _fg_rows[0]["item_id"],
+                      "sku": _fg_rows[0]["sku"],
+                      "item_name": _fg_rows[0]["item_name"],
+                      "qty_bags": sum(float(r["qty_change"]) for r in _fg_rows),
+                      "lot_code": _fg_rows[0]["lot_code"]}
     out = _erp_batch_dict(conn, batch)
     conn.close()
     out["recipe_lines"] = scaled
     out["ingredients_used"] = used
+    out["finished_goods_receipt"] = _fg_receipt
     return jsonify(batch=out)
 
 
@@ -14119,6 +31679,12 @@ def erp_batch_start(batch_id):
     if batch["status"] != "planned":
         conn.close()
         return jsonify(error="only planned batches can be started"), 400
+    if batch["qc_hold"]:
+        conn.close()
+        return jsonify(error="batch %s is on QC hold: %s — release the hold"
+                       " before starting it"
+                       % (batch["batch_number"],
+                          batch["qc_hold_reason"] or "no reason given")), 400
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "UPDATE erp_production_batches SET status = 'in_progress', started_at = ?,"
@@ -14131,7 +31697,11 @@ def erp_batch_start(batch_id):
 @app.post("/api/erp/batches/<int:batch_id>/complete")
 def erp_batch_complete(batch_id):
     """Complete a batch: consume ingredients (FEFO lots) via production_out
-    movements, snapshot costs, stamp lot code + 6-month expiry. All-or-nothing."""
+    movements, snapshot costs, stamp lot code + 6-month expiry. All-or-nothing.
+    Total cost = ingredient cost + labor + overhead (Wave 1 rule reversal:
+    recipe/BOM cost stays ingredients + packaging only; batch cost is the
+    actual and adds labor + overhead). Labor/overhead inputs may be
+    overridden here; otherwise the values stored at create time apply."""
     actor, err = _erp_check_perm("batches.write")
     if err:
         return err
@@ -14144,6 +31714,12 @@ def erp_batch_complete(batch_id):
     if batch["status"] != "in_progress":
         conn.close()
         return jsonify(error="only in-progress batches can be completed"), 400
+    if batch["qc_hold"]:
+        conn.close()
+        return jsonify(error="batch %s is on QC hold: %s — release the hold"
+                       " before completing it"
+                       % (batch["batch_number"],
+                          batch["qc_hold_reason"] or "no reason given")), 400
     try:
         actual = float(data.get("actual_qty_bags") or 0)
     except (TypeError, ValueError):
@@ -14160,6 +31736,20 @@ def erp_batch_complete(batch_id):
     if waste < 0:
         conn.close()
         return jsonify(error="waste_qty_bags cannot be negative"), 400
+    # Prod9 Wave 2: optional free-text waste reason, stored on the batch.
+    # Blank = no reason given; never blocks completion.
+    waste_reason = (data.get("waste_reason") or "")
+    if not isinstance(waste_reason, str):
+        waste_reason = str(waste_reason)
+    waste_reason = waste_reason.strip()
+    if len(waste_reason) > 500:
+        conn.close()
+        return jsonify(error="waste_reason must be 500 characters or fewer"), 400
+    labor, labor_err = _erp_parse_batch_labor(data, batch)
+    if labor_err:
+        conn.close()
+        return jsonify(error=labor_err), 400
+    labor_minutes, labor_rate, overhead_pct = labor
     recipe = _erp_get_recipe(conn, batch["recipe_id"])
     batch_size = float(recipe["batch_size_bags"]) if recipe else 0
     if batch_size <= 0:
@@ -14174,11 +31764,20 @@ def erp_batch_complete(batch_id):
     plan = []
     for l in lines:
         need = float(l["qty_per_batch"]) * scale
-        on_hand = _erp_on_hand(conn, l["item_id"], batch["location_id"])
-        if on_hand + 1e-9 < need:
+        item = _erp_get_item(conn, l["item_id"])
+        pickable = _erp_pickable_qty(conn, l["item_id"], batch["location_id"],
+                                     bool(item and item["track_lots"]))
+        if pickable + 1e-9 < need:
+            total = _erp_on_hand(conn, l["item_id"], batch["location_id"])
             conn.close()
+            if total + 1e-9 >= need:
+                return jsonify(error="insufficient available stock of %s:"
+                               " some stock is on QC hold (have %s %s"
+                               " available, need %s %s)"
+                               % (l["sku"], _erp_fmt_qty(pickable), l["unit"],
+                                  _erp_fmt_qty(need), l["unit"])), 400
             return jsonify(error="insufficient stock of %s (have %s %s, need %s %s)"
-                           % (l["sku"], _erp_fmt_qty(on_hand), l["unit"],
+                           % (l["sku"], _erp_fmt_qty(pickable), l["unit"],
                               _erp_fmt_qty(need), l["unit"])), 400
         plan.append((l, need))
     # Consume FEFO lots, post movements, snapshot costs.
@@ -14219,17 +31818,59 @@ def erp_batch_complete(batch_id):
                 " qty_used, unit, unit_cost_cents) VALUES (?, ?, '', ?, ?, ?)",
                 (batch_id, item["id"], remaining, l["unit"], avg))
             total_cost += remaining * avg
-    total_cost_cents = int(round(total_cost))
+    ingredient_cost_cents = int(round(total_cost))
+    labor_cents, overhead_cents, total_cost_cents = _erp_batch_labor_overhead(
+        ingredient_cost_cents, labor_minutes, labor_rate, overhead_pct)
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "UPDATE erp_production_batches SET status = 'completed',"
-        " actual_qty_bags = ?, waste_qty_bags = ?, lot_code = ?, expiry_date = ?,"
-        " total_cost_cents = ?, completed_at = ?, produced_by = ? WHERE id = ?",
-        (actual, waste, lot_code, expiry, total_cost_cents, now, actor, batch_id))
+        " actual_qty_bags = ?, waste_qty_bags = ?, waste_reason = ?,"
+        " lot_code = ?, expiry_date = ?,"
+        " total_cost_cents = ?, completed_at = ?, produced_by = ?,"
+        " labor_minutes = ?, labor_rate_cents_per_hour = ?, overhead_pct = ?,"
+        " ingredient_cost_cents = ?, labor_cost_cents = ?, overhead_cents = ?"
+        " WHERE id = ?",
+        (actual, waste, waste_reason, lot_code, expiry, total_cost_cents,
+         now, actor, labor_minutes, labor_rate, overhead_pct,
+         ingredient_cost_cents, labor_cents, overhead_cents, batch_id))
+    # Prod9 Wave 3 (item 3): finished-goods receipt. A completed batch
+    # stocks the finished popcorn it produced: a production_in movement
+    # for the recipe's POP-* item, qty = actual bags, under the batch's
+    # stamped lot code + 6-month expiry, with an erp_lots row so FEFO
+    # and expiry alerts cover finished goods. A recipe with no matching
+    # POP-* item receipts nothing (no SKU is invented). Average cost
+    # follows the PO-receive rule (weighted average, before posting).
+    fg_receipt = None
+    fg_item = _erp_recipe_finished_item(conn, recipe)
+    if fg_item is not None and actual > 0:
+        per_bag_cents = int(round(total_cost_cents / actual))
+        new_avg = _erp_new_avg_cost(conn, fg_item["id"], actual, per_bag_cents)
+        conn.execute("UPDATE erp_items SET avg_cost_cents = ? WHERE id = ?",
+                     (new_avg, fg_item["id"]))
+        _erp_post_movement(conn, fg_item["id"], batch["location_id"], actual,
+                           "production_in", actor, ref_type="batch",
+                           ref_id=batch["batch_number"], lot_code=lot_code,
+                           unit_cost_cents=per_bag_cents,
+                           note="Batch %s" % batch["batch_number"])
+        _lot_exists = conn.execute(
+            "SELECT 1 FROM erp_lots WHERE lot_code = ? AND item_id = ?"
+            " AND location_id = ?",
+            (lot_code, fg_item["id"], batch["location_id"])).fetchone()
+        if not _lot_exists:
+            conn.execute(
+                "INSERT INTO erp_lots (lot_code, item_id, supplier_lot,"
+                " received_date, expiry_date, location_id)"
+                " VALUES (?, ?, '', ?, ?, ?)",
+                (lot_code, fg_item["id"], today_s, expiry,
+                 batch["location_id"]))
+        fg_receipt = {"item_id": fg_item["id"], "sku": fg_item["sku"],
+                      "item_name": fg_item["name"], "qty_bags": actual,
+                      "lot_code": lot_code, "expiry_date": expiry}
     conn.commit()
     batch = conn.execute("SELECT * FROM erp_production_batches WHERE id = ?",
                          (batch_id,)).fetchone()
     out = _erp_batch_dict(conn, batch)
+    out["finished_goods_receipt"] = fg_receipt
     conn.close()
     return jsonify(batch=out)
 
@@ -14279,6 +31920,18 @@ def erp_batch_reverse(batch_id):
                            lot_code=u["lot_code"],
                            unit_cost_cents=int(u["unit_cost_cents"] or 0),
                            note="Reversal of batch %s" % batch["batch_number"])
+    # Prod9 Wave 3: reverse the finished-goods receipt the completion
+    # posted (if any), so a reversed batch leaves no phantom shelf stock.
+    for _m in conn.execute(
+            "SELECT * FROM erp_stock_ledger WHERE movement_type = 'production_in'"
+            " AND ref_type = 'batch' AND ref_id = ?",
+            (batch["batch_number"],)).fetchall():
+        _erp_post_movement(conn, _m["item_id"], batch["location_id"],
+                           -float(_m["qty_change"]), "production_reversal",
+                           actor, ref_type="batch", ref_id=batch["batch_number"],
+                           lot_code=_m["lot_code"],
+                           unit_cost_cents=int(_m["unit_cost_cents"] or 0),
+                           note="Reversal of batch %s" % batch["batch_number"])
     conn.execute("UPDATE erp_production_batches SET status = 'reversed' WHERE id = ?",
                  (batch_id,))
     conn.commit()
@@ -14305,6 +31958,742 @@ def erp_batch_trace(batch_id):
     return jsonify(batch_number=batch["batch_number"], lot_code=batch["lot_code"],
                    expiry_date=batch["expiry_date"], status=batch["status"],
                    ingredients=used)
+
+
+# ---------------- Prod9 Wave 2: QC holds + yield/waste trending --------
+# Lot holds gate inventory (inventory.adjust: holding stock is an inventory
+# control action); batch holds gate production (batches.write). A hold
+# needs a reason, and a release needs a reason too; both record the actor.
+
+def _erp_resolve_lot(conn, lot_code, location_id):
+    """Resolve a lot_code (+ optional location_id) to (item_id,
+    location_id). Returns ((item_id, location_id), None) or
+    (None, error_string). Lots live in erp_lots; fall back to ledger rows
+    for lot codes that only appear there."""
+    cands = []
+    for tbl in ("erp_lots", "erp_stock_ledger"):
+        q = ("SELECT DISTINCT item_id, location_id FROM %s"
+             " WHERE lot_code = ?" % tbl)
+        args = [lot_code]
+        if location_id:
+            q += " AND location_id = ?"
+            args.append(location_id)
+        cands += [(r["item_id"], r["location_id"]) for r in
+                  conn.execute(q, args).fetchall()]
+    uniq = sorted(set(cands))
+    if not uniq:
+        if location_id:
+            return None, "lot %s not found at that location" % lot_code
+        return None, "lot %s not found" % lot_code
+    if len(uniq) > 1 and not location_id:
+        return None, ("lot %s exists at multiple locations —"
+                      " specify location_id" % lot_code)
+    if location_id:
+        pick = [c for c in uniq if c[1] == location_id]
+        if not pick:
+            return None, "lot %s not found at that location" % lot_code
+        return pick[0], None
+    return uniq[0], None
+
+
+def _erp_qc_hold_dict(conn, h):
+    d = dict(h)
+    item = _erp_get_item(conn, h["item_id"])
+    d["item_sku"] = item["sku"] if item else ""
+    d["item_name"] = item["name"] if item else ""
+    loc = _erp_get_location(conn, h["location_id"])
+    d["location_code"] = loc["code"] if loc else ""
+    d["is_active"] = not h["released_at"]
+    return d
+
+
+@app.post("/api/erp/lots/hold")
+def erp_lot_hold():
+    actor, err = _erp_check_perm("inventory.adjust")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    lot_code = (data.get("lot_code") or "").strip()
+    if not lot_code:
+        return jsonify(error="lot_code is required"), 400
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        return jsonify(error="a reason is required to hold a lot"), 400
+    if len(reason) > 500:
+        return jsonify(error="reason must be 500 characters or fewer"), 400
+    try:
+        location_id = int(data["location_id"]) if data.get("location_id") else None
+    except (TypeError, ValueError):
+        return jsonify(error="location_id must be a number"), 400
+    conn = db()
+    resolved, rerr = _erp_resolve_lot(conn, lot_code, location_id)
+    if rerr:
+        conn.close()
+        return jsonify(error=rerr), 404 if "not found" in rerr else 400
+    item_id, location_id = resolved
+    if _erp_active_qc_hold(conn, lot_code, location_id):
+        conn.close()
+        return jsonify(error="lot %s is already on QC hold" % lot_code), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_qc_holds (lot_code, item_id, location_id, reason,"
+        " held_by, held_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (lot_code, item_id, location_id, reason, actor, now))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_qc_holds WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    out = _erp_qc_hold_dict(conn, row)
+    conn.close()
+    return jsonify(hold=out), 201
+
+
+@app.post("/api/erp/lots/release")
+def erp_lot_release():
+    actor, err = _erp_check_perm("inventory.adjust")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    lot_code = (data.get("lot_code") or "").strip()
+    if not lot_code:
+        return jsonify(error="lot_code is required"), 400
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        return jsonify(error="a reason is required to release a lot"), 400
+    if len(reason) > 500:
+        return jsonify(error="reason must be 500 characters or fewer"), 400
+    try:
+        location_id = int(data["location_id"]) if data.get("location_id") else None
+    except (TypeError, ValueError):
+        return jsonify(error="location_id must be a number"), 400
+    conn = db()
+    resolved, rerr = _erp_resolve_lot(conn, lot_code, location_id)
+    if rerr:
+        conn.close()
+        return jsonify(error=rerr), 404 if "not found" in rerr else 400
+    _item_id, location_id = resolved
+    hold = _erp_active_qc_hold(conn, lot_code, location_id)
+    if not hold:
+        conn.close()
+        return jsonify(error="lot %s is not on QC hold" % lot_code), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_qc_holds SET released_at = ?, released_by = ?,"
+        " release_reason = ? WHERE id = ?",
+        (now, actor, reason, hold["id"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_qc_holds WHERE id = ?",
+                       (hold["id"],)).fetchone()
+    out = _erp_qc_hold_dict(conn, row)
+    conn.close()
+    return jsonify(hold=out)
+
+
+@app.get("/api/erp/qc-holds")
+def erp_list_qc_holds():
+    actor, err = _erp_check_perm("inventory.read")
+    if err:
+        return err
+    active_only = (request.args.get("active") or "").strip() == "1"
+    conn = db()
+    q = "SELECT * FROM erp_qc_holds"
+    if active_only:
+        q += " WHERE released_at = ''"
+    q += " ORDER BY (released_at = '') DESC, held_at DESC, id DESC LIMIT 100"
+    rows = conn.execute(q).fetchall()
+    out = [_erp_qc_hold_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(holds=out, count=len(out))
+
+
+@app.post("/api/erp/batches/<int:batch_id>/hold")
+def erp_batch_hold(batch_id):
+    actor, err = _erp_check_perm("batches.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        return jsonify(error="a reason is required to hold a batch"), 400
+    if len(reason) > 500:
+        return jsonify(error="reason must be 500 characters or fewer"), 400
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    if batch["status"] not in ("planned", "in_progress"):
+        conn.close()
+        return jsonify(error="only planned or in-progress batches can be held"), 400
+    if batch["qc_hold"]:
+        conn.close()
+        return jsonify(error="batch %s is already on QC hold"
+                       % batch["batch_number"]), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_production_batches SET qc_hold = 1, qc_hold_reason = ?,"
+        " qc_hold_by = ?, qc_hold_at = ?, qc_hold_released_by = '',"
+        " qc_hold_released_at = '', qc_hold_release_reason = '' WHERE id = ?",
+        (reason, actor, now, batch_id))
+    conn.commit()
+    batch = conn.execute("SELECT * FROM erp_production_batches WHERE id = ?",
+                         (batch_id,)).fetchone()
+    out = _erp_batch_dict(conn, batch)
+    conn.close()
+    return jsonify(batch=out)
+
+
+@app.post("/api/erp/batches/<int:batch_id>/release")
+def erp_batch_release(batch_id):
+    actor, err = _erp_check_perm("batches.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        return jsonify(error="a reason is required to release a batch"), 400
+    if len(reason) > 500:
+        return jsonify(error="reason must be 500 characters or fewer"), 400
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    if not batch["qc_hold"]:
+        conn.close()
+        return jsonify(error="batch %s is not on QC hold"
+                       % batch["batch_number"]), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_production_batches SET qc_hold = 0,"
+        " qc_hold_released_by = ?, qc_hold_released_at = ?,"
+        " qc_hold_release_reason = ? WHERE id = ?",
+        (actor, now, reason, batch_id))
+    conn.commit()
+    batch = conn.execute("SELECT * FROM erp_production_batches WHERE id = ?",
+                         (batch_id,)).fetchone()
+    out = _erp_batch_dict(conn, batch)
+    conn.close()
+    return jsonify(batch=out)
+
+
+@app.get("/api/erp/production/yield-trend")
+def erp_production_yield_trend():
+    """Yield / waste trending over completed batches.
+
+    Yield % per batch = actual_qty_bags / planned_qty_bags. Averages are
+    bag-weighted (total actual / total planned) so a 100-bag batch counts
+    more than a 10-bag one. Grouped by recipe and by week (Monday start,
+    from completed_at). ?weeks=N limits to the most recent N weeks
+    (default 12, 1-52); ?recipe_id= filters to one recipe.
+    Returns overall average yield + worst-yield recipes so the trend is
+    actionable. Only completed batches have a yield."""
+    actor, err = _erp_check_perm("batches.read")
+    if err:
+        return err
+    try:
+        weeks = int(request.args.get("weeks") or 12)
+    except (TypeError, ValueError):
+        return jsonify(error="weeks must be a number"), 400
+    weeks = max(1, min(52, weeks))
+    recipe_id = request.args.get("recipe_id")
+    try:
+        recipe_id = int(recipe_id) if recipe_id else None
+    except (TypeError, ValueError):
+        return jsonify(error="recipe_id must be a number"), 400
+    conn = db()
+    if recipe_id:
+        recipe = _erp_get_recipe(conn, recipe_id)
+        if not recipe:
+            conn.close()
+            return jsonify(error="recipe not found"), 404
+    rows = conn.execute(
+        "SELECT b.*, r.name AS recipe_name FROM erp_production_batches b"
+        " LEFT JOIN erp_recipes r ON r.id = b.recipe_id"
+        " WHERE b.status = 'completed'"
+        + (" AND b.recipe_id = ?" if recipe_id else "")
+        + " ORDER BY b.completed_at",
+        (recipe_id,) if recipe_id else ()).fetchall()
+    conn.close()
+
+    def _avg(planned, actual):
+        if planned <= 0:
+            return None
+        return round(actual / planned * 100, 1)
+
+    def _summarize(group_rows):
+        planned = sum(float(r["planned_qty_bags"] or 0) for r in group_rows)
+        actual = sum(float(r["actual_qty_bags"] or 0) for r in group_rows)
+        waste = sum(float(r["waste_qty_bags"] or 0) for r in group_rows)
+        yields = [_erp_batch_yield_pct(r) for r in group_rows]
+        yields = [y for y in yields if y is not None]
+        return {
+            "batches": len(group_rows),
+            "total_planned_bags": planned,
+            "total_actual_bags": actual,
+            "total_waste_bags": waste,
+            "avg_yield_pct": _avg(planned, actual),
+            "worst_yield_pct": min(yields) if yields else None,
+            "best_yield_pct": max(yields) if yields else None,
+        }
+
+    by_recipe_map = {}
+    by_week_map = {}
+    for r in rows:
+        key = (r["recipe_id"], r["recipe_name"] or "")
+        by_recipe_map.setdefault(key, []).append(r)
+        try:
+            day = datetime.strptime(
+                (r["completed_at"] or "")[:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        monday = day - timedelta(days=day.weekday())
+        by_week_map.setdefault(monday.isoformat(), []).append(r)
+    by_recipe = []
+    for (rid, rname), grows in sorted(by_recipe_map.items(),
+                                      key=lambda kv: kv[0][1].lower()):
+        s = _summarize(grows)
+        s.update({"recipe_id": rid, "recipe_name": rname})
+        by_recipe.append(s)
+    by_recipe_sorted = sorted(
+        by_recipe,
+        key=lambda s: (s["avg_yield_pct"] is None, s["avg_yield_pct"]))
+    by_week = []
+    for monday, wrows in sorted(by_week_map.items()):
+        s = _summarize(wrows)
+        s.update({"week_start": monday})
+        by_week.append(s)
+    by_week = by_week[-weeks:]
+    overall = _summarize(rows)
+    return jsonify(
+        yield_definition="yield % per batch = actual_qty_bags /"
+                         " planned_qty_bags; averages are bag-weighted"
+                         " (total actual / total planned) over completed"
+                         " batches only",
+        overall=overall,
+        by_recipe=by_recipe,
+        worst_recipes=by_recipe_sorted[:5],
+        by_week=by_week)
+
+
+# ---------------- Prod9 Wave 3: MRP + make-to-stock + scheduling ----
+# DELIBERATE REVERSAL (item 3): made-to-order was the Oct 16 call; this
+# wave adds shelf stock for finished popcorn (POP-* items), which chains
+# expect. Batches with no order link are stock production: completing one
+# posts a finished-goods receipt (see erp_batch_complete). Nothing here
+# changes made-to-order behavior for batches that carry an order ref.
+
+def _erp_parse_sched_date(value):
+    """Parse a scheduled date: 'YYYY-MM-DD' -> itself, '' -> '' (unscheduled),
+    anything else -> None (invalid)."""
+    s = value if isinstance(value, str) else str(value or "")
+    s = s.strip()
+    if not s:
+        return ""
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+    return s
+
+
+_ERP_PROD_CAPACITY_DEFAULTS = {"max_batches_per_day": 4,
+                               "max_labor_hours_per_day": 8}
+
+
+def _erp_prod_capacity(conn):
+    """Daily capacity: {max_batches_per_day, max_labor_hours_per_day}.
+    Stored in erp_production_settings; missing keys fall back to defaults."""
+    out = dict(_ERP_PROD_CAPACITY_DEFAULTS)
+    for r in conn.execute(
+            "SELECT key, value FROM erp_production_settings"
+            " WHERE key IN ('max_batches_per_day', 'max_labor_hours_per_day')").fetchall():
+        try:
+            v = float(r["value"])
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            out[r["key"]] = int(v) if v == int(v) else v
+    return out
+
+
+def _erp_mrp_row(conn, frow, recipe, plan, target_bags):
+    """One MRP row: forecast demand vs finished-goods stock vs planned
+    batches. net_required = max(0, projection - on_hand - planned);
+    suggested batches round up to whole batches of the recipe's size."""
+    flavor = (_erp_recipe_flavor_name(recipe["name"]) if recipe
+              else frow["flavor"])
+    velocity = float(frow["velocity_4w"]) if frow else 0.0
+    projection = float(frow["projection_4w"]) if frow else 0.0
+    batch_size = float(recipe["batch_size_bags"]) if recipe else 0.0
+    fg = _erp_recipe_finished_item(conn, recipe) if recipe else None
+    on_hand = _erp_on_hand(conn, fg["id"]) if fg else 0.0
+    planned_bags = float((plan or {}).get("bags") or 0)
+    planned_batches = int((plan or {}).get("count") or 0)
+    net = max(0.0, projection - on_hand - planned_bags)
+    suggested = 0
+    if recipe and batch_size > 0 and net > 0:
+        suggested = int(net // batch_size)
+        if net - suggested * batch_size > 1e-9:
+            suggested += 1
+    return {"flavor": flavor, "category": frow["category"] if frow else "",
+            "recipe_id": recipe["id"] if recipe else None,
+            "recipe_name": recipe["name"] if recipe else "",
+            "recipe_version": recipe["version"] if recipe else None,
+            "batch_size_bags": batch_size,
+            "velocity_4w": velocity, "projection_4w": projection,
+            "on_hand_bags": round(on_hand, 2),
+            "planned_bags": planned_bags, "planned_batches": planned_batches,
+            "net_required_bags": round(net, 1),
+            "suggested_batches": suggested,
+            "suggested_bags": round(suggested * batch_size, 1),
+            "target_bags": target_bags,
+            "below_target": bool(target_bags > 0
+                                 and on_hand + planned_bags < target_bags),
+            "has_finished_goods_item": fg is not None,
+            "finished_goods_sku": fg["sku"] if fg else "",
+            "has_recipe": recipe is not None}
+
+
+def _erp_mrp(conn):
+    """MRP over the shared forecast (_erp_forecast_flavors — same velocity
+    and projection the Reports forecast shows). One row per flavor (catalog
+    flavors first, then any active recipe whose flavor is not in the
+    catalog), plus BOM-exploded ingredient needs for the suggested batches
+    and the shortfall list. No purchase order is created or suggested here:
+    purchase orders carry popcorn lines only, so ingredient shortfalls are
+    a list only."""
+    fc = _erp_forecast_flavors(conn)
+    recipes = conn.execute(
+        "SELECT * FROM erp_recipes WHERE active = 1 ORDER BY name").fetchall()
+    planned = {}
+    for b in conn.execute(
+            "SELECT * FROM erp_production_batches"
+            " WHERE status IN ('planned', 'in_progress')").fetchall():
+        slot = planned.setdefault(b["recipe_id"], {"bags": 0.0, "count": 0})
+        slot["bags"] += float(b["planned_qty_bags"] or 0)
+        slot["count"] += 1
+    targets = {}
+    for t in conn.execute("SELECT * FROM erp_stock_targets").fetchall():
+        targets.setdefault(int(t["recipe_id"]), []).append(t)
+
+    def _target_bags(rid):
+        rows = targets.get(rid) or []
+        for t in rows:
+            if int(t["location_id"] or 0) == 0:
+                return float(t["target_bags"] or 0)
+        return float(rows[0]["target_bags"] or 0) if rows else 0.0
+
+    rows = []
+    used_recipe_ids = set()
+    for f in fc["flavors"]:
+        key = _erp_flavor_key(f["flavor"])
+        recipe = None
+        for r in recipes:
+            if _erp_flavor_key(_erp_recipe_flavor_name(r["name"])) == key:
+                recipe = r
+                break
+        rows.append(_erp_mrp_row(conn, f, recipe,
+                                 planned.get(recipe["id"]) if recipe else None,
+                                 _target_bags(recipe["id"]) if recipe else 0.0))
+        if recipe:
+            used_recipe_ids.add(recipe["id"])
+    for r in recipes:
+        if r["id"] in used_recipe_ids:
+            continue
+        rows.append(_erp_mrp_row(conn, None, r, planned.get(r["id"]),
+                                 _target_bags(r["id"])))
+    needs = {}
+    for row in rows:
+        if not row["suggested_batches"] or not row["recipe_id"]:
+            continue
+        for ln in _erp_recipe_lines(conn, row["recipe_id"],
+                                    row["recipe_version"]):
+            need = float(ln["qty_per_batch"]) * row["suggested_batches"]
+            e = needs.setdefault(ln["item_id"],
+                                 {"item_id": ln["item_id"], "sku": ln["sku"],
+                                  "item_name": ln["item_name"],
+                                  "unit": ln["unit"], "needed": 0.0})
+            e["needed"] += need
+    ing_needs = []
+    shortfalls = []
+    for e in sorted(needs.values(), key=lambda x: x["sku"]):
+        on_hand = _erp_on_hand(conn, e["item_id"])
+        e["needed"] = round(e["needed"], 2)
+        e["on_hand"] = round(on_hand, 2)
+        e["short"] = round(max(0.0, e["needed"] - on_hand), 2)
+        ing_needs.append(e)
+        if e["short"] > 0:
+            shortfalls.append(dict(e))
+    return {"flavors": rows, "ingredient_needs": ing_needs,
+            "shortfalls": shortfalls, "window_start": fc["window_start"],
+            "window_end": fc["window_end"],
+            "generated_on": fc["generated_on"]}
+
+
+def _erp_stock_target_dict(conn, t):
+    d = dict(t)
+    recipe = _erp_get_recipe(conn, t["recipe_id"])
+    d["recipe_name"] = recipe["name"] if recipe else ""
+    d["flavor"] = (_erp_recipe_flavor_name(recipe["name"]) if recipe else "")
+    fg = _erp_recipe_finished_item(conn, recipe) if recipe else None
+    d["finished_goods_sku"] = fg["sku"] if fg else ""
+    d["has_finished_goods_item"] = fg is not None
+    if fg:
+        loc = int(t["location_id"] or 0)
+        d["on_hand_bags"] = _erp_on_hand(
+            conn, fg["id"], loc if loc else None)
+    else:
+        d["on_hand_bags"] = 0.0
+    d["below_target"] = bool(
+        float(t["target_bags"] or 0) > 0
+        and d["on_hand_bags"] < float(t["target_bags"] or 0))
+    return d
+
+
+@app.get("/api/erp/production/mrp")
+def erp_production_mrp():
+    """Demand forecast / MRP: per-flavor projected demand (next 4 weeks,
+    from the shared forecast), finished-goods on hand, already-planned
+    batches, net required production, suggested batches, and BOM-exploded
+    ingredient needs with on-hand vs needed. No purchase order is created
+    or suggested for ingredient shortfalls (popcorn-only PO rule)."""
+    actor, err = _erp_check_perm("batches.read")
+    if err:
+        return err
+    conn = db()
+    data = _erp_mrp(conn)
+    conn.close()
+    data["note"] = (
+        "Net required = projected 4-week demand - finished-goods on hand"
+        " - already-planned batches (floored at 0); suggested batches round"
+        " up to whole batches of the recipe's batch size. Ingredient needs"
+        " explode the BOM for the suggested batches only. Shortfalls are a"
+        " list only: purchase orders carry popcorn lines only, so the MRP"
+        " never creates or suggests ingredient purchase orders.")
+    return jsonify(data)
+
+
+@app.get("/api/erp/production/stock-targets")
+def erp_production_stock_targets():
+    """Per-recipe finished-goods stock targets vs on hand (all locations
+    unless a target row carries a location). Recipes without a target row
+    report target 0."""
+    actor, err = _erp_check_perm("batches.read")
+    if err:
+        return err
+    conn = db()
+    rows = []
+    for r in conn.execute(
+            "SELECT * FROM erp_recipes WHERE active = 1 ORDER BY name").fetchall():
+        t = conn.execute(
+            "SELECT * FROM erp_stock_targets WHERE recipe_id = ?"
+            " ORDER BY location_id LIMIT 1", (r["id"],)).fetchone()
+        if t is None:
+            t = {"id": None, "recipe_id": r["id"], "location_id": 0,
+                 "target_bags": 0, "updated_by": "", "updated_at": ""}
+        rows.append(_erp_stock_target_dict(conn, t))
+    conn.close()
+    return jsonify(stock_targets=rows)
+
+
+@app.put("/api/erp/production/stock-targets")
+def erp_production_stock_target_put():
+    """Set a finished-goods stock target for one recipe (upsert)."""
+    actor, err = _erp_check_perm("batches.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    recipe = _erp_get_recipe(conn, data.get("recipe_id"))
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    try:
+        target = float(data.get("target_bags"))
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="target_bags must be a number"), 400
+    if target < 0:
+        conn.close()
+        return jsonify(error="target_bags cannot be negative"), 400
+    try:
+        loc_id = int(data.get("location_id") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="location_id must be a number"), 400
+    if loc_id and not _erp_get_location(conn, loc_id):
+        conn.close()
+        return jsonify(error="location not found"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    existing = conn.execute(
+        "SELECT * FROM erp_stock_targets WHERE recipe_id = ? AND location_id = ?",
+        (recipe["id"], loc_id)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE erp_stock_targets SET target_bags = ?, updated_by = ?,"
+            " updated_at = ? WHERE id = ?",
+            (target, actor, now, existing["id"]))
+        tid = existing["id"]
+    else:
+        cur = conn.execute(
+            "INSERT INTO erp_stock_targets (recipe_id, location_id, target_bags,"
+            " updated_by, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (recipe["id"], loc_id, target, actor, now))
+        tid = cur.lastrowid
+    conn.commit()
+    t = conn.execute("SELECT * FROM erp_stock_targets WHERE id = ?",
+                     (tid,)).fetchone()
+    out = _erp_stock_target_dict(conn, t)
+    conn.close()
+    return jsonify(stock_target=out)
+
+
+@app.get("/api/erp/production/capacity")
+def erp_production_capacity():
+    """Daily production capacity (max batches/day + max labor hours/day)."""
+    actor, err = _erp_check_perm("batches.read")
+    if err:
+        return err
+    conn = db()
+    cap = _erp_prod_capacity(conn)
+    conn.close()
+    return jsonify(capacity=cap)
+
+
+@app.put("/api/erp/production/capacity")
+def erp_production_capacity_put():
+    """Set daily production capacity. Either key may be given; each given
+    value must be a number > 0 (batches must be whole)."""
+    actor, err = _erp_check_perm("batches.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    updates = {}
+    if "max_batches_per_day" in data:
+        try:
+            v = float(data.get("max_batches_per_day"))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="max_batches_per_day must be a number"), 400
+        if v <= 0 or v != int(v):
+            conn.close()
+            return jsonify(
+                error="max_batches_per_day must be a whole number above zero"), 400
+        updates["max_batches_per_day"] = str(int(v))
+    if "max_labor_hours_per_day" in data:
+        try:
+            v = float(data.get("max_labor_hours_per_day"))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="max_labor_hours_per_day must be a number"), 400
+        if v <= 0:
+            conn.close()
+            return jsonify(
+                error="max_labor_hours_per_day must be above zero"), 400
+        updates["max_labor_hours_per_day"] = str(v)
+    if not updates:
+        conn.close()
+        return jsonify(error="max_batches_per_day or max_labor_hours_per_day"
+                       " is required"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    for k, v in updates.items():
+        conn.execute(
+            "INSERT INTO erp_production_settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (k, v))
+    conn.commit()
+    cap = _erp_prod_capacity(conn)
+    conn.close()
+    return jsonify(capacity=cap)
+
+
+@app.get("/api/erp/production/calendar")
+def erp_production_calendar():
+    """Production calendar: planned + in-progress batches grouped by
+    scheduled date, with per-day batch count + labor hours and an
+    over-capacity flag. ?from=/?to= default to today..today+13.
+    Batches with no scheduled date list under 'unscheduled'."""
+    actor, err = _erp_check_perm("batches.read")
+    if err:
+        return err
+    today = datetime.now(timezone.utc).date()
+    from_s = (request.args.get("from") or "").strip() or today.isoformat()
+    to_s = (request.args.get("to") or "").strip() or (
+        today + timedelta(days=13)).isoformat()
+    try:
+        from_d = datetime.strptime(from_s, "%Y-%m-%d").date()
+        to_d = datetime.strptime(to_s, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    if to_d < from_d:
+        return jsonify(error="to must not be before from"), 400
+    conn = db()
+    cap = _erp_prod_capacity(conn)
+    rows = conn.execute(
+        "SELECT * FROM erp_production_batches"
+        " WHERE status IN ('planned', 'in_progress')"
+        " ORDER BY scheduled_date, id").fetchall()
+    by_date = {}
+    unscheduled = []
+    for b in rows:
+        d = _erp_batch_dict(conn, b)
+        sched = (b["scheduled_date"] or "").strip()
+        if not sched:
+            unscheduled.append(d)
+        elif from_s <= sched <= to_s:
+            by_date.setdefault(sched, []).append(d)
+    days = []
+    cur = from_d
+    while cur <= to_d:
+        ds = cur.isoformat()
+        day_batches = by_date.get(ds, [])
+        hours = round(sum(float(b["labor_minutes"] or 0) for b in day_batches) / 60.0, 2)
+        over_batches = len(day_batches) > int(cap["max_batches_per_day"])
+        over_hours = hours > float(cap["max_labor_hours_per_day"])
+        days.append({"date": ds, "batches": day_batches,
+                     "batch_count": len(day_batches),
+                     "labor_hours": hours,
+                     "over_capacity": bool(over_batches or over_hours),
+                     "over_batches": over_batches,
+                     "over_hours": over_hours})
+        cur += timedelta(days=1)
+    conn.close()
+    return jsonify({"from": from_s, "to": to_s, "capacity": cap,
+                    "days": days, "unscheduled": unscheduled})
+
+
+@app.post("/api/erp/batches/<int:batch_id>/schedule")
+def erp_batch_schedule(batch_id):
+    """Reschedule a planned batch (set/clear its scheduled date). Only
+    planned batches can be rescheduled; '' clears the date (unscheduled)."""
+    actor, err = _erp_check_perm("batches.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    batch = _erp_get_batch(conn, batch_id)
+    if not batch:
+        conn.close()
+        return jsonify(error="batch not found"), 404
+    if batch["status"] != "planned":
+        conn.close()
+        return jsonify(error="only planned batches can be rescheduled"), 400
+    if "scheduled_date" not in data:
+        conn.close()
+        return jsonify(error="scheduled_date is required"), 400
+    sched = _erp_parse_sched_date(data.get("scheduled_date"))
+    if sched is None:
+        conn.close()
+        return jsonify(error="scheduled_date must be YYYY-MM-DD"), 400
+    conn.execute("UPDATE erp_production_batches SET scheduled_date = ?"
+                 " WHERE id = ?", (sched, batch_id))
+    conn.commit()
+    batch = conn.execute("SELECT * FROM erp_production_batches WHERE id = ?",
+                         (batch_id,)).fetchone()
+    out = _erp_batch_dict(conn, batch)
+    conn.close()
+    return jsonify(batch=out)
 
 
 # ---------------- ERP Phase 3: Order hub + wholesale CRM ----------------
@@ -14344,6 +32733,30 @@ def _erp_set_fulfillment(conn, source, order_id, status, actor, note=""):
     if source == "wholesale":
         conn.execute("UPDATE erp_wholesale_orders SET status = ? WHERE id = ?",
                      (status, order_id))
+        if status in ("shipped", "picked_up"):
+            # Dept 9: auto-post the delivered wholesale order (AR invoice).
+            # A posting failure must never roll back the status change, so
+            # it runs inside a savepoint; the failure is audited and the
+            # backfill control retries it.
+            try:
+                conn.execute("SAVEPOINT acct_sale_post")
+                _inv_id, _st, _err = _acct_post_wholesale_sale(
+                    conn, "system", order_id)
+                if _err:
+                    raise RuntimeError(_err)
+                conn.execute("RELEASE SAVEPOINT acct_sale_post")
+            except Exception as _e:
+                try:
+                    conn.execute("ROLLBACK TO SAVEPOINT acct_sale_post")
+                    conn.execute("RELEASE SAVEPOINT acct_sale_post")
+                except Exception:
+                    pass
+                try:
+                    _acct_audit(conn, "system", "sale.post_failed",
+                                "sale_post", 0,
+                                "wholesale:%d %s" % (order_id, _e))
+                except Exception:
+                    pass
     return None
 
 
@@ -15025,6 +33438,9 @@ def erp_import_wholesale_accounts():
             " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
             (r["name"], r["contact_name"], r["email"], r["phone"], r["address"],
              r["price_per_bag_cents"], r["payment_terms"], r["notes"], actor, now))
+    _erp_settings_audit(conn, actor, "import.wholesale_accounts",
+                        "wholesale_accounts", 0,
+                        "Imported %d wholesale account(s) from CSV" % len(rows))
     conn.commit()
     conn.close()
     return jsonify(imported=len(rows))
@@ -15059,15 +33475,492 @@ _ERP_RESET_TABLES = [
     "erp_lots",
     "erp_items",
     "erp_locations",
+    "erp_stores",
+    "erp_store_transfers",
+    "erp_store_sales",
+    "erp_store_zreports",
+    "erp_store_shifts",
+    "erp_store_timeclock",
+    "erp_store_maintenance",
+    "erp_store_voids",
+    "erp_store_cash_audits",
+    "erp_store_planograms",
+    "erp_store_drawers",
+    "erp_store_lp_flags",
+    "erp_store_pm_schedules",
     "erp_vendors",
     "erp_edi_documents",
     "erp_edi_partners",
     "erp_qb_links",
     "erp_qb_oauth",
     "erp_qb_config",
+    "erp_company_profile",
     "erp_sales_summaries",
     "erp_flavor_categories",
 ]
+# PERMANENCE RULE (Phase 4, section 1.6): _ERP_RESET_TABLES must contain
+# zero erp_acct_* tables. Accounting data -- journal, invoices, bills,
+# payroll, tax filings, audit log -- is KEPT by a reset; erp_qb_links
+# stays (bridge idempotency map, not accounting data) while
+# erp_acct_migration_links is never in this list. There is no accounting
+# wipe endpoint.
+assert not any(t.startswith("erp_acct_") for t in _ERP_RESET_TABLES), \
+    "_ERP_RESET_TABLES must not contain accounting tables"
+# Wave B: the Settings audit log must survive a wipe -- the pre-wipe row
+# is the only record that a wipe was requested (Wave C depends on it).
+assert "erp_settings_audit" not in _ERP_RESET_TABLES, \
+    "erp_settings_audit must survive the reset (wipe audit rows)"
+# Dept 11: the staff audit log survives a wipe too -- the staff rows
+# themselves are never wiped, so the record of who changed them must
+# not be wiped either.
+assert "erp_staff_audit" not in _ERP_RESET_TABLES, \
+    "erp_staff_audit must survive the reset (staff audit rows)"
+# HR Wave A: HR employee records and onboarding items are people
+# records like the staff rows -- a wipe must never erase them.
+assert "erp_hr_employees" not in _ERP_RESET_TABLES, \
+    "erp_hr_employees must survive the reset (HR records)"
+assert "erp_hr_onboarding" not in _ERP_RESET_TABLES, \
+    "erp_hr_onboarding must survive the reset (onboarding items)"
+# HR Wave B: events, roster links and time records are people records
+# like the Wave A tables -- a wipe must never erase them.
+assert "erp_hr_events" not in _ERP_RESET_TABLES, \
+    "erp_hr_events must survive the reset (HR events)"
+assert "erp_hr_event_staff" not in _ERP_RESET_TABLES, \
+    "erp_hr_event_staff must survive the reset (HR roster)"
+assert "erp_hr_time_records" not in _ERP_RESET_TABLES, \
+    "erp_hr_time_records must survive the reset (HR time records)"
+# Dept 13 (Quality & Food Safety) Wave A: the recall plan, drill log,
+# supplier COAs and HACCP records are food-safety records -- a wipe must
+# never erase them.
+assert "erp_quality_recall_plan" not in _ERP_RESET_TABLES, \
+    "erp_quality_recall_plan must survive the reset (recall plan)"
+assert "erp_quality_recall_drills" not in _ERP_RESET_TABLES, \
+    "erp_quality_recall_drills must survive the reset (recall drills)"
+assert "erp_quality_coas" not in _ERP_RESET_TABLES, \
+    "erp_quality_coas must survive the reset (supplier COAs)"
+assert "erp_quality_haccp" not in _ERP_RESET_TABLES, \
+    "erp_quality_haccp must survive the reset (HACCP plan)"
+# Dept 14 (Legal & Compliance) Wave B: the IP register, agreements
+# register and compliance calendar are legal records -- a wipe must
+# never erase them.
+assert "erp_legal_ip" not in _ERP_RESET_TABLES, \
+    "erp_legal_ip must survive the reset (IP register)"
+assert "erp_legal_agreements" not in _ERP_RESET_TABLES, \
+    "erp_legal_agreements must survive the reset (agreements register)"
+assert "erp_legal_compliance" not in _ERP_RESET_TABLES, \
+    "erp_legal_compliance must survive the reset (compliance calendar)"
+# Additions Wave C: lease schedules, quality checklists + templates,
+# HR benefits + onboarding templates are registers/people records --
+# a wipe must never erase them.
+assert "erp_legal_lease_schedules" not in _ERP_RESET_TABLES, \
+    "erp_legal_lease_schedules must survive the reset (lease schedules)"
+assert "erp_quality_checklist_templates" not in _ERP_RESET_TABLES, \
+    "erp_quality_checklist_templates must survive the reset (checklist templates)"
+assert "erp_quality_checklists" not in _ERP_RESET_TABLES, \
+    "erp_quality_checklists must survive the reset (checklist completions)"
+assert "erp_hr_benefits" not in _ERP_RESET_TABLES, \
+    "erp_hr_benefits must survive the reset (HR benefits)"
+assert "erp_hr_onboarding_templates" not in _ERP_RESET_TABLES, \
+    "erp_hr_onboarding_templates must survive the reset (onboarding templates)"
+# Wave C: wipe-export tokens and deletion tombstones survive a wipe too.
+# A wipe must not erase which export authorized it, and a restore of a
+# pre-wipe export must still skip rows the user deliberately deleted.
+assert "erp_wipe_exports" not in _ERP_RESET_TABLES, \
+    "erp_wipe_exports must survive the reset (wipe authorization record)"
+assert "erp_deleted_keys" not in _ERP_RESET_TABLES, \
+    "erp_deleted_keys must survive the reset (deleted stays deleted)"
+
+
+
+# ---------------- Dept 10 Settings Wave C (items 5 + 6) ----------------
+# Full data export + import, and the wipe pre-export gate.
+#
+# WIPE-GATE MECHANISM (chosen): one-time, latest-only token. Every full
+# export mints a token; generating a newer export invalidates older
+# unconsumed tokens, and a successful wipe consumes its token and
+# invalidates every other outstanding token. So a stale export -- from a
+# previous wipe, or superseded by a newer export -- can never authorize a
+# later wipe. The token is NOT the backup itself: step 1 of the wipe flow
+# downloads the export file, step 2 confirms the download, step 3 wipes
+# with the token from that export.
+# IMPORT RULES: the whole file is validated before anything is written
+# (any bad row -> 400, zero writes); re-import is idempotent (rows are
+# matched by id / natural key and skipped when already present); accounting
+# tables (erp_acct_*) are never written -- export rows for them are
+# reported as skipped; tombstoned / inactive rows are never resurrected;
+# purchase-order lines must reference popcorn items only.
+
+_ERP_EXPORT_FORMAT = "pop-a-licious-erp-export"
+_ERP_EXPORT_VERSION = 1
+# Natural key per table, used for tombstone / inactive checks on import.
+_ERP_IMPORT_NATURAL_KEY = {
+    "erp_items": "sku",
+    "erp_locations": "code",
+    "erp_wholesale_accounts": "name",
+    "erp_recipes": "name",
+    "erp_vendors": "name",
+}
+_ERP_IMPORT_TOMBSTONE_KIND = {
+    "erp_items": "item",
+    "erp_locations": "location",
+    "erp_wholesale_accounts": "wholesale_account",
+    "erp_recipes": "recipe",
+}
+
+
+class _ErpImportError(Exception):
+    pass
+
+
+def _erp_build_export(conn, actor):
+    """Full ERP dump: every erp_* table except erp_wipe_exports (tokens
+    must never travel inside a downloadable file). Covers everything the
+    wipe deletes, plus accounting data, plus the Settings audit log."""
+    names = [r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+        " AND substr(name, 1, 4) = 'erp_' ORDER BY name").fetchall()]
+    tables = {}
+    for name in names:
+        if name == "erp_wipe_exports":
+            continue
+        tables[name] = [dict(r) for r in conn.execute(
+            "SELECT * FROM %s" % name).fetchall()]
+    total = sum(len(rows) for rows in tables.values())
+    export = {
+        "format": _ERP_EXPORT_FORMAT,
+        "version": _ERP_EXPORT_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "exported_by": actor,
+        "tables": tables,
+    }
+    return export, total
+
+
+def _erp_new_wipe_token(conn, actor, row_counts):
+    """Mint the token for a fresh export; invalidate older unconsumed ones
+    so only the latest export can authorize a wipe."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_wipe_exports SET invalidated_at = ?"
+        " WHERE consumed_at = '' AND invalidated_at = ''", (now,))
+    token = secrets.token_urlsafe(32)
+    cur = conn.execute(
+        "INSERT INTO erp_wipe_exports (token, actor, created_at, row_counts)"
+        " VALUES (?, ?, ?, ?)",
+        (token, actor, now, json.dumps(row_counts)))
+    return token, cur.lastrowid
+
+
+@app.post("/api/erp/settings/export")
+def erp_settings_export():
+    """Generate + return the full data export (JSON) and the one-time wipe
+    token for this export. Admin-only. The download itself happens in the
+    browser from the returned JSON; the audit row records the generation."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    export, total = _erp_build_export(conn, actor)
+    counts = {t: len(rows) for t, rows in export["tables"].items()}
+    token, token_id = _erp_new_wipe_token(conn, actor, counts)
+    _erp_settings_audit(
+        conn, actor, "settings.export.generated", "settings", 0,
+        "Full data export generated: %d rows across %d tables (export #%d)"
+        % (total, len(counts), token_id))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, export=export, wipe_token=token,
+                   tables=len(counts), rows=total)
+
+
+def _erp_import_seed_csv(conn, actor, text):
+    """Opening balances in the POST /api/erp/seed format
+    (sku,location_code,qty,lot_code,expiry_date,unit_cost_cents), via CSV
+    text. Validates the whole file first; idempotent -- a row already
+    seeded as an opening_balance movement for the same item/location/qty
+    is skipped instead of double-posted."""
+    import csv
+    import io
+    if not (text or "").strip():
+        raise _ErpImportError("csv text is required")
+    reader = csv.DictReader(io.StringIO(text))
+    plan = []
+    for n, raw in enumerate(reader, 2):
+        row = {(k or "").strip(): (v or "").strip()
+               for k, v in raw.items()}
+        item = conn.execute("SELECT * FROM erp_items WHERE sku = ?",
+                            (row.get("sku") or "",)).fetchone()
+        if not item or not item["active"]:
+            raise _ErpImportError("row %d: unknown sku '%s'"
+                                  % (n, row.get("sku")))
+        loc = _erp_get_location_by_code(conn, row.get("location_code"))
+        if not loc or not loc["active"]:
+            raise _ErpImportError("row %d: unknown location_code '%s'"
+                                  % (n, row.get("location_code")))
+        try:
+            qty = float(row.get("qty") or 0)
+        except (TypeError, ValueError):
+            raise _ErpImportError("row %d: qty must be a number" % n)
+        if qty <= 0:
+            raise _ErpImportError("row %d: qty must be greater than zero" % n)
+        try:
+            cost = int(row.get("unit_cost_cents") or 0)
+        except (TypeError, ValueError):
+            cost = 0
+        plan.append((item, loc, qty, row.get("lot_code") or "",
+                     row.get("expiry_date") or "", cost))
+    if not plan:
+        raise _ErpImportError("no seed rows found")
+    today = datetime.now(timezone.utc).date().isoformat()
+    imported = 0
+    skipped = 0
+    for item, loc, qty, lot_code, expiry_date, cost in plan:
+        already = conn.execute(
+            "SELECT 1 FROM erp_stock_ledger WHERE movement_type = 'opening_balance'"
+            " AND item_id = ? AND location_id = ? AND qty_change = ? LIMIT 1",
+            (item["id"], loc["id"], qty)).fetchone()
+        if already:
+            skipped += 1
+            continue
+        if cost > 0:
+            new_avg = _erp_new_avg_cost(conn, item["id"], qty, cost)
+        else:
+            new_avg = None
+        _erp_post_movement(conn, item["id"], loc["id"], qty,
+                           "opening_balance", actor, unit_cost_cents=cost,
+                           lot_code=lot_code, note="Opening balance seed")
+        if new_avg is not None:
+            conn.execute("UPDATE erp_items SET avg_cost_cents = ? WHERE id = ?",
+                         (new_avg, item["id"]))
+        if lot_code or expiry_date:
+            conn.execute(
+                "INSERT INTO erp_lots (lot_code, item_id, supplier_lot, received_date,"
+                " expiry_date, location_id) VALUES (?, ?, '', ?, ?, ?)",
+                (lot_code, item["id"], today, expiry_date, loc["id"]))
+        imported += 1
+    return ({"format": "seed_csv", "imported": imported,
+             "skipped_existing": skipped},
+            "import.seed",
+            "Seed import: %d opening-balance row(s) imported, %d already seeded"
+            % (imported, skipped))
+
+
+def _erp_import_wholesale_csv(conn, actor, text):
+    """Bulk wholesale-account import, same columns as
+    POST /api/erp/wholesale-accounts/import (name, contact_name, email,
+    phone, address, price_per_bag_cents, payment_terms, notes). Validates
+    the whole file first; idempotent on re-import (same name -> skipped,
+    never duplicated) and never resurrects a deleted account."""
+    import csv
+    import io
+    if not (text or "").strip():
+        raise _ErpImportError("csv text is required")
+    reader = csv.DictReader(io.StringIO(text))
+    rows = []
+    for n, raw in enumerate(reader, 2):
+        row = {(k or "").strip(): (v or "").strip()
+               for k, v in raw.items()}
+        name = row.get("name") or ""
+        if not name:
+            raise _ErpImportError("row %d: name is required" % n)
+        try:
+            price = int(row.get("price_per_bag_cents") or 400)
+        except (TypeError, ValueError):
+            raise _ErpImportError("row %d: price_per_bag_cents must be a number" % n)
+        if price <= 0:
+            raise _ErpImportError("row %d: price_per_bag_cents must be > 0" % n)
+        rows.append({"name": name,
+                     "contact_name": row.get("contact_name") or "",
+                     "email": row.get("email") or "",
+                     "phone": row.get("phone") or "",
+                     "address": row.get("address") or "",
+                     "price_per_bag_cents": price,
+                     "payment_terms": row.get("payment_terms") or "",
+                     "notes": row.get("notes") or ""})
+    if not rows:
+        raise _ErpImportError("no account rows found")
+    now = datetime.now(timezone.utc).isoformat()
+    imported = 0
+    skipped_existing = 0
+    skipped_deleted = 0
+    for r in rows:
+        if _erp_is_deleted(conn, "wholesale_account", r["name"]):
+            skipped_deleted += 1
+            continue
+        exists = conn.execute(
+            "SELECT 1 FROM erp_wholesale_accounts WHERE lower(name) = lower(?)",
+            (r["name"],)).fetchone()
+        if exists:
+            skipped_existing += 1
+            continue
+        conn.execute(
+            "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
+            " price_per_bag_cents, payment_terms, notes, active, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            (r["name"], r["contact_name"], r["email"], r["phone"], r["address"],
+             r["price_per_bag_cents"], r["payment_terms"], r["notes"], actor, now))
+        imported += 1
+    return ({"format": "wholesale_csv", "imported": imported,
+             "skipped_existing": skipped_existing,
+             "skipped_deleted": skipped_deleted},
+            "import.wholesale_accounts",
+            "Imported %d wholesale account(s) from CSV (%d already present,"
+            " %d deleted, skipped)" % (imported, skipped_existing, skipped_deleted))
+
+
+def _erp_import_export_json(conn, actor, export):
+    """Restore a full export (the JSON POST /api/erp/settings/export
+    returns). Validates the whole file before writing anything: unknown
+    table/column, a non-popcorn purchase-order line, or a malformed row
+    rejects the file with zero writes. Accounting tables are skipped
+    outright (never overwritten); tombstoned or inactive rows are skipped
+    (deleted stays deleted); rows already present by id are skipped, so a
+    re-import is a no-op."""
+    if not isinstance(export, dict) or not isinstance(export.get("tables"), dict):
+        raise _ErpImportError("export must be an object with a 'tables' object")
+    if export.get("format") not in (None, _ERP_EXPORT_FORMAT):
+        raise _ErpImportError("not a Pop-A-Licious ERP export")
+    if export.get("version") not in (None, _ERP_EXPORT_VERSION):
+        raise _ErpImportError("unsupported export version: %r"
+                              % (export.get("version"),))
+    tables = export["tables"]
+    known = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+        " AND substr(name, 1, 4) = 'erp_'").fetchall()}
+    columns = {}
+    for t in known:
+        columns[t] = {r[1] for r in conn.execute(
+            "PRAGMA table_info(%s)" % t).fetchall()}
+    # ---- validate everything first; no writes in this pass ----
+    skipped_acct = sorted(t for t in tables if t.startswith("erp_acct_"))
+    skipped_tables = sorted(t for t in tables if t == "erp_wipe_exports")
+    for t, rows in tables.items():
+        if t.startswith("erp_acct_") or t == "erp_wipe_exports":
+            continue
+        if t not in known:
+            raise _ErpImportError("unknown table '%s'" % t)
+        if not isinstance(rows, list):
+            raise _ErpImportError("table '%s' must be a list of rows" % t)
+        for i, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                raise _ErpImportError("table '%s' row %d: must be an object" % (t, i))
+            bad = sorted(set(row) - columns[t])
+            if bad:
+                raise _ErpImportError("table '%s' row %d: unknown column(s) %s"
+                                      % (t, i, ", ".join(bad)))
+    # Purchase orders carry popcorn only: a PO line whose item is not a
+    # popcorn item rejects the whole file. Resolve the item type from the
+    # export's own items first, then from the live database.
+    if "erp_po_lines" in tables:
+        by_id = {}
+        for row in tables.get("erp_items") or []:
+            if isinstance(row, dict) and "id" in row:
+                by_id[row["id"]] = row.get("type")
+        for i, row in enumerate(tables["erp_po_lines"], 1):
+            if not isinstance(row, dict):
+                continue
+            itype = by_id.get(row.get("item_id"))
+            if itype is None:
+                live = conn.execute("SELECT type FROM erp_items WHERE id = ?",
+                                    (row.get("item_id"),)).fetchone()
+                itype = live["type"] if live else None
+            if itype is None:
+                raise _ErpImportError(
+                    "erp_po_lines row %d: unknown item_id %r" % (i, row.get("item_id")))
+            if itype != "popcorn":
+                raise _ErpImportError(
+                    "erp_po_lines row %d: only popcorn can be added to a purchase"
+                    " order (item type is '%s')" % (i, itype))
+    # ---- write pass: tombstones first, so they apply to this file too ----
+    imported = {}
+    imported_total = 0
+    skipped_deleted = 0
+    skipped_existing = 0
+    order = sorted(tables)
+    if "erp_deleted_keys" in order:
+        order.remove("erp_deleted_keys")
+        order.insert(0, "erp_deleted_keys")
+    for t in order:
+        if t.startswith("erp_acct_") or t == "erp_wipe_exports":
+            continue
+        rows = tables[t]
+        nkey = _ERP_IMPORT_NATURAL_KEY.get(t)
+        kind = _ERP_IMPORT_TOMBSTONE_KIND.get(t)
+        done = 0
+        for row in rows:
+            if nkey and kind and row.get(nkey) is not None:
+                if _erp_is_deleted(conn, kind, row[nkey]):
+                    skipped_deleted += 1
+                    continue
+                live = conn.execute(
+                    "SELECT active FROM %s WHERE %s = ?" % (t, nkey),
+                    (row[nkey],)).fetchone()
+                if live is not None and "active" in columns[t]                         and not live["active"]:
+                    skipped_deleted += 1
+                    continue
+            cols = [c for c in row if c in columns[t]]
+            if not cols:
+                continue
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO %s (%s) VALUES (%s)"
+                % (t, ", ".join(cols), ", ".join("?" * len(cols))),
+                tuple(row[c] for c in cols))
+            if cur.rowcount:
+                done += 1
+            else:
+                skipped_existing += 1
+        imported[t] = done
+        imported_total += done
+    return ({"format": "export_json", "imported": imported,
+             "imported_total": imported_total,
+             "skipped_existing": skipped_existing,
+             "skipped_deleted": skipped_deleted,
+             "skipped_accounting_tables": skipped_acct,
+             "skipped_tables": skipped_tables},
+            "import.export",
+            "Export import: %d row(s) imported, %d already present, %d deleted"
+            " (skipped), accounting tables skipped: %s"
+            % (imported_total, skipped_existing, skipped_deleted,
+               ", ".join(skipped_acct) if skipped_acct else "none"))
+
+
+@app.post("/api/erp/settings/import")
+def erp_settings_import():
+    """Import data into the ERP. Admin-only. Formats:
+    - seed_csv: opening balances, same columns as build/seed-template.csv.
+    - wholesale_csv: bulk wholesale accounts, same columns as the wholesale
+      CSV import. - export_json: a full export from /api/erp/settings/export.
+    The whole file is validated before anything is written; see
+    _erp_import_export_json for the shared guarantees."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fmt = (data.get("format") or "").strip()
+    conn = db()
+    try:
+        if fmt == "seed_csv":
+            summary, action, detail = _erp_import_seed_csv(
+                conn, actor, data.get("csv") or "")
+        elif fmt == "wholesale_csv":
+            summary, action, detail = _erp_import_wholesale_csv(
+                conn, actor, data.get("csv") or "")
+        elif fmt == "export_json":
+            summary, action, detail = _erp_import_export_json(
+                conn, actor, data.get("export"))
+        else:
+            conn.close()
+            return jsonify(error="format must be seed_csv, wholesale_csv or export_json"), 400
+    except _ErpImportError as exc:
+        conn.rollback()
+        conn.close()
+        return jsonify(error=str(exc)), 400
+    _erp_settings_audit(conn, actor, action, "settings", 0, detail)
+    conn.commit()
+    conn.close()
+    out = {"ok": True}
+    out.update(summary)
+    return jsonify(out)
 
 
 @app.post("/api/erp/reset")
@@ -15083,14 +33976,56 @@ def erp_reset():
     actor, err = _require_erp_admin()
     if err:
         return err
+    # Permanence rule (Phase 4, section 1.6): if the reset list ever
+    # contains an accounting table, refuse and delete nothing.
+    if any(t.startswith("erp_acct_") for t in _ERP_RESET_TABLES):
+        return jsonify(
+            error="reset list contains accounting tables; refusing to wipe"), 500
     data = request.get_json(force=True) or {}
     if data.get("confirm") != "RESET ALL ERP DATA":
         return jsonify(error="confirmation phrase required"), 400
+    # Wave C (item 5): a wipe needs the one-time token minted by a fresh
+    # full export -- the backup must exist before the data can go. The
+    # token is single-use and latest-only: generating a newer export
+    # invalidates older tokens, and a successful wipe consumes its token
+    # and invalidates the rest, so no stale export can authorize a later
+    # wipe.
+    token = (data.get("wipe_token") or "").strip()
+    if not token:
+        return jsonify(error="a pre-wipe export is required: generate a full"
+                             " export first and pass its wipe_token"), 400
     conn = db()
+    _trow = conn.execute("SELECT * FROM erp_wipe_exports WHERE token = ?",
+                         (token,)).fetchone()
+    if not _trow or _trow["consumed_at"] or _trow["invalidated_at"]:
+        conn.close()
+        return jsonify(error="wipe token is missing, already used, or superseded"
+                             " by a newer export; generate a fresh pre-wipe export"), 400
+    # The wipe is irreversible, so its audit rows are written BEFORE the
+    # wipe runs -- and erp_settings_audit is deliberately NOT in
+    # _ERP_RESET_TABLES, so both rows survive the wipe itself. The
+    # requested row is committed before any DELETE runs; the completed
+    # row is written after, with the deleted counts.
+    _erp_settings_audit(conn, actor, "settings.wipe.requested", "settings", 0,
+                        "Wipe requested by %s; %d ERP tables to be cleared;"
+                        " pre-wipe export #%d"
+                        % (actor, len(_ERP_RESET_TABLES), _trow["id"]))
+    conn.commit()
     deleted = {}
     for table in _ERP_RESET_TABLES:
         cur = conn.execute("DELETE FROM %s" % table)
         deleted[table] = cur.rowcount
+    _erp_settings_audit(
+        conn, actor, "settings.wipe.completed", "settings", 0,
+        "Wipe completed: %d rows deleted across %d tables"
+        % (sum(deleted.values()), len(deleted)))
+    # Consume this token and invalidate every other outstanding token, so
+    # the export that authorized this wipe can never authorize another.
+    _now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_wipe_exports SET consumed_at = ? WHERE id = ?",
+                 (_now, _trow["id"]))
+    conn.execute("UPDATE erp_wipe_exports SET invalidated_at = ?"
+                 " WHERE consumed_at = '' AND invalidated_at = ''", (_now,))
     conn.commit()
     conn.close()
     return jsonify(reset=True, deleted=deleted)
@@ -15363,10 +34298,9 @@ def _send_new_wholesale_order_emails(order_number, acct, lines, total_cents, po_
             "<p>Or log in to the ERP order hub to review it.</p>"
             % (order_number, acct["name"], line_rows, dollars(total_cents),
                po_number or "—", address_label or "—", accept_btn))
-    for to_email in _WHOLESALE_ADMIN_EMAILS:
-        send_email(to_email,
-                   "New wholesale order %s from %s — review to accept"
-                   % (order_number, acct["name"]), html)
+    _erp_send_alert(None, "order", list(_WHOLESALE_ADMIN_EMAILS),
+                    "New wholesale order %s from %s — review to accept"
+                    % (order_number, acct["name"]), html)
 
 
 def _send_order_accepted_email(to_email, order_number, business_name):
@@ -15862,6 +34796,18 @@ def erp_delete_wholesale_account(account_id):
     if not acct:
         conn.close()
         return jsonify(error="account not found"), 404
+    # Permanence rule (Phase 4, section 1.7): a posted invoice depends on
+    # its wholesale account. Refuse while any non-void invoice references
+    # it; voided invoices do not block the delete.
+    _open_inv = conn.execute(
+        "SELECT COUNT(*) AS c FROM erp_acct_invoices"
+        " WHERE customer_id = ? AND status != 'void'",
+        (account_id,)).fetchone()["c"]
+    if _open_inv:
+        conn.close()
+        return jsonify(
+            error="wholesale account has %d non-void invoice(s) and cannot"
+            " be deleted" % _open_inv), 400
     order_ids = [r["id"] for r in conn.execute(
         "SELECT id FROM erp_wholesale_orders WHERE account_id = ?", (account_id,))]
     if order_ids:
@@ -15880,6 +34826,7 @@ def erp_delete_wholesale_account(account_id):
     conn.execute("DELETE FROM erp_wholesale_users WHERE account_id = ?", (account_id,))
     conn.execute("DELETE FROM erp_wholesale_addresses WHERE account_id = ?", (account_id,))
     conn.execute("DELETE FROM erp_wholesale_accounts WHERE id = ?", (account_id,))
+    _erp_tombstone(conn, "wholesale_account", acct["name"], actor)
     conn.commit()
     conn.close()
     return jsonify(ok=True, deleted_orders=len(order_ids))
@@ -18313,6 +37260,19 @@ def _erp_parse_summary_flavors(items_summary):
     return out
 
 
+def _erp_online_bags(r):
+    """Bag count for an online sales row: parse items_summary; fall back to
+    total_qty only when the summary parses to 0 (empty/unparseable). The
+    Stripe webhook stores total_qty from session metadata, which is 0 on
+    rows whose metadata never carried it (live order #1001) — items_summary
+    is correct there, and the by-flavor table + forecast already count from
+    the same parse."""
+    parsed = sum(q for q, _ in _erp_parse_summary_flavors(r["items_summary"]))
+    if parsed:
+        return parsed
+    return int(r["total_qty"] or 0)
+
+
 def _erp_csv_response(filename, header, rows):
     import csv
     import io
@@ -18531,22 +37491,13 @@ def erp_report_sales():
     })
 
 
-# ---------- report: customers / retention ----------
-
-@app.get("/api/erp/reports/customers")
-def erp_report_customers():
-    """One row per customer: retail keyed by normalized lowercase email
-    (orders + captured paypal_orders, uncaptured PayPal excluded), wholesale
-    keyed by account email — or by account when it has no email. Repeat =
-    2+ orders. Not a CRM: a simple customer list with repeat rate + LTV."""
-    actor, err = _erp_check_perm("reports.read")
-    if err:
-        return err
-    df, dt = _erp_report_dates(request.args)
-    if df is None:
-        return jsonify(error="from/to must be YYYY-MM-DD"), 400
-    fmt = (request.args.get("format") or "json").strip().lower()
-    conn = db()
+def _erp_customer_rows(conn, df="", dt=""):
+    """One row per customer, shared keying for the Reports customers
+    endpoint and the Marketing CRM (Dept 8 item 2): retail keyed by
+    normalized lowercase email from _erp_online_sales_rows (orders +
+    captured paypal_orders, uncaptured PayPal excluded), wholesale
+    keyed by account email — or by account when it has no email.
+    Returns the customers dict (no repeat flag, no sorting)."""
     customers = {}
 
     def _add(key, display, email, account_name, order_dt, bags, spent):
@@ -18593,6 +37544,26 @@ def erp_report_customers():
             _add("account:%d" % r["account_id"], r["account_name"], "",
                  r["account_name"], r["created_at"],
                  float(r["bags"] or 0), int(r["spent"] or 0))
+    return customers
+
+
+# ---------- report: customers / retention ----------
+
+@app.get("/api/erp/reports/customers")
+def erp_report_customers():
+    """One row per customer: retail keyed by normalized lowercase email
+    (orders + captured paypal_orders, uncaptured PayPal excluded), wholesale
+    keyed by account email — or by account when it has no email. Repeat =
+    2+ orders. Not a CRM: a simple customer list with repeat rate + LTV."""
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    df, dt = _erp_report_dates(request.args)
+    if df is None:
+        return jsonify(error="from/to must be YYYY-MM-DD"), 400
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    customers = _erp_customer_rows(conn, df, dt)
     conn.close()
     rows = sorted(customers.values(), key=lambda c: -c["total_spent_cents"])
     for c in rows:
@@ -18832,23 +37803,18 @@ def erp_report_programs():
                     "subscriptions": subscriptions, "fundraisers": fundraisers})
 
 
-# ---------- report: demand forecast ----------
+def _erp_forecast_flavors(conn):
+    """Shared forecast computation: Reports forecast + Production MRP.
 
-@app.get("/api/erp/reports/forecast")
-def erp_report_forecast():
-    """Per-flavor demand forecast. Bags sold per week over the last 8 weeks
-    (online orders + captured PayPal + wholesale lines, same de-duplication
-    as the Sales report), 4-week average velocity, and a forward projection
-    for the next 4 weeks = velocity x 4. A simple average projection only:
-    no seasonality, no trend adjustment, no confidence figure. The canonical
-    flavor list comes from erp_flavor_categories, so flavors with no recent
-    sales still appear, flagged has_recent_sales=False. Names not in the
-    catalog (variety packs, merch) appear as their own rows."""
-    actor, err = _erp_check_perm("reports.read")
-    if err:
-        return err
-    fmt = (request.args.get("format") or "json").strip().lower()
-    conn = db()
+    Returns {generated_on, window_start, window_end, buckets, flavors,
+    note}: per-flavor bags/week over the last 8 weeks (online orders +
+    captured PayPal + wholesale lines, same de-duplication as the Sales
+    report), 4-week average velocity, projection = velocity x 4. A simple
+    average projection only: no seasonality, no trend adjustment, no
+    confidence figure. The canonical flavor list comes from
+    erp_flavor_categories, so flavors with no recent sales still appear,
+    flagged has_recent_sales=False. Names not in the catalog (variety
+    packs, merch) appear as their own rows."""
     today = datetime.now(timezone.utc).date()
     buckets = []
     for i in range(7, -1, -1):
@@ -18911,20 +37877,35 @@ def erp_report_forecast():
     for key in sorted(sales):
         entry = sales[key]
         flavors.append(_row(entry["display"], "", entry["weekly"]))
-    conn.close()
     note = ("Simple average projection: 4-week average weekly velocity x 4 "
             "weeks. No seasonality or trend adjustment; flavors with no sales "
             "in the last 8 weeks are flagged.")
+    return {"generated_on": today.isoformat(),
+            "window_start": window_start, "window_end": window_end,
+            "buckets": buckets, "flavors": flavors, "note": note}
+
+
+# ---------- report: demand forecast ----------
+
+@app.get("/api/erp/reports/forecast")
+def erp_report_forecast():
+    """Per-flavor demand forecast (see _erp_forecast_flavors, shared with
+    the Production MRP so the two can never disagree on velocity)."""
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    data = _erp_forecast_flavors(conn)
+    conn.close()
     if fmt == "csv":
         header = ["flavor", "category"] +             ["week_%d_bags" % (i + 1) for i in range(8)] +             ["total_bags_8w", "velocity_4w", "projection_4w", "has_recent_sales"]
         return _erp_csv_response(
-            "erp-forecast-%s.csv" % today.isoformat(), header,
+            "erp-forecast-%s.csv" % data["generated_on"], header,
             [[f["flavor"], f["category"]] + f["weekly_bags"] +
              [f["total_bags_8w"], f["velocity_4w"], f["projection_4w"],
-              "yes" if f["has_recent_sales"] else "no"] for f in flavors])
-    return jsonify({"generated_on": today.isoformat(),
-                    "window_start": window_start, "window_end": window_end,
-                    "buckets": buckets, "flavors": flavors, "note": note})
+              "yes" if f["has_recent_sales"] else "no"] for f in data["flavors"]])
+    return jsonify(data)
 
 
 # ---------- report: inventory valuation ----------
@@ -18985,7 +37966,10 @@ def erp_report_production_margin():
     rows = conn.execute(
         "SELECT r.id AS recipe_id, r.name AS flavor, r.batch_size_bags,"
         " COUNT(b.id) AS batches, COALESCE(SUM(b.actual_qty_bags), 0) AS bags,"
-        " COALESCE(SUM(b.total_cost_cents), 0) AS cost_cents"
+        " COALESCE(SUM(b.total_cost_cents), 0) AS cost_cents,"
+        " COALESCE(SUM(b.ingredient_cost_cents), 0) AS ingredient_cents,"
+        " COALESCE(SUM(b.labor_cost_cents), 0) AS labor_cents,"
+        " COALESCE(SUM(b.overhead_cents), 0) AS overhead_cents"
         " FROM erp_production_batches b"
         " JOIN erp_recipes r ON r.id = b.recipe_id"
         " WHERE b.status = 'completed' AND b.actual_qty_bags > 0"
@@ -19000,6 +37984,9 @@ def erp_report_production_margin():
             "flavor": r["flavor"], "batches": r["batches"],
             "bags_produced": bags,
             "cost_per_bag_cents": round(cpb, 2),
+            "ingredient_cost_cents": int(r["ingredient_cents"] or 0),
+            "labor_cost_cents": int(r["labor_cents"] or 0),
+            "overhead_cents": int(r["overhead_cents"] or 0),
             "retail_price_cents": 800,
             "retail_margin_cents": round(800 - cpb, 2),
             "retail_margin_pct": round((800 - cpb) / 800 * 100, 1) if cpb else 100.0,
@@ -19009,16 +37996,20 @@ def erp_report_production_margin():
         })
     conn.close()
     note = ("Wholesale price uses the default $4.00/bag; per-account prices may vary. "
-            "Retail is $8.00/bag.")
+            "Retail is $8.00/bag. Batch cost includes ingredients + labor + "
+            "overhead (labor + overhead are batch actuals only; recipe/BOM cost "
+            "stays ingredients + packaging).")
     if fmt == "csv":
         return _erp_csv_response(
             "erp-production-margin.csv",
             ["flavor", "batches", "bags_produced", "cost_per_bag_cents",
+             "ingredient_cost_cents", "labor_cost_cents", "overhead_cents",
              "retail_price_cents", "retail_margin_cents", "retail_margin_pct",
              "wholesale_price_cents", "wholesale_margin_cents",
              "wholesale_margin_pct"],
             [[f["flavor"], f["batches"], f["bags_produced"],
-              f["cost_per_bag_cents"], f["retail_price_cents"],
+              f["cost_per_bag_cents"], f["ingredient_cost_cents"],
+              f["labor_cost_cents"], f["overhead_cents"], f["retail_price_cents"],
               f["retail_margin_cents"], f["retail_margin_pct"],
               f["wholesale_price_cents"], f["wholesale_margin_cents"],
               f["wholesale_margin_pct"]] for f in flavors])
@@ -19692,16 +38683,26 @@ def erp_faire_sync():
             summary["stopped_on_429"] = True
             summary["errors"].append(
                 "Faire rate limited (429) — stopping, will resume next run")
+            # Dept 10 Wave A: run-level failures are also written to the
+            # import log, so the Settings health page can show them from
+            # stored data (a 401 stops the poll before any order is seen,
+            # so without this row there would be nothing in the log).
+            _faire_log(conn, "", "", "", "error", [], [], "",
+                       "Faire rate limited (429) — stopping, will resume next run")
             stopped = True
             break
         if status == 0:
             summary["errors"].append(
                 "Faire request failed: %s" % (data.get("error") or "network error"))
+            _faire_log(conn, "", "", "", "error", [], [], "",
+                       "Faire request failed: %s" % (data.get("error") or "network error"))
             stopped = True
             break
         if status != 200:
             summary["errors"].append(
                 "Faire orders request failed (HTTP %s)" % status)
+            _faire_log(conn, "", "", "", "error", [], [], "",
+                       "Faire orders request failed (HTTP %s)" % status)
             stopped = True
             break
         for o in data.get("orders") or []:
@@ -20087,6 +39088,764 @@ def _qb_call_with_refresh(conn, fn):
         raise _QBOError("QuickBooks session expired - please reconnect", status=400)
 
 
+# ---------- Dept 10 Settings Wave A ----------
+# Item 1: company / legal-entity profile (single row, erp_company_profile).
+# Item 2: integration health (Settings subview; no live pings, no new
+# credentials -- status comes from env/config flags plus stored activity).
+_ERP_COMPANY_PROFILE_DEFAULTS = {
+    "legal_name": "FUDGETOPIA LLC",
+    "facility_address": "6290 McLeod Dr, Suite 120, Las Vegas, NV 89120",
+    "office_address": "2013 Angel Falls Dr, Henderson, NV 89074",
+    "ein": "",
+    "fiscal_year": "",
+    "base_currency": "USD",
+}
+
+
+def _erp_company_profile(conn):
+    """The company profile as a dict. A missing row (e.g. after a wipe,
+    before the next restart re-seeds) falls back to the known defaults,
+    so invoices, statements and tax filings never render a blank header.
+    EIN / fiscal year stay blank when unknown -- never invented."""
+    try:
+        row = conn.execute(
+            "SELECT * FROM erp_company_profile WHERE id = 1").fetchone()
+    except Exception:
+        row = None
+    out = dict(_ERP_COMPANY_PROFILE_DEFAULTS)
+    out["updated_by"] = ""
+    out["updated_at"] = ""
+    if row:
+        d = dict(row)
+        for key in _ERP_COMPANY_PROFILE_DEFAULTS:
+            out[key] = d.get(key) or ""
+        out["updated_by"] = d.get("updated_by") or ""
+        out["updated_at"] = d.get("updated_at") or ""
+    return out
+
+
+def _erp_company_profile_validate(data):
+    """Validate a profile PUT body. Returns (clean, None) or (None, error).
+    Only keys present in the body are updated; unknown keys are ignored.
+    EIN and fiscal year may be cleared back to blank ("not provided")."""
+    if not isinstance(data, dict):
+        return None, "profile must be an object"
+    clean = {}
+    for key in ("legal_name", "facility_address", "office_address"):
+        if key in data:
+            val = data[key]
+            if not isinstance(val, str) or not val.strip():
+                return None, "%s must be a non-empty string" % key
+            if len(val.strip()) > 500:
+                return None, "%s is too long" % key
+            clean[key] = val.strip()
+    if "ein" in data:
+        val = data["ein"]
+        if val is None:
+            val = ""
+        if not isinstance(val, str):
+            return None, "ein must be a string"
+        val = val.strip()
+        if val and (len(val) > 20 or not re.match(r"^[0-9][0-9\- ]*$", val)):
+            return None, "ein must contain only digits and dashes"
+        clean["ein"] = val
+    if "fiscal_year" in data:
+        val = data["fiscal_year"]
+        if val is None:
+            val = ""
+        if not isinstance(val, str):
+            return None, "fiscal_year must be a string"
+        val = val.strip()
+        if len(val) > 64:
+            return None, "fiscal_year is too long"
+        clean["fiscal_year"] = val
+    if "base_currency" in data:
+        val = data["base_currency"]
+        if not isinstance(val, str) or not re.match(r"^[A-Za-z]{3}$",
+                                                    val.strip()):
+            return None, "base_currency must be a 3-letter code such as USD"
+        clean["base_currency"] = val.strip().upper()
+    return clean, None
+
+
+@app.get("/api/erp/settings/company-profile")
+def erp_settings_company_profile():
+    # Same gate as the other Settings endpoints (QuickBooks status/config):
+    # qb.manage is admin-only and never grantable to staff, so no new
+    # permission was invented.
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    out = _erp_company_profile(conn)
+    conn.close()
+    return jsonify({"profile": out})
+
+
+@app.put("/api/erp/settings/company-profile")
+def erp_settings_company_profile_put():
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True)
+    clean, error = _erp_company_profile_validate(data)
+    if error:
+        return jsonify(error=error), 400
+    if not clean:
+        return jsonify(error="no profile fields provided"), 400
+    conn = db()
+    before = _erp_company_profile(conn)
+    profile = dict(before)
+    profile.update(clean)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO erp_company_profile (id, legal_name,"
+        " facility_address, office_address, ein, fiscal_year,"
+        " base_currency, updated_by, updated_at)"
+        " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (profile["legal_name"], profile["facility_address"],
+         profile["office_address"], profile["ein"], profile["fiscal_year"],
+         profile["base_currency"], actor, now))
+    changed = [k for k in sorted(clean)
+               if (before.get(k) or "") != (profile.get(k) or "")]
+    _erp_settings_audit(
+        conn, actor, "company_profile.updated", "company_profile", 0,
+        ("Changed: " + ", ".join(changed)) if changed
+        else "Saved with no field changes")
+    conn.commit()
+    out = _erp_company_profile(conn)
+    conn.close()
+    return jsonify({"profile": out})
+
+
+def _erp_health_entry(key, name, configured, last_success_at,
+                      last_success_detail, last_error_at, last_error,
+                      connected=None, check_error=None):
+    """One integration's health entry. Statuses are deliberately modest:
+    'unconfigured' (no credentials), 'configured' (credentials set --
+    NOT a health claim; last success/error are shown as the evidence),
+    'error' (a stored failure newer than the last success), 'unknown'
+    (the stored evidence itself could not be read). No live pings."""
+    if check_error:
+        status = "unknown"
+        evidence = "Could not check stored activity: %s" % check_error
+    elif not configured:
+        status = "unconfigured"
+        evidence = "Not configured: credentials are not set on the backend."
+    elif last_error_at and (not last_success_at
+                            or last_error_at > last_success_at):
+        status = "error"
+        evidence = ("A stored failure is newer than the last successful"
+                    " call — see the last error below.")
+    else:
+        status = "configured"
+        if last_success_at:
+            evidence = ("Credentials are set; the last successful call"
+                        " is shown below.")
+        else:
+            evidence = ("Configured, but no successful call is recorded"
+                        " in the ERP yet.")
+    entry = {"key": key, "name": name, "status": status,
+             "configured": bool(configured),
+             "last_success_at": last_success_at or "",
+             "last_success_detail": last_success_detail or "",
+             "last_error_at": last_error_at or "",
+             "last_error": last_error or "",
+             "evidence": evidence}
+    if connected is not None:
+        entry["connected"] = bool(connected)
+    return entry
+
+
+def _erp_integration_health(conn):
+    """Health for the six integrations, from env/config + stored data only.
+    Last-success sources: QuickBooks pushes (erp_qb_links), Shippo labels
+    (orders / fundraiser_orders), Stripe orders (orders), captured PayPal
+    orders (paypal_orders), Printful submissions (orders), Faire imports
+    (erp_faire_import_log + erp_faire_sync summary). Last-error sources:
+    Faire import log / sync summary only -- the other integrations store
+    no error record (failures surface only in server logs), and the entry
+    says so rather than claiming a clean bill of health."""
+    out = []
+
+    # QuickBooks: reuse the existing status logic (creds + stored tokens).
+    try:
+        cid, csec = _qb_creds()
+        qb_configured = bool(cid and csec)
+        tok = _qb_tokens(conn)
+        qb_connected = (_QBO_TEST_DOUBLE is not None or bool(
+            tok and tok["access_token"] and tok["realm_id"]))
+        last_push = conn.execute(
+            "SELECT MAX(pushed_at) AS m, COUNT(*) AS c FROM erp_qb_links"
+            " WHERE pushed_at LIKE '____-__-__T%'").fetchone()
+        qb_success = (last_push["m"] or "") if last_push else ""
+        qb_detail = ("Last push to QuickBooks %s (%d pushed)"
+                     % (qb_success, int(last_push["c"] or 0))
+                     if qb_success else "")
+        entry = _erp_health_entry(
+            "quickbooks", "QuickBooks", qb_configured, qb_success, qb_detail,
+            "", "", connected=qb_connected)
+        if qb_configured and not qb_connected:
+            entry["evidence"] = ("Configured, but not connected:"
+                                 " no active QuickBooks session.")
+        out.append(entry)
+    except Exception as e:
+        out.append(_erp_health_entry(
+            "quickbooks", "QuickBooks", False, "", "", "", "",
+            check_error=str(e)))
+
+    # Shippo: last label created is the last successful Shippo call.
+    # All MAX() timestamps below require an ISO-shaped value: production
+    # writers always store ISO timestamps, while seed/test fixtures
+    # sometimes store the literal placeholder 'now', which would
+    # otherwise sort after every real timestamp.
+    try:
+        shippo_success, shippo_detail = "", ""
+        best = conn.execute(
+            "SELECT MAX(shippo_label_created_at) AS m,"
+            " COUNT(*) AS c FROM orders"
+            " WHERE shippo_label_created_at != ''"
+            " AND shippo_label_created_at LIKE '____-__-__T%'").fetchone()
+        cands = [(best["m"] or "", int(best["c"] or 0))]
+        try:
+            has_fund = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                " AND name = 'fundraiser_orders'").fetchone()
+            if has_fund:
+                fb = conn.execute(
+                    "SELECT MAX(shippo_label_created_at) AS m,"
+                    " COUNT(*) AS c FROM fundraiser_orders"
+                    " WHERE shippo_label_created_at != ''"
+                    " AND shippo_label_created_at LIKE '____-__-__T%'").fetchone()
+                cands.append((fb["m"] or "", int(fb["c"] or 0)))
+        except Exception:
+            pass
+        for ts, count in cands:
+            if ts and (not shippo_success or ts > shippo_success):
+                shippo_success = ts
+                shippo_detail = "Last Shippo label created %s (%d labels total)" % (ts, count)
+        out.append(_erp_health_entry(
+            "shippo", "Shippo", bool(SHIPPO_API_KEY), shippo_success,
+            shippo_detail, "", "",
+            connected=None))
+        out[-1]["evidence"] += (" Label failures are not stored;"
+                                " they appear only in server logs.")
+    except Exception as e:
+        out.append(_erp_health_entry(
+            "shippo", "Shippo", False, "", "", "", "", check_error=str(e)))
+
+    # Stripe: last order row is the last successful Stripe checkout.
+    try:
+        row = conn.execute(
+            "SELECT MAX(created_at) AS m, COUNT(*) AS c FROM orders"
+            " WHERE stripe_session_id != '' AND stripe_session_id IS NOT NULL"
+            " AND created_at LIKE '____-__-__T%'").fetchone()
+        st_success = row["m"] or ""
+        st_detail = ("Last Stripe order %s (%d Stripe orders)"
+                     % (st_success, int(row["c"] or 0))) if st_success else ""
+        out.append(_erp_health_entry(
+            "stripe", "Stripe", bool(os.environ.get("STRIPE_SECRET_KEY")),
+            st_success, st_detail, "", ""))
+        out[-1]["evidence"] += (" Payment failures are not stored;"
+                                " they appear only in server logs.")
+    except Exception as e:
+        out.append(_erp_health_entry(
+            "stripe", "Stripe", False, "", "", "", "", check_error=str(e)))
+
+    # PayPal: last captured order is the last successful PayPal call.
+    try:
+        row = conn.execute(
+            "SELECT MAX(created_at) AS m, COUNT(*) AS c FROM paypal_orders"
+            " WHERE status = 'captured'"
+            " AND created_at LIKE '____-__-__T%'").fetchone()
+        pp_success = row["m"] or ""
+        pp_detail = ("Last captured PayPal order %s (%d captured)"
+                     % (pp_success, int(row["c"] or 0))) if pp_success else ""
+        out.append(_erp_health_entry(
+            "paypal", "PayPal",
+            bool(PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET),
+            pp_success, pp_detail, "", ""))
+    except Exception as e:
+        out.append(_erp_health_entry(
+            "paypal", "PayPal", False, "", "", "", "", check_error=str(e)))
+
+    # Printful: last submitted merch order is the last successful call.
+    try:
+        row = conn.execute(
+            "SELECT MAX(created_at) AS m, COUNT(*) AS c FROM orders"
+            " WHERE printful_order_id != ''"
+            " AND printful_order_id IS NOT NULL"
+            " AND created_at LIKE '____-__-__T%'").fetchone()
+        pf_success = row["m"] or ""
+        pf_detail = ("Last Printful order submitted %s (%d submitted)"
+                     % (pf_success, int(row["c"] or 0))) if pf_success else ""
+        out.append(_erp_health_entry(
+            "printful", "Printful", bool(PRINTFUL_API_KEY),
+            pf_success, pf_detail, "", ""))
+        out[-1]["evidence"] += (" Submission failures are not stored;"
+                                " they appear only in server logs.")
+    except Exception as e:
+        out.append(_erp_health_entry(
+            "printful", "Printful", False, "", "", "", "",
+            check_error=str(e)))
+
+    # Faire: last import-log row + sync summary. A stored failure (e.g. the
+    # HTTP 401 auth failure) beats an older success, so an open auth
+    # failure shows as an error with its own text, never as healthy.
+    try:
+        faire_configured = bool(
+            os.environ.get("FAIRE_APP_ID")
+            and os.environ.get("FAIRE_APP_SECRET")
+            and os.environ.get("FAIRE_ACCESS_TOKEN"))
+        sync = conn.execute(
+            "SELECT * FROM erp_faire_sync WHERE id = 1").fetchone()
+        last_run = (sync["last_run_at"] if sync else "") or ""
+        summary_errors = []
+        if sync and sync["last_summary"]:
+            try:
+                summary_errors = (json.loads(sync["last_summary"]) or {}
+                                  ).get("errors") or []
+            except (TypeError, ValueError):
+                summary_errors = []
+        ok_row = conn.execute(
+            "SELECT * FROM erp_faire_import_log WHERE outcome = 'imported'"
+            " ORDER BY id DESC LIMIT 1").fetchone()
+        err_row = conn.execute(
+            "SELECT * FROM erp_faire_import_log WHERE outcome = 'error'"
+            " ORDER BY id DESC LIMIT 1").fetchone()
+        f_success = (ok_row["created_at"] if ok_row else "") or ""
+        f_detail = ("Last imported order %s (%s)"
+                    % (f_success, ok_row["display_id"])
+                    if ok_row else "")
+        if last_run and (not f_success or last_run > f_success):
+            f_detail = (f_detail + " " if f_detail else "") + \
+                "Last sync run %s." % last_run
+        f_error_at, f_error = "", ""
+        if err_row:
+            f_error_at = err_row["created_at"] or ""
+            f_error = err_row["notes"] or "import failed"
+        if summary_errors:
+            # The sync summary carries run-level failures (e.g. HTTP 401
+            # before any order was seen) with the run's timestamp.
+            summary_text = "; ".join(str(e) for e in summary_errors)
+            if not f_error_at or (last_run and last_run >= f_error_at):
+                f_error_at = last_run or f_error_at
+                f_error = summary_text
+        out.append(_erp_health_entry(
+            "faire", "Faire", faire_configured, f_success, f_detail,
+            f_error_at, f_error))
+    except Exception as e:
+        out.append(_erp_health_entry(
+            "faire", "Faire", False, "", "", "", "", check_error=str(e)))
+
+    return {"integrations": out}
+
+
+@app.get("/api/erp/settings/integrations")
+def erp_settings_integrations():
+    # Same Settings gate as the company profile (qb.manage, admin-only).
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    out = _erp_integration_health(conn)
+    conn.close()
+    return jsonify(out)
+
+
+# ---------- Dept 10 Settings Wave B ----------
+# Item 3: notification / alert preferences. Item 4: Settings audit log.
+#
+# ALERT MODEL: four categories (low_stock, purchase_order, order,
+# failure). Preferences are stored per category; NO saved row means
+# today's behavior exactly -- every wired call site passes its own
+# current recipients as the default, so with nothing saved the mail
+# goes to precisely the addresses it goes to today. A saved row
+# overrides: enabled=false, or an empty saved recipient list, means
+# that category sends nothing. Customer-facing mail (order
+# confirmations, verification, invites, accepted/declined notices,
+# the renewal-failure customer copy) is NEVER gated by these prefs.
+# The vendor PO email is the purchase order itself, addressed to the
+# vendor from the vendor record: it is deliberately NOT gated, and no
+# admin purchase-order alert is sent today, so the purchase_order
+# toggle is stored and ready for the first admin PO alert (e.g. an
+# overdue-PO digest) in a later wave.
+_ERP_ALERT_CATEGORIES = ("low_stock", "purchase_order", "order", "failure")
+_ERP_ALERT_META = {
+    "low_stock": {
+        "label": "Low stock",
+        "description": ("Reorder-needed emails when an inventory count finds"
+                        " items at zero, and the inventory reminder."),
+    },
+    "purchase_order": {
+        "label": "Purchase orders",
+        "description": ("Admin alerts about purchase orders. The email sent"
+                        " to a vendor IS the purchase order -- it always goes"
+                        " to the vendor and is never gated by this setting."
+                        " No admin purchase-order alert is sent today."),
+    },
+    "order": {
+        "label": "Orders",
+        "description": ("New store orders (merchant inbox), new wholesale"
+                        " orders waiting for review, and staff merch"
+                        " redemptions."),
+    },
+    "failure": {
+        "label": "Failures",
+        "description": ("Subscription renewal failures (merchant copy). The"
+                        " customer is always emailed directly -- this setting"
+                        " only controls the merchant copy."),
+    },
+}
+
+
+def _erp_alert_default_recipients(category):
+    """Canonical defaults for one category, for display: where its alerts
+    go when no preferences are saved. The live send path uses each call
+    site's own current recipients (see _erp_send_alert), which agree
+    with these lists."""
+    if category == "low_stock":
+        return list(_WHOLESALE_ADMIN_EMAILS)
+    if category == "purchase_order":
+        return list(ADMIN_EMAILS)
+    if category == "order":
+        out = []
+        for e in ([ORDER_NOTIFY_EMAIL] if ORDER_NOTIFY_EMAIL else []) \
+                + list(_WHOLESALE_ADMIN_EMAILS) + list(ADMIN_EMAILS):
+            if e and e not in out:
+                out.append(e)
+        return out
+    if category == "failure":
+        return ([ORDER_NOTIFY_EMAIL] if ORDER_NOTIFY_EMAIL else [])
+    return []
+
+
+def _erp_alert_recipients(conn, category, default_recipients):
+    """Recipient list for one alert category. No saved row -> exactly
+    default_recipients (today's behavior). Saved + enabled -> the saved
+    list. Saved + disabled, or a saved empty list -> no recipients."""
+    row = None
+    try:
+        row = conn.execute(
+            "SELECT enabled, recipients FROM erp_notification_prefs"
+            " WHERE category = ?", (category,)).fetchone()
+    except Exception:
+        row = None
+    if row is None:
+        return list(default_recipients)
+    if not row[0]:
+        return []
+    try:
+        saved = json.loads(row[1] or "[]")
+    except (TypeError, ValueError):
+        saved = []
+    out = []
+    for e in (saved or []):
+        if isinstance(e, str):
+            e = e.strip().lower()
+            if e and EMAIL_RE.match(e) and e not in out:
+                out.append(e)
+    return out
+
+
+def _erp_send_alert(conn, category, default_recipients, subject, html,
+                    from_email=None):
+    """Send one admin alert to a category's recipients. Returns how many
+    mails were sent. Never raises -- a failed or disabled alert must not
+    break the operation that triggered it. conn may be None (a fresh
+    connection is opened to read the preferences)."""
+    own_conn = None
+    try:
+        if conn is None:
+            own_conn = db()
+            conn = own_conn
+        recipients = _erp_alert_recipients(conn, category, default_recipients)
+        sent = 0
+        for to_email in recipients:
+            try:
+                send_email(to_email, subject, html, from_email=from_email)
+                sent += 1
+            except Exception:
+                pass
+        return sent
+    except Exception:
+        return 0
+    finally:
+        if own_conn is not None:
+            try:
+                own_conn.close()
+            except Exception:
+                pass
+
+
+def _erp_notification_prefs_effective(conn):
+    """Effective preferences for all four categories: saved values when
+    a row exists, otherwise the defaults (with saved=false)."""
+    out = {}
+    for cat in _ERP_ALERT_CATEGORIES:
+        row = None
+        try:
+            row = conn.execute(
+                "SELECT enabled, recipients FROM erp_notification_prefs"
+                " WHERE category = ?", (cat,)).fetchone()
+        except Exception:
+            row = None
+        meta = _ERP_ALERT_META[cat]
+        if row is None:
+            out[cat] = {"enabled": True,
+                        "recipients": _erp_alert_default_recipients(cat),
+                        "saved": False,
+                        "default_recipients":
+                            _erp_alert_default_recipients(cat),
+                        "label": meta["label"],
+                        "description": meta["description"]}
+        else:
+            try:
+                saved = json.loads(row[1] or "[]")
+            except (TypeError, ValueError):
+                saved = []
+            saved = [str(e).strip().lower() for e in (saved or [])
+                     if isinstance(e, str) and e.strip()]
+            out[cat] = {"enabled": bool(row[0]),
+                        "recipients": saved,
+                        "saved": True,
+                        "default_recipients":
+                            _erp_alert_default_recipients(cat),
+                        "label": meta["label"],
+                        "description": meta["description"]}
+    return out
+
+
+def _erp_notification_prefs_validate(data):
+    """Validate a prefs PUT body. Accepts per-category objects at the top
+    level, or under a "preferences" wrapper. Returns (clean, None) or
+    (None, error). Only keys present are updated; unknown keys ignored.
+    clean: {category: {"enabled": bool|None, "recipients": list|None}}."""
+    if not isinstance(data, dict):
+        return None, "preferences must be an object"
+    body = data.get("preferences") if isinstance(data.get("preferences"),
+                                                 dict) else data
+    if not isinstance(body, dict):
+        return None, "preferences must be an object"
+    clean = {}
+    for cat, val in body.items():
+        if cat not in _ERP_ALERT_CATEGORIES:
+            continue
+        if not isinstance(val, dict):
+            return None, "%s must be an object" % cat
+        entry = {}
+        if "enabled" in val:
+            if not isinstance(val["enabled"], bool):
+                return None, "%s.enabled must be true or false" % cat
+            entry["enabled"] = val["enabled"]
+        if "recipients" in val:
+            recips = val["recipients"]
+            if not isinstance(recips, list) or \
+                    not all(isinstance(e, str) for e in recips):
+                return None, "%s.recipients must be a list of emails" % cat
+            if len(recips) > 10:
+                return None, "%s.recipients allows at most 10 addresses" % cat
+            norm = []
+            for e in recips:
+                e = e.strip().lower()
+                if not e:
+                    continue
+                if len(e) > 254 or not EMAIL_RE.match(e):
+                    return None, "%s has an invalid email: %s" % (cat, e)
+                if e not in norm:
+                    norm.append(e)
+            entry["recipients"] = norm
+        if entry:
+            clean[cat] = entry
+    if not clean:
+        return None, "no notification preferences provided"
+    return clean, None
+
+
+@app.get("/api/erp/settings/notification-preferences")
+def erp_settings_notification_prefs():
+    # Same Settings gate as the company profile (qb.manage, admin-only).
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    out = _erp_notification_prefs_effective(conn)
+    conn.close()
+    return jsonify({"preferences": out})
+
+
+@app.put("/api/erp/settings/notification-preferences")
+def erp_settings_notification_prefs_put():
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True)
+    clean, error = _erp_notification_prefs_validate(data)
+    if error:
+        return jsonify(error=error), 400
+    conn = db()
+    now = datetime.now(timezone.utc).isoformat()
+    changed = []
+    for cat in _ERP_ALERT_CATEGORIES:
+        if cat not in clean:
+            continue
+        row = conn.execute(
+            "SELECT enabled, recipients FROM erp_notification_prefs"
+            " WHERE category = ?", (cat,)).fetchone()
+        if row is None:
+            enabled = clean[cat].get("enabled", True)
+            recips = clean[cat].get(
+                "recipients", _erp_alert_default_recipients(cat))
+        else:
+            try:
+                prev = json.loads(row[1] or "[]")
+            except (TypeError, ValueError):
+                prev = []
+            enabled = clean[cat].get("enabled", bool(row[0]))
+            recips = clean[cat].get("recipients", prev)
+        conn.execute(
+            "INSERT OR REPLACE INTO erp_notification_prefs (category,"
+            " enabled, recipients, updated_by, updated_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (cat, 1 if enabled else 0, json.dumps(recips), actor, now))
+        changed.append("%s: %s, recipients=[%s]"
+                       % (cat, "enabled" if enabled else "disabled",
+                          ", ".join(recips)))
+    _erp_settings_audit(conn, actor, "notification_preferences.updated",
+                        "notification_preferences", 0,
+                        "Notification preferences saved: " + "; ".join(changed))
+    conn.commit()
+    out = _erp_notification_prefs_effective(conn)
+    conn.close()
+    return jsonify({"preferences": out})
+
+
+# ---------- Dept 10 Settings Wave B, item 4: Settings audit log ----------
+# Separate from the Phase 4 accounting audit (erp_acct_audit), which
+# covers accounting writes only. This log covers Settings actions only:
+# QuickBooks connect/disconnect, item-mapping saves, company-profile
+# changes, notification-preference changes, wipe requests/completions,
+# and ERP import runs. Only actions taken after this ships are logged;
+# history is NOT backfilled. The table is excluded from
+# _ERP_RESET_TABLES so wipe rows survive the wipe.
+def _erp_settings_audit(conn, actor, action, target_type="", target_id=0,
+                        detail=""):
+    conn.execute(
+        "INSERT INTO erp_settings_audit (actor, action, target_type,"
+        " target_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (actor or "", action, target_type or "", int(target_id or 0),
+         detail or "", datetime.now(timezone.utc).isoformat()))
+
+
+def _erp_staff_audit(conn, actor, action, target_type="staff", target_id=0,
+                     detail=""):
+    """Write one row to the staff audit log (Dept 11). Same shape as
+    _erp_settings_audit; the two logs stay separate on purpose."""
+    conn.execute(
+        "INSERT INTO erp_staff_audit (actor, action, target_type,"
+        " target_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (actor or "", action, target_type or "staff", int(target_id or 0),
+         detail or "", datetime.now(timezone.utc).isoformat()))
+
+
+def _erp_staff_is_self(actor_user, staff_row):
+    """True when the staff row is the acting admin's own account.
+
+    Admins log in as members (users table, ADMIN_EMAILS); staff rows are
+    a separate table. The email match catches the normal case (DJ:
+    dj@fudgetopia.net on both sides). The name fallback covers the known
+    mismatch (Matt: admin matt@fudgetopia.net, staff row
+    matt@pop-a-licious.com) -- full names are compared case-insensitively.
+    A staff row is only "self" by name when the name is non-empty and an
+    exact match; two different people sharing a first name do not match.
+    """
+    if not actor_user or not staff_row:
+        return False
+    # _current_member() returns a sqlite3.Row (no .get); staff rows are
+    # Rows too. Normalize both to plain dicts first.
+    actor = dict(actor_user)
+    staff = dict(staff_row)
+    actor_email = (actor.get("email") or "").strip().lower()
+    staff_email = (staff.get("email") or "").strip().lower()
+    if actor_email and actor_email == staff_email:
+        return True
+    actor_name = (actor.get("name") or "").strip().lower()
+    staff_name = (staff.get("name") or "").strip().lower()
+    return bool(actor_name and actor_name == staff_name)
+
+
+def _erp_tombstone(conn, kind, key, actor):
+    """Record a user deletion so no import can resurrect the row."""
+    conn.execute(
+        "INSERT OR IGNORE INTO erp_deleted_keys (kind, key, deleted_by,"
+        " deleted_at) VALUES (?, ?, ?, ?)",
+        ((kind or "").strip().lower(), (key or "").strip().lower(),
+         actor or "", datetime.now(timezone.utc).isoformat()))
+
+
+def _erp_is_deleted(conn, kind, key):
+    """True when the natural key was deliberately deleted by the user."""
+    row = conn.execute(
+        "SELECT 1 FROM erp_deleted_keys WHERE kind = ? AND key = ?",
+        ((kind or "").strip().lower(), (key or "").strip().lower())).fetchone()
+    return bool(row)
+
+
+def _erp_settings_audit_day(value):
+    """Day-granularity filter value: the YYYY-MM-DD part of a date or
+    datetime string, or None when it does not parse as one."""
+    s = (value or "").strip()
+    if not re.match(r"^\d{4}-\d{2}-\d{2}", s):
+        return None
+    try:
+        datetime.strptime(s[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+    return s[:10]
+
+
+@app.get("/api/erp/settings/audit")
+def erp_settings_audit_list():
+    # Same Settings gate as the company profile (qb.manage, admin-only).
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    try:
+        limit = int(request.args.get("limit") or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 500))
+    action = (request.args.get("action") or "").strip()
+    actor_f = (request.args.get("actor") or "").strip()
+    from_day = _erp_settings_audit_day(request.args.get("from") or "")
+    to_day = _erp_settings_audit_day(request.args.get("to") or "")
+    conds = []
+    args = []
+    if action:
+        conds.append("action = ?")
+        args.append(action)
+    if actor_f:
+        conds.append("actor = ?")
+        args.append(actor_f)
+    # Day-granularity, inclusive of the whole day on both ends.
+    if from_day:
+        conds.append("substr(created_at, 1, 10) >= ?")
+        args.append(from_day)
+    if to_day:
+        conds.append("substr(created_at, 1, 10) <= ?")
+        args.append(to_day)
+    where = (" WHERE " + " AND ".join(conds)) if conds else ""
+    conn = db()
+    total = conn.execute(
+        "SELECT COUNT(*) AS c FROM erp_settings_audit" + where, args).fetchone()["c"]
+    rows = conn.execute(
+        "SELECT * FROM erp_settings_audit" + where +
+        " ORDER BY id DESC LIMIT ?", args + [limit]).fetchall()
+    conn.close()
+    return jsonify({"audit": [dict(r) for r in rows], "total": int(total),
+                    "limit": limit})
+
+
 @app.get("/api/erp/quickbooks/status")
 def erp_qb_status():
     actor, err = _erp_check_perm("qb.manage")
@@ -20225,6 +39984,9 @@ def erp_qb_callback():
     _qb_store_tokens(conn, data.get("access_token", ""),
                      data.get("refresh_token", ""),
                      data.get("expires_in", 3600), realm_id)
+    _erp_settings_audit(conn, email, "quickbooks.connect", "quickbooks", 0,
+                        "Connected to QuickBooks (realm %s)" % realm_id)
+    conn.commit()
     # Best-effort company name for the settings card.
     try:
         info = _QBOClient(data["access_token"], realm_id).query(
@@ -20248,6 +40010,8 @@ def erp_qb_disconnect():
         return err
     conn = db()
     conn.execute("DELETE FROM erp_qb_oauth WHERE id = 1")
+    _erp_settings_audit(conn, actor, "quickbooks.disconnect", "quickbooks", 0,
+                        "Disconnected QuickBooks")
     conn.commit()
     conn.close()
     return jsonify({"ok": True, "connected": False})
@@ -20272,10 +40036,16 @@ def erp_qb_config_set():
         return err
     data = request.get_json(force=True, silent=True) or {}
     conn = db()
+    saved = []
     for key in ("wholesale_item_id", "wholesale_item_name", "sales_item_id"):
         if key in data:
             conn.execute("INSERT OR REPLACE INTO erp_qb_config (key, value)"
                          " VALUES (?, ?)", (key, str(data[key] or "").strip()))
+            saved.append("%s=%s" % (key, str(data[key] or "").strip()))
+    if saved:
+        _erp_settings_audit(conn, actor, "quickbooks.mapping_saved",
+                            "quickbooks", 0,
+                            "Item mapping saved: " + ", ".join(saved))
     conn.commit()
     out = {k: _qb_config(conn, k) for k in
            ("wholesale_item_id", "wholesale_item_name", "sales_item_id")}
