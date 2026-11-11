@@ -26890,9 +26890,17 @@ def _acct_qb_diff(conn, snap):
             erp_ap[bill["vendor_name"]] = bill["bal"]
     ap_available = (types.get("bills", {}) or {}).get("status") == "pulled" \
         or (ver.get("ap_total_cents") is not None)
+    qb_ap_total = ver.get("ap_total_cents")
+    if qb_ap_total is None and ap_available:
+        # Bills were pulled: the QB AP total is the open bills'
+        # balances in the snapshot (0 when QuickBooks has no bills).
+        qb_ap_total = sum(int(b.get("balance_cents") or 0)
+                          for b in snap.get("bills") or []
+                          if (b.get("status") or "") == "open")
     ap = {"erp_total_cents": sum(erp_ap.values()),
-          "qb_total_cents": ver.get("ap_total_cents"),
-          "difference_cents": None,
+          "qb_total_cents": qb_ap_total,
+          "difference_cents": (sum(erp_ap.values()) - qb_ap_total
+                               if ap_available else None),
           "status": ("compared" if ap_available
                      else "not_available_in_snapshot"),
           "vendors": [{"vendor_name": n, "erp_cents": v,
@@ -26918,9 +26926,8 @@ def _acct_qb_diff(conn, snap):
              "qb_total_liabilities_cents": qb_liab,
              "qb_total_equity_cents": qb_equity,
              "qb_balanced": qb_balanced,
-             "note": "QuickBooks journal entries are not in the"
-                     " snapshot, so no QuickBooks trial-balance detail"
-                     " can be compared; only the balance-sheet totals"
+             "note": "QuickBooks trial-balance detail is not compared"
+                     " in this report; only the balance-sheet totals"
                      " above are shown."}
 
     uncompared = []
@@ -27748,30 +27755,59 @@ def erp_acct_qb_pull_run_types():
     if not rate_limited and error is None:
         # Bank transactions: one pass over the four bank-touching
         # entity types, kept only when they touch an ERP bank account.
+        # The snapshot's bank accounts carry no qb_id (the MCP pull
+        # built them from the balance sheet), so the bank ids come from
+        # a live Account query, falling back to whatever qb_id the
+        # snapshot does have; the snapshot's bank accounts are
+        # backfilled from the live list by name.
+        try:
+            data = _qb_call_with_refresh(
+                conn, lambda c: c.query(
+                    "select Id, Name from Account"
+                    " where AccountType = 'Bank'"))
+            for acct in (((data or {}).get("QueryResponse") or {})
+                         .get("Account") or []):
+                aid = str(acct.get("Id") or "")
+                if aid:
+                    bank_ids.add(aid)
+                    for b in snap.get("bank_accounts") or []:
+                        if not b.get("qb_id") and \
+                                _acct_qb_norm_name(b.get("name")) == \
+                                _acct_qb_norm_name(acct.get("Name")):
+                            b["qb_id"] = aid
+            _qb_pull_save_snapshot(snap, _qb_pull_write_path(read_path))
+        except _QBOError as e:
+            if _qb_is_rate_limited(e):
+                rate_limited = True
+            else:
+                error = str(e)
+                error_status = e.status
         bank_rows = {}
         for old in snap["bank_transactions"]:
             if isinstance(old, dict) and old.get("qb_id"):
                 bank_rows[_qb_pull_norm_id(old["qb_id"])] = old
-        for entity in ("Purchase", "Deposit", "BillPayment", "Transfer"):
-            time.sleep(_QB_PULL_PACE_SECONDS)
-            try:
-                rows = _qb_call_with_refresh(
-                    conn, lambda c, e=entity: _qb_pull_fetch_all(
-                        c, "select * from %s ORDER BY TxnDate" % e))
-            except _QBOError as e:
-                if _qb_is_rate_limited(e):
-                    rate_limited = True
-                else:
-                    error = str(e)
-                    error_status = e.status
-                break
-            for raw in rows:
-                row = _qb_pull_bank_txn_row(entity, raw, bank_ids)
-                if row is None:
-                    continue
-                bank_rows[_qb_pull_norm_id(row["qb_id"])] = row
-            if rate_limited or error is not None:
-                break
+        if not rate_limited and error is None:
+            for entity in ("Purchase", "Deposit", "BillPayment",
+                           "Transfer"):
+                time.sleep(_QB_PULL_PACE_SECONDS)
+                try:
+                    rows = _qb_call_with_refresh(
+                        conn, lambda c, e=entity: _qb_pull_fetch_all(
+                            c, "select * from %s ORDER BY TxnDate" % e))
+                except _QBOError as e:
+                    if _qb_is_rate_limited(e):
+                        rate_limited = True
+                    else:
+                        error = str(e)
+                        error_status = e.status
+                    break
+                for raw in rows:
+                    row = _qb_pull_bank_txn_row(entity, raw, bank_ids)
+                    if row is None:
+                        continue
+                    bank_rows[_qb_pull_norm_id(row["qb_id"])] = row
+                if rate_limited or error is not None:
+                    break
         if not rate_limited and error is None:
             snap["bank_transactions"] = sorted(
                 bank_rows.values(),
