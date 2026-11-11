@@ -27381,6 +27381,91 @@ def erp_acct_qb_pull_probe():
     })
 
 
+@app.post("/api/erp/accounting/qb-pull/probe-types")
+def erp_acct_qb_pull_probe_types():
+    """Live probe: how many records exist for the five export types
+    the invoice pull never covered (vendors, bills, customer payments,
+    journal entries, bank transactions). One count(*) query per entity
+    type through the ERP's own QuickBooks OAuth connection, plus the
+    bank-account list (names + ids only). Read-only -- nothing is
+    written. Stops on the first 429 and reports the counts gathered
+    so far, same rule as the invoice probe."""
+    actor, err = _qb_pull_auth()
+    if err:
+        return err
+    conn = db()
+    tok = _qb_tokens(conn)
+    counts = {}
+    bank_accounts = []
+    rate_limited = False
+    error = None
+    error_status = None
+    company = ""
+    try:
+        info = _qb_call_with_refresh(
+            conn, lambda c: c.query("select * from CompanyInfo"))
+        company = (((info or {}).get("QueryResponse") or {})
+                   .get("CompanyInfo") or [{}])[0].get("CompanyName", "")
+    except _QBOError as e:
+        if _qb_is_rate_limited(e):
+            rate_limited = True
+        else:
+            error = str(e)
+            error_status = e.status
+    for entity in ("Vendor", "Bill", "Payment", "JournalEntry",
+                   "Purchase", "Deposit", "BillPayment", "Transfer"):
+        if rate_limited or error is not None:
+            break
+        try:
+            data = _qb_call_with_refresh(
+                conn, lambda c, e=entity: c.query(
+                    "select count(*) from %s" % e))
+        except _QBOError as e:
+            if _qb_is_rate_limited(e):
+                rate_limited = True
+            else:
+                error = str(e)
+                error_status = e.status
+            break
+        total = ((data or {}).get("QueryResponse") or {}).get("totalCount")
+        counts[entity.lower()] = int(total) if total is not None else None
+    if not rate_limited and error is None:
+        try:
+            data = _qb_call_with_refresh(
+                conn, lambda c: c.query(
+                    "select Id, Name from Account"
+                    " where AccountType = 'Bank'"))
+            for acct in (((data or {}).get("QueryResponse") or {})
+                         .get("Account") or []):
+                bank_accounts.append({
+                    "id": str(acct.get("Id") or ""),
+                    "name": acct.get("Name") or ""})
+        except _QBOError as e:
+            if _qb_is_rate_limited(e):
+                rate_limited = True
+            else:
+                error = str(e)
+                error_status = e.status
+    conn.close()
+    if error is not None:
+        return jsonify(error=error, counts=counts,
+                       bank_accounts=bank_accounts,
+                       rate_limited=False), error_status or 502
+    if rate_limited:
+        return jsonify(error="QuickBooks rate-limited (HTTP 429)",
+                       counts=counts, bank_accounts=bank_accounts,
+                       rate_limited=True,
+                       company_name=company, realm_id=""), 429
+    return jsonify({
+        "company_name": company,
+        "realm_id": (tok["realm_id"] if tok else "") or "",
+        "company_ok": bool(company),
+        "counts": counts,
+        "bank_accounts": bank_accounts,
+        "rate_limited": False,
+    })
+
+
 @app.post("/api/erp/accounting/qb-pull/run")
 def erp_acct_qb_pull_run():
     """Pull invoice windows through the ERP's own QuickBooks OAuth
