@@ -24168,11 +24168,19 @@ def _acct_bill_dict(row):
     return d
 
 
-def _acct_validate_invoice_lines(raw, default_taxable=True):
+def _acct_validate_invoice_lines(raw, default_taxable=True,
+                                 allow_credits=False):
     """Returns (clean, subtotal, None) or (None, 0, error). Clean lines carry
     description, qty, rate_cents, amount_cents, taxable. A line's own
     taxable flag wins; otherwise it inherits default_taxable (retail sales
-    are taxable, wholesale/resale-exempt sales are not)."""
+    are taxable, wholesale/resale-exempt sales are not).
+
+    allow_credits (migration import only): real QuickBooks invoices carry
+    credit lines -- an Early Pay Credit at a negative rate, a return at a
+    negative qty, a zero-amount filler line. Those are arithmetic, not
+    business rules: the amount is still qty x rate and the footing check
+    in the import enforces the totals. New invoices created in the ERP
+    keep the strict rules (qty >= 1, rate >= 0)."""
     if not isinstance(raw, list) or not raw:
         return None, 0, "at least one line is required"
     clean = []
@@ -24184,10 +24192,10 @@ def _acct_validate_invoice_lines(raw, default_taxable=True):
         if not desc:
             return None, 0, "every line needs a description"
         qty = _acct_int_cents(entry.get("qty"))
-        if qty is None or qty < 1:
+        if qty is None or (not allow_credits and qty < 1):
             return None, 0, "qty must be a whole number of at least 1"
         rate = _acct_int_cents(entry.get("rate_cents", 0))
-        if rate is None or rate < 0:
+        if rate is None or (not allow_credits and rate < 0):
             return None, 0, "rate_cents must be whole cents"
         amount = qty * rate
         subtotal += amount
@@ -29248,6 +29256,35 @@ def _acct_migrate_record_link(conn, qb_type, qb_id, erp_type, erp_id):
          datetime.now(timezone.utc).isoformat()))
 
 
+def _acct_migrate_repair_lines(raw):
+    """Repair quantities the QuickBooks MCP pull dropped on old invoices.
+
+    The pull recorded qty 0 on some lines while amount_cents and
+    rate_cents survived intact. When the amount is an exact whole
+    multiple of the rate, the quantity is exactly recoverable as
+    amount / rate (e.g. 3 cases at 4188 = 12564) -- no guessing, and
+    the import's footing check still enforces the totals. Lines that
+    do not repair exactly are left untouched and the invoice is
+    skipped by the validator/footing check, as before. Returns a new
+    list; the snapshot is never mutated."""
+    if not isinstance(raw, list):
+        return raw
+    out = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            out.append(entry)
+            continue
+        entry = dict(entry)
+        qty = _acct_int_cents(entry.get("qty"))
+        rate = _acct_int_cents(entry.get("rate_cents", 0))
+        amount = _acct_int_cents(entry.get("amount_cents", 0))
+        if (qty == 0 and rate not in (None, 0) and amount not in (None, 0)
+                and amount % rate == 0):
+            entry["qty"] = amount // rate
+        out.append(entry)
+    return out
+
+
 def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
     """Import one snapshot. Returns the summary dict. Raises
     _AcctMigrateFail on any fatal problem; the caller rolls back."""
@@ -29503,7 +29540,9 @@ def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
         if customer_type not in ("wholesale", "retail"):
             customer_type = "wholesale"
         lines, subtotal, error = _acct_validate_invoice_lines(
-            rec.get("lines"), default_taxable=(customer_type == "retail"))
+            _acct_migrate_repair_lines(rec.get("lines")),
+            default_taxable=(customer_type == "retail"),
+            allow_credits=True)
         if error:
             skip("invoice", "%s: %s" % (qb_id, error))
             continue
