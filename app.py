@@ -27048,6 +27048,34 @@ def erp_acct_qb_snapshot_upload():
                    accounts=counts["accounts"]), 201
 
 
+@app.get("/api/erp/accounting/qb-snapshot")
+def erp_acct_qb_snapshot_download():
+    """Return the stored QuickBooks migration snapshot so the parent
+    agent can verify it (acct_verify.py) and feed it to the
+    migrate/import endpoint. Admin-only (accounting.write) or the cron
+    secret, same pattern as the upload. 404 when no snapshot is
+    stored. The snapshot holds QuickBooks financial data: it is
+    returned only to an admin session or the cron secret, never to
+    anonymous or customer callers, and it is never logged."""
+    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+        pass
+    else:
+        actor, err = _erp_check_perm("accounting.write")
+        if err:
+            return err
+    path = _acct_qb_snapshot_path()
+    if not path:
+        return jsonify(error="no QuickBooks migration snapshot stored"), 404
+    try:
+        with open(path, encoding="utf-8") as fh:
+            snap = json.load(fh)
+    except (OSError, ValueError) as exc:
+        return jsonify(error="stored snapshot unreadable: %s" % exc), 500
+    if not isinstance(snap, dict):
+        return jsonify(error="stored snapshot is not an object"), 500
+    return jsonify(snap)
+
+
 # ---- QuickBooks OAuth pull: probe + invoice-window pull ----
 # The migration pull (hidden_files/acct_migrate.py) reads QuickBooks
 # through a SEPARATE connection (the QuickBooks MCP CLI) and has been
@@ -29894,9 +29922,19 @@ def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
 
 @app.post("/api/erp/accounting/migrate/import")
 def erp_acct_migrate_import():
-    actor, err = _erp_check_perm("accounting.write")
-    if err:
-        return err
+    # Nov 10: the cron secret is accepted as well as an admin session
+    # (same pattern as the sales backfill and the qb-snapshot
+    # endpoints), so the parent agent can run the import from a job
+    # without a browser session. The import itself is atomic and
+    # idempotent on erp_acct_migration_links, so a cron-triggered
+    # import is as safe as an admin-triggered one.
+    actor = None
+    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+        actor = "cron"
+    else:
+        actor, err = _erp_check_perm("accounting.write")
+        if err:
+            return err
     data = request.get_json(force=True, silent=True)
     if not isinstance(data, dict):
         return jsonify(error="snapshot must be a JSON object"), 400
