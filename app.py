@@ -29285,6 +29285,96 @@ def _acct_migrate_repair_lines(raw):
     return out
 
 
+def _acct_migrate_prior_postings(conn):
+    """Net debit-credit cents already posted by earlier migration runs,
+    split into document postings and prior opening-balance entries.
+
+    The opening entry is a true-up: targets minus everything the
+    migration already posted. A re-run that newly imports an invoice
+    the first run skipped must NOT double-count it -- the first run's
+    opening entry already covered it, so the re-run's opening entry
+    corrects exactly that amount back. (Nov 10 live: Baker $1,312.76
+    was skipped in run 1, covered by opening #10, then posted by its
+    own invoice in run 2 -- without this, GL A/R ran $1,312.76 high.)
+
+    Document postings are read from the migrated rows themselves
+    (journal_entry_id IS NOT NULL means the row posted, so a paid
+    invoice that never posted is never counted, and a voided invoice
+    nets to zero with its reversing entry). A payment or invoice the
+    user creates after migration has no QuickBooks id and is never
+    counted, so post-migration activity is untouched by the true-up.
+    Returns (doc_posted, open_posted), each {erp account id: net_dc}.
+    """
+    doc = {}
+    open_posted = {}
+
+    def add(d, account_id, net_dc):
+        if account_id:
+            d[account_id] = d.get(account_id, 0) + net_dc
+
+    ar_id = _acct_account_id_by_code(conn, ERP_ACCT_AR_CODE)
+    ap_id = _acct_account_id_by_code(conn, ERP_ACCT_AP_CODE)
+    tax_id = _acct_account_id_by_code(conn, ERP_ACCT_TAX_PAYABLE_CODE)
+    ws_id = _acct_account_id_by_code(conn, ERP_ACCT_WHOLESALE_INCOME_CODE)
+    rt_id = _acct_account_id_by_code(conn, ERP_ACCT_RETAIL_INCOME_CODE)
+
+    for row in conn.execute(
+            "SELECT total_cents, subtotal_cents, tax_cents, customer_type"
+            " FROM erp_acct_invoices WHERE qb_id IS NOT NULL"
+            " AND journal_entry_id IS NOT NULL").fetchall():
+        add(doc, ar_id, row["total_cents"] or 0)
+        income_id = ws_id if row["customer_type"] != "retail" else rt_id
+        add(doc, income_id, -(row["subtotal_cents"] or 0))
+        if row["tax_cents"]:
+            add(doc, tax_id, -(row["tax_cents"] or 0))
+    for row in conn.execute(
+            "SELECT lines, total_cents FROM erp_acct_bills"
+            " WHERE qb_id IS NOT NULL"
+            " AND journal_entry_id IS NOT NULL").fetchall():
+        try:
+            lines = json.loads(row["lines"] or "[]")
+        except (ValueError, TypeError):
+            lines = []
+        for ln in lines:
+            if isinstance(ln, dict):
+                add(doc, ln.get("account_id"),
+                    _acct_int_cents(ln.get("amount_cents")) or 0)
+        add(doc, ap_id, -(row["total_cents"] or 0))
+    # Migrated payments and journal entries: read their journal lines
+    # directly (the payment row carries its entry id; a JE link's
+    # erp_id IS its entry id).
+    entry_ids = set()
+    for row in conn.execute(
+            "SELECT journal_entry_id FROM erp_acct_payments"
+            " WHERE qb_id IS NOT NULL"
+            " AND journal_entry_id IS NOT NULL").fetchall():
+        entry_ids.add(row["journal_entry_id"])
+    for row in conn.execute(
+            "SELECT erp_id FROM erp_acct_migration_links"
+            " WHERE qb_type = 'journal_entry'").fetchall():
+        entry_ids.add(row["erp_id"])
+    if entry_ids:
+        for row in conn.execute(
+                "SELECT account_id, debit_cents, credit_cents"
+                " FROM erp_acct_journal_lines WHERE entry_id IN (%s)"
+                % ",".join("?" * len(entry_ids)),
+                tuple(entry_ids)).fetchall():
+            add(doc, row["account_id"],
+                (row["debit_cents"] or 0) - (row["credit_cents"] or 0))
+    # Prior opening-balance entries: their lines are the previous
+    # true-ups, counted separately so the Net Income residual does
+    # not double-count them.
+    for row in conn.execute(
+            "SELECT jl.account_id, jl.debit_cents, jl.credit_cents"
+            " FROM erp_acct_journal_lines jl"
+            " JOIN erp_acct_journal j ON j.id = jl.entry_id"
+            " WHERE j.source = 'migration'"
+            " AND j.source_id = 'opening-balances'").fetchall():
+        add(open_posted, row["account_id"],
+            (row["debit_cents"] or 0) - (row["credit_cents"] or 0))
+    return doc, open_posted
+
+
 def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
     """Import one snapshot. Returns the summary dict. Raises
     _AcctMigrateFail on any fatal problem; the caller rolls back."""
@@ -29309,6 +29399,10 @@ def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
 
     posted = {}   # erp account id -> net debit-credit cents posted here
     targets = {}  # erp account id -> target debit-credit cents (balance sheet)
+    # True-up base: what earlier migration runs already posted, so a
+    # re-run corrects the opening entry instead of double-counting.
+    prior_doc, open_posted = _acct_migrate_prior_postings(conn)
+    posted.update(prior_doc)
 
     def track(account_id, net_dc):
         if account_id:
@@ -29390,6 +29484,29 @@ def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
                 "UPDATE erp_acct_accounts SET parent_id = ? WHERE id = ?",
                 (parent["id"], erp_id))
             acct_by_id[erp_id]["parent_id"] = parent["id"]
+
+    # Targets for balance-sheet accounts the merge skipped as already
+    # linked (a re-run): the opening entry is a true-up against the
+    # CURRENT snapshot, so every balance-sheet account in it needs a
+    # target whether or not this run (re)created it.
+    for rec in lists["accounts"]:
+        name = (rec.get("name") or "").strip()
+        atype = (rec.get("type") or "").strip()
+        if not name or atype not in ERP_ACCT_TYPES:
+            continue
+        if (rec.get("source") != "balance_sheet"
+                or rec.get("balance_cents") is None):
+            continue
+        link = _acct_migrate_link(conn, "account", qb_key(rec, name))
+        erp_id = link["erp_id"] if link else None
+        if erp_id is None:
+            existing = acct_by_norm.get(_acct_migrate_norm_name(name))
+            erp_id = existing["id"] if existing else None
+        if erp_id is not None and erp_id not in targets:
+            bal = _acct_int_cents(rec.get("balance_cents"))
+            if bal is None:
+                continue
+            targets[erp_id] = bal if atype in ("asset", "expense") else -bal
 
     # --- customers -> wholesale accounts ---
     ws_by_norm = {}
@@ -29921,7 +30038,8 @@ def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
     for erp_id, target_dc in targets.items():
         if erp_id == ni_id:
             continue
-        residual = target_dc - posted.get(erp_id, 0)
+        residual = (target_dc - posted.get(erp_id, 0)
+                    - open_posted.get(erp_id, 0))
         if residual == 0:
             continue
         raw.append({"account_id": erp_id,
@@ -29931,7 +30049,8 @@ def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
     if ni_id is not None:
         ni_posted = sum(posted.get(aid, 0) for aid, a in acct_by_id.items()
                         if a["type"] in ("income", "expense"))
-        residual = targets[ni_id] - ni_posted
+        residual = (targets[ni_id] - ni_posted
+                    - open_posted.get(ni_id, 0))
         if residual != 0:
             raw.append({"account_id": ni_id,
                         "debit_cents": residual if residual > 0 else 0,
