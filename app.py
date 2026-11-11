@@ -29968,6 +29968,18 @@ def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
         if atype not in ERP_ACCT_TYPES:
             skip("account", "%s: unknown type %r" % (name, atype))
             continue
+        if rec.get("source") == "qb_chart" and atype in (
+                "asset", "liability", "equity"):
+            # Balance-sheet accounts come only from the balance-sheet
+            # snapshot (consolidated parents with targets). A qb_chart
+            # child would double-count against its parent's target,
+            # and its balance is already inside the parent; the
+            # journal-entry import falls back to the recorded name
+            # instead (see below).
+            skip("account",
+                 "%s: balance-sheet account from qb_chart -- not created"
+                 % name)
+            continue
         key = _acct_migrate_norm_name(name)
         if _acct_migrate_link(conn, "account", qb_key(rec, name)):
             skipped["account"] += 1
@@ -30534,6 +30546,23 @@ def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
                 acct_name = (ln.get("account_name") or "").strip()
                 acct = acct_by_norm.get(_acct_migrate_norm_name(acct_name)) \
                     if acct_name else None
+                if not acct and acct_name:
+                    # QuickBooks names a child by its fully qualified
+                    # name ("Parent:Child"); the chart may record it
+                    # under its short name, a wider suffix, or the
+                    # parent -- try those in that order, so a payroll
+                    # liability child lands on its own short-named
+                    # account rather than the consolidated parent.
+                    _parts = acct_name.split(":")
+                    _cands = [":".join(_parts[_i:])
+                              for _i in range(1, len(_parts))]
+                    _cands += [":".join(_parts[:_i])
+                               for _i in range(len(_parts) - 1, 0, -1)]
+                    for _cand in _cands:
+                        acct = acct_by_norm.get(
+                            _acct_migrate_norm_name(_cand))
+                        if acct:
+                            break
                 if not acct:
                     bad = "unknown account %r" % acct_name
                     break
