@@ -2721,6 +2721,58 @@ def init_db():
             created_at TEXT NOT NULL,
             decided_at TEXT
         );
+        -- Phase 1 gap 1 (Nov 10): bill-payment approval. One row per
+        -- payment request; money moves only on approval by the OTHER
+        -- founder, as a journal entry through _acct_post_entry
+        -- (source "payment"). status is requested / approved /
+        -- rejected / cancelled; a rejected or cancelled request posts
+        -- nothing and can never be approved later. requested_by /
+        -- decided_by are _erp_actor() strings; approval requires a
+        -- different actor than the requester. bank_account_id NULL
+        -- means the seeded Checking -- Operating (1010).
+        CREATE TABLE IF NOT EXISTS erp_acct_bill_payment_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bill_id INTEGER NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            method TEXT NOT NULL DEFAULT 'cash',
+            bank_account_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'requested',
+            requested_by TEXT NOT NULL DEFAULT '',
+            decided_by TEXT NOT NULL DEFAULT '',
+            journal_entry_id INTEGER,
+            created_at TEXT NOT NULL,
+            decided_at TEXT
+        );
+        -- Phase 1 gap 2 (Nov 10): sales-tax filing checklist. One row
+        -- per item per filing; done=1 is checked, done=0 is unchecked.
+        -- Unchecking never deletes the row: Phase 1 permanence (the
+        -- only DELETE on an erp_acct_ table is the period-lock unlock),
+        -- and the row keeps who checked it and when. item_key is one
+        -- of the fixed ERP_ACCT_TAX_CHECKLIST_ITEMS keys.
+        CREATE TABLE IF NOT EXISTS erp_acct_tax_checklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filing_id INTEGER NOT NULL,
+            item_key TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 1,
+            done_by TEXT NOT NULL DEFAULT '',
+            done_at TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(filing_id, item_key)
+        );
+        -- Phase 1 gap 2 (Nov 10): sales-tax reminder log. One row per
+        -- (period, kind) actually sent, so the daily job reminds once
+        -- per kind per period and never spams. kind is due_soon /
+        -- overdue.
+        CREATE TABLE IF NOT EXISTS erp_acct_tax_reminders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            period_start TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            sent_to TEXT NOT NULL DEFAULT '',
+            UNIQUE(period_start, period_end, kind)
+        );
         CREATE TABLE IF NOT EXISTS erp_acct_bill_po_links (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             bill_id INTEGER NOT NULL,
@@ -23669,7 +23721,8 @@ _ACCT_BACKUP_TABLES = (
     "erp_acct_payroll_tax_tables", "erp_acct_payroll_filings",
     "erp_acct_migration_links", "erp_acct_audit",
     "erp_acct_period_locks", "erp_acct_sale_posts",
-    "erp_acct_draws",
+    "erp_acct_draws", "erp_acct_bill_payment_requests",
+    "erp_acct_tax_checklist", "erp_acct_tax_reminders",
 )
 _ACCT_BACKUP_RATE_LIMIT_SECONDS = 300
 _ACCT_BACKUP_LAST_EXPORT_TS = 0.0
@@ -25213,6 +25266,13 @@ def erp_acct_get_bill(bill_id):
 
 @app.post("/api/erp/accounting/bills/<int:bill_id>/pay")
 def erp_acct_pay_bill(bill_id):
+    """Request payment on a bill. Phase 1 section 2.3: a bill payment
+    posts only after the OTHER founder approves it -- this endpoint
+    records the request and moves no money. The approver posts it via
+    POST /bill-payment-requests/<id>/approve, which inserts the
+    erp_acct_payments row and the journal entry (Dr 2000 AP / Cr
+    cash) exactly as the old direct-pay did. A request is approved,
+    rejected, or cancelled -- never edited, never self-approved."""
     actor, err = _erp_check_perm("accounting.write")
     if err:
         return err
@@ -25242,32 +25302,143 @@ def erp_acct_pay_bill(bill_id):
     if amount > bill["balance_cents"]:
         conn.close()
         return jsonify(error="payment exceeds the bill balance"), 400
-    cash_id, bank_err = _acct_cash_account_id(conn, bank_account_id)
-    if bank_err:
-        conn.close()
-        return jsonify(error=bank_err), 400
-    ap_id = _acct_account_id_by_code(conn, ERP_ACCT_AP_CODE)
-    if not cash_id or not ap_id:
-        conn.close()
-        return jsonify(error="chart of accounts is missing a required account"), 500
+    if bank_account_id is not None:
+        bank = conn.execute(
+            "SELECT * FROM erp_acct_bank_accounts WHERE id = ?",
+            (bank_account_id,)).fetchone()
+        if not bank:
+            conn.close()
+            return jsonify(error="bank account not found"), 404
+        if not bank["active"]:
+            conn.close()
+            return jsonify(error="bank account is inactive"), 400
     now = datetime.now(timezone.utc).isoformat()
-    approval_note = "Approved by %s at %s" % (actor or "", now)
+    cur = conn.execute(
+        "INSERT INTO erp_acct_bill_payment_requests (bill_id, amount_cents,"
+        " date, method, bank_account_id, status, requested_by, decided_by,"
+        " journal_entry_id, created_at, decided_at)"
+        " VALUES (?, ?, ?, ?, ?, 'requested', ?, '', NULL, ?, NULL)",
+        (bill_id, amount, date, method, bank_account_id, actor or "", now))
+    req_id = cur.lastrowid
+    _acct_audit(conn, actor, "billpay.request", "bill_payment_request", req_id,
+                "bill #%d %d cents via %s on %s"
+                % (bill_id, amount, method, date))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                       (bill_id,)).fetchone()
+    req = _acct_bill_payment_request_get(conn, req_id)
+    conn.close()
+    return jsonify(bill=_acct_bill_dict(row),
+                   payment_request=_acct_bill_payment_request_dict(req)), 201
+
+
+def _acct_bill_payment_request_dict(row, bill=None):
+    d = dict(row)
+    if bill is not None:
+        d["vendor_name"] = bill["vendor_name"]
+        d["bill_date"] = bill["date"]
+        d["bill_due_date"] = bill["due_date"]
+        d["bill_balance_cents"] = bill["balance_cents"]
+        d["bill_status"] = bill["status"]
+    return d
+
+
+def _acct_bill_payment_request_get(conn, req_id):
+    return conn.execute(
+        "SELECT * FROM erp_acct_bill_payment_requests WHERE id = ?",
+        (req_id,)).fetchone()
+
+
+@app.get("/api/erp/accounting/bill-payment-requests")
+def erp_acct_list_bill_payment_requests():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    conn = db()
+    if status:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_bill_payment_requests WHERE status = ?"
+            " ORDER BY id DESC", (status,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_bill_payment_requests"
+            " ORDER BY id DESC").fetchall()
+    out = []
+    for r in rows:
+        bill = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                            (r["bill_id"],)).fetchone()
+        out.append(_acct_bill_payment_request_dict(r, bill))
+    conn.close()
+    return jsonify(payment_requests=out)
+
+
+@app.post("/api/erp/accounting/bill-payment-requests/<int:req_id>/approve")
+def erp_acct_approve_bill_payment(req_id):
+    """Approve a requested bill payment and post it: Dr 2000 AP / Cr
+    bank (1010 Checking -- Operating by default, or the requested
+    bank account's GL account). The approver must differ from the
+    requester; _acct_post_entry enforces period locks. The bill is
+    re-checked here -- an earlier approval may have lowered its
+    balance below this request, in which case approval fails and the
+    request stays open for the requester to cancel or re-request."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    req = _acct_bill_payment_request_get(conn, req_id)
+    if not req:
+        conn.close()
+        return jsonify(error="payment request not found"), 404
+    if req["status"] != "requested":
+        conn.close()
+        return jsonify(error="only a requested payment can be approved"
+                       " (status: %s)" % req["status"]), 400
+    if (actor or "") == (req["requested_by"] or ""):
+        conn.close()
+        return jsonify(error="you cannot approve your own bill payment;"
+                       " the other founder must approve it"), 403
+    bill = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                        (req["bill_id"],)).fetchone()
+    if not bill:
+        conn.close()
+        return jsonify(error="bill not found"), 404
+    if bill["status"] != "open":
+        conn.close()
+        return jsonify(error="bill is no longer open"), 400
+    if req["amount_cents"] > bill["balance_cents"]:
+        conn.close()
+        return jsonify(error="payment exceeds the bill balance of %d cents"
+                       % bill["balance_cents"]), 400
+    cash_id, bank_err = _acct_cash_account_id(conn, req["bank_account_id"])
+    ap_id = _acct_account_id_by_code(conn, ERP_ACCT_AP_CODE)
+    if not cash_id or not ap_id or bank_err:
+        conn.close()
+        return jsonify(error=bank_err or
+                       "chart of accounts is missing a required account"), 500
+    amount = req["amount_cents"]
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("SAVEPOINT acct_billpay_approve")
+    approval_note = ("Approved by %s at %s (requested by %s)"
+                     % (actor or "", now, req["requested_by"] or ""))
     cur = conn.execute(
         "INSERT INTO erp_acct_payments (invoice_id, bill_id, date,"
         " amount_cents, method, bank_account_id, journal_entry_id,"
         " approval_note, qb_id, created_at)"
         " VALUES (NULL, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
-        (bill_id, date, amount, method, bank_account_id, approval_note,
-         (data.get("qb_id") or "").strip() or None, now))
+        (req["bill_id"], req["date"], amount, req["method"],
+         req["bank_account_id"], approval_note, None, now))
     pay_id = cur.lastrowid
     entry_id, error = _acct_post_entry(
-        conn, actor, date, "Payment on bill #%d" % bill_id,
-        "payment", bill_id,
+        conn, actor, req["date"], "Payment on bill #%d" % req["bill_id"],
+        "payment", req["bill_id"],
         [{"account_id": ap_id, "debit_cents": amount, "credit_cents": 0,
-          "memo": "Payment on bill #%d" % bill_id},
+          "memo": "Payment on bill #%d" % req["bill_id"]},
          {"account_id": cash_id, "debit_cents": 0, "credit_cents": amount,
-          "memo": "Payment on bill #%d" % bill_id}])
+          "memo": "Payment on bill #%d" % req["bill_id"]}])
     if error:
+        conn.execute("ROLLBACK TO SAVEPOINT acct_billpay_approve")
+        conn.execute("RELEASE SAVEPOINT acct_billpay_approve")
         conn.close()
         return jsonify(error=error), 400
     conn.execute("UPDATE erp_acct_payments SET journal_entry_id = ? WHERE id = ?",
@@ -25275,17 +25446,94 @@ def erp_acct_pay_bill(bill_id):
     new_balance = bill["balance_cents"] - amount
     new_status = "paid" if new_balance == 0 else "open"
     conn.execute("UPDATE erp_acct_bills SET balance_cents = ?, status = ?"
-                 " WHERE id = ?", (new_balance, new_status, bill_id))
-    _acct_audit(conn, actor, "bill.pay", "bill", bill_id,
+                 " WHERE id = ?", (new_balance, new_status, req["bill_id"]))
+    conn.execute("UPDATE erp_acct_bill_payment_requests SET status = 'approved',"
+                 " decided_by = ?, journal_entry_id = ?, decided_at = ?"
+                 " WHERE id = ?",
+                 (actor or "", entry_id, now, req_id))
+    _acct_audit(conn, actor, "billpay.approve", "bill_payment_request", req_id,
+                "bill #%d %d cents entry #%d approved by %s (requested by %s)"
+                % (req["bill_id"], amount, entry_id, actor or "",
+                   req["requested_by"] or ""))
+    _acct_audit(conn, actor, "bill.pay", "bill", req["bill_id"],
                 "payment #%d %d cents via %s new balance %d entry #%d; %s"
-                % (pay_id, amount, method, new_balance, entry_id, approval_note))
+                % (pay_id, amount, req["method"], new_balance, entry_id,
+                   approval_note))
+    conn.execute("RELEASE SAVEPOINT acct_billpay_approve")
     conn.commit()
-    row = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
-                       (bill_id,)).fetchone()
-    pay = conn.execute("SELECT * FROM erp_acct_payments WHERE id = ?",
-                       (pay_id,)).fetchone()
+    row = _acct_bill_payment_request_get(conn, req_id)
+    bill_row = conn.execute("SELECT * FROM erp_acct_bills WHERE id = ?",
+                            (req["bill_id"],)).fetchone()
     conn.close()
-    return jsonify(bill=_acct_bill_dict(row), payment=dict(pay))
+    return jsonify(payment_request=_acct_bill_payment_request_dict(row, bill_row),
+                   bill=_acct_bill_dict(bill_row), journal_entry_id=entry_id)
+
+
+@app.post("/api/erp/accounting/bill-payment-requests/<int:req_id>/reject")
+def erp_acct_reject_bill_payment(req_id):
+    """Reject a requested bill payment. Posts nothing; the decision is
+    by the other founder, like approval."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    req = _acct_bill_payment_request_get(conn, req_id)
+    if not req:
+        conn.close()
+        return jsonify(error="payment request not found"), 404
+    if req["status"] != "requested":
+        conn.close()
+        return jsonify(error="only a requested payment can be rejected"
+                       " (status: %s)" % req["status"]), 400
+    if (actor or "") == (req["requested_by"] or ""):
+        conn.close()
+        return jsonify(error="you cannot reject your own bill payment;"
+                       " the other founder must decide it"), 403
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_acct_bill_payment_requests SET status = 'rejected',"
+                 " decided_by = ?, decided_at = ? WHERE id = ?",
+                 (actor or "", now, req_id))
+    _acct_audit(conn, actor, "billpay.reject", "bill_payment_request", req_id,
+                "bill #%d %d cents rejected by %s (requested by %s)"
+                % (req["bill_id"], req["amount_cents"], actor or "",
+                   req["requested_by"] or ""))
+    conn.commit()
+    row = _acct_bill_payment_request_get(conn, req_id)
+    conn.close()
+    return jsonify(payment_request=_acct_bill_payment_request_dict(row))
+
+
+@app.post("/api/erp/accounting/bill-payment-requests/<int:req_id>/cancel")
+def erp_acct_cancel_bill_payment(req_id):
+    """Withdraw your own requested bill payment. Posts nothing. Only
+    the requester can cancel; the other founder rejects instead."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    req = _acct_bill_payment_request_get(conn, req_id)
+    if not req:
+        conn.close()
+        return jsonify(error="payment request not found"), 404
+    if req["status"] != "requested":
+        conn.close()
+        return jsonify(error="only a requested payment can be cancelled"
+                       " (status: %s)" % req["status"]), 400
+    if (actor or "") != (req["requested_by"] or ""):
+        conn.close()
+        return jsonify(error="only the requester can cancel this payment;"
+                       " the other founder can reject it"), 403
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_acct_bill_payment_requests SET status = 'cancelled',"
+                 " decided_by = ?, decided_at = ? WHERE id = ?",
+                 (actor or "", now, req_id))
+    _acct_audit(conn, actor, "billpay.cancel", "bill_payment_request", req_id,
+                "bill #%d %d cents cancelled by requester"
+                % (req["bill_id"], req["amount_cents"]))
+    conn.commit()
+    row = _acct_bill_payment_request_get(conn, req_id)
+    conn.close()
+    return jsonify(payment_request=_acct_bill_payment_request_dict(row))
 
 
 @app.post("/api/erp/accounting/bills/<int:bill_id>/void")
@@ -26826,7 +27074,9 @@ def _acct_qb_diff(conn, snap):
                  "erp_name": er["name"], "erp_balance_cents": ebal,
                  "difference_cents": ebal - qbal,
                  "status": "match" if ebal == qbal else "difference",
-                 "note": ""})
+                 "note": ("3040 holds the migration residual only; see the"
+                          " Net income reconciliation below."
+                          if norm == "net income" and ebal != qbal else "")})
         else:
             acct_rows.append(
                 {"qb_name": qname, "qb_type": qa.get("type"),
@@ -26930,6 +27180,85 @@ def _acct_qb_diff(conn, snap):
                      " in this report; only the balance-sheet totals"
                      " above are shown."}
 
+    # --- sales + net income reconciliation (Phase 1 gap 3) ---
+    # ERP income accounts hold only what the migration actually posted:
+    # open-invoice income, journal-entry income lines, and post-migration
+    # retail sales. Paid invoices never post to ERP income -- their money
+    # is in the bank balances and the opening entry -- so all-time
+    # QuickBooks sales is NOT comparable; the comparable figure is the
+    # income attributable to the posted documents. The old untraced
+    # "Sales row" (ERP $24,628.60 vs QB $20,001.40) matches no account,
+    # invoice total, or combination in the snapshot or the ledger, and
+    # no endpoint ever computed it; this section replaces it with a
+    # checkable reconciliation.
+    erp_income_cents = sum(_acct_qb_normal_balance(r) for r in erp_rows
+                           if r["type"] == "income")
+    qb_open_invoice_cents = sum(
+        int(i.get("subtotal_cents") or 0)
+        for i in (snap.get("invoices") or [])
+        if (i.get("status") or "") == "open")
+    qb_type_by_norm = {}
+    for qa in qb_accounts:
+        qb_type_by_norm[_acct_qb_norm_name(qa.get("name") or "")] = qa.get("type")
+    for cr in (snap.get("qb_chart") or []):
+        qb_type_by_norm.setdefault(
+            _acct_qb_norm_name(cr.get("name") or ""), cr.get("type"))
+    qb_je_income_cents = 0
+    for j in (snap.get("journal_entries") or []):
+        for ln in (j.get("lines") or []):
+            if qb_type_by_norm.get(
+                    _acct_qb_norm_name(ln.get("account_name") or "")) == "income":
+                qb_je_income_cents += (int(ln.get("credit_cents") or 0)
+                                       - int(ln.get("debit_cents") or 0))
+    retail_row = next((r for r in erp_rows
+                       if r["code"] == ERP_ACCT_RETAIL_INCOME_CODE), None)
+    retail_cents = _acct_qb_normal_balance(retail_row) if retail_row else 0
+    qb_all_time_sales_cents = sum(
+        int(i.get("subtotal_cents") or 0)
+        for i in (snap.get("invoices") or []))
+    sales_diff = (erp_income_cents - qb_open_invoice_cents
+                  - qb_je_income_cents - retail_cents)
+    sales = {"erp_income_cents": erp_income_cents,
+             "qb_open_invoice_cents": qb_open_invoice_cents,
+             "qb_je_income_cents": qb_je_income_cents,
+             "erp_retail_cents": retail_cents,
+             "difference_cents": sales_diff,
+             "qb_all_time_sales_cents": qb_all_time_sales_cents,
+             "status": "match" if sales_diff == 0 else "difference",
+             "note": "ERP income is open-invoice income plus journal-entry"
+                     " income plus post-migration retail. All-time"
+                     " QuickBooks sales is not comparable: paid invoices"
+                     " never post to ERP income (their money is in the"
+                     " bank balances and the opening entry)."}
+    qb_ni_row = next((a for a in qb_accounts
+                      if _acct_qb_norm_name(a.get("name") or "") == "net income"),
+                     None)
+    qb_ni_cents = (qb_ni_row.get("balance_cents")
+                   if qb_ni_row else None)
+    erp_3040_row = next((r for r in erp_rows
+                         if _acct_qb_norm_name(r["name"]) == "net income"),
+                        None)
+    erp_3040_cents = (_acct_qb_normal_balance(erp_3040_row)
+                      if erp_3040_row else None)
+    erp_pl_net_cents = _acct_net_income(erp_rows)
+    ni_diff = None
+    if qb_ni_cents is not None and erp_3040_cents is not None:
+        ni_diff = (erp_3040_cents + erp_pl_net_cents - retail_cents
+                   - qb_ni_cents)
+    net_income = {"qb_net_income_cents": qb_ni_cents,
+                  "erp_3040_cents": erp_3040_cents,
+                  "erp_pl_net_cents": erp_pl_net_cents,
+                  "erp_retail_cents": retail_cents,
+                  "difference_cents": ni_diff,
+                  "status": ("match" if ni_diff == 0 else
+                             "difference" if ni_diff is not None else
+                             "not_available_in_snapshot"),
+                  "note": "QuickBooks folds all income and expense into"
+                          " Net Income. The ERP keeps it split: the 3040"
+                          " account holds only the migration residual,"
+                          " the rest sits in the income/expense accounts."
+                          " 3040 + P&L net income - post-migration retail"
+                          " equals QuickBooks Net Income."}
     uncompared = []
     if missing_months:
         uncompared.append(
@@ -26965,6 +27294,8 @@ def _acct_qb_diff(conn, snap):
             "receivables": ar,
             "payables": ap,
             "trial_balance": trial,
+            "sales": sales,
+            "net_income": net_income,
             "uncompared": uncompared,
             "status": "match" if all_match else (
                 "incomplete" if not complete else "differences"),
@@ -27896,6 +28227,23 @@ def erp_acct_qb_pull_run_types():
                 error = "could not store snapshot: %s" % exc
                 error_status = 500
     if not rate_limited and error is None:
+        # Invoices and items were never recorded in meta.types by the
+        # invoice pull (qb-pull/run records invoices only on its own
+        # complete branch, and items are not migrated at all), so
+        # meta.complete could never flip True. Record both here:
+        # invoices from the snapshot the pull filled, items as
+        # not_pulled by design (the ERP keeps its own item master;
+        # QuickBooks items are never imported). The complete rule
+        # accepts any recorded status.
+        types = meta.setdefault("types", {})
+        types["invoices"] = {
+            "status": "pulled", "count": len(snap.get("invoices") or []),
+            "pulled_at": now,
+            "note": "monthly windows through the invoice pull (qb-pull/run)"}
+        types.setdefault("items", {
+            "status": "not_pulled", "count": 0,
+            "note": "QuickBooks items are not migrated; the ERP keeps"
+                    " its own item master"})
         meta["complete"] = all(
             (meta.get("types") or {}).get(t, {}).get("status")
             in ("pulled", "not_available", "not_pulled")
@@ -27955,6 +28303,34 @@ def erp_acct_qb_pull_run():
     conn = db()
     remaining = _qb_pull_remaining_windows(snap)
     if not remaining:
+        # Already complete from an earlier run: make sure the types the
+        # complete rule needs are recorded (the original run predated
+        # the invoices/items recording), then save if anything changed.
+        # A save failure here is not fatal -- the in-memory meta is
+        # complete and the next run-types call backfills the file.
+        _types = meta.setdefault("types", {})
+        _changed = False
+        if "invoices" not in _types:
+            _types["invoices"] = {
+                "status": "pulled", "count": len(snap.get("invoices") or []),
+                "pulled_at": datetime.now(timezone.utc).isoformat(),
+                "note": "monthly windows through the invoice pull (qb-pull/run)"}
+            _changed = True
+        if "items" not in _types:
+            _types["items"] = {
+                "status": "not_pulled", "count": 0,
+                "note": "QuickBooks items are not migrated; the ERP keeps"
+                        " its own item master"}
+            _changed = True
+        if _changed:
+            meta["complete"] = all(
+                (meta.get("types") or {}).get(t, {}).get("status")
+                in ("pulled", "not_available", "not_pulled")
+                for t in _QB_PULL_COMPLETE_TYPES)
+            try:
+                _qb_pull_save_snapshot(snap, _qb_pull_write_path(read_path))
+            except OSError:
+                pass
         conn.close()
         return jsonify(ok=True, complete=True, windows_pulled=[],
                        windows_remaining=0,
@@ -28019,6 +28395,10 @@ def erp_acct_qb_pull_run():
                     "QuickBooks OAuth connection"
                     % _qb_pull_month_window(
                         datetime.now(timezone.utc).strftime("%Y-%m"))[1]}
+        types["items"] = {
+            "status": "not_pulled", "count": 0,
+            "note": "QuickBooks items are not migrated; the ERP keeps"
+                    " its own item master"}
         meta.setdefault("verification", {}) \
             .setdefault("qb_counts", {})["invoices"] = len(seen)
         meta["complete"] = all(
@@ -29049,6 +29429,219 @@ def erp_acct_file_tax_filing(filing_id):
     conn.close()
     return jsonify(filing=_acct_tax_filing_dict(row))
 
+
+
+
+# ---- Sales-tax filing checklist + reminder (Phase 1 gap 2, Nov 10) ----
+# Spec 2.6 wants a filing checklist and a reminder before the due date.
+# The checklist is five fixed steps per filing; the reminder is a
+# cron-secret endpoint the daily job calls, once per kind per period.
+ERP_ACCT_TAX_CHECKLIST_ITEMS = (
+    ("verify_liability",
+     "Verify the computed liability against invoices plus auto-posted retail tax"),
+    ("reconcile_2100",
+     "Reconcile account 2100 (Sales Tax Payable) to the computed liability"),
+    ("remit_payment", "Remittance posted (Dr 2100 / Cr cash)"),
+    ("file_return", "Return filed with the Nevada Department of Taxation"),
+    ("save_confirmation", "Filing confirmation saved"),
+)
+ERP_ACCT_TAX_CHECKLIST_LABELS = dict(ERP_ACCT_TAX_CHECKLIST_ITEMS)
+
+
+def _acct_tax_checklist_items(conn, filing_id):
+    done = {r["item_key"]: r for r in conn.execute(
+        "SELECT * FROM erp_acct_tax_checklist"
+        " WHERE filing_id = ? AND done = 1",
+        (filing_id,)).fetchall()}
+    return [{"item_key": k, "label": label,
+             "done": k in done,
+             "done_by": done[k]["done_by"] if k in done else "",
+             "done_at": done[k]["done_at"] if k in done else None}
+            for k, label in ERP_ACCT_TAX_CHECKLIST_ITEMS]
+
+
+@app.get("/api/erp/accounting/tax/filings/<int:filing_id>/checklist")
+def erp_acct_tax_checklist(filing_id):
+    actor, err = _erp_check_perm("tax.read")
+    if err:
+        return err
+    conn = db()
+    filing = conn.execute("SELECT * FROM erp_acct_tax_filings WHERE id = ?",
+                          (filing_id,)).fetchone()
+    if not filing:
+        conn.close()
+        return jsonify(error="filing not found"), 404
+    items = _acct_tax_checklist_items(conn, filing_id)
+    conn.close()
+    return jsonify(filing_id=filing_id, items=items)
+
+
+@app.post("/api/erp/accounting/tax/filings/<int:filing_id>/checklist")
+def erp_acct_tax_checklist_set(filing_id):
+    actor, err = _erp_check_perm("tax.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    item_key = (data.get("item_key") or "").strip()
+    if item_key not in ERP_ACCT_TAX_CHECKLIST_LABELS:
+        return jsonify(error="item_key must be one of "
+                       + ", ".join(k for k, _ in ERP_ACCT_TAX_CHECKLIST_ITEMS)), 400
+    done = data.get("done")
+    if done not in (True, False):
+        return jsonify(error="done must be true or false"), 400
+    conn = db()
+    filing = conn.execute("SELECT * FROM erp_acct_tax_filings WHERE id = ?",
+                          (filing_id,)).fetchone()
+    if not filing:
+        conn.close()
+        return jsonify(error="filing not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    if done:
+        existing = conn.execute(
+            "SELECT id FROM erp_acct_tax_checklist"
+            " WHERE filing_id = ? AND item_key = ?",
+            (filing_id, item_key)).fetchone()
+        if existing:
+            conn.execute("UPDATE erp_acct_tax_checklist"
+                         " SET done = 1, done_by = ?, done_at = ?"
+                         " WHERE id = ?",
+                         (actor or "", now, existing["id"]))
+        else:
+            conn.execute(
+                "INSERT INTO erp_acct_tax_checklist (filing_id, item_key,"
+                " done, done_by, done_at, created_at)"
+                " VALUES (?, ?, 1, ?, ?, ?)",
+                (filing_id, item_key, actor or "", now, now))
+        _acct_audit(conn, actor, "tax.checklist", "tax_filing", filing_id,
+                    "%s checked" % item_key)
+    else:
+        # No DELETE: permanence -- the row stays with done=0.
+        conn.execute("UPDATE erp_acct_tax_checklist SET done = 0"
+                     " WHERE filing_id = ? AND item_key = ?",
+                     (filing_id, item_key))
+        _acct_audit(conn, actor, "tax.checklist", "tax_filing", filing_id,
+                    "%s unchecked" % item_key)
+    conn.commit()
+    items = _acct_tax_checklist_items(conn, filing_id)
+    conn.close()
+    return jsonify(filing_id=filing_id, items=items)
+
+
+def _acct_tax_remind_auth():
+    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+        return "cron", None
+    return _erp_check_perm("tax.write")
+
+
+@app.post("/api/erp/accounting/tax/remind")
+def erp_acct_tax_remind():
+    """Send the sales-tax filing reminder for the most recently
+    completed month, once per kind per period. 'due_soon' fires in the
+    5 days before the 20th; 'overdue' fires after the 20th; both only
+    while the filing is not filed (or not created yet). Idempotent on
+    erp_acct_tax_reminders. Body {"as_of": "YYYY-MM-DD"} overrides
+    today (tests / manual trigger); default is today (UTC)."""
+    actor, err = _acct_tax_remind_auth()
+    if err:
+        return err
+    data = request.get_json(silent=True) or {}
+    as_of_raw = (data.get("as_of") or "").strip()
+    if as_of_raw:
+        if not _acct_valid_date(as_of_raw):
+            return jsonify(error="as_of must be YYYY-MM-DD"), 400
+        today = datetime.strptime(as_of_raw, "%Y-%m-%d").date()
+    else:
+        today = datetime.now(timezone.utc).date()
+    due = today.replace(day=20)
+    first_this = today.replace(day=1)
+    last_prev = first_this - timedelta(days=1)
+    period_start = last_prev.replace(day=1).isoformat()
+    period_end = last_prev.isoformat()
+    period_label = last_prev.strftime("%B %Y")
+    jurisdiction = ERP_ACCT_TAX_DEFAULT_JURISDICTION
+    if today > due:
+        kind = "overdue"
+    elif (due - today).days <= 5:
+        kind = "due_soon"
+    else:
+        return jsonify(reminded=False, kind=None, period_start=period_start,
+                       period_end=period_end, due=due.isoformat(),
+                       reason="outside the reminder window")
+    conn = db()
+    filing = conn.execute(
+        "SELECT * FROM erp_acct_tax_filings WHERE jurisdiction = ?"
+        " AND period_start <= ? AND period_end >= ? LIMIT 1",
+        (jurisdiction, period_end, period_start)).fetchone()
+    if filing and filing["status"] == "filed":
+        conn.close()
+        return jsonify(reminded=False, kind=kind, period_start=period_start,
+                       period_end=period_end, due=due.isoformat(),
+                       reason="filing already filed")
+    sent = conn.execute(
+        "SELECT * FROM erp_acct_tax_reminders WHERE period_start = ?"
+        " AND period_end = ? AND kind = ?",
+        (period_start, period_end, kind)).fetchone()
+    if sent:
+        conn.close()
+        return jsonify(reminded=False, kind=kind, period_start=period_start,
+                       period_end=period_end, due=due.isoformat(),
+                       reason="reminder already sent",
+                       sent_at=sent["sent_at"])
+    if filing:
+        outstanding = filing["tax_collected_cents"] - filing["tax_remitted_cents"]
+        detail = ("Collected $%.2f, remitted $%.2f, outstanding $%.2f."
+                  % (filing["tax_collected_cents"] / 100.0,
+                     filing["tax_remitted_cents"] / 100.0,
+                     outstanding / 100.0))
+        filing_status = filing["status"]
+    else:
+        detail = "No filing has been created for this period yet."
+        filing_status = "missing"
+    subject = ("Sales tax filing %s - %s %s (due %s)"
+               % ("overdue" if kind == "overdue" else "due soon",
+                  jurisdiction, period_label, due.isoformat()))
+    body = ("The %s sales tax return for %s is due %s. %s<br><br>"
+            "Open the ERP Accounting tab, Sales Tax, to remit and file it:"
+            " https://erp.pop-a-licious.com/#/accounting"
+            % (jurisdiction, period_label, due.isoformat(), detail))
+    sent_to = []
+    try:
+        for to in ADMIN_EMAILS:
+            send_email(to, subject, body)
+            sent_to.append(to)
+    except Exception as exc:
+        conn.close()
+        return jsonify(error="reminder email failed: %s" % exc), 502
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO erp_acct_tax_reminders (period_start, period_end, kind,"
+        " sent_at, sent_to) VALUES (?, ?, ?, ?, ?)",
+        (period_start, period_end, kind, now, ", ".join(sent_to)))
+    _acct_audit(conn, actor, "tax.remind", "tax_filing",
+                filing["id"] if filing else 0,
+                "%s %s reminder sent to %s (filing %s)"
+                % (period_label, kind, ", ".join(sent_to), filing_status))
+    conn.commit()
+    conn.close()
+    return jsonify(reminded=True, kind=kind, period_start=period_start,
+                   period_end=period_end, due=due.isoformat(),
+                   filing_status=filing_status, sent_to=sent_to)
+
+
+@app.get("/api/erp/accounting/tax/reminders")
+def erp_acct_tax_reminders_list():
+    """Reminder log for the Sales Tax tab: one row per reminder sent,
+    newest first. The daily job POSTs /tax/remind; this read shows
+    whether it fired."""
+    actor, err = _erp_check_perm("tax.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_acct_tax_reminders"
+        " ORDER BY sent_at DESC LIMIT 50").fetchall()
+    conn.close()
+    return jsonify(reminders=[dict(r) for r in rows])
 
 
 # ---- Payroll (Phase 1 step 6) ----
