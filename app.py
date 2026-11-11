@@ -26672,21 +26672,47 @@ ERP_PLAID_CLI_ENV = "ERP_PLAID_CLI"
 ERP_PLAID_CLI_DEFAULT = "/opt/hatch/bin/plaid"
 
 
+ERP_QB_SNAPSHOT_VOLUME_PATH = "/data/qb-migration-snapshot.json"
+
+
+def _acct_qb_snapshot_candidates():
+    """Candidate snapshot locations in read order: the goal's
+    hidden_files copy next to build/ (sandbox/dev), the Railway volume
+    copy /data/qb-migration-snapshot.json (live -- the same volume
+    that holds the database), then one next to app.py. The volume
+    copy is checked before the beside-app.py copy so a snapshot
+    uploaded live always wins over a stale repo copy."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return (os.path.join(here, "..", "hidden_files",
+                         "qb-migration-snapshot.json"),
+            ERP_QB_SNAPSHOT_VOLUME_PATH,
+            os.path.join(here, "qb-migration-snapshot.json"))
+
+
 def _acct_qb_snapshot_path():
     """Where the QB migration snapshot is read from at request time:
     ERP_QB_SNAPSHOT_PATH wins (tests point it at a fixture), else the
-    goal's hidden_files copy next to build/, else one next to app.py.
+    first existing candidate from _acct_qb_snapshot_candidates().
     Returns the first existing path, or None."""
     env = (os.environ.get(ERP_QB_SNAPSHOT_ENV) or "").strip()
     if env:
         return env if os.path.isfile(env) else None
-    here = os.path.dirname(os.path.abspath(__file__))
-    for cand in (os.path.join(here, "..", "hidden_files",
-                              "qb-migration-snapshot.json"),
-                 os.path.join(here, "qb-migration-snapshot.json")):
+    for cand in _acct_qb_snapshot_candidates():
         if os.path.isfile(cand):
             return cand
     return None
+
+
+def _acct_qb_snapshot_write_path():
+    """Where an uploaded snapshot is stored: the ERP_QB_SNAPSHOT_PATH
+    override when set (tests point it at a fixture), else the Railway
+    volume file /data/qb-migration-snapshot.json. Never the repo: the
+    snapshot holds QuickBooks financial data and must not be
+    committed."""
+    env = (os.environ.get(ERP_QB_SNAPSHOT_ENV) or "").strip()
+    if env:
+        return env
+    return ERP_QB_SNAPSHOT_VOLUME_PATH
 
 
 def _acct_qb_norm_name(name):
@@ -26955,6 +26981,496 @@ def erp_acct_qb_diff():
     conn = db()
     out = _acct_qb_diff(conn, snap)
     conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/accounting/qb-snapshot")
+def erp_acct_qb_snapshot_upload():
+    """Store a QuickBooks migration snapshot so the qb-diff report can
+    read it live. The snapshot lives on the Railway volume
+    (/data/qb-migration-snapshot.json -- the same volume that holds
+    the database), never in the repo: it holds QuickBooks financial
+    data and must not be committed. Admin-only (accounting.write) or
+    the cron secret, same pattern as the sales backfill. The body
+    must be {"snapshot": {...}} with a meta dict and list-valued
+    invoices/customers/accounts; anything else is 400 and writes
+    nothing. Written atomically (temp file + os.replace) and audited
+    as qb.snapshot_upload. The snapshot contents are never logged --
+    the audit detail and the response carry counts only."""
+    actor = None
+    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+        actor = "cron"
+    else:
+        actor, err = _erp_check_perm("accounting.write")
+        if err:
+            return err
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) \
+            or not isinstance(data.get("snapshot"), dict):
+        return jsonify(error="body must be {\"snapshot\": {...}}"), 400
+    snap = data["snapshot"]
+    if not isinstance(snap.get("meta"), dict):
+        return jsonify(error="snapshot.meta must be an object"), 400
+    for key in ("invoices", "customers", "accounts"):
+        if not isinstance(snap.get(key), list):
+            return jsonify(error="snapshot.%s must be a list" % key), 400
+    path = _acct_qb_snapshot_write_path()
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".qb-snapshot-",
+                                   dir=parent or ".")
+        os.close(fd)
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(snap, fh)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError as exc:
+        return jsonify(error="could not store snapshot: %s" % exc), 500
+    counts = {k: len(snap[k]) for k in ("invoices", "customers", "accounts")}
+    conn = db()
+    _acct_audit(conn, actor, "qb.snapshot_upload", "qb_snapshot", 0,
+                "snapshot stored: %d invoices, %d customers, %d accounts"
+                % (counts["invoices"], counts["customers"],
+                   counts["accounts"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, stored=True, path=path,
+                   invoices=counts["invoices"],
+                   customers=counts["customers"],
+                   accounts=counts["accounts"]), 201
+
+
+# ---- QuickBooks OAuth pull: probe + invoice-window pull ----
+# The migration pull (hidden_files/acct_migrate.py) reads QuickBooks
+# through a SEPARATE connection (the QuickBooks MCP CLI) and has been
+# 429-throttled since Nov 9. The ERP itself is now authorized to the
+# same company (FUDGETOPIA LLC, same realm) under its own OAuth tokens,
+# so these endpoints pull the remaining invoice windows through the
+# ERP's own connection instead. Scope is INVOICES ONLY: accounts, aging,
+# customers and items are already marked pulled in the snapshot.
+# The snapshot fields are written exactly as acct_migrate.py writes them
+# (meta.invoice_windows_done as [start, end] pairs, invoices sorted by
+# (date, doc_number), money in integer cents), so acct_verify.py and the
+# migrate/import endpoint keep working unchanged. Two deliberate
+# deviations from the MCP script, both documented where they happen:
+# (1) the MCP running invoice_total_count base (113) is provably wrong
+# -- 313 invoices are stored -- so this pull sets it to the exact
+# distinct-invoice count after every window; (2) qb_id values here are
+# the plain QuickBooks Ids, while the MCP pull stored opaque MCP ids
+# ("<base64>:<id>") -- dedup compares the trailing segment, so the same
+# invoice is never stored twice under the two spellings.
+_QB_PULL_PACE_SECONDS = 0.5
+_QB_PULL_PAGE_SIZE = 1000
+_QB_PULL_FIRST_MONTH = "2020-01"
+_QB_PULL_MAX_MONTHS = 5
+_QB_PULL_COMPLETE_TYPES = ("accounts", "customers", "vendors", "items",
+                           "invoices", "bills", "payments", "bank_accounts",
+                           "bank_transactions", "journal_entries")
+
+
+def _qb_is_rate_limited(exc):
+    """True when a _QBOError is a 429. The real client raises
+    _QBOError('QuickBooks error 429: ...') with the default 502 status,
+    so both the status and the message are checked; the test double
+    raises with status=429."""
+    return (getattr(exc, "status", None) == 429
+            or re.search(r"\b429\b", str(exc)) is not None)
+
+
+def _qb_pull_to_cents(value):
+    """Decimal string/number -> integer cents (same rules as
+    acct_migrate.to_cents). None when unparseable."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value * 100
+    if isinstance(value, float):
+        return int(Decimal(str(value)) * 100)
+    s = str(value).strip().replace("$", "").replace(",", "")
+    if s.startswith("(") and s.endswith(")"):
+        s = "-" + s[1:-1]
+    if not s or s in ("-", "--"):
+        return None
+    try:
+        return int(Decimal(s) * 100)
+    except Exception:
+        return None
+
+
+def _qb_pull_norm_id(qb_id):
+    """Trailing segment of a QuickBooks id. The MCP pull stored opaque
+    ids ('<base64>:<id>'); the OAuth API returns the plain id. Both
+    spellings reduce to the real id, so dedup works across pulls."""
+    s = str(qb_id or "")
+    return s.rsplit(":", 1)[-1] if s else ""
+
+
+def _qb_pull_month_window(yyyy_mm):
+    """(first, last) YYYY-MM-DD dates for a YYYY-MM month."""
+    y, m = int(yyyy_mm[:4]), int(yyyy_mm[5:7])
+    first = "%04d-%02d-01" % (y, m)
+    if m == 12:
+        nxt = datetime(y + 1, 1, 1)
+    else:
+        nxt = datetime(y, m + 1, 1)
+    return first, (nxt - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _qb_pull_invoice_row(inv):
+    """A raw QuickBooks Invoice dict -> the snapshot invoice shape
+    acct_migrate.py writes. Returns None when the record has no Id.
+    Tax comes from TxnTaxDetail.TotalTax when present, else from the
+    TaxLineDetail lines; SubTotalLineDetail lines are not products."""
+    qid = str(inv.get("Id") or "")
+    if not qid:
+        return None
+    cust = inv.get("CustomerRef") or {}
+    email = (inv.get("BillEmail") or {}).get("Address") or ""
+    lines = []
+    tax_cents = None
+    txn_tax = inv.get("TxnTaxDetail") or {}
+    if txn_tax.get("TotalTax") is not None:
+        tax_cents = _qb_pull_to_cents(txn_tax.get("TotalTax"))
+    for ln in inv.get("Line") or []:
+        if not isinstance(ln, dict):
+            continue
+        dtype = ln.get("DetailType")
+        if dtype == "TaxLineDetail":
+            if txn_tax.get("TotalTax") is None:
+                tax_cents = (tax_cents or 0) \
+                    + (_qb_pull_to_cents(ln.get("Amount")) or 0)
+            continue
+        if dtype != "SalesItemLineDetail":
+            continue
+        detail = ln.get("SalesItemLineDetail") or {}
+        item_ref = detail.get("ItemRef") or {}
+        tax_ref = detail.get("TaxCodeRef") or {}
+        lines.append({
+            "description": ln.get("Description")
+                           or item_ref.get("name") or "",
+            "qty": int(Decimal(str(detail.get("Qty") or 1))),
+            "rate_cents": _qb_pull_to_cents(detail.get("UnitPrice")) or 0,
+            "amount_cents": _qb_pull_to_cents(ln.get("Amount")) or 0,
+            "taxable": tax_ref.get("value") == "TAX",
+            "item_qb_id": str(item_ref.get("value") or ""),
+        })
+    subtotal = sum(l["amount_cents"] for l in lines)
+    total = _qb_pull_to_cents(inv.get("TotalAmt"))
+    balance = _qb_pull_to_cents(inv.get("Balance"))
+    return {
+        "qb_id": qid,
+        "doc_number": str(inv.get("DocNumber") or ""),
+        "customer_qb_id": str(cust.get("value") or ""),
+        "customer_name": cust.get("name") or "",
+        "customer_email": email,
+        "date": inv.get("TxnDate") or "",
+        "due_date": inv.get("DueDate") or "",
+        "lines": lines,
+        "subtotal_cents": subtotal,
+        "tax_cents": tax_cents if tax_cents is not None else 0,
+        "total_cents": total if total is not None else subtotal,
+        "balance_cents": balance if balance is not None else 0,
+        "status": "open" if (balance or 0) > 0 else "paid",
+        "customer_type": "wholesale",
+    }
+
+
+def _qb_pull_fetch_window(client, frm, to):
+    """All invoices in one [frm, to] window via the QBO query API,
+    paginated (MAXRESULTS 1000). Returns a list of raw QuickBooks
+    invoice dicts. Raises _QBOError on any failure -- including 429,
+    which the caller must not retry."""
+    out = []
+    start = 1
+    total = None
+    for _page in range(100):
+        data = client.query(
+            "select * from Invoice where TxnDate >= '%s'"
+            " and TxnDate <= '%s' ORDER BY TxnDate"
+            " STARTPOSITION %d MAXRESULTS %d"
+            % (frm, to, start, _QB_PULL_PAGE_SIZE))
+        resp = (data or {}).get("QueryResponse") or {}
+        page = resp.get("Invoice") or []
+        if total is None:
+            total = resp.get("totalCount")
+        out.extend(page)
+        if len(page) < _QB_PULL_PAGE_SIZE:
+            break
+        if total is not None and len(out) >= total:
+            break
+        start += _QB_PULL_PAGE_SIZE
+    else:
+        raise _QBOError("QuickBooks invoice window %s..%s is too large"
+                        " to page" % (frm, to))
+    return out
+
+
+def _qb_pull_load_snapshot():
+    """(snapshot dict, read path) or (None, None) when no snapshot
+    file exists. A malformed file raises ValueError."""
+    path = _acct_qb_snapshot_path()
+    if not path:
+        return None, None
+    with open(path, encoding="utf-8") as fh:
+        snap = json.load(fh)
+    if not isinstance(snap, dict):
+        raise ValueError("snapshot is not an object")
+    return snap, path
+
+
+def _qb_pull_write_path(read_path):
+    """Where the pull writes the snapshot back: the
+    ERP_QB_SNAPSHOT_PATH override when set (tests point it at a
+    fixture), else the same file it was read from -- except a
+    beside-app.py copy, which is a stale repo fallback the pull must
+    never write into (the volume path wins there instead)."""
+    env = (os.environ.get(ERP_QB_SNAPSHOT_ENV) or "").strip()
+    if env:
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    beside = os.path.join(here, "qb-migration-snapshot.json")
+    if read_path and os.path.abspath(read_path) != os.path.abspath(beside):
+        return read_path
+    return _acct_qb_snapshot_write_path()
+
+
+def _qb_pull_save_snapshot(snap, path):
+    """Atomic snapshot write (temp file + os.replace), mirroring the
+    qb-snapshot upload endpoint. pulled_at is refreshed on every save."""
+    snap.setdefault("meta", {})["pulled_at"] = \
+        datetime.now(timezone.utc).isoformat()
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".qb-pull-", dir=parent or ".")
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(snap, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _qb_pull_remaining_windows(snap):
+    """[(month, frm, to)] for every month 2020-01..current month whose
+    window is not in meta.invoice_windows_done, oldest first."""
+    done = {tuple(w) for w in
+            (snap.get("meta") or {}).get("invoice_windows_done", [])}
+    now_mm = datetime.now(timezone.utc).strftime("%Y-%m")
+    out = []
+    for mm in _acct_qb_months(_QB_PULL_FIRST_MONTH, now_mm):
+        frm, to = _qb_pull_month_window(mm)
+        if (frm, to) not in done:
+            out.append((mm, frm, to))
+    return out
+
+
+def _qb_pull_auth():
+    """qb.manage admin session OR the cron secret, same pattern as the
+    sales backfill / qb-snapshot upload. Returns (actor, None) when
+    allowed, else (None, (resp, code))."""
+    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+        return "cron", None
+    actor, err = _erp_check_perm("qb.manage")
+    return actor, err
+
+
+@app.post("/api/erp/accounting/qb-pull/probe")
+def erp_acct_qb_pull_probe():
+    """Live probe of the ERP's own QuickBooks OAuth connection: one
+    CompanyInfo query plus one small invoice-count query for the first
+    missing invoice window. Read-only -- nothing is written. A 429
+    from either query returns 429 with rate_limited true and no retry,
+    which is the whole point of the probe: it tells the caller whether
+    the throttle follows the company or only the MCP connection."""
+    actor, err = _qb_pull_auth()
+    if err:
+        return err
+    conn = db()
+    try:
+        snap, _path = _qb_pull_load_snapshot()
+    except (OSError, ValueError):
+        snap = None
+    remaining = _qb_pull_remaining_windows(snap) if snap else []
+    # First missing window, or the current month when everything is
+    # already pulled (the probe is a live-read test either way).
+    probe_month = (remaining[0][0] if remaining
+                   else datetime.now(timezone.utc).strftime("%Y-%m"))
+    frm, to = _qb_pull_month_window(probe_month)
+    tok = _qb_tokens(conn)
+    try:
+        info = _qb_call_with_refresh(
+            conn, lambda c: c.query("select * from CompanyInfo"))
+        company = (((info or {}).get("QueryResponse") or {})
+                   .get("CompanyInfo") or [{}])[0].get("CompanyName", "")
+        count_data = _qb_call_with_refresh(
+            conn, lambda c: c.query(
+                "select count(*) from Invoice where TxnDate >= '%s'"
+                " and TxnDate <= '%s'" % (frm, to)))
+        total = ((count_data or {}).get("QueryResponse") or {}) \
+            .get("totalCount")
+    except _QBOError as e:
+        conn.close()
+        if _qb_is_rate_limited(e):
+            return jsonify(error="QuickBooks rate-limited (HTTP 429)",
+                           rate_limited=True, company_ok=False,
+                           invoice_probe={"month": probe_month,
+                                          "count": None,
+                                          "rate_limited": True}), 429
+        return jsonify(error=str(e)), e.status
+    conn.close()
+    if total is None:
+        return jsonify(error="QuickBooks did not return an invoice count",
+                       rate_limited=False), 502
+    return jsonify({
+        "company_name": company,
+        "realm_id": (tok["realm_id"] if tok else "") or "",
+        "company_ok": bool(company),
+        "invoice_probe": {"month": probe_month, "count": int(total),
+                          "rate_limited": False},
+    })
+
+
+@app.post("/api/erp/accounting/qb-pull/run")
+def erp_acct_qb_pull_run():
+    """Pull invoice windows through the ERP's own QuickBooks OAuth
+    connection. Resume-safe: windows already in
+    meta.invoice_windows_done are skipped; invoices dedupe by
+    QuickBooks id (trailing segment, so MCP-opaque and plain ids match).
+    One month per QBO query, paginated; ~0.5s between calls. STOPS on
+    the first 429 and saves the partial progress first -- no retry, no
+    sleep-loop. Optional body {"months": N} (1..5, default 1)."""
+    actor, err = _qb_pull_auth()
+    if err:
+        return err
+    try:
+        months = int((request.get_json(silent=True) or {}).get("months", 1))
+    except (TypeError, ValueError):
+        months = 1
+    months = max(1, min(_QB_PULL_MAX_MONTHS, months))
+    try:
+        snap, read_path = _qb_pull_load_snapshot()
+    except (OSError, ValueError) as exc:
+        return jsonify(error="QuickBooks migration snapshot unreadable: %s"
+                       % exc, snapshot_status="unreadable"), 500
+    if snap is None:
+        return jsonify(error="QuickBooks migration snapshot not found",
+                       snapshot_status="missing"), 404
+    meta = snap.get("meta")
+    if not isinstance(meta, dict) or not isinstance(snap.get("invoices"),
+                                                    list):
+        return jsonify(error="snapshot.meta must be an object and "
+                       "snapshot.invoices must be a list"), 400
+    conn = db()
+    remaining = _qb_pull_remaining_windows(snap)
+    if not remaining:
+        conn.close()
+        return jsonify(ok=True, complete=True, windows_pulled=[],
+                       windows_remaining=0,
+                       windows_done=len(meta.get("invoice_windows_done",
+                                                 [])),
+                       invoices=len(snap["invoices"]),
+                       rate_limited=False)
+    seen = {}
+    for _inv in snap["invoices"]:
+        if isinstance(_inv, dict) and _inv.get("qb_id"):
+            seen[_qb_pull_norm_id(_inv["qb_id"])] = _inv
+    pulled = []
+    rate_limited = False
+    error = None
+    error_status = None
+    for _mm, frm, to in remaining[:months]:
+        time.sleep(_QB_PULL_PACE_SECONDS)
+        try:
+            rows = _qb_call_with_refresh(
+                conn, lambda c, f=frm, t=to: _qb_pull_fetch_window(c, f, t))
+        except _QBOError as e:
+            if _qb_is_rate_limited(e):
+                rate_limited = True
+            else:
+                error = str(e)
+                error_status = e.status
+            break
+        for raw in rows:
+            row = _qb_pull_invoice_row(raw)
+            if row is None:
+                continue
+            key = _qb_pull_norm_id(row["qb_id"])
+            if key in seen:
+                continue
+            seen[key] = row
+        done = {tuple(w) for w in meta.get("invoice_windows_done", [])}
+        done.add((frm, to))
+        meta["invoice_windows_done"] = sorted(done)
+        # The MCP running total (113) is provably wrong -- 313 invoices
+        # are stored -- so the total is the exact distinct-invoice
+        # count, recomputed after every window.
+        meta["invoice_total_count"] = len(seen)
+        meta.setdefault("oauth_pull_windows", []).append([frm, to])
+        meta["oauth_pull_last_at"] = datetime.now(timezone.utc).isoformat()
+        snap["invoices"] = sorted(
+            seen.values(), key=lambda i: (i.get("date") or "",
+                                          i.get("doc_number") or ""))
+        try:
+            _qb_pull_save_snapshot(snap, _qb_pull_write_path(read_path))
+        except OSError as exc:
+            error = "could not store snapshot: %s" % exc
+            error_status = 500
+            break
+        pulled.append([frm, to])
+    remaining_after = _qb_pull_remaining_windows(snap)
+    complete = not remaining_after
+    if complete:
+        types = meta.setdefault("types", {})
+        types["invoices"] = {
+            "status": "pulled", "count": len(seen),
+            "note": "monthly windows through %s, pulled via the ERP "
+                    "QuickBooks OAuth connection"
+                    % _qb_pull_month_window(
+                        datetime.now(timezone.utc).strftime("%Y-%m"))[1]}
+        meta.setdefault("verification", {}) \
+            .setdefault("qb_counts", {})["invoices"] = len(seen)
+        meta["complete"] = all(
+            (meta.get("types") or {}).get(t, {}).get("status")
+            in ("pulled", "not_available", "not_pulled")
+            for t in _QB_PULL_COMPLETE_TYPES)
+        try:
+            _qb_pull_save_snapshot(snap, _qb_pull_write_path(read_path))
+        except OSError as exc:
+            error = "could not store snapshot: %s" % exc
+            error_status = 500
+    _acct_audit(conn, actor, "qb.pull_run", "qb_snapshot", 0,
+                "pulled %d windows (%s), %d invoices total, "
+                "remaining %d, rate_limited %s"
+                % (len(pulled),
+                   ", ".join("%s..%s" % (f, t) for f, t in pulled) or "none",
+                   len(seen), len(remaining_after), rate_limited))
+    conn.commit()
+    conn.close()
+    out = {"ok": True, "complete": complete, "windows_pulled": pulled,
+           "windows_remaining": len(remaining_after),
+           "windows_done": len(meta.get("invoice_windows_done", [])),
+           "invoices": len(seen), "rate_limited": rate_limited}
+    if rate_limited:
+        out["error"] = "QuickBooks rate-limited (HTTP 429)"
+        return jsonify(out), 429
+    if error is not None:
+        out["error"] = error
+        return jsonify(out), error_status or 502
     return jsonify(out)
 
 
