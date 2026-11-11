@@ -27666,16 +27666,55 @@ def _qb_pull_bank_txn_row(entity, t, bank_ids):
     }
 
 
+# QuickBooks AccountType -> ERP chart type. Unknown types are skipped
+# (never guessed) by _qb_pull_chart_row.
+_QB_CHART_TYPE_MAP = {
+    "Bank": "asset", "Accounts Receivable": "asset",
+    "Other Current Asset": "asset", "Fixed Asset": "asset",
+    "Other Asset": "asset", "Accounts Payable": "liability",
+    "Credit Card": "liability", "Other Current Liability": "liability",
+    "Long Term Liability": "liability", "Equity": "equity",
+    "Income": "income", "Other Income": "income",
+    "Cost of Goods Sold": "expense", "Expense": "expense",
+    "Other Expense": "expense"}
+
+
+def _qb_pull_chart_row(raw):
+    """A raw Account dict -> a chart row shaped exactly as the
+    migration import's chart merge reads it (name / type / qb_id /
+    parent_name). The name is the FullyQualifiedName, so a child like
+    Payroll Expenses:Wages matches the name a journal-entry line
+    carries. Balance is reference only -- source is qb_chart, never
+    balance_sheet, so it never becomes an opening-entry target.
+    Returns None for rows with no id/name or an unmapped type."""
+    name = ((raw.get("FullyQualifiedName") or raw.get("Name") or "")
+            .strip())
+    if not name or not raw.get("Id"):
+        return None
+    atype = _QB_CHART_TYPE_MAP.get((raw.get("AccountType") or "").strip())
+    if atype is None:
+        return None
+    parent = raw.get("ParentRef") or {}
+    balance = None
+    if raw.get("CurrentBalance") is not None:
+        balance = _qb_pull_to_cents(raw.get("CurrentBalance"))
+    return {"qb_id": str(raw["Id"]), "name": name, "type": atype,
+            "parent_name": (parent.get("name") or ""),
+            "balance_cents": balance, "source": "qb_chart"}
+
+
 @app.post("/api/erp/accounting/qb-pull/run-types")
 def erp_acct_qb_pull_run_types():
     """Pull the five export types the invoice pull never covered --
     vendors, bills, customer payments, journal entries, and bank
     transactions -- through the ERP's own QuickBooks OAuth connection,
-    into the migration snapshot. Rows are shaped exactly as the
-    migration import reads them; bank transactions are reference only
-    (the import deliberately skips them). One entity at a time, saved
-    after each; STOPS on the first 429 and saves the partial progress
-    first -- no retry, no sleep-loop."""
+    into the migration snapshot, plus the full chart of accounts
+    (qb_chart) so journal-entry lines can resolve at import. Rows are
+    shaped exactly as the migration import reads them; bank
+    transactions are reference only (the import deliberately skips
+    them). One entity at a time, saved after each; STOPS on the first
+    429 and saves the partial progress first -- no retry, no
+    sleep-loop."""
     actor, err = _qb_pull_auth()
     if err:
         return err
@@ -27703,6 +27742,37 @@ def erp_acct_qb_pull_run_types():
     rate_limited = False
     error = None
     error_status = None
+    # Full chart of accounts first: the balance-sheet snapshot never
+    # carried P&L accounts, so journal-entry lines referencing them
+    # (payroll, rent, COGS, income) could not resolve at import.
+    # Stored as qb_chart (the diff keeps reading the balance-sheet
+    # accounts list, so this changes no report); the import merges
+    # it into the chart by name, with the QuickBooks type mapped.
+    if not rate_limited and error is None:
+        try:
+            chart_rows = _qb_call_with_refresh(
+                conn, lambda c: _qb_pull_fetch_all(
+                    c, "select Id, Name, FullyQualifiedName, AccountType,"
+                    " AccountSubType, ParentRef, CurrentBalance"
+                    " from Account ORDER BY FullyQualifiedName"))
+        except _QBOError as e:
+            if _qb_is_rate_limited(e):
+                rate_limited = True
+            else:
+                error = str(e)
+                error_status = e.status
+            chart_rows = []
+        if not rate_limited and error is None:
+            chart = []
+            for raw in chart_rows:
+                row = _qb_pull_chart_row(raw)
+                if row is not None:
+                    chart.append(row)
+            snap["qb_chart"] = chart
+            meta.setdefault("types", {})["accounts"] = {
+                "status": "pulled", "count": len(chart),
+                "pulled_at": now}
+            _qb_pull_save_snapshot(snap, _qb_pull_write_path(read_path))
     jobs = [
         ("vendors", "Vendor", "select * from Vendor ORDER BY DisplayName",
          _qb_pull_vendor_row),
@@ -30578,6 +30648,26 @@ def erp_acct_migrate_import():
             if not isinstance(rec, dict):
                 return jsonify(error="%s entries must be objects" % key), 400
         lists[key] = val
+    # QB's full chart (pulled by qb-pull/run-types into qb_chart):
+    # P&L accounts the balance-sheet snapshot never carried. Merged
+    # into the chart list so journal-entry lines can resolve; they
+    # carry no balance target (source is qb_chart, not
+    # balance_sheet) and lose to a balance-sheet record of the same
+    # name. Rows with an unknown type are dropped, never guessed.
+    _seen_chart_names = {_acct_migrate_norm_name((r.get("name") or ""))
+                         for r in lists["accounts"]}
+    for _rec in (data.get("qb_chart") or []):
+        if not isinstance(_rec, dict):
+            continue
+        _name = (_rec.get("name") or "").strip()
+        if not _name:
+            continue
+        if _acct_migrate_norm_name(_name) in _seen_chart_names:
+            continue
+        if (_rec.get("type") or "") not in ERP_ACCT_TYPES:
+            continue
+        _seen_chart_names.add(_acct_migrate_norm_name(_name))
+        lists["accounts"].append(_rec)
     meta = data.get("meta") or {}
     if not isinstance(meta, dict):
         return jsonify(error="meta must be an object"), 400
