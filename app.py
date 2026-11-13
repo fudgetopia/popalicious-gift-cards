@@ -1911,6 +1911,32 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_erp_quality_checklists_store_date
             ON erp_quality_checklists (store_id, checklist_date);
+        -- SOP Library: the read copy of the SOP files
+        -- (files/sops/SOP-dept-*.md), imported by hidden_files/
+        -- sop_import.py. One row per SOP: dept 1-15, number is the
+        -- SOP number from the file heading ("5.1") or "" when the
+        -- file's SOPs are unnumbered, title is the heading text,
+        -- body is the SOP markdown, position is the SOP's order
+        -- inside its department file. The files stay the source of
+        -- truth: SOPs are edited in the files and re-imported, never
+        -- edited in the ERP. NOT in _ERP_RESET_TABLES -- a wipe must
+        -- never erase the procedure library.
+        CREATE TABLE IF NOT EXISTS erp_quality_sops (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dept INTEGER NOT NULL,
+            number TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL,
+            body TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'Live',
+            position INTEGER NOT NULL DEFAULT 0,
+            imported_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_erp_quality_sops_dept_title
+            ON erp_quality_sops (dept, title);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_sops_dept
+            ON erp_quality_sops (dept);
         -- Dept 14 (Legal & Compliance) Wave B: trademark/IP register,
         -- contracts + insurance register, and compliance calendar.
         -- Like the HR/staff/Quality records, legal records are NOT in
@@ -16978,6 +17004,202 @@ def quality_temperature_log():
                     "completed_by": d["completed_by"] or ""})
     conn.close()
     return jsonify(readings=readings)
+
+
+# ---------------- SOP Library ----------------
+# Read copy of the SOP files (files/sops/). List/get are admin-only;
+# import is admin OR the cron secret (the automated sync job runs it
+# after SOP edits); delete is admin-only. The library never edits SOP
+# text -- edits happen in the files and are re-imported.
+_QUALITY_SOP_DEPTS = {
+    1: "Dashboard", 2: "Inventory", 3: "Purchasing", 4: "Production",
+    5: "Order hub", 6: "Wholesale accounts", 7: "Reports",
+    8: "Marketing & Service", 9: "Accounting", 10: "Settings",
+    11: "Staff & Permissions", 12: "HR", 13: "Quality & Food Safety",
+    14: "Legal & Compliance", 15: "Stores",
+}
+
+
+def _quality_sop_dict(row, include_body=False):
+    d = {
+        "id": row["id"], "dept": row["dept"],
+        "dept_name": _QUALITY_SOP_DEPTS.get(row["dept"], ""),
+        "number": row["number"], "title": row["title"],
+        "status": row["status"], "position": row["position"],
+        "imported_by": row["imported_by"],
+        "created_at": row["created_at"], "updated_at": row["updated_at"],
+    }
+    if include_body:
+        d["body"] = row["body"]
+    return d
+
+
+def _quality_sop_import_actor():
+    """Admin session, or the cron secret for the automated SOP sync.
+    Returns (actor, error-response-or-None)."""
+    actor, err = _require_erp_admin()
+    if err is None:
+        return actor, None
+    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+        return "cron", None
+    return None, err
+
+
+@app.get("/api/erp/quality/sops")
+def quality_sops_list():
+    """List SOPs (no bodies -- use the detail endpoint to read one).
+    Filter by dept (1-15) and q (matches title or body)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    dept = request.args.get("dept")
+    q = (request.args.get("q") or "").strip()
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_quality_sops ORDER BY dept, position, id"
+        ).fetchall()
+    conn.close()
+    sops = []
+    for r in rows:
+        if dept not in (None, ""):
+            try:
+                if r["dept"] != int(dept):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        if q:
+            ql = q.lower()
+            if ql not in (r["title"] or "").lower() and \
+                    ql not in (r["body"] or "").lower():
+                continue
+        sops.append(_quality_sop_dict(r))
+    return jsonify(sops=sops, total=len(sops))
+
+
+@app.get("/api/erp/quality/sops/<int:sop_id>")
+def quality_sop_get(sop_id):
+    """One SOP, with its markdown body."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_quality_sops WHERE id = ?",
+                       (sop_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify(error="sop not found"), 404
+    return jsonify(sop=_quality_sop_dict(row, include_body=True))
+
+
+@app.post("/api/erp/quality/sops/import")
+def quality_sops_import():
+    """Upsert SOPs from the SOP files. Body: {"sops": [...], "prune":
+    true/false}. Each item: dept (1-15), number ("" when unnumbered),
+    title, body, status, position. Upsert key is (dept, title).
+    With prune true (and a non-empty list), rows not in the import
+    set are deleted -- a retired SOP leaves the library."""
+    actor, err = _quality_sop_import_actor()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    items = data.get("sops")
+    if not isinstance(items, list) or len(items) > 1000:
+        return jsonify(error="sops must be a list of at most 1000 SOPs"), 400
+    prune = bool(data.get("prune"))
+    cleaned = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            return jsonify(error="sops[%d] must be an object" % i), 400
+        dept = item.get("dept")
+        if not isinstance(dept, int) or isinstance(dept, bool) \
+                or dept not in _QUALITY_SOP_DEPTS:
+            return jsonify(error="sops[%d].dept must be 1-15" % i), 400
+        number = item.get("number") or ""
+        if not isinstance(number, str) or len(number) > 20:
+            return jsonify(
+                error="sops[%d].number must be text of at most 20 characters"
+                % i), 400
+        title = item.get("title") or ""
+        if not isinstance(title, str) or not title.strip() \
+                or len(title) > 500:
+            return jsonify(
+                error="sops[%d].title must be non-empty text of at most"
+                " 500 characters" % i), 400
+        body = item.get("body") or ""
+        if not isinstance(body, str) or len(body) > 200000:
+            return jsonify(
+                error="sops[%d].body must be text of at most 200000"
+                " characters" % i), 400
+        status = item.get("status") or "Live"
+        if not isinstance(status, str) or not status.strip() \
+                or len(status) > 50:
+            return jsonify(
+                error="sops[%d].status must be non-empty text of at most"
+                " 50 characters" % i), 400
+        try:
+            position = int(item.get("position") or 0)
+        except (TypeError, ValueError):
+            return jsonify(error="sops[%d].position must be a number" % i), 400
+        cleaned.append((dept, number.strip(), title.strip(), body,
+                        status.strip(), position))
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    imported = updated = 0
+    for dept, number, title, body, status, position in cleaned:
+        row = conn.execute(
+            "SELECT id FROM erp_quality_sops WHERE dept = ? AND title = ?",
+            (dept, title)).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE erp_quality_sops SET number = ?, body = ?,"
+                " status = ?, position = ?, imported_by = ?,"
+                " updated_at = ? WHERE id = ?",
+                (number, body, status, position, actor, now, row["id"]))
+            updated += 1
+        else:
+            conn.execute(
+                "INSERT INTO erp_quality_sops (dept, number, title, body,"
+                " status, position, imported_by, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (dept, number, title, body, status, position, actor, now,
+                 now))
+            imported += 1
+    pruned = 0
+    if prune and cleaned:
+        keep = {(dept, title) for dept, _, title, _, _, _ in cleaned}
+        rows = conn.execute(
+            "SELECT id, dept, title FROM erp_quality_sops").fetchall()
+        for r in rows:
+            if (r["dept"], r["title"]) not in keep:
+                conn.execute("DELETE FROM erp_quality_sops WHERE id = ?",
+                             (r["id"],))
+                pruned += 1
+    conn.commit()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM erp_quality_sops").fetchone()[0]
+    conn.close()
+    return jsonify(imported=imported, updated=updated, pruned=pruned,
+                   total=total)
+
+
+@app.post("/api/erp/quality/sops/<int:sop_id>/delete")
+def quality_sop_delete(sop_id):
+    """Delete one SOP from the library (a retired SOP). The file stays
+    the source of truth -- deleting here only removes the read copy;
+    re-importing the file brings it back."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT id FROM erp_quality_sops WHERE id = ?",
+                       (sop_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="sop not found"), 404
+    conn.execute("DELETE FROM erp_quality_sops WHERE id = ?", (sop_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(deleted=sop_id)
 
 
 # ---------------- Dept 14 Legal & Compliance (Wave B) ----------------
