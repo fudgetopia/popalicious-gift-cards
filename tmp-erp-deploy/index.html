@@ -20928,6 +20928,54 @@ function renderErpHrPtoSection(employees, reload) {
   return wrap;
 }
 
+/* SOP Library markdown: minimal safe renderer for SOP bodies.
+   Headings, rules, bullet/numbered lists, paragraphs; inline bold,
+   italic, code. Input is escaped first, so only the tags built here
+   ever reach the page. */
+function erpSopMarkdown(md) {
+  function esc(s) { return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+  function inline(s) {
+    var e = esc(s);
+    e = e.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+    e = e.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>");
+    e = e.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+    return e;
+  }
+  var lines = String(md || "").split("\n");
+  var out = [];
+  var list = null;
+  function closeList() { if (list) { out.push("</" + list + ">"); list = null; } }
+  lines.forEach(function (line) {
+    var t = line.trim();
+    if (t === "---" || t === "***") { closeList(); out.push("<hr>"); return; }
+    var hm = t.match(/^(#{1,4})\s+(.*)$/);
+    if (hm) {
+      closeList();
+      var lvl = hm[1].length + 2;
+      if (lvl > 6) lvl = 6;
+      out.push("<h" + lvl + ">" + inline(hm[2]) + "</h" + lvl + ">");
+      return;
+    }
+    var bm = t.match(/^[-*]\s+(.*)$/);
+    if (bm) {
+      if (list !== "ul") { closeList(); out.push("<ul>"); list = "ul"; }
+      out.push("<li>" + inline(bm[1]) + "</li>");
+      return;
+    }
+    var nm = t.match(/^\d+[.)]\s+(.*)$/);
+    if (nm) {
+      if (list !== "ol") { closeList(); out.push("<ol>"); list = "ol"; }
+      out.push("<li>" + inline(nm[1]) + "</li>");
+      return;
+    }
+    if (!t) { closeList(); return; }
+    closeList();
+    out.push("<p>" + inline(t) + "</p>");
+  });
+  closeList();
+  return out.join("\n");
+}
+
 /* ---------------- Quality & Food Safety (Dept 13 Wave A) ---------------- */
 // Admin-only. Records start empty: a single recall plan, a recall drill
 // log, supplier COAs per lot, HACCP plan records, and complaint trending
@@ -20944,7 +20992,8 @@ async function loadErpQualityDetail() {
     var checklists = await erpGet("/api/erp/quality/checklists").catch(function () { return { checklists: [] }; });
     var tempLog = await erpGet("/api/erp/quality/temperature-log").catch(function () { return { readings: [] }; });
     var stores = await erpGet("/api/erp/stores").catch(function () { return { stores: [] }; });
-    renderErpQualityDetail({ plan: plan.plan || null, drills: drills.drills || [], coas: coas.coas || [], lots: coas.lots || [], lots_without_coa: coas.lots_without_coa || [], haccp: haccp.records || [], complaints: complaints, templates: templates.templates || [], checklists: checklists.checklists || [], tempLog: tempLog.readings || [], stores: stores.stores || [] });
+    var sops = await erpGet("/api/erp/quality/sops").catch(function () { return { sops: [], total: 0 }; });
+    renderErpQualityDetail({ plan: plan.plan || null, drills: drills.drills || [], coas: coas.coas || [], lots: coas.lots || [], lots_without_coa: coas.lots_without_coa || [], haccp: haccp.records || [], complaints: complaints, templates: templates.templates || [], checklists: checklists.checklists || [], tempLog: tempLog.readings || [], stores: stores.stores || [], sops: sops.sops || [] });
     setAdminDetailStatus((drills.drills || []).length + " recall drill" + ((drills.drills || []).length === 1 ? "" : "s") + " · " + (coas.coas || []).length + " COA" + ((coas.coas || []).length === 1 ? "" : "s") + " · " + (haccp.records || []).length + " HACCP record" + ((haccp.records || []).length === 1 ? "" : "s") + ".");
   } catch (error) {
     setAdminDetailStatus(error instanceof TypeError ?
@@ -21294,6 +21343,114 @@ function renderErpQualityDetail(data) {
   var chkWrap = document.createElement("div");
   renderErpQualityChecklistsSection(chkWrap, data.templates || [], data.checklists || [], data.tempLog || [], data.stores || [], loadErpQualityDetail);
   els.body.appendChild(chkWrap);
+
+  // --- SOP Library (read copy of the SOP files). ---
+  var sopCard = qCard("SOP Library");
+  sopCard.appendChild(qNote("Read-only copy of the SOP files — every SOP, by department. SOPs are edited in the SOP files and re-imported (hidden_files/sop_import.py); this library never edits them."));
+  var sopAll = data.sops || [];
+  var SOP_DEPTS = [[1, "Dashboard"], [2, "Inventory"], [3, "Purchasing"], [4, "Production"], [5, "Order hub"], [6, "Wholesale accounts"], [7, "Reports"], [8, "Marketing & Service"], [9, "Accounting"], [10, "Settings"], [11, "Staff & Permissions"], [12, "HR"], [13, "Quality & Food Safety"], [14, "Legal & Compliance"], [15, "Stores"]];
+  function sopDeptName(d) {
+    for (var i = 0; i < SOP_DEPTS.length; i++) if (SOP_DEPTS[i][0] === d) return SOP_DEPTS[i][1];
+    return "";
+  }
+  function sopLabel(s) {
+    return (s.number ? "SOP " + s.number + " — " : "") + s.title;
+  }
+  var sopCount = qRow("");
+  sopCard.appendChild(sopCount);
+  var sopDept = document.createElement("select");
+  var sopDeptAll = document.createElement("option");
+  sopDeptAll.value = "";
+  sopDeptAll.textContent = "All departments";
+  sopDept.appendChild(sopDeptAll);
+  SOP_DEPTS.forEach(function (d) {
+    var opt = document.createElement("option");
+    opt.value = String(d[0]);
+    opt.textContent = d[0] + ". " + d[1];
+    sopDept.appendChild(opt);
+  });
+  sopCard.appendChild(erpField("Department", sopDept));
+  var sopSearch = qInput("Search SOPs — title or text");
+  sopCard.appendChild(erpField("Search", sopSearch));
+  var sopList = document.createElement("div");
+  sopList.style.flex = "1 1 100%";
+  sopCard.appendChild(sopList);
+  var sopDetail = document.createElement("div");
+  sopDetail.style.flex = "1 1 100%";
+  sopDetail.style.display = "none";
+  sopCard.appendChild(sopDetail);
+  var sopStatus = qStatus();
+  sopCard.appendChild(sopStatus);
+  function renderSopList(rows) {
+    sopList.replaceChildren();
+    var shown = rows;
+    if (!sopSearch.value.trim() && sopDept.value) {
+      shown = rows.filter(function (s) { return String(s.dept) === sopDept.value; });
+    }
+    sopCount.textContent = shown.length + " SOP" + (shown.length === 1 ? "" : "s") + (sopDept.value ? " · Dept " + sopDept.value + " " + sopDeptName(Number(sopDept.value)) : "") + (sopSearch.value.trim() ? " · matching \"" + sopSearch.value.trim() + "\"" : "");
+    if (!shown.length) {
+      sopList.appendChild(qRow(sopAll.length ? "No SOPs match." : "No SOPs imported yet — run hidden_files/sop_import.py."));
+      return;
+    }
+    shown.forEach(function (s) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.style.flex = "1 1 100%";
+      btn.style.textAlign = "left";
+      btn.textContent = sopLabel(s) + " · Dept " + s.dept + " " + sopDeptName(s.dept) + (s.status && s.status !== "Live" ? " · " + s.status : "");
+      btn.addEventListener("click", function () { openSop(s); });
+      sopList.appendChild(btn);
+    });
+  }
+  function refreshSopList() {
+    var q = sopSearch.value.trim();
+    if (!q) { renderSopList(sopAll); return; }
+    sopStatus.textContent = "Searching…";
+    var url = "/api/erp/quality/sops?q=" + encodeURIComponent(q);
+    if (sopDept.value) url += "&dept=" + encodeURIComponent(sopDept.value);
+    erpGet(url).then(function (res) {
+      sopStatus.textContent = "";
+      renderSopList(res.sops || []);
+    }).catch(function (error) {
+      sopStatus.textContent = error.message;
+    });
+  }
+  var sopSearchTimer = null;
+  sopSearch.addEventListener("input", function () {
+    if (sopSearchTimer) clearTimeout(sopSearchTimer);
+    sopSearchTimer = setTimeout(refreshSopList, 300);
+  });
+  sopDept.addEventListener("change", refreshSopList);
+  function openSop(s) {
+    sopStatus.textContent = "Loading…";
+    erpGet("/api/erp/quality/sops/" + s.id).then(function (res) {
+      var full = res.sop || s;
+      sopList.style.display = "none";
+      sopDetail.replaceChildren();
+      var back = qButton("Back to list");
+      back.addEventListener("click", function () {
+        sopDetail.style.display = "none";
+        sopList.style.display = "";
+        sopStatus.textContent = "";
+      });
+      sopDetail.appendChild(back);
+      var t = document.createElement("h3");
+      t.style.flex = "1 1 100%";
+      t.textContent = sopLabel(full);
+      sopDetail.appendChild(t);
+      sopDetail.appendChild(qNote("Dept " + full.dept + " · " + sopDeptName(full.dept) + " · " + (full.status || "Live") + (full.updated_at ? " · imported " + full.updated_at : "")));
+      var bodyEl = document.createElement("div");
+      bodyEl.style.flex = "1 1 100%";
+      bodyEl.innerHTML = erpSopMarkdown(full.body || "");
+      sopDetail.appendChild(bodyEl);
+      sopDetail.style.display = "";
+      sopStatus.textContent = "";
+    }).catch(function (error) {
+      sopStatus.textContent = error.message;
+    });
+  }
+  renderSopList(sopAll);
+  els.body.appendChild(sopCard);
 }
 function renderErpQualityChecklistsSection(wrap, templates, checklists, tempLog, stores, reload) {
   // Digital quality checklists, Additions Wave C. Templates are
