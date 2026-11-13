@@ -17132,10 +17132,10 @@ def quality_sops_import():
                 " characters" % i), 400
         status = item.get("status") or "Live"
         if not isinstance(status, str) or not status.strip() \
-                or len(status) > 50:
+                or len(status) > 200:
             return jsonify(
                 error="sops[%d].status must be non-empty text of at most"
-                " 50 characters" % i), 400
+                " 200 characters" % i), 400
         try:
             position = int(item.get("position") or 0)
         except (TypeError, ValueError):
