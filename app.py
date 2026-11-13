@@ -38169,6 +38169,73 @@ def _erp_recipe_nutrition(conn, recipe_id):
             "allergens_text": allergens}
 
 
+def _erp_auto_serving_grams(conn, recipe_id):
+    """Serving weight (grams per 1-cup serving) derived from the recipe
+    itself: total ingredient weight per batch / bags per batch /
+    servings per bag. Servings per bag defaults to 5 (the house
+    standard on every live recipe) when the recipe has none saved.
+    Weight comes from each ingredient line's own conversion (cup
+    weight or standard kitchen weight), never from nutrition facts --
+    a line with no nutrition facts still weighs something. Packaging
+    lines carry no finished-product weight and are skipped. Returns
+    (grams_int, servings_used), or (None, servings_used) when it
+    cannot be derived: any ingredient line that will not convert to
+    grams (an understated batch weight must never become a label
+    weight), zero batch weight, or a computed serving under 8 g --
+    plain air-popped popcorn is ~8 g per cup, so anything lighter
+    means the recipe is missing its popcorn base. Whole grams,
+    halves up.
+    """
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe:
+        return None, None
+    lines = _erp_recipe_lines(conn, recipe_id, recipe["version"])
+    batch_grams = 0.0
+    for ln in lines:
+        d = dict(ln)
+        if (d["item_type"] or "") != "ingredient":
+            continue
+        cup_oz, _src = _erp_cup_weight_oz(d)
+        grams = _erp_convert_qty(float(d["qty_per_batch"] or 0),
+                                 d["unit"], "g", cup_oz)
+        if grams is None:
+            return None, None
+        batch_grams += grams
+    bags = float(recipe["batch_size_bags"] or 0)
+    servings = recipe["servings_per_bag"]
+    servings = int(servings) if servings else 5
+    if bags <= 0 or servings <= 0 or batch_grams <= 0:
+        return None, servings
+    grams = batch_grams / bags / servings
+    if grams < 8:
+        return None, servings
+    return int(_erp_round_inc(grams, 1)), servings
+
+
+def _erp_apply_auto_serving_grams(conn, recipe_id):
+    """Recompute the serving weight after a recipe save and store it.
+    Serving weight always comes from the recipe: a value typed by hand
+    in Label Settings is replaced on the next recipe save. When the
+    recipe has no servings per bag saved, the house standard 5 is
+    stored with it so the label stays self-consistent (servings x
+    grams = net weight). Returns the grams stored, or None when it
+    could not be derived -- the stored value is left untouched.
+    """
+    grams, servings = _erp_auto_serving_grams(conn, recipe_id)
+    if grams is None:
+        return None
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if recipe["servings_per_bag"]:
+        conn.execute("UPDATE erp_recipes SET serving_grams = ? WHERE id = ?",
+                     (grams, recipe_id))
+    else:
+        conn.execute("UPDATE erp_recipes SET serving_grams = ?,"
+                     " servings_per_bag = ? WHERE id = ?",
+                     (grams, servings, recipe_id))
+    conn.commit()
+    return grams
+
+
 @app.get("/api/erp/recipes/<int:recipe_id>/nutrition")
 def erp_recipe_nutrition(recipe_id):
     actor, err = _erp_check_perm("recipes.read")
@@ -38502,6 +38569,7 @@ def erp_create_recipe():
             (recipe_id, ln["item_id"], ln["qty_per_batch"], ln["unit"],
              ln["notes"]))
     conn.commit()
+    _erp_apply_auto_serving_grams(conn, recipe_id)
     row = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
                        (recipe_id,)).fetchone()
     lines = _erp_recipe_lines(conn, recipe_id, 1)
@@ -38582,6 +38650,7 @@ def erp_update_recipe(recipe_id):
             (recipe_id, new_version, ln["item_id"], ln["qty_per_batch"],
              ln["unit"], ln["notes"]))
     conn.commit()
+    _erp_apply_auto_serving_grams(conn, recipe_id)
     row = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
                        (recipe_id,)).fetchone()
     lines = _erp_recipe_lines(conn, recipe_id, new_version)
@@ -38795,6 +38864,7 @@ def erp_import_recipes():
         return jsonify(error="no recipe rows found"), 400
     now = datetime.now(timezone.utc).isoformat()
     created = 0
+    created_ids = []
     for rname in order:
         g = grouped[rname]
         clean, err_msg = _erp_validate_recipe_lines(conn, g["lines"])
@@ -38812,9 +38882,12 @@ def erp_import_recipes():
                 " qty_per_batch, unit, notes) VALUES (?, 1, ?, ?, ?, ?)",
                 (rid, ln["item_id"], ln["qty_per_batch"], ln["unit"], ln["notes"]))
         created += 1
+        created_ids.append(rid)
     _erp_settings_audit(conn, actor, "import.recipes", "recipes", 0,
                         "Imported %d recipe(s) from CSV" % created)
     conn.commit()
+    for rid in created_ids:
+        _erp_apply_auto_serving_grams(conn, rid)
     conn.close()
     return jsonify(ok=True, imported=created)
 
