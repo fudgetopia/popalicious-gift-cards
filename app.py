@@ -37530,12 +37530,14 @@ def _erp_recipe_nutrition(conn, recipe_id):
         for ln in detail if ln.get("ingredients_text"))
     # Allergens: dedupe across lines (two ingredients can both list
     # Soy -- the label's Contains line must name each allergen once).
-    # Split each line's text on commas/semicolons, keep first-seen
+    # Split each line's text on commas, semicolons, AND the word "and"
+    # ("Milk and Soy" is two allergens, not one); keep first-seen
     # order and original casing, match case-insensitively.
     _seen_allergens = set()
     _allergen_list = []
     for ln in detail:
-        for _part in re.split(r"[,;]", ln.get("allergens_text") or ""):
+        for _part in re.split(r"[,;]|\band\b", ln.get("allergens_text") or "",
+                              flags=re.IGNORECASE):
             _name = _part.strip()
             if _name and _name.lower() not in _seen_allergens:
                 _seen_allergens.add(_name.lower())
