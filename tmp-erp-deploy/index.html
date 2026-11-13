@@ -314,6 +314,23 @@ button { font-family: inherit; }
         #erpPrintView .botleft { float: left !important; width: calc(100% - 2.05in) !important; }
         #erpPrintView .botright { float: right !important; }
       }
+      /* mobile register — Apple Store-style roaming checkout: big
+         touch targets, ticket + total pinned at the bottom. */
+      .erp-register .erp-flavor-grid { display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+      .erp-register .erp-flavor-grid button { min-height: 48px; font-size: 15px; }
+      .erp-register-ticket { position: sticky; bottom: 0;
+        background: var(--surface); border-top: 2px solid var(--ink);
+        padding: 10px 0; z-index: 2; }
+      .erp-scan-box input { min-height: 44px; font-size: 16px; }
+      @media (max-width: 700px) {
+        .app-main { padding: 12px 12px 40px; }
+        .erp-register .erp-flavor-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .erp-register .erp-flavor-grid button { min-height: 60px; font-size: 16px; }
+        .erp-register button { min-height: 48px; font-size: 16px; }
+        .erp-register input, .erp-register select { font-size: 16px;
+          min-height: 48px; padding: 10px 12px; }
+      }
 </style>
 </head>
 <body>
@@ -1351,8 +1368,13 @@ function renderRoute() {
     var dr = a.getAttribute("data-route");
     var routeReadPerm = { inventory: "inventory.read", purchasing: "purchasing.read",
       orders: "orders.read", loyalty: "loyalty.read", edi: "edi.read", reports: "reports.read", accounting: "accounting.read" }[dr];
-    if (dr === "settings" || dr === "staff-perms" || dr === "hr" || dr === "quality" || dr === "legal" || dr === "stores") {
+    if (dr === "settings" || dr === "staff-perms" || dr === "quality" || dr === "legal" || dr === "stores") {
       a.style.display = erpIsAdmin() ? "" : "none";
+    } else if (dr === "hr") {
+      // HR Additions 5: the HR tab is the admin directory for admins
+      // and the "My HR" self-service view for staff; other roles never
+      // see the link (wholesale never reaches this shell at all).
+      a.style.display = (erpIsAdmin() || erpSession().role === "staff") ? "" : "none";
     } else if (dr === "production") {
       a.style.display = (erpCan("recipes.read") || erpCan("batches.read")) ? "" : "none";
     } else if (dr === "marketing") {
@@ -1432,7 +1454,10 @@ function renderRoute() {
     loadErpStaffPermsDetail();
   } else if (r === "hr") {
     document.title = "HR \u00b7 Pop-A-Licious ERP";
-    if (!erpIsAdmin()) { location.hash = "#/"; return; }
+    // HR Additions 5: staff reach the "My HR" self-service view
+    // through loadErpHrDetail's 403 fallback; only callers who are
+    // neither admin nor staff bounce back home.
+    if (!erpIsAdmin() && erpSession().role !== "staff") { location.hash = "#/"; return; }
     loadErpHrDetail();
   } else if (r === "quality") {
     document.title = "Quality & Food Safety \u00b7 Pop-A-Licious ERP";
@@ -3091,6 +3116,81 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           s = s.replace(/\D/g, "");
           if (s.length === 14 && s.slice(0, 2) === "00") s = s.slice(2);
           return s;
+        }
+        // Parse a GS1 Digital Link URI: /01/{GTIN}/10/{lot}/17/{YYMMDD}
+        // (query ?10=&17= also read). Returns {gtin, lot, expiry} with
+        // expiry as YYYY-MM-DD or null. A malformed AI value is
+        // dropped, never invented; a bare digits scan is GTIN only.
+        function erpParseGs1DigitalLink(code) {
+          var raw = String(code || "").trim();
+          var out = { gtin: "", lot: null, expiry: null };
+          if (!raw) return out;
+          var path = raw;
+          var query = "";
+          var q = raw.indexOf("?");
+          if (q >= 0) { path = raw.slice(0, q); query = raw.slice(q + 1); }
+          var parts = path.split("/").filter(function (p) { return p !== ""; });
+          for (var i = 0; i + 1 < parts.length; i++) {
+            var ai = parts[i];
+            var val = parts[i + 1];
+            if (ai === "01") { out.gtin = val; i++; }
+            else if (ai === "10") { try { out.lot = decodeURIComponent(val); } catch (e) { out.lot = val; } i++; }
+            else if (ai === "17") { out.expiry = erpGs1ExpiryToISO(val); i++; }
+          }
+          if (!out.gtin) {
+            var m = raw.match(/\/01\/(\d{12,14})/);
+            if (m) out.gtin = m[1];
+            else if (/^\d{12,14}$/.test(raw.replace(/\D/g, ""))) out.gtin = raw.replace(/\D/g, "");
+          }
+          if (query) {
+            var params = {};
+            query.split("&").forEach(function (kv) {
+              var eq = kv.indexOf("=");
+              if (eq > 0) params[kv.slice(0, eq)] = kv.slice(eq + 1);
+            });
+            if (!out.lot && params["10"]) { try { out.lot = decodeURIComponent(params["10"]); } catch (e) { out.lot = params["10"]; } }
+            if (!out.expiry && params["17"]) out.expiry = erpGs1ExpiryToISO(params["17"]);
+          }
+          if (out.lot !== null) {
+            out.lot = String(out.lot).trim().slice(0, 64);
+            if (!out.lot) out.lot = null;
+          }
+          return out;
+        }
+        // AI 17 expiry is YYMMDD; convert to YYYY-MM-DD, or null when
+        // the value is not a real date.
+        function erpGs1ExpiryToISO(v) {
+          var s = String(v || "").replace(/\D/g, "");
+          if (s.length !== 6) return null;
+          var yy = Number(s.slice(0, 2)), mm = Number(s.slice(2, 4)), dd = Number(s.slice(4, 6));
+          if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
+          var days = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][mm - 1];
+          if (dd > days) return null;
+          var yyyy = 2000 + yy;
+          var pmm = mm < 10 ? "0" + mm : "" + mm;
+          var pdd = dd < 10 ? "0" + dd : "" + dd;
+          if (isNaN(Date.parse(yyyy + "-" + pmm + "-" + pdd))) return null;
+          return yyyy + "-" + pmm + "-" + pdd;
+        }
+        // Resolve a register scan to a flavor: the scanned GS1 Digital
+        // Link (or bare UPC-A) must match a flavor UPC in the label
+        // map, and that flavor must be on this register's catalog.
+        // Returns {flavor, lot, expiry} or null. Never guesses.
+        function erpRegisterResolveScan(code, catalog) {
+          var parsed = erpParseGs1DigitalLink(code);
+          var upc = erpNormalizeScanCode(parsed.gtin || code);
+          if (upc.length !== 12) return null;
+          var name = null;
+          if (typeof ERP_FLAVOR_CODES !== "undefined") {
+            Object.keys(ERP_FLAVOR_CODES).forEach(function (k) {
+              if (ERP_FLAVOR_CODES[k] && ERP_FLAVOR_CODES[k].upc === upc) name = ERP_FLAVOR_CODES[k].name;
+            });
+          }
+          if (!name) return null;
+          var onCatalog = false;
+          (catalog && catalog.flavors || []).forEach(function (f) { if (f.name === name) onCatalog = true; });
+          if (!onCatalog) return null;
+          return { flavor: name, lot: parsed.lot, expiry: parsed.expiry };
         }
         // Resolve a scanned code to an item: exact SKU first, then the
         // flavor UPC from the label map (erpMatchFlavorCode). Returns
@@ -7136,7 +7236,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           var table = document.createElement("table");
           table.className = "admin-orders-table";
           var head = document.createElement("tr");
-          ["Employee", "Hours", "Gross", "Federal", "SS", "Medicare", "Net"].forEach(function (h) {
+          ["Employee", "Hours", "Source", "Gross", "Federal", "SS", "Medicare", "Net"].forEach(function (h) {
             var th = document.createElement("th");
             th.textContent = h;
             head.appendChild(th);
@@ -7145,7 +7245,8 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           (run.lines || []).forEach(function (l) {
             var tr = document.createElement("tr");
             tr.appendChild(erpCell("Employee", l.employee_name));
-            tr.appendChild(erpCell("Hours", l.hours === null || l.hours === undefined ? "\\u2014" : String(l.hours)));
+            tr.appendChild(erpCell("Hours", l.hours === null || l.hours === undefined ? "\\u2014" : String(l.hours) + ((l.regular_hours !== null && l.regular_hours !== undefined) ? " (" + l.regular_hours + " reg + " + (l.ot_hours || 0) + " OT)" : "")));
+            tr.appendChild(erpCell("Source", (l.source === "store_timeclock" ? "Store timeclock" + (l.pay_stub && l.pay_stub.timeclock_store_name ? " — " + l.pay_stub.timeclock_store_name : "") : "Manual entry")));
             tr.appendChild(erpCell("Gross", erpMoney(l.gross_cents)));
             tr.appendChild(erpCell("Federal", erpMoney(l.federal_cents)));
             tr.appendChild(erpCell("SS", erpMoney(l.ss_cents)));
@@ -18068,8 +18169,28 @@ async function loadErpHrDetail() {
     var otAlerts = await erpGet("/api/erp/hr/overtime-alerts").catch(function () { return null; });
     var onbTemplates = await erpGet("/api/erp/hr/onboarding-templates").catch(function () { return { templates: [] }; });
     renderErpHrDetail(data, staffList.staff || [], eventsData.events || [], totalsData.totals || [], otAlerts, onbTemplates.templates || []);
-    setAdminDetailStatus(data.employees.length + " employee record" + (data.employees.length === 1 ? "." : "s.") + " · " + (eventsData.events || []).length + " event" + ((eventsData.events || []).length === 1 ? "." : "s."));
+    setAdminDetailStatus((data.employees || []).length + " employee record" + ((data.employees || []).length === 1 ? "." : "s.") + " · " + (eventsData.events || []).length + " event" + ((eventsData.events || []).length === 1 ? "." : "s."));
   } catch (error) {
+    // HR Additions 5: staff have no admin HR access, so the admin
+    // fetch above throws for them: fall back to the self-service view
+    // from GET /api/erp/hr/me. Admins keep the original error; staff
+    // with no linked HR record see the /me error (e.g. "no HR record
+    // is linked to your login").
+    if (!erpIsAdmin()) {
+      try {
+        var me = await erpGet("/api/erp/hr/me");
+        renderErpHrSelfService(me);
+        setAdminDetailStatus("Showing your own HR record.");
+        return;
+      } catch (meError) {
+        // No record of your own and no admin list to show: clear any
+        // stale tab content so it can never be mistaken for HR data.
+        adminDetailEls().body.replaceChildren();
+        setAdminDetailStatus(meError instanceof TypeError ?
+          "We couldn't connect to load HR." : meError.message, true);
+        return;
+      }
+    }
     setAdminDetailStatus(error instanceof TypeError ?
       "We couldn't connect to load HR." : error.message, true);
   }
@@ -18234,6 +18355,12 @@ function renderErpHrDetail(data, staffList, events, timeTotals, overtimeAlerts, 
   els.body.appendChild(tplWrap);
   els.body.appendChild(renderErpHrEventsSection(events || [], employees, loadErpHrDetail));
   els.body.appendChild(renderErpHrTimeSummarySection(timeTotals || []));
+  els.body.appendChild(renderErpHrPtoSection(employees, loadErpHrDetail));
+  els.body.appendChild(renderErpHrReviewsSection(employees, loadErpHrDetail));
+  els.body.appendChild(renderErpHrPayrollFeedSection());
+  els.body.appendChild(renderErpHrRecurringSection(employees, loadErpHrDetail));
+  els.body.appendChild(renderErpHrDocumentsExpiringSection());
+  els.body.appendChild(renderErpHrHiringSection(loadErpHrDetail));
 }
 function renderErpHrCard(e) {
   var card = document.createElement("div");
@@ -18250,6 +18377,7 @@ function renderErpHrCard(e) {
   if (e.hire_date) bits.push("Hired " + e.hire_date);
   bits.push(e.linked ? ("ERP login: " + (e.staff_email || "linked")) : "No ERP login (event staff)");
   bits.push("Rate: " + hrRateDollars(e.hourly_rate_cents));
+  bits.push(e.payroll_eligible ? "Payroll: eligible (opt-in)" : "Payroll: cash only");
   bits.push("Onboarding: " + e.onboarding_done + "/" + e.onboarding_total + " done");
   meta.textContent = bits.join(" · ");
   card.appendChild(meta);
@@ -18331,6 +18459,17 @@ function renderErpHrDetailView(card, e, status, reload) {
     var rateLine = document.createElement("p");
     rateLine.textContent = "Hourly rate: " + hrRateDollars(detail.hourly_rate_cents) + " (the default for new time records; each record can override it).";
     view.appendChild(rateLine);
+    var payrollLine = document.createElement("p");
+    payrollLine.textContent = "Payroll: " + (detail.payroll_eligible ? "eligible (opt-in — event hours can be fed to a payrun)" : "cash only (not payroll-eligible)") + " · Rate: " + hrRateDollars(detail.hourly_rate_cents) + (detail.payroll_eligible ? "" : " · Opting in needs an hourly rate set on this record first.") + " Cash stays the default.";
+    view.appendChild(payrollLine);
+    var fedLine = document.createElement("p");
+    fedLine.className = "admin-orders-empty";
+    fedLine.textContent = "Loading fed time records…";
+    view.appendChild(fedLine);
+    erpGet("/api/erp/hr/time-records?employee_id=" + encodeURIComponent(String(e.id))).then(function (trData) {
+      var fed = (trData.time_records || []).filter(function (r) { return r.payrun_line_id !== null && r.payrun_line_id !== undefined; });
+      fedLine.textContent = fed.length ? "Fed to payroll: " + fed.map(function (r) { return "record #" + r.id + " → payrun line #" + r.payrun_line_id; }).join(" · ") + ". Fed records are payroll now, not cash — cash cannot be paid on them." : "No time records fed to payroll yet — cash records stay cash unless fed from the “Feed to payrun” section below.";
+    }).catch(function () { fedLine.textContent = "Could not load fed time records."; });
     var evTitle = document.createElement("h4");
     evTitle.textContent = "Events assigned";
     view.appendChild(evTitle);
@@ -18408,6 +18547,28 @@ function renderErpHrDetailView(card, e, status, reload) {
       benErr.textContent = "Benefits could not be loaded.";
       benWrap.appendChild(benErr);
     });
+    var docWrap = document.createElement("div");
+    docWrap.style.flex = "1 1 100%";
+    view.appendChild(docWrap);
+    erpGet("/api/erp/hr/employees/" + encodeURIComponent(String(e.id)) + "/documents").then(function (docData) {
+      renderErpHrDocumentsSection(docWrap, detail, docData.documents || [], status, function () { renderErpHrDetailView(card, e, status, reload); });
+    }).catch(function () {
+      var docErr = document.createElement("p");
+      docErr.className = "admin-orders-empty";
+      docErr.textContent = "Documents could not be loaded.";
+      docWrap.appendChild(docErr);
+    });
+    var offWrap = document.createElement("div");
+    offWrap.style.flex = "1 1 100%";
+    view.appendChild(offWrap);
+    erpGet("/api/erp/hr/employees/" + encodeURIComponent(String(e.id)) + "/offboarding").then(function (offData) {
+      renderErpHrOffboardingSection(offWrap, detail, offData.offboarding || null, status, function () { renderErpHrDetailView(card, e, status, reload); });
+    }).catch(function () {
+      var offErr = document.createElement("p");
+      offErr.className = "admin-orders-empty";
+      offErr.textContent = "Offboarding could not be loaded.";
+      offWrap.appendChild(offErr);
+    });
     var closeBtn = document.createElement("button");
     closeBtn.type = "button";
     closeBtn.textContent = "Close";
@@ -18455,6 +18616,14 @@ function renderErpHrEditForm(card, emp, status, reload) {
   form.appendChild(erpField("Hire date", hireInput));
   var rateInput = hrEditInput(emp.hourly_rate_cents === null || emp.hourly_rate_cents === undefined ? "" : String((emp.hourly_rate_cents / 100).toFixed(2)), "e.g. 20.00 (blank = no rate)");
   form.appendChild(erpField("Hourly rate ($/hr, optional)", rateInput));
+  var eligBox = document.createElement("input");
+  eligBox.type = "checkbox";
+  eligBox.checked = !!emp.payroll_eligible;
+  form.appendChild(erpField("Payroll-eligible (opt-in)", eligBox));
+  var eligNote = document.createElement("p");
+  eligNote.className = "admin-orders-empty";
+  eligNote.textContent = "Opt-in only: ticking this lets this person\u2019s event hours be fed to a payrun from the \u201cFeed to payrun\u201d section. Cash stays the default — unticked, hours stay a cash record only. Opting in needs an hourly rate set above.";
+  form.appendChild(eligNote);
   var linkNote = document.createElement("p");
   linkNote.className = "admin-orders-empty";
   linkNote.textContent = emp.linked ? ("Linked to ERP login: " + (emp.staff_email || "") + ". The link cannot be moved here; hire date stays in sync with the staff row.") : "No ERP login (event staff) — standalone record.";
@@ -18473,7 +18642,8 @@ function renderErpHrEditForm(card, emp, status, reload) {
       emergency_contact: emergInput.value, emergency_phone: emergPhoneInput.value,
       hire_date: hireInput.value, hourly_rate_cents: rateCents
     }).then(function () {
-      reload();
+      if (eligBox.checked === !!emp.payroll_eligible) return reload();
+      return erpPost("/api/erp/hr/employees/" + encodeURIComponent(String(emp.id)) + "/payroll-eligibility", { payroll_eligible: eligBox.checked }).then(function () { reload(); });
     }).catch(function (error) {
       status.textContent = error.message;
       saveBtn.disabled = false;
@@ -19028,6 +19198,1733 @@ function renderErpHrTimeSummarySection(timeTotals) {
     row.textContent = entry.employee_name + ": " + (t.hours || 0) + " hours · owed " + (t.cash_owed_cents === null || t.cash_owed_cents === undefined ? "—" : erpMoney(t.cash_owed_cents)) + " · paid " + erpMoney(t.cash_paid_cents || 0) + " · outstanding " + (t.outstanding_cents === null || t.outstanding_cents === undefined ? "—" : erpMoney(t.outstanding_cents));
     wrap.appendChild(row);
   });
+  return wrap;
+}
+
+/* HR Additions 7: hiring pipeline + offboarding */
+// Admin-only tab section. Applicants start empty -- the admin adds
+// them; no names or details are ever invented. Stage rules (same as
+// the backend): forward-only to the next stage (applied -> screening
+// -> interview -> offer -> hired), rejected from any stage, hired
+// only from offer and only through the Hire action, which creates the
+// employee record and seeds onboarding. A hired applicant's record
+// is sealed (notes can still be appended). Offboarding is one record
+// per employee ever, seeded with the four standard items; checking
+// "Revoke ERP access" only RECORDS that it was done -- the admin
+// still deactivates the login in Staff & permissions, and this
+// section never changes the existing deactivate behaviour.
+var HR_ADD7_NEXT_STAGE = { applied: "screening", screening: "interview", interview: "offer" };
+var HR_ADD7_STAGES = ["applied", "screening", "interview", "offer", "hired", "rejected"];
+function renderErpHrHiringSection(reload) {
+  var wrap = document.createElement("div");
+  var title = document.createElement("h2");
+  title.textContent = "Hiring pipeline";
+  wrap.appendChild(title);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Applicants start empty — add them by hand; nothing is pre-filled. Stages move forward only: applied → screening → interview → offer → hired. Rejected can be set from any stage. Hired is only reached through the Hire action, which creates the employee record and seeds their onboarding checklist. A hired applicant's record is sealed (notes can still be appended).";
+  wrap.appendChild(note);
+  var form = document.createElement("div");
+  form.className = "erp-form";
+  var formTitle = document.createElement("h3");
+  formTitle.textContent = "Add applicant";
+  form.appendChild(formTitle);
+  function hrAdd7Input(placeholder, type) {
+    var input = document.createElement("input");
+    input.type = type || "text";
+    input.placeholder = placeholder || "";
+    return input;
+  }
+  var nameInput = hrAdd7Input("Name");
+  form.appendChild(erpField("Name", nameInput));
+  var roleInput = hrAdd7Input("Role applied for");
+  form.appendChild(erpField("Role applied for", roleInput));
+  var emailInput = hrAdd7Input("Email", "email");
+  form.appendChild(erpField("Email", emailInput));
+  var phoneInput = hrAdd7Input("Phone", "tel");
+  form.appendChild(erpField("Phone", phoneInput));
+  var sourceInput = hrAdd7Input("Source (optional)");
+  form.appendChild(erpField("Source", sourceInput));
+  var dateInput = hrAdd7Input("YYYY-MM-DD (blank = today)");
+  form.appendChild(erpField("Applied date", dateInput));
+  var notesInput = hrAdd7Input("Notes (optional)");
+  form.appendChild(erpField("Notes", notesInput));
+  var contactNote = document.createElement("p");
+  contactNote.className = "admin-orders-empty";
+  contactNote.textContent = "At least one contact is required: an email or a phone number.";
+  form.appendChild(contactNote);
+  var addStatus = document.createElement("p");
+  addStatus.style.color = "var(--muted)";
+  addStatus.style.flex = "1 1 100%";
+  form.appendChild(addStatus);
+  var addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.textContent = "Add applicant";
+  addBtn.addEventListener("click", function () {
+    addBtn.disabled = true;
+    addStatus.textContent = "Adding…";
+    erpPost("/api/erp/hr/applicants", {
+      name: nameInput.value, role: roleInput.value, email: emailInput.value,
+      phone: phoneInput.value, source: sourceInput.value,
+      applied_date: dateInput.value, notes: notesInput.value
+    }).then(function () {
+      if (typeof reload === "function") reload();
+    }).catch(function (error) {
+      addStatus.textContent = error.message;
+      addBtn.disabled = false;
+    });
+  });
+  form.appendChild(addBtn);
+  wrap.appendChild(form);
+  var filterLabel = document.createElement("p");
+  filterLabel.className = "admin-orders-empty";
+  filterLabel.textContent = "Filter by stage:";
+  wrap.appendChild(filterLabel);
+  var filterSel = document.createElement("select");
+  var allOpt = document.createElement("option");
+  allOpt.value = "";
+  allOpt.textContent = "All stages";
+  filterSel.appendChild(allOpt);
+  HR_ADD7_STAGES.forEach(function (s) {
+    var opt = document.createElement("option");
+    opt.value = s;
+    opt.textContent = s;
+    filterSel.appendChild(opt);
+  });
+  wrap.appendChild(filterSel);
+  var listWrap = document.createElement("div");
+  wrap.appendChild(listWrap);
+  var listStatus = document.createElement("p");
+  listStatus.className = "admin-orders-empty";
+  listStatus.textContent = "Loading applicants…";
+  listWrap.appendChild(listStatus);
+  function loadApplicants() {
+    var stage = filterSel.value;
+    var path = "/api/erp/hr/applicants" + (stage ? "?stage=" + encodeURIComponent(stage) : "");
+    erpGet(path).then(function (data) {
+      listWrap.replaceChildren();
+      var applicants = data.applicants || [];
+      if (!applicants.length) {
+        var none = document.createElement("p");
+        none.className = "admin-orders-empty";
+        none.textContent = "No applicants yet. Add the first one above.";
+        listWrap.appendChild(none);
+        return;
+      }
+      applicants.forEach(function (a) {
+        var card = document.createElement("div");
+        card.className = "erp-form";
+        var h3 = document.createElement("h3");
+        h3.textContent = a.name + " — " + a.role + " (" + a.stage + ")";
+        card.appendChild(h3);
+        var meta = document.createElement("p");
+        meta.className = "admin-orders-empty";
+        var bits = [];
+        if (a.email) bits.push(a.email);
+        if (a.phone) bits.push(a.phone);
+        if (a.source) bits.push("Source: " + a.source);
+        if (a.applied_date) bits.push("Applied " + a.applied_date);
+        if (a.stage === "hired" && a.hired_employee_id) bits.push("Hired as employee #" + a.hired_employee_id);
+        if (a.notes) bits.push("Notes: " + a.notes);
+        meta.textContent = bits.join(" · ");
+        card.appendChild(meta);
+        var status = document.createElement("p");
+        status.style.color = "var(--muted)";
+        status.style.flex = "1 1 100%";
+        card.appendChild(status);
+        var next = HR_ADD7_NEXT_STAGE[a.stage];
+        if (next) {
+          var nextBtn = document.createElement("button");
+          nextBtn.type = "button";
+          nextBtn.textContent = "Move to " + next;
+          nextBtn.addEventListener("click", function () {
+            nextBtn.disabled = true;
+            status.textContent = "Moving…";
+            erpPost("/api/erp/hr/applicants/" + encodeURIComponent(String(a.id)) + "/stage", { stage: next }).then(function () {
+              if (typeof reload === "function") reload();
+            }).catch(function (error) {
+              status.textContent = error.message;
+              nextBtn.disabled = false;
+            });
+          });
+          card.appendChild(nextBtn);
+        }
+        if (a.stage === "offer") {
+          var hireBtn = document.createElement("button");
+          hireBtn.type = "button";
+          hireBtn.textContent = "Hire";
+          hireBtn.addEventListener("click", function () {
+            hireBtn.disabled = true;
+            status.textContent = "Hiring…";
+            erpPost("/api/erp/hr/applicants/" + encodeURIComponent(String(a.id)) + "/hire", {}).then(function () {
+              if (typeof reload === "function") reload();
+            }).catch(function (error) {
+              status.textContent = error.message;
+              hireBtn.disabled = false;
+            });
+          });
+          card.appendChild(hireBtn);
+        }
+        if (a.stage !== "hired" && a.stage !== "rejected") {
+          var rejBtn = document.createElement("button");
+          rejBtn.type = "button";
+          rejBtn.textContent = "Reject";
+          rejBtn.addEventListener("click", function () {
+            rejBtn.disabled = true;
+            status.textContent = "Rejecting…";
+            erpPost("/api/erp/hr/applicants/" + encodeURIComponent(String(a.id)) + "/stage", { stage: "rejected" }).then(function () {
+              if (typeof reload === "function") reload();
+            }).catch(function (error) {
+              status.textContent = error.message;
+              rejBtn.disabled = false;
+            });
+          });
+          card.appendChild(rejBtn);
+        }
+        if (a.stage !== "hired") {
+          var delBtn = document.createElement("button");
+          delBtn.type = "button";
+          delBtn.textContent = "Delete";
+          delBtn.addEventListener("click", function () {
+            delBtn.disabled = true;
+            status.textContent = "Deleting…";
+            erpDelete("/api/erp/hr/applicants/" + encodeURIComponent(String(a.id))).then(function () {
+              if (typeof reload === "function") reload();
+            }).catch(function (error) {
+              status.textContent = error.message;
+              delBtn.disabled = false;
+            });
+          });
+          card.appendChild(delBtn);
+        }
+        listWrap.appendChild(card);
+      });
+    }).catch(function (error) {
+      listWrap.replaceChildren();
+      var err = document.createElement("p");
+      err.className = "admin-orders-empty";
+      err.textContent = "Applicants could not be loaded: " + error.message;
+      listWrap.appendChild(err);
+    });
+  }
+  filterSel.addEventListener("change", loadApplicants);
+  loadApplicants();
+  return wrap;
+}
+function renderErpHrOffboardingSection(wrap, employee, offboarding, status, reload) {
+  // One record per employee ever, seeded with the four standard items.
+  // Checking "Revoke ERP access" only records that it was done -- the
+  // admin still deactivates the login in Staff & permissions.
+  wrap.replaceChildren();
+  var card = document.createElement("div");
+  card.className = "erp-form";
+  card.style.flex = "1 1 100%";
+  var title = document.createElement("h4");
+  title.textContent = "Offboarding — " + employee.name;
+  card.appendChild(title);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "One offboarding record per employee. Checking “Revoke ERP access” only records that it was done — the admin still deactivates the login in Staff & permissions. This section never deactivates anything itself.";
+  card.appendChild(note);
+  if (!offboarding) {
+    var exitInput = document.createElement("input");
+    exitInput.type = "text";
+    exitInput.placeholder = "YYYY-MM-DD (blank = today)";
+    card.appendChild(erpField("Exit date", exitInput));
+    var reasonInput = document.createElement("input");
+    reasonInput.type = "text";
+    reasonInput.placeholder = "Reason (optional)";
+    card.appendChild(erpField("Reason", reasonInput));
+    var startBtn = document.createElement("button");
+    startBtn.type = "button";
+    startBtn.textContent = "Start offboarding";
+    startBtn.addEventListener("click", function () {
+      startBtn.disabled = true;
+      status.textContent = "Starting offboarding…";
+      erpPost("/api/erp/hr/employees/" + encodeURIComponent(String(employee.id)) + "/offboarding", {
+        exit_date: exitInput.value, reason: reasonInput.value
+      }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        startBtn.disabled = false;
+      });
+    });
+    card.appendChild(startBtn);
+    wrap.appendChild(card);
+    return;
+  }
+  var prog = document.createElement("p");
+  prog.textContent = "Offboarding: " + offboarding.done + "/" + offboarding.total + " done"
+    + (offboarding.completed ? " — complete" : "")
+    + (offboarding.exit_date ? " · Exit " + offboarding.exit_date : "")
+    + (offboarding.reason ? " · " + offboarding.reason : "");
+  card.appendChild(prog);
+  var list = document.createElement("div");
+  (offboarding.items || []).forEach(function (item) {
+    var row = document.createElement("label");
+    row.style.display = "block";
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !!item.done;
+    box.addEventListener("change", function () {
+      box.disabled = true;
+      var path = "/api/erp/hr/offboarding-items/" + encodeURIComponent(String(item.id)) + (box.checked ? "/check" : "/uncheck");
+      erpPost(path, {}).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        box.disabled = false;
+        box.checked = !!item.done;
+      });
+    });
+    row.appendChild(box);
+    var span = document.createElement("span");
+    span.textContent = " " + item.label + (item.done && item.done_by ? " — done by " + item.done_by + (item.done_at ? " on " + item.done_at.slice(0, 10) : "") : "");
+    row.appendChild(span);
+    list.appendChild(row);
+  });
+  card.appendChild(list);
+  wrap.appendChild(card);
+}
+/* HR Additions 6: document storage */
+// Employee HR documents ONLY -- this is NOT a general file store: no
+// other entity type stores files here, and downloads are admin-only.
+// One file per upload, 5 MB maximum, stored as base64 in the ERP.
+// List/metadata views never carry the blob; only the download endpoint
+// returns it. Metadata edits can never replace the file bytes;
+// deleting a document is permanent.
+var HR_DOCUMENT_TYPES = ["I-9", "W-4", "Food handler card",
+  "Driver's license", "Passport", "Direct deposit form", "Offer letter",
+  "NDA", "Training certificate", "Other"];
+function hrDocSizeText(bytes) {
+  if (bytes === null || bytes === undefined) return "—";
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+}
+function hrDocLine(d) {
+  return d.filename + " (" + d.doc_type + ") — received " + (d.received_date || "—")
+    + (d.expiry_date ? " · expires " + d.expiry_date : " · no expiry")
+    + " · " + hrDocSizeText(d.size_bytes)
+    + (d.notes ? " — " + d.notes : "");
+}
+function renderErpHrDocumentsExpiringSection() {
+  // Self-fetching: the HR tab never passes this data in; the section
+  // loads it itself, like the per-employee detail views do.
+  var wrap = document.createElement("div");
+  var h2 = document.createElement("h2");
+  h2.textContent = "Documents expiring soon";
+  wrap.appendChild(h2);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Employee HR documents only — this is not a general file store. Documents expiring in the next 30 days, plus any already expired.";
+  wrap.appendChild(note);
+  var body = document.createElement("div");
+  body.textContent = "Loading expiring documents…";
+  wrap.appendChild(body);
+  erpGet("/api/erp/hr/documents/expiring").then(function (data) {
+    body.replaceChildren();
+    var expired = data.expired || [];
+    var expiring = data.expiring || [];
+    if (!expired.length && !expiring.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No documents expiring in the next 30 days.";
+      body.appendChild(none);
+      return;
+    }
+    expired.forEach(function (d) {
+      var p = document.createElement("p");
+      p.textContent = "EXPIRED: " + d.filename + " (" + d.doc_type + ") — "
+        + (d.employee_name || ("Employee #" + d.employee_id))
+        + " · expired " + d.expiry_date
+        + (d.days_until_expiry !== undefined && d.days_until_expiry !== null
+          ? " (" + Math.abs(d.days_until_expiry) + " days ago)" : "");
+      body.appendChild(p);
+    });
+    expiring.forEach(function (d) {
+      var p = document.createElement("p");
+      p.textContent = d.filename + " (" + d.doc_type + ") — "
+        + (d.employee_name || ("Employee #" + d.employee_id))
+        + " · expires " + d.expiry_date
+        + (d.days_until_expiry !== undefined && d.days_until_expiry !== null
+          ? " (in " + d.days_until_expiry + " days)" : "");
+      body.appendChild(p);
+    });
+  }).catch(function () {
+    body.replaceChildren();
+    var err = document.createElement("p");
+    err.className = "admin-orders-empty";
+    err.textContent = "Expiring documents could not be loaded.";
+    body.appendChild(err);
+  });
+  return wrap;
+}
+function renderErpHrDocumentsSection(wrap, employee, documents, status, reload) {
+  // Per-employee documents, shown inside the employee detail view.
+  // Upload reads the chosen file in the browser (FileReader) and posts
+  // base64; the server enforces the 5 MB cap on the decoded bytes.
+  wrap.replaceChildren();
+  var card = document.createElement("div");
+  card.className = "erp-form";
+  card.style.flex = "1 1 100%";
+  var title = document.createElement("h4");
+  title.textContent = "Documents — " + employee.name;
+  card.appendChild(title);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Employee HR documents only — this is not a general file store. Files are stored in the ERP, 5 MB maximum each. Downloads are admin-only; deleting a document is permanent.";
+  card.appendChild(note);
+  function dInput(placeholder, type) {
+    var input = document.createElement("input");
+    input.type = type || "text";
+    input.placeholder = placeholder || "";
+    return input;
+  }
+  function dButton(label) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    return b;
+  }
+  var typeSelect = document.createElement("select");
+  HR_DOCUMENT_TYPES.forEach(function (t) {
+    var opt = document.createElement("option");
+    opt.value = t;
+    opt.textContent = t;
+    typeSelect.appendChild(opt);
+  });
+  card.appendChild(erpField("Document type", typeSelect));
+  var customTypeInput = dInput("Or type a document type (e.g. Tribal enrollment letter)");
+  card.appendChild(erpField("Custom document type (optional)", customTypeInput));
+  var fileInput = dInput("", "file");
+  card.appendChild(erpField("File (5 MB maximum)", fileInput));
+  var receivedInput = dInput("YYYY-MM-DD");
+  card.appendChild(erpField("Received date", receivedInput));
+  var expiryInput = dInput("YYYY-MM-DD (blank = no expiry)");
+  card.appendChild(erpField("Expiry date", expiryInput));
+  var notesInput = dInput("Notes (optional)");
+  card.appendChild(erpField("Notes", notesInput));
+  var uploadBtn = dButton("Upload document");
+  uploadBtn.addEventListener("click", function () {
+    var file = fileInput.files && fileInput.files[0];
+    if (!file) { status.textContent = "Choose a file to upload."; return; }
+    if (file.size > 5242880) {
+      status.textContent = "File is too large — 5 MB maximum.";
+      return;
+    }
+    if (typeof FileReader === "undefined") {
+      status.textContent = "This browser cannot read files here.";
+      return;
+    }
+    var docType = customTypeInput.value.trim() || typeSelect.value;
+    if (!receivedInput.value.trim()) {
+      status.textContent = "Received date is required (YYYY-MM-DD).";
+      return;
+    }
+    uploadBtn.disabled = true;
+    status.textContent = "Uploading…";
+    var reader = new FileReader();
+    reader.onload = function () {
+      var dataUrl = String(reader.result || "");
+      var b64 = dataUrl.indexOf(",") >= 0 ? dataUrl.slice(dataUrl.indexOf(",") + 1) : dataUrl;
+      erpPost("/api/erp/hr/employees/" + employee.id + "/documents", {
+        employee_id: employee.id, doc_type: docType,
+        filename: file.name, mime_type: file.type || "application/octet-stream",
+        data_b64: b64, received_date: receivedInput.value,
+        expiry_date: expiryInput.value, notes: notesInput.value
+      }).then(function () {
+        reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        uploadBtn.disabled = false;
+      });
+    };
+    reader.onerror = function () {
+      status.textContent = "Could not read that file.";
+      uploadBtn.disabled = false;
+    };
+    reader.readAsDataURL(file);
+  });
+  card.appendChild(uploadBtn);
+  if (!(documents || []).length) {
+    var none = document.createElement("p");
+    none.className = "admin-orders-empty";
+    none.textContent = "No documents on file for this employee yet.";
+    card.appendChild(none);
+  }
+  (documents || []).forEach(function (doc) {
+    var rowCard = document.createElement("div");
+    rowCard.className = "erp-form";
+    rowCard.style.flex = "1 1 100%";
+    var line = document.createElement("p");
+    line.style.flex = "1 1 100%";
+    line.textContent = hrDocLine(doc);
+    rowCard.appendChild(line);
+    var dlBtn = dButton("Download");
+    dlBtn.addEventListener("click", function () {
+      dlBtn.disabled = true;
+      erpGet("/api/erp/hr/documents/" + encodeURIComponent(String(doc.id)) + "/download").then(function (data) {
+        var payload = data.document || {};
+        var bin = atob(payload.data_b64 || "");
+        var bytes = new Uint8Array(bin.length);
+        for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        var blob = new Blob([bytes], { type: payload.mime_type || "application/octet-stream" });
+        if (typeof URL === "undefined" || !URL.createObjectURL) {
+          status.textContent = "This browser cannot download files here.";
+          dlBtn.disabled = false;
+          return;
+        }
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = payload.filename || doc.filename;
+        a.click();
+        dlBtn.disabled = false;
+      }).catch(function (error) {
+        status.textContent = error.message;
+        dlBtn.disabled = false;
+      });
+    });
+    rowCard.appendChild(dlBtn);
+    var editBtn = dButton("Edit");
+    editBtn.addEventListener("click", function () {
+      rowCard.replaceChildren();
+      var et = document.createElement("h4");
+      et.textContent = "Edit document";
+      rowCard.appendChild(et);
+      var etNote = document.createElement("p");
+      etNote.className = "admin-orders-empty";
+      etNote.textContent = "Metadata only — the file itself cannot be replaced here. Upload a new copy to replace it, then delete the old one.";
+      rowCard.appendChild(etNote);
+      var tInput = dInput("Document type");
+      tInput.value = doc.doc_type || "";
+      rowCard.appendChild(erpField("Document type", tInput));
+      var rInput = dInput("YYYY-MM-DD");
+      rInput.value = doc.received_date || "";
+      rowCard.appendChild(erpField("Received date", rInput));
+      var eInput = dInput("YYYY-MM-DD (blank = no expiry)");
+      eInput.value = doc.expiry_date || "";
+      rowCard.appendChild(erpField("Expiry date", eInput));
+      var nInput = dInput("Notes");
+      nInput.value = doc.notes || "";
+      rowCard.appendChild(erpField("Notes", nInput));
+      var saveBtn = dButton("Save changes");
+      saveBtn.addEventListener("click", function () {
+        saveBtn.disabled = true;
+        erpPost("/api/erp/hr/documents/" + doc.id + "/update", {
+          doc_type: tInput.value, received_date: rInput.value,
+          expiry_date: eInput.value, notes: nInput.value
+        }).then(function () {
+          reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          saveBtn.disabled = false;
+        });
+      });
+      rowCard.appendChild(saveBtn);
+      var cancelBtn = dButton("Cancel");
+      cancelBtn.addEventListener("click", function () { reload(); });
+      rowCard.appendChild(cancelBtn);
+    });
+    rowCard.appendChild(editBtn);
+    var delBtn = dButton("Delete");
+    delBtn.addEventListener("click", function () {
+      if (!window.confirm("Delete " + doc.filename + " permanently? The file cannot be recovered.")) return;
+      delBtn.disabled = true;
+      erpPost("/api/erp/hr/documents/" + doc.id + "/delete", {}).then(function () {
+        reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        delBtn.disabled = false;
+      });
+    });
+    rowCard.appendChild(delBtn);
+    card.appendChild(rowCard);
+  });
+  wrap.appendChild(card);
+}
+
+/* ---------------- HR self-service: My HR (HR Additions 5) ---------------- */
+// Staff (and admins checking their own record) see exactly ONE record --
+// their own -- from GET /api/erp/hr/me. No editing, no admin controls,
+// no other employee's data anywhere in this view. PTO, reviews,
+// recurring schedules and documents come from parallel subsystems and
+// are rendered generically (whatever columns those tables have); when
+// a subsystem has not landed yet the section says so instead of
+// breaking. The review Acknowledge button calls the reviews
+// subsystem's POST /api/erp/hr/reviews/<id>/acknowledge (not built
+// here); a 403/404 from it is shown inline, never swallowed.
+function hrMeRowLines(row) {
+  // Generic "label: value" lines for one parallel-subsystem row.
+  // Internal keys (ids, audit stamps) are skipped; the rest is the
+  // employee's own data, shown as-is.
+  var skip = { id: 1, employee_id: 1, staff_id: 1, employee: 1,
+    created_at: 1, updated_at: 1, created_by: 1, updated_by: 1 };
+  var lines = [];
+  Object.keys(row || {}).forEach(function (k) {
+    if (skip[k]) return;
+    var v = row[k];
+    if (v === null || v === undefined || v === "") return;
+    var label = k.replace(/_/g, " ");
+    label = label.charAt(0).toUpperCase() + label.slice(1);
+    lines.push(label + ": " + (typeof v === "object" ? JSON.stringify(v) : String(v)));
+  });
+  return lines;
+}
+function hrMeSection(title) {
+  var card = document.createElement("div");
+  card.className = "erp-form";
+  var h = document.createElement("h3");
+  h.textContent = title;
+  card.appendChild(h);
+  return card;
+}
+function hrMeNote(card, text) {
+  var p = document.createElement("p");
+  p.className = "admin-orders-empty";
+  p.textContent = text;
+  card.appendChild(p);
+  return p;
+}
+function hrMeKv(card, label, value) {
+  var p = document.createElement("p");
+  p.textContent = label + ": " + ((value === null || value === undefined || value === "") ? "—" : String(value));
+  card.appendChild(p);
+  return p;
+}
+function hrMeRosterLine(a) {
+  return (a.date || "No date") + " — " + (a.name || ("Event #" + a.event_id))
+    + (a.location ? " (" + a.location + ")" : "")
+    + (a.assignment_role ? " · role: " + a.assignment_role : "");
+}
+function renderErpHrSelfService(me) {
+  var els = adminDetailEls();
+  els.body.replaceChildren();
+  var emp = me.employee || {};
+  var h2 = document.createElement("h2");
+  h2.textContent = "My HR — your record only";
+  els.body.appendChild(h2);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "This is your own HR record only. You can view it here; any changes are made by an admin. " + hrCashNote();
+  els.body.appendChild(note);
+  // Profile (read-only).
+  var prof = hrMeSection("Your profile");
+  hrMeKv(prof, "Name", emp.name);
+  hrMeKv(prof, "Email", emp.email);
+  hrMeKv(prof, "Role", emp.role);
+  hrMeKv(prof, "Department", emp.department);
+  hrMeKv(prof, "Phone", emp.phone);
+  hrMeKv(prof, "Emergency contact", emp.emergency_contact);
+  hrMeKv(prof, "Emergency contact phone", emp.emergency_phone);
+  hrMeKv(prof, "Hire date", emp.hire_date);
+  hrMeKv(prof, "Hourly rate", hrRateDollars(emp.hourly_rate_cents));
+  hrMeKv(prof, "Status", emp.active ? "Active" : "Inactive");
+  els.body.appendChild(prof);
+  // PTO (parallel subsystem; defensive: section says so when absent).
+  var pto = hrMeSection("Time off (PTO)");
+  if (!me.pto_available) {
+    hrMeNote(pto, "PTO tracking isn't set up yet — ask an admin when it is available.");
+  } else {
+    (me.pto_balances || []).forEach(function (b) {
+      hrMeRowLines(b).forEach(function (ln) { hrMeNote(pto, ln); });
+    });
+    (me.pto_requests || []).forEach(function (r) {
+      var line = hrMeRowLines(r).join(" · ");
+      if (line) hrMeNote(pto, line);
+    });
+    if (!(me.pto_balances || []).length && !(me.pto_requests || []).length) {
+      hrMeNote(pto, "No PTO balance or requests on file.");
+    }
+  }
+  els.body.appendChild(pto);
+  // Reviews (parallel subsystem; acknowledge endpoint is theirs).
+  var rev = hrMeSection("Performance reviews");
+  if (!me.reviews_available) {
+    hrMeNote(rev, "Performance reviews aren't set up yet — ask an admin when they are available.");
+  } else if (!(me.reviews || []).length) {
+    hrMeNote(rev, "No reviews on file.");
+  } else {
+    var revStatus = document.createElement("p");
+    revStatus.className = "admin-orders-empty";
+    rev.appendChild(revStatus);
+    (me.reviews || []).forEach(function (r) {
+      var row = document.createElement("div");
+      var title = document.createElement("p");
+      var rTitle = r.title || r.period || ("Review" + (r.id ? " #" + r.id : ""));
+      title.textContent = rTitle + " — ";
+      title.appendChild(erpStatusChip(r.status || "pending"));
+      row.appendChild(title);
+      hrMeRowLines(r).forEach(function (ln) {
+        var p = document.createElement("p");
+        p.textContent = ln;
+        row.appendChild(p);
+      });
+      if (String(r.status || "").toLowerCase() !== "acknowledged") {
+        var ackBtn = document.createElement("button");
+        ackBtn.textContent = "Acknowledge";
+        ackBtn.addEventListener("click", function () {
+          ackBtn.disabled = true;
+          revStatus.textContent = "Sending acknowledgement…";
+          erpPost("/api/erp/hr/reviews/" + r.id + "/acknowledge", {}).then(function () {
+            revStatus.textContent = "Acknowledged. Thank you.";
+            ackBtn.remove();
+            loadErpHrDetail();
+          }).catch(function (err) {
+            ackBtn.disabled = false;
+            revStatus.textContent = "Acknowledgement failed: " + (err && err.message ? err.message : "couldn't reach the server.");
+          });
+        });
+        row.appendChild(ackBtn);
+      }
+      rev.appendChild(row);
+    });
+  }
+  els.body.appendChild(rev);
+  // Recurring schedule (parallel subsystem).
+  var sched = hrMeSection("Recurring schedule");
+  if (!me.schedules_available) {
+    hrMeNote(sched, "Recurring schedules aren't set up yet — ask an admin when they are available.");
+  } else if (!(me.schedules || []).length) {
+    hrMeNote(sched, "No recurring schedule on file.");
+  } else {
+    (me.schedules || []).forEach(function (s) {
+      var line = hrMeRowLines(s).join(" · ");
+      if (line) hrMeNote(sched, line);
+    });
+  }
+  els.body.appendChild(sched);
+  // Roster: events assigned (upcoming, then past).
+  var ros = hrMeSection("Events you're assigned to");
+  if (!(me.roster || []).length) {
+    hrMeNote(ros, "No events assigned.");
+  } else {
+    if ((me.roster_upcoming || []).length) {
+      var upH = document.createElement("p");
+      upH.textContent = "Upcoming";
+      ros.appendChild(upH);
+      me.roster_upcoming.forEach(function (a) { hrMeNote(ros, hrMeRosterLine(a)); });
+    }
+    if ((me.roster_past || []).length) {
+      var pastH = document.createElement("p");
+      pastH.textContent = "Past";
+      ros.appendChild(pastH);
+      me.roster_past.forEach(function (a) { hrMeNote(ros, hrMeRosterLine(a)); });
+    }
+  }
+  els.body.appendChild(ros);
+  // Time records + cash totals.
+  var time = hrMeSection("Your time + cash");
+  var tot = me.time_totals || {};
+  hrMeKv(time, "Total hours", tot.hours);
+  hrMeKv(time, "Total owed", (tot.cash_owed_cents === null || tot.cash_owed_cents === undefined) ? "No rate set" : erpMoney(tot.cash_owed_cents));
+  hrMeKv(time, "Cash paid", erpMoney(tot.cash_paid_cents || 0));
+  hrMeKv(time, "Outstanding", (tot.outstanding_cents === null || tot.outstanding_cents === undefined) ? "—" : erpMoney(tot.outstanding_cents));
+  hrMeNote(time, hrCashNote());
+  if (!(me.time_records || []).length) {
+    hrMeNote(time, "No time records yet.");
+  } else {
+    me.time_records.forEach(function (t) {
+      hrMeNote(time, (t.event_name || ("Event #" + t.event_id)) + ": " + (t.hours || 0) + " hours · owed " + (t.cash_owed_cents === null || t.cash_owed_cents === undefined ? "—" : erpMoney(t.cash_owed_cents)) + " · paid " + erpMoney(t.cash_paid_cents || 0) + " · outstanding " + (t.remaining_cents === null || t.remaining_cents === undefined ? "—" : erpMoney(t.remaining_cents)));
+    });
+  }
+  els.body.appendChild(time);
+  // Documents (parallel subsystem).
+  var docs = hrMeSection("Your documents");
+  if (!me.documents_available) {
+    hrMeNote(docs, "Document storage isn't set up yet — ask an admin when it is available.");
+  } else if (!(me.documents || []).length) {
+    hrMeNote(docs, "No documents on file.");
+  } else {
+    (me.documents || []).forEach(function (d) {
+      var line = hrMeRowLines(d).join(" · ");
+      if (line) hrMeNote(docs, line);
+    });
+  }
+  els.body.appendChild(docs);
+}
+
+// HR Additions 4: recurring schedules
+// Templates generate plain one-off events on demand (Generate events
+// with a date range) -- nothing runs in the background. Editing a
+// template never rewrites events already generated; only future
+// generations use the new template. A template with generated events
+// cannot be deleted until its generated events are deleted first.
+// This section self-fetches its templates (erpGet) and is appended by
+// renderErpHrDetail; loadErpHrDetail is not modified.
+function renderErpHrRecurringSection(employees, reload) {
+  var wrap = document.createElement("div");
+  var h2 = document.createElement("h2");
+  h2.textContent = "Recurring schedules";
+  wrap.appendChild(h2);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Templates for events that repeat weekly, biweekly, or monthly. Generating is explicit: pick a date range and the template creates one event per occurrence, with its roster copied. Generating the same range twice never duplicates an event. Editing a template never rewrites events already generated — only future generations use the new template. A template with generated events cannot be deleted until its generated events are deleted first.";
+  wrap.appendChild(note);
+  var status = document.createElement("p");
+  status.style.color = "var(--muted)";
+  status.style.flex = "1 1 100%";
+  wrap.appendChild(status);
+  var listWrap = document.createElement("div");
+  wrap.appendChild(listWrap);
+  var activeEmps = (employees || []).filter(function (e) { return e.active; });
+  // select.value is the first option in a real browser; fall back to
+  // the selected / first option child so the form also works where
+  // .value is not populated (e.g. the DOM-stub harness).
+  function selectValue(sel) {
+    if (sel.value) return sel.value;
+    var opts = sel.children || [];
+    for (var i = 0; i < opts.length; i++) {
+      if (opts[i].selected) return opts[i].value;
+    }
+    return opts.length ? opts[0].value : "";
+  }
+  function scheduleText(t) {
+    if (t.frequency === "monthly") return "Monthly on day " + t.day_of_month;
+    var label = t.frequency === "biweekly" ? "Every 2 weeks on " : "Weekly on ";
+    return label + (t.weekday_name || "");
+  }
+  function renderList(templates) {
+    listWrap.replaceChildren();
+    if (!templates.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No recurring templates yet. Add the first one below.";
+      listWrap.appendChild(none);
+      return;
+    }
+    templates.forEach(function (t) { listWrap.appendChild(renderErpHrRecurringCard(t)); });
+  }
+  function renderErpHrRecurringCard(t) {
+    var card = document.createElement("div");
+    card.className = "erp-form";
+    var h3 = document.createElement("h3");
+    h3.textContent = t.title + " — " + scheduleText(t)
+      + (t.time ? " at " + t.time : "")
+      + (t.location ? " · " + t.location : "")
+      + " · from " + (t.anchor_date || "");
+    card.appendChild(h3);
+    var meta = document.createElement("p");
+    meta.className = "admin-orders-empty";
+    meta.textContent = "Roster: " + ((t.roster_names || []).length ? t.roster_names.join(", ") : "nobody yet")
+      + " · " + (t.instance_count || 0) + " event" + ((t.instance_count || 0) === 1 ? "" : "s") + " generated.";
+    card.appendChild(meta);
+    var cardStatus = document.createElement("p");
+    cardStatus.style.color = "var(--muted)";
+    cardStatus.style.flex = "1 1 100%";
+    card.appendChild(cardStatus);
+    var instBody = document.createElement("div");
+    instBody.style.flex = "1 1 100%";
+    card.appendChild(instBody);
+    // Generate instances for a date range.
+    var fromInput = document.createElement("input");
+    fromInput.type = "text";
+    fromInput.placeholder = "YYYY-MM-DD";
+    card.appendChild(erpField("Generate from", fromInput));
+    var toInput = document.createElement("input");
+    toInput.type = "text";
+    toInput.placeholder = "YYYY-MM-DD";
+    card.appendChild(erpField("Generate to", toInput));
+    var genBtn = document.createElement("button");
+    genBtn.type = "button";
+    genBtn.textContent = "Generate events";
+    genBtn.addEventListener("click", function () {
+      if (!fromInput.value.trim() || !toInput.value.trim()) { cardStatus.textContent = "Enter both dates (YYYY-MM-DD)."; return; }
+      genBtn.disabled = true;
+      cardStatus.textContent = "Generating…";
+      erpPost("/api/erp/hr/recurring-events/" + encodeURIComponent(String(t.id)) + "/generate", { date_from: fromInput.value, date_to: toInput.value }).then(function (res) {
+        cardStatus.textContent = "Generated " + (res.generated || 0) + " event" + ((res.generated || 0) === 1 ? "" : "s") + ", " + (res.already_existing || 0) + " already existed.";
+        genBtn.disabled = false;
+        reload();
+      }).catch(function (error) {
+        cardStatus.textContent = error.message;
+        genBtn.disabled = false;
+      });
+    });
+    card.appendChild(genBtn);
+    var viewBtn = document.createElement("button");
+    viewBtn.type = "button";
+    viewBtn.textContent = "View instances";
+    viewBtn.addEventListener("click", function () {
+      cardStatus.textContent = "Loading instances…";
+      erpGet("/api/erp/hr/recurring-events/" + encodeURIComponent(String(t.id)) + "/instances").then(function (res) {
+        cardStatus.textContent = "";
+        instBody.replaceChildren();
+        var title = document.createElement("h4");
+        title.textContent = "Generated instances (" + (res.instances || []).length + ")";
+        instBody.appendChild(title);
+        if (!(res.instances || []).length) {
+          var none2 = document.createElement("p");
+          none2.className = "admin-orders-empty";
+          none2.textContent = "No events generated yet.";
+          instBody.appendChild(none2);
+        }
+        (res.instances || []).forEach(function (ev) {
+          var row = document.createElement("p");
+          row.textContent = (ev.occurrence_date || ev.date) + " — " + ev.name
+            + (ev.location ? " · " + ev.location : "")
+            + " · roster: " + (ev.roster || []).length;
+          instBody.appendChild(row);
+        });
+      }).catch(function (error) { cardStatus.textContent = error.message; });
+    });
+    card.appendChild(viewBtn);
+    // Edit (title / location / time only -- the schedule itself is set
+    // at creation; editing never rewrites generated events).
+    var editBody = document.createElement("div");
+    editBody.style.flex = "1 1 100%";
+    card.appendChild(editBody);
+    var editBtn = document.createElement("button");
+    editBtn.type = "button";
+    editBtn.textContent = "Edit template";
+    editBtn.addEventListener("click", function () {
+      editBody.replaceChildren();
+      var titleInput = document.createElement("input");
+      titleInput.type = "text";
+      titleInput.value = t.title;
+      editBody.appendChild(erpField("Title", titleInput));
+      var locInput = document.createElement("input");
+      locInput.type = "text";
+      locInput.value = t.location || "";
+      editBody.appendChild(erpField("Location", locInput));
+      var timeInput = document.createElement("input");
+      timeInput.type = "text";
+      timeInput.value = t.time || "";
+      editBody.appendChild(erpField("Time (HH:MM, blank if none)", timeInput));
+      var saveBtn = document.createElement("button");
+      saveBtn.type = "button";
+      saveBtn.textContent = "Save changes";
+      saveBtn.addEventListener("click", function () {
+        if (!titleInput.value.trim()) { cardStatus.textContent = "Title is required."; return; }
+        saveBtn.disabled = true;
+        cardStatus.textContent = "Saving…";
+        erpPost("/api/erp/hr/recurring-events/" + encodeURIComponent(String(t.id)) + "/update", { title: titleInput.value, location: locInput.value, time: timeInput.value }).then(function () {
+          reload();
+        }).catch(function (error) {
+          cardStatus.textContent = error.message;
+          saveBtn.disabled = false;
+        });
+      });
+      editBody.appendChild(saveBtn);
+      var cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", function () { editBody.replaceChildren(); });
+      editBody.appendChild(cancelBtn);
+    });
+    card.appendChild(editBtn);
+    var delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.textContent = "Delete template";
+    delBtn.addEventListener("click", function () {
+      if (!window.confirm("Delete recurring template " + t.title + "? It can only be deleted when it has no generated events.")) return;
+      delBtn.disabled = true;
+      cardStatus.textContent = "Deleting…";
+      erpPost("/api/erp/hr/recurring-events/" + encodeURIComponent(String(t.id)) + "/delete", {}).then(function () {
+        reload();
+      }).catch(function (error) {
+        cardStatus.textContent = error.message;
+        delBtn.disabled = false;
+      });
+    });
+    card.appendChild(delBtn);
+    return card;
+  }
+  // Create form.
+  var addCard = document.createElement("div");
+  addCard.className = "erp-form";
+  var addTitle = document.createElement("h3");
+  addTitle.textContent = "Add recurring template";
+  addCard.appendChild(addTitle);
+  var titleInput = document.createElement("input");
+  titleInput.type = "text";
+  titleInput.placeholder = "Template title (event name)";
+  addCard.appendChild(erpField("Title", titleInput));
+  var freqSelect = document.createElement("select");
+  ["weekly", "biweekly", "monthly"].forEach(function (f) {
+    var opt = document.createElement("option");
+    opt.value = f;
+    opt.textContent = f === "weekly" ? "Weekly" : f === "biweekly" ? "Every 2 weeks" : "Monthly";
+    freqSelect.appendChild(opt);
+  });
+  addCard.appendChild(erpField("Frequency", freqSelect));
+  var weekdaySelect = document.createElement("select");
+  ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"].forEach(function (name, i) {
+    var opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = name;
+    weekdaySelect.appendChild(opt);
+  });
+  addCard.appendChild(erpField("Weekday (weekly / every 2 weeks)", weekdaySelect));
+  var domInput = document.createElement("input");
+  domInput.type = "text";
+  domInput.placeholder = "1-31";
+  addCard.appendChild(erpField("Day of month (monthly only)", domInput));
+  var timeInput = document.createElement("input");
+  timeInput.type = "text";
+  timeInput.placeholder = "HH:MM (blank if none)";
+  addCard.appendChild(erpField("Time (HH:MM)", timeInput));
+  var anchorInput = document.createElement("input");
+  anchorInput.type = "text";
+  anchorInput.placeholder = "YYYY-MM-DD";
+  addCard.appendChild(erpField("Anchor date (first occurrence)", anchorInput));
+  var locInput = document.createElement("input");
+  locInput.type = "text";
+  locInput.placeholder = "Location";
+  addCard.appendChild(erpField("Location", locInput));
+  var rosterTitle = document.createElement("p");
+  rosterTitle.className = "admin-orders-empty";
+  rosterTitle.textContent = "Roster template — tick the people copied onto every generated event:";
+  addCard.appendChild(rosterTitle);
+  var rosterBoxes = [];
+  activeEmps.forEach(function (e) {
+    var row = document.createElement("p");
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = String(e.id);
+    row.textContent = e.name + (e.role ? " (" + e.role + ")" : "");
+    row.appendChild(box);
+    addCard.appendChild(row);
+    rosterBoxes.push(box);
+  });
+  if (!activeEmps.length) {
+    var noEmp = document.createElement("p");
+    noEmp.className = "admin-orders-empty";
+    noEmp.textContent = "No active employees yet — add employee records first, then tick them here.";
+    addCard.appendChild(noEmp);
+  }
+  var addStatus = document.createElement("p");
+  addStatus.style.color = "var(--muted)";
+  addStatus.style.flex = "1 1 100%";
+  addCard.appendChild(addStatus);
+  var addBtn = document.createElement("button");
+  addBtn.type = "button";
+  addBtn.textContent = "Add recurring template";
+  addBtn.addEventListener("click", function () {
+    if (!titleInput.value.trim()) { addStatus.textContent = "Title is required."; return; }
+    if (!anchorInput.value.trim()) { addStatus.textContent = "Anchor date is required (YYYY-MM-DD)."; return; }
+    var freq = selectValue(freqSelect);
+    var payload = { title: titleInput.value, frequency: freq,
+      time: timeInput.value, anchor_date: anchorInput.value,
+      location: locInput.value,
+      roster_ids: rosterBoxes.filter(function (b) { return b.checked; }).map(function (b) { return Number(b.value); }) };
+    if (freq === "monthly") {
+      payload.day_of_month = domInput.value.trim() ? Number(domInput.value) : null;
+      payload.weekday = null;
+    } else {
+      payload.weekday = Number(selectValue(weekdaySelect));
+      payload.day_of_month = null;
+    }
+    addBtn.disabled = true;
+    addStatus.textContent = "Adding…";
+    erpPost("/api/erp/hr/recurring-events", payload).then(function () {
+      reload();
+    }).catch(function (error) {
+      addStatus.textContent = error.message;
+      addBtn.disabled = false;
+    });
+  });
+  addCard.appendChild(addBtn);
+  wrap.appendChild(addCard);
+  status.textContent = "Loading recurring templates…";
+  erpGet("/api/erp/hr/recurring-events").then(function (data) {
+    status.textContent = "";
+    renderList(data.templates || []);
+  }).catch(function (error) { status.textContent = error.message; });
+  return wrap;
+}
+
+
+/* HR Additions 3: event-staff payroll feed */
+// Opt-in only: feed UNFED event time records for one payroll-eligible
+// employee + period into a DRAFT payrun. Cash stays the default --
+// unticked (not payroll-eligible) employees stay cash records only and
+// the feed refuses them. This section self-fetches the employee list
+// and the time records inside its render function; it never touches
+// loadErpHrDetail. Feeding posts nothing to the ledger itself: the
+// draft payrun still flows through the existing approve -> pay flow.
+function renderErpHrPayrollFeedSection() {
+  var wrap = document.createElement("div");
+  wrap.className = "erp-form";
+  wrap.style.flex = "1 1 100%";
+  var title = document.createElement("h3");
+  title.textContent = "Feed to payrun — event staff (opt-in only)";
+  wrap.appendChild(title);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Explicit action only: feeds UNFED event time records for one payroll-eligible employee whose event date falls in the period into a DRAFT payrun (created if none is open for the period). Cash stays the default — employees who are not payroll-eligible stay cash records only and cannot be fed. Hours split regular/OT by the Nevada rule (past 8 h in a day, past 40 h in a week after daily OT is excluded) at the payroll employee's hourly rate. A fed record is payroll now, not cash — cash cannot be paid on it afterwards.";
+  wrap.appendChild(note);
+  var empSelect = document.createElement("select");
+  wrap.appendChild(erpField("Employee", empSelect));
+  var startInput = document.createElement("input");
+  startInput.type = "text";
+  startInput.placeholder = "YYYY-MM-DD";
+  wrap.appendChild(erpField("Period start", startInput));
+  var endInput = document.createElement("input");
+  endInput.type = "text";
+  endInput.placeholder = "YYYY-MM-DD";
+  wrap.appendChild(erpField("Period end", endInput));
+  var payDateInput = document.createElement("input");
+  payDateInput.type = "text";
+  payDateInput.placeholder = "YYYY-MM-DD (needed only for a new payrun)";
+  wrap.appendChild(erpField("Pay date", payDateInput));
+  var runInput = document.createElement("input");
+  runInput.type = "text";
+  runInput.placeholder = "optional — attach to an existing draft payrun id";
+  wrap.appendChild(erpField("Payrun id (optional)", runInput));
+  var status = document.createElement("p");
+  status.style.color = "var(--muted)";
+  status.style.flex = "1 1 100%";
+  wrap.appendChild(status);
+  var fedList = document.createElement("p");
+  fedList.className = "admin-orders-empty";
+  fedList.textContent = "Loading fed time records…";
+  wrap.appendChild(fedList);
+  erpGet("/api/erp/hr/employees").then(function (empData) {
+    var emps = empData.employees || [];
+    emps.forEach(function (e) {
+      var opt = document.createElement("option");
+      opt.value = String(e.id);
+      opt.textContent = e.name + (e.payroll_eligible ? " — payroll-eligible" : " — cash only") + (e.hourly_rate_cents === null || e.hourly_rate_cents === undefined ? " (no rate)" : " (" + hrRateDollars(e.hourly_rate_cents) + ")");
+      empSelect.appendChild(opt);
+    });
+    if (!emps.length) {
+      var none = document.createElement("option");
+      none.value = "";
+      none.textContent = "No employee records yet";
+      empSelect.appendChild(none);
+    }
+  }).catch(function () { status.textContent = "Could not load employees."; });
+  erpGet("/api/erp/hr/time-records").then(function (trData) {
+    var fed = (trData.time_records || []).filter(function (r) { return r.payrun_line_id !== null && r.payrun_line_id !== undefined; });
+    fedList.textContent = fed.length ? "Already fed to payroll: " + fed.map(function (r) { return "record #" + r.id + " (" + (r.employee_name || ("employee #" + r.employee_id)) + ") → payrun line #" + r.payrun_line_id; }).join(" · ") + "." : "No time records fed to payroll yet.";
+  }).catch(function () { fedList.textContent = "Could not load fed time records."; });
+  var feedBtn = document.createElement("button");
+  feedBtn.type = "button";
+  feedBtn.textContent = "Feed event hours to payrun";
+  feedBtn.addEventListener("click", function () {
+    feedBtn.disabled = true;
+    status.textContent = "Feeding…";
+    var body = {
+      employee_id: empSelect.value ? Number(empSelect.value) : null,
+      period_start: startInput.value.trim(),
+      period_end: endInput.value.trim(),
+      pay_date: payDateInput.value.trim() || undefined,
+      payrun_id: runInput.value.trim() ? Number(runInput.value.trim()) : undefined
+    };
+    erpPost("/api/erp/hr/time-records/feed-payrun", body).then(function (res) {
+      if (res.fed) {
+        status.textContent = "Fed " + res.fed + " record(s) into payrun #" + (res.run && res.run.id) + " — line #" + (res.fed_line && res.fed_line.id) + ", " + (res.regular_hours || 0) + " regular + " + (res.ot_hours || 0) + " OT hours, gross " + erpMoney(res.fed_line ? res.fed_line.gross_cents : 0) + ". The payrun is a DRAFT — approve it in Accounting to pay.";
+      } else if (res.unmapped && res.unmapped.length) {
+        status.textContent = "Nothing fed: " + (res.note || "employee has no usable hourly payroll record") + " (" + res.unmapped[0].reason + ").";
+      } else {
+        status.textContent = res.note || ("Fed 0 records (already fed: " + (res.already_fed || 0) + ").");
+      }
+      feedBtn.disabled = false;
+      loadErpHrDetail();
+    }).catch(function (error) {
+      status.textContent = error.message;
+      feedBtn.disabled = false;
+    });
+  });
+  wrap.appendChild(feedBtn);
+  return wrap;
+}
+
+// HR Additions 2: performance reviews
+// Admin-only section on the HR tab. Cycles start empty; the admin
+// creates them, then creates one review per employee per cycle.
+// Rating is 1-5 with fixed labels (1 = Needs improvement ...
+// 5 = Exceptional). Status flow is draft -> submitted ->
+// acknowledged. Only the admin creates/edits/submits here; the
+// employee acknowledges in the self-service view (separate
+// subsystem) -- this view shows status only and never acknowledges
+// on the employee's behalf. This section self-fetches its data
+// with erpGet inside its render function; loadErpHrDetail is
+// untouched.
+var HR_REVIEW_RATINGS = [[1, "Needs improvement"], [2, "Developing"],
+  [3, "Meets expectations"], [4, "Exceeds expectations"],
+  [5, "Exceptional"]];
+function hrReviewRatingText(r) {
+  if (r === null || r === undefined || r === "") return "No rating yet";
+  var found = null;
+  HR_REVIEW_RATINGS.forEach(function (p) { if (p[0] === Number(r)) found = p[1]; });
+  return found ? (r + " — " + found) : String(r);
+}
+function renderErpHrReviewsSection(employees, reload) {
+  var wrap = document.createElement("div");
+  var h2 = document.createElement("h2");
+  h2.textContent = "Performance reviews";
+  wrap.appendChild(h2);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Admin-only. Cycles start empty — add one, then add one review per employee per cycle. Rating is 1–5: 1 Needs improvement, 2 Developing, 3 Meets expectations, 4 Exceeds expectations, 5 Exceptional. A review goes draft → submitted → acknowledged; only the reviewed employee acknowledges it, in their self-service view — this view shows the status, it never acknowledges on their behalf. Reviews carry no money and never touch payroll.";
+  wrap.appendChild(note);
+  var loadNote = document.createElement("p");
+  loadNote.className = "admin-orders-empty";
+  loadNote.textContent = "Loading review cycles…";
+  wrap.appendChild(loadNote);
+  function rvInput(placeholder, type) {
+    var input = document.createElement("input");
+    input.type = type || "text";
+    input.placeholder = placeholder || "";
+    return input;
+  }
+  function rvButton(label) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    return b;
+  }
+  function rvRatingSelect(current) {
+    var sel = document.createElement("select");
+    var blank = document.createElement("option");
+    blank.value = "";
+    blank.textContent = "No rating yet";
+    sel.appendChild(blank);
+    HR_REVIEW_RATINGS.forEach(function (p) {
+      var opt = document.createElement("option");
+      opt.value = String(p[0]);
+      opt.textContent = p[0] + " — " + p[1];
+      if (current !== null && current !== undefined && Number(current) === p[0]) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    return sel;
+  }
+  function rvEmployeeSelect(current) {
+    var sel = document.createElement("select");
+    (employees || []).forEach(function (e) {
+      var opt = document.createElement("option");
+      opt.value = String(e.id);
+      opt.textContent = e.name + (e.email ? " (" + e.email + ")" : "");
+      if (current !== null && current !== undefined && Number(current) === e.id) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    return sel;
+  }
+  erpGet("/api/erp/hr/review-cycles").then(function (cyData) {
+    var cycles = cyData.cycles || [];
+    wrap.removeChild(loadNote);
+    // Add cycle form.
+    var addCard = document.createElement("div");
+    addCard.className = "erp-form";
+    var addTitle = document.createElement("h3");
+    addTitle.textContent = "Add review cycle";
+    addCard.appendChild(addTitle);
+    var nameInput = rvInput("Cycle name, e.g. 2026 year-end");
+    addCard.appendChild(erpField("Cycle name", nameInput));
+    var periodInput = rvInput("Period, e.g. 2026 H2");
+    addCard.appendChild(erpField("Period", periodInput));
+    var dueInput = rvInput("YYYY-MM-DD (blank if undecided)");
+    addCard.appendChild(erpField("Due date", dueInput));
+    var addStatus = document.createElement("p");
+    addStatus.style.color = "var(--muted)";
+    addStatus.style.flex = "1 1 100%";
+    addCard.appendChild(addStatus);
+    var addBtn = rvButton("Add cycle");
+    addBtn.addEventListener("click", function () {
+      if (!nameInput.value.trim()) { addStatus.textContent = "Cycle name is required."; return; }
+      addBtn.disabled = true;
+      addStatus.textContent = "Adding…";
+      erpPost("/api/erp/hr/review-cycles", {
+        name: nameInput.value, period: periodInput.value,
+        due_date: dueInput.value
+      }).then(function () { reload(); }).catch(function (error) {
+        addStatus.textContent = error.message;
+        addBtn.disabled = false;
+      });
+    });
+    addCard.appendChild(addBtn);
+    wrap.appendChild(addCard);
+    if (!cycles.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No review cycles yet. Add the first one above.";
+      wrap.appendChild(none);
+      return;
+    }
+    // Cycle picker + reviews for the picked cycle.
+    var pickCard = document.createElement("div");
+    pickCard.className = "erp-form";
+    var cycleSel = document.createElement("select");
+    cycles.forEach(function (c) {
+      var opt = document.createElement("option");
+      opt.value = String(c.id);
+      opt.textContent = c.name + (c.period ? " (" + c.period + ")" : "")
+        + (c.due_date ? " — due " + c.due_date : "")
+        + " · " + (c.review_count || 0) + " review(s)";
+      cycleSel.appendChild(opt);
+    });
+    pickCard.appendChild(erpField("Review cycle", cycleSel));
+    var listWrap = document.createElement("div");
+    listWrap.style.flex = "1 1 100%";
+    pickCard.appendChild(listWrap);
+    var formStatus = document.createElement("p");
+    formStatus.style.color = "var(--muted)";
+    formStatus.style.flex = "1 1 100%";
+    pickCard.appendChild(formStatus);
+    function loadReviews() {
+      var cid = cycleSel.value;
+      listWrap.replaceChildren();
+      var loading = document.createElement("p");
+      loading.className = "admin-orders-empty";
+      loading.textContent = "Loading reviews…";
+      listWrap.appendChild(loading);
+      erpGet("/api/erp/hr/reviews?cycle_id=" + encodeURIComponent(cid)).then(function (rvData) {
+        listWrap.replaceChildren();
+        // Add review form for this cycle.
+        var rvCard = document.createElement("div");
+        rvCard.className = "erp-form";
+        rvCard.style.flex = "1 1 100%";
+        var rvTitle = document.createElement("h3");
+        rvTitle.textContent = "Add review";
+        rvCard.appendChild(rvTitle);
+        var empSel = rvEmployeeSelect(null);
+        rvCard.appendChild(erpField("Employee", empSel));
+        var reviewerInput = rvInput("Reviewer name");
+        rvCard.appendChild(erpField("Reviewer", reviewerInput));
+        var reviewerEmailInput = rvInput("Reviewer email (optional)", "email");
+        rvCard.appendChild(erpField("Reviewer email", reviewerEmailInput));
+        var ratingSel = rvRatingSelect(null);
+        rvCard.appendChild(erpField("Rating", ratingSel));
+        var strengthsInput = rvInput("Strengths");
+        rvCard.appendChild(erpField("Strengths", strengthsInput));
+        var growthInput = rvInput("Growth areas");
+        rvCard.appendChild(erpField("Growth areas", growthInput));
+        var goalsInput = rvInput("Goals");
+        rvCard.appendChild(erpField("Goals", goalsInput));
+        var rvAddBtn = rvButton("Add review");
+        rvAddBtn.addEventListener("click", function () {
+          if (!reviewerInput.value.trim()) { formStatus.textContent = "Reviewer name is required."; return; }
+          rvAddBtn.disabled = true;
+          formStatus.textContent = "Adding…";
+          erpPost("/api/erp/hr/reviews", {
+            cycle_id: Number(cid), employee_id: Number(empSel.value),
+            reviewer_name: reviewerInput.value,
+            reviewer_email: reviewerEmailInput.value,
+            rating: ratingSel.value ? Number(ratingSel.value) : null,
+            strengths: strengthsInput.value,
+            growth_areas: growthInput.value, goals: goalsInput.value
+          }).then(function () { reload(); }).catch(function (error) {
+            formStatus.textContent = error.message;
+            rvAddBtn.disabled = false;
+          });
+        });
+        rvCard.appendChild(rvAddBtn);
+        listWrap.appendChild(rvCard);
+        var reviews = rvData.reviews || [];
+        if (!reviews.length) {
+          var rvNone = document.createElement("p");
+          rvNone.className = "admin-orders-empty";
+          rvNone.textContent = "No reviews in this cycle yet. Add the first one above.";
+          listWrap.appendChild(rvNone);
+          return;
+        }
+        reviews.forEach(function (rv) {
+          var row = document.createElement("div");
+          row.className = "erp-form";
+          row.style.flex = "1 1 100%";
+          var rt = document.createElement("h4");
+          rt.textContent = (rv.employee_name || ("Employee #" + rv.employee_id))
+            + " — reviewed by " + (rv.reviewer_name || "—");
+          row.appendChild(rt);
+          var meta = document.createElement("p");
+          meta.className = "admin-orders-empty";
+          meta.textContent = "Rating: " + hrReviewRatingText(rv.rating)
+            + " · Status: " + rv.status
+            + (rv.status === "acknowledged" && rv.acknowledged_at ? " (acknowledged " + rv.acknowledged_at.slice(0, 10) + ")" : "")
+            + (rv.reviewer_email ? " · Reviewer email: " + rv.reviewer_email : "");
+          row.appendChild(meta);
+          [["Strengths", rv.strengths], ["Growth areas", rv.growth_areas],
+           ["Goals", rv.goals]].forEach(function (pair) {
+            if (!pair[1]) return;
+            var p = document.createElement("p");
+            p.textContent = pair[0] + ": " + pair[1];
+            row.appendChild(p);
+          });
+          if (rv.status === "draft") {
+            var subBtn = rvButton("Submit review");
+            subBtn.addEventListener("click", function () {
+              subBtn.disabled = true;
+              erpPost("/api/erp/hr/reviews/" + rv.id + "/submit", {}).then(function () {
+                reload();
+              }).catch(function (error) {
+                formStatus.textContent = error.message;
+                subBtn.disabled = false;
+              });
+            });
+            row.appendChild(subBtn);
+          }
+          if (rv.status !== "acknowledged") {
+            var editBtn = rvButton("Edit");
+            editBtn.addEventListener("click", function () {
+              row.replaceChildren();
+              var et = document.createElement("h4");
+              et.textContent = "Edit review — " + (rv.employee_name || ("Employee #" + rv.employee_id));
+              row.appendChild(et);
+              var erInput = rvInput("Reviewer name");
+              erInput.value = rv.reviewer_name || "";
+              row.appendChild(erpField("Reviewer", erInput));
+              var eeInput = rvInput("Reviewer email (optional)", "email");
+              eeInput.value = rv.reviewer_email || "";
+              row.appendChild(erpField("Reviewer email", eeInput));
+              var eRating = rvRatingSelect(rv.rating);
+              row.appendChild(erpField("Rating", eRating));
+              var esInput = rvInput("Strengths");
+              esInput.value = rv.strengths || "";
+              row.appendChild(erpField("Strengths", esInput));
+              var egInput = rvInput("Growth areas");
+              egInput.value = rv.growth_areas || "";
+              row.appendChild(erpField("Growth areas", egInput));
+              var eoInput = rvInput("Goals");
+              eoInput.value = rv.goals || "";
+              row.appendChild(erpField("Goals", eoInput));
+              var saveBtn = rvButton("Save changes");
+              saveBtn.addEventListener("click", function () {
+                saveBtn.disabled = true;
+                erpPost("/api/erp/hr/reviews/" + rv.id + "/update", {
+                  reviewer_name: erInput.value,
+                  reviewer_email: eeInput.value,
+                  rating: eRating.value ? Number(eRating.value) : null,
+                  strengths: esInput.value, growth_areas: egInput.value,
+                  goals: eoInput.value
+                }).then(function () { reload(); }).catch(function (error) {
+                  formStatus.textContent = error.message;
+                  saveBtn.disabled = false;
+                });
+              });
+              row.appendChild(saveBtn);
+              var cancelBtn = rvButton("Cancel");
+              cancelBtn.addEventListener("click", function () { reload(); });
+              row.appendChild(cancelBtn);
+            });
+            row.appendChild(editBtn);
+          }
+          listWrap.appendChild(row);
+        });
+      }).catch(function () {
+        listWrap.replaceChildren();
+        var err = document.createElement("p");
+        err.className = "admin-orders-empty";
+        err.textContent = "Could not load reviews.";
+        listWrap.appendChild(err);
+      });
+    }
+    cycleSel.addEventListener("change", loadReviews);
+    wrap.appendChild(pickCard);
+    loadReviews();
+  }).catch(function () {
+    loadNote.textContent = "Could not load review cycles.";
+  });
+  return wrap;
+}
+
+// HR Additions 1: PTO / time-off tracking. Self-fetches its data
+// with erpGet (types, requests, per-employee balances) -- the HR
+// loader is not touched. Balances start at 0 days; an admin grants
+// days per person per type and nothing accrues automatically. A
+// request goes draft -> pending -> approved/denied, the approver must
+// be a different admin than the requester, overlap with a rostered
+// event only warns (never blocks), and days are calendar days, start
+// to end inclusive. PTO has no money in it -- no ledger or payroll.
+function renderErpHrPtoSection(employees, reload) {
+  var wrap = document.createElement("div");
+  var h2 = document.createElement("h2");
+  h2.textContent = "Time off (PTO)";
+  wrap.appendChild(h2);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Balances start at 0 days — an admin grants days per person per type, and nothing accrues automatically. A request goes draft → pending → approved or denied, and the approver must be a different admin than the requester. Overlapping a rostered event only warns, never blocks. Days are calendar days, start to end inclusive.";
+  wrap.appendChild(note);
+  var status = document.createElement("p");
+  status.style.color = "var(--muted)";
+  status.style.flex = "1 1 100%";
+  wrap.appendChild(status);
+  function ptoWarnText(warnings) {
+    return (warnings || []).map(function (w) {
+      return "Overlaps " + (w.event_name || ("event #" + w.event_id)) + (w.event_date ? " on " + w.event_date : "");
+    }).join("; ");
+  }
+  function ptoFillSelect(select, types, allLabel) {
+    select.replaceChildren();
+    var def = document.createElement("option");
+    def.value = "";
+    def.textContent = allLabel || "Pick a type";
+    select.appendChild(def);
+    (types || []).filter(function (t) { return t.active; }).forEach(function (t) {
+      var opt = document.createElement("option");
+      opt.value = String(t.id);
+      opt.textContent = t.name;
+      select.appendChild(opt);
+    });
+  }
+  function ptoEmpSelect() {
+    var select = document.createElement("select");
+    (employees || []).forEach(function (e) {
+      var opt = document.createElement("option");
+      opt.value = String(e.id);
+      opt.textContent = e.name + (e.email ? " (" + e.email + ")" : "");
+      select.appendChild(opt);
+    });
+    return select;
+  }
+  // --- Request types (admin-configurable list). ---
+  var typesBox = document.createElement("div");
+  wrap.appendChild(typesBox);
+  var typeInput = document.createElement("input");
+  typeInput.type = "text";
+  typeInput.placeholder = "New type, e.g. bereavement";
+  var typeBtn = document.createElement("button");
+  typeBtn.type = "button";
+  typeBtn.textContent = "Add type";
+  typeBtn.addEventListener("click", function () {
+    if (!typeInput.value.trim()) return;
+    typeBtn.disabled = true;
+    status.textContent = "Adding type…";
+    erpPost("/api/erp/hr/pto-types", { name: typeInput.value }).then(function () {
+      typeInput.value = "";
+      status.textContent = "Type added.";
+      typeBtn.disabled = false;
+      ptoRefresh();
+    }).catch(function (error) {
+      status.textContent = error.message;
+      typeBtn.disabled = false;
+    });
+  });
+  // --- Request types card (list lives in typesBox, filled by refresh). ---
+  var typeCard = document.createElement("div");
+  typeCard.className = "erp-form";
+  var typeTitle = document.createElement("h3");
+  typeTitle.textContent = "Request types";
+  typeCard.appendChild(typeTitle);
+  typeCard.appendChild(erpField("Add a type", typeInput));
+  typeCard.appendChild(typeBtn);
+  wrap.appendChild(typeCard);
+  // --- Annual grant form (admin sets days per person per type). ---
+  var grantCard = document.createElement("div");
+  grantCard.className = "erp-form";
+  var grantTitle = document.createElement("h3");
+  grantTitle.textContent = "Set annual grant";
+  grantCard.appendChild(grantTitle);
+  var grantEmp = ptoEmpSelect();
+  grantCard.appendChild(erpField("Employee", grantEmp));
+  var grantType = document.createElement("select");
+  grantCard.appendChild(erpField("Type", grantType));
+  var grantDays = document.createElement("input");
+  grantDays.type = "text";
+  grantDays.placeholder = "Days, e.g. 10";
+  grantCard.appendChild(erpField("Annual grant (days)", grantDays));
+  var grantBtn = document.createElement("button");
+  grantBtn.type = "button";
+  grantBtn.textContent = "Set annual grant";
+  grantBtn.addEventListener("click", function () {
+    var days = Number(grantDays.value);
+    if (!grantEmp.value || !grantType.value || isNaN(days) || days < 0) {
+      status.textContent = "Pick an employee and a type, and enter grant days of 0 or more.";
+      return;
+    }
+    grantBtn.disabled = true;
+    status.textContent = "Saving grant…";
+    erpPost("/api/erp/hr/employees/" + encodeURIComponent(grantEmp.value) + "/pto-grant", {
+      type_id: Number(grantType.value), granted_days: days
+    }).then(function (bal) {
+      status.textContent = "Grant saved — remaining " + bal.remaining_days + " " + bal.type + " days.";
+      grantBtn.disabled = false;
+      ptoRefresh();
+    }).catch(function (error) {
+      status.textContent = error.message;
+      grantBtn.disabled = false;
+    });
+  });
+  grantCard.appendChild(grantBtn);
+  wrap.appendChild(grantCard);
+  // --- New request form (creates a draft). ---
+  var reqCard = document.createElement("div");
+  reqCard.className = "erp-form";
+  var reqTitle = document.createElement("h3");
+  reqTitle.textContent = "New time-off request";
+  reqCard.appendChild(reqTitle);
+  var reqEmp = ptoEmpSelect();
+  reqCard.appendChild(erpField("Employee", reqEmp));
+  var reqType = document.createElement("select");
+  reqCard.appendChild(erpField("Type", reqType));
+  var reqStart = document.createElement("input");
+  reqStart.type = "text";
+  reqStart.placeholder = "YYYY-MM-DD";
+  reqCard.appendChild(erpField("Start date", reqStart));
+  var reqEnd = document.createElement("input");
+  reqEnd.type = "text";
+  reqEnd.placeholder = "YYYY-MM-DD";
+  reqCard.appendChild(erpField("End date", reqEnd));
+  var reqNotes = document.createElement("input");
+  reqNotes.type = "text";
+  reqNotes.placeholder = "Notes (optional)";
+  reqCard.appendChild(erpField("Notes", reqNotes));
+  var reqBtn = document.createElement("button");
+  reqBtn.type = "button";
+  reqBtn.textContent = "Create draft request";
+  reqBtn.addEventListener("click", function () {
+    if (!reqEmp.value || !reqType.value || !reqStart.value.trim() || !reqEnd.value.trim()) {
+      status.textContent = "Pick an employee and a type, and enter start and end dates.";
+      return;
+    }
+    reqBtn.disabled = true;
+    status.textContent = "Creating request…";
+    erpPost("/api/erp/hr/pto-requests", {
+      employee_id: Number(reqEmp.value), type_id: Number(reqType.value),
+      start_date: reqStart.value.trim(), end_date: reqEnd.value.trim(),
+      notes: reqNotes.value
+    }).then(function (created) {
+      var warn = ptoWarnText(created.warnings);
+      status.textContent = "Draft request created (" + created.days + " days)." + (warn ? " Warning: " + warn + "." : "");
+      reqBtn.disabled = false;
+      ptoRefresh();
+    }).catch(function (error) {
+      status.textContent = error.message;
+      reqBtn.disabled = false;
+    });
+  });
+  reqCard.appendChild(reqBtn);
+  wrap.appendChild(reqCard);
+  // --- Balances + request list (filled by ptoRefresh). ---
+  var balBox = document.createElement("div");
+  wrap.appendChild(balBox);
+  var reqBox = document.createElement("div");
+  wrap.appendChild(reqBox);
+  function ptoRefresh() {
+    erpGet("/api/erp/hr/pto-types").then(function (tData) {
+      var types = tData.types || [];
+      typesBox.replaceChildren();
+      var line = document.createElement("p");
+      line.textContent = "Types: " + types.map(function (t) {
+        return t.name + (t.active ? "" : " (inactive)");
+      }).join(", ");
+      typesBox.appendChild(line);
+      ptoFillSelect(grantType, types);
+      ptoFillSelect(reqType, types);
+    }).catch(function () {
+      typesBox.replaceChildren();
+      var err = document.createElement("p");
+      err.className = "admin-orders-empty";
+      err.textContent = "Could not load PTO types.";
+      typesBox.appendChild(err);
+    });
+    balBox.replaceChildren();
+    (employees || []).forEach(function (e) {
+      erpGet("/api/erp/hr/employees/" + encodeURIComponent(String(e.id)) + "/pto-balance").then(function (bData) {
+        var row = document.createElement("p");
+        row.textContent = e.name + ": " + (bData.balances || []).map(function (b) {
+          return b.type + " — granted " + b.granted_days + " · approved " + b.approved_days + " · remaining " + b.remaining_days;
+        }).join(" · ");
+        balBox.appendChild(row);
+      }).catch(function () {
+        var err = document.createElement("p");
+        err.className = "admin-orders-empty";
+        err.textContent = "Could not load the PTO balance for " + e.name + ".";
+        balBox.appendChild(err);
+      });
+    });
+    erpGet("/api/erp/hr/pto-requests").then(function (rData) {
+      reqBox.replaceChildren();
+      var title = document.createElement("h3");
+      title.textContent = "Time-off requests";
+      reqBox.appendChild(title);
+      var reqs = rData.requests || [];
+      if (!reqs.length) {
+        var none = document.createElement("p");
+        none.className = "admin-orders-empty";
+        none.textContent = "No time-off requests yet.";
+        reqBox.appendChild(none);
+        return;
+      }
+      reqs.forEach(function (r) {
+        var card = document.createElement("div");
+        card.className = "erp-form";
+        var emp = null;
+        (employees || []).forEach(function (e) { if (e.id === r.employee_id) emp = e; });
+        var head = document.createElement("h3");
+        head.textContent = (emp ? emp.name : ("Employee #" + r.employee_id)) + " — " + r.type + " · " + r.status;
+        card.appendChild(head);
+        var det = document.createElement("p");
+        det.className = "admin-orders-empty";
+        det.textContent = r.start_date + " to " + r.end_date + " (" + r.days + " days)" + (r.notes ? " — " + r.notes : "") + " · requested by " + (r.requested_by || "—") + (r.decided_by ? " · decided by " + r.decided_by : "") + (r.override_used ? " · OVERRIDE: balance went negative" : "");
+        card.appendChild(det);
+        var warn = ptoWarnText(r.warnings);
+        if (warn) {
+          var w = document.createElement("p");
+          w.textContent = "Warning: " + warn + ".";
+          card.appendChild(w);
+        }
+        var rowStatus = document.createElement("p");
+        rowStatus.style.color = "var(--muted)";
+        rowStatus.style.flex = "1 1 100%";
+        card.appendChild(rowStatus);
+        function ptoAct(label, path, body) {
+          var b = document.createElement("button");
+          b.type = "button";
+          b.textContent = label;
+          b.addEventListener("click", function () {
+            b.disabled = true;
+            rowStatus.textContent = label + "…";
+            erpPost(path, body || {}).then(function (done) {
+              var w2 = ptoWarnText(done.warnings);
+              rowStatus.textContent = label + " done." + (w2 ? " Warning: " + w2 + "." : "");
+              ptoRefresh();
+              if (typeof reload === "function") reload();
+            }).catch(function (error) {
+              rowStatus.textContent = error.message;
+              b.disabled = false;
+            });
+          });
+          card.appendChild(b);
+          return b;
+        }
+        if (r.status === "draft") {
+          ptoAct("Submit", "/api/erp/hr/pto-requests/" + encodeURIComponent(String(r.id)) + "/submit");
+        }
+        if (r.status === "pending") {
+          var ov = document.createElement("input");
+          ov.type = "checkbox";
+          var ovLabel = document.createElement("label");
+          ovLabel.appendChild(ov);
+          var ovSpan = document.createElement("span");
+          ovSpan.textContent = " Allow negative balance (override)";
+          ovLabel.appendChild(ovSpan);
+          card.appendChild(ovLabel);
+          // Approve reads the override checkbox at click time, so the
+          // flag sent is the one checked when approval happens.
+          var approveBtn = document.createElement("button");
+          approveBtn.type = "button";
+          approveBtn.textContent = "Approve";
+          approveBtn.addEventListener("click", function () {
+            approveBtn.disabled = true;
+            rowStatus.textContent = "Approving…";
+            erpPost("/api/erp/hr/pto-requests/" + encodeURIComponent(String(r.id)) + "/approve", { override_allowed: !!ov.checked }).then(function (done) {
+              var w3 = ptoWarnText(done.warnings);
+              rowStatus.textContent = "Approve done." + (w3 ? " Warning: " + w3 + "." : "");
+              ptoRefresh();
+              if (typeof reload === "function") reload();
+            }).catch(function (error) {
+              rowStatus.textContent = error.message;
+              approveBtn.disabled = false;
+            });
+          });
+          card.appendChild(approveBtn);
+          ptoAct("Deny", "/api/erp/hr/pto-requests/" + encodeURIComponent(String(r.id)) + "/deny");
+        }
+        reqBox.appendChild(card);
+      });
+    }).catch(function () {
+      reqBox.replaceChildren();
+      var err = document.createElement("p");
+      err.className = "admin-orders-empty";
+      err.textContent = "Could not load time-off requests.";
+      reqBox.appendChild(err);
+    });
+  }
+  ptoRefresh();
   return wrap;
 }
 
@@ -20678,6 +22575,18 @@ function renderErpStoresCard(st, locations, reload) {
   card.appendChild(toggleBtn);
   return card;
 }
+function erpStoresLedgerText(sale) {
+  var st = (sale && sale.ledger_status) || "unposted";
+  if (st === "posted") return " · ledger posted entry #" + sale.ledger_entry_id;
+  if (st === "reversed") return " · ledger reversed entry #" + sale.ledger_entry_id;
+  if (st === "post_failed") return " · ledger post failed: " + (sale.ledger_error || "unknown error");
+  if (st === "voided") return " · ledger voided — never posts";
+  return " · ledger unposted";
+}
+function erpStoresZLedgerText(z) {
+  if (!z || z.posted_total_cents === undefined || z.posted_total_cents === null) return "";
+  return " · ledger posted " + erpMoney(z.posted_total_cents) + " (" + (z.posted_sale_count || 0) + " sales)" + (z.posted_ties ? " — ties" : " — does not tie to Z total");
+}
 async function renderErpStoresDetailView(card, st, status, reload) {
   card.replaceChildren();
   var title = document.createElement("h3");
@@ -20702,6 +22611,8 @@ async function renderErpStoresDetailView(card, st, status, reload) {
     var planograms = await erpGet("/api/erp/stores/" + st.id + "/planograms").catch(function () { return { planograms: [] }; });
     var spf = await erpGet("/api/erp/stores/" + st.id + "/sales-per-foot").catch(function () { return { sections: [], has_sales: false, total_sales_cents: 0 }; });
     var lpThresholds = await erpGet("/api/erp/stores/" + st.id + "/lp-thresholds").catch(function () { return null; });
+    var taxRate = await erpGet("/api/erp/stores/" + st.id + "/tax-rate").catch(function () { return null; });
+    if (taxRate && typeof taxRate.effective_rate_bps !== "number") taxRate = null;
     var lpFlags = await erpGet("/api/erp/stores/" + st.id + "/lp-flags").catch(function () { return { flags: [] }; });
     var pmSchedules = await erpGet("/api/erp/stores/" + st.id + "/pm-schedules").catch(function () { return { schedules: [] }; });
     var catalog = await erpGet("/api/erp/stores/" + st.id + "/register-catalog").catch(function () { return null; });
@@ -20749,7 +22660,7 @@ async function renderErpStoresDetailView(card, st, status, reload) {
       });
       salesList.forEach(function (sale) {
         var p = document.createElement("p");
-        p.textContent = sale.sale_key + " · " + (sale.register || "no register") + " · " + (sale.tender || "no tender") + " · " + erpMoney(sale.total_cents) + " · " + (sale.items || []).map(function (i) { return i.flavor + " ×" + i.qty; }).join(", ");
+        p.textContent = sale.sale_key + " · " + (sale.register || "no register") + " · " + (sale.tender || "no tender") + " · " + erpMoney(sale.total_cents) + " · " + (sale.items || []).map(function (i) { return i.flavor + " ×" + i.qty; }).join(", ") + erpStoresLedgerText(sale);
         card.appendChild(p);
       });
     }
@@ -20765,7 +22676,7 @@ async function renderErpStoresDetailView(card, st, status, reload) {
     } else {
       zList.forEach(function (z) {
         var p = document.createElement("p");
-        p.textContent = z.report_date + " · " + z.register + " · total " + erpMoney(z.total_cents) + " · cash counted " + erpMoney(z.cash_count_cents) + " · variance " + erpMoney(z.variance_cents);
+        p.textContent = z.report_date + " · " + z.register + " · total " + erpMoney(z.total_cents) + " · cash counted " + erpMoney(z.cash_count_cents) + " · variance " + erpMoney(z.variance_cents) + erpStoresZLedgerText(z);
         card.appendChild(p);
       });
     }
@@ -20775,9 +22686,9 @@ async function renderErpStoresDetailView(card, st, status, reload) {
     renderErpStoresAdditionsWB(card, st, {
       planograms: planograms.planograms || [], spf: spf,
       lpThresholds: lpThresholds, lpFlags: lpFlags.flags || [],
-      pmSchedules: pmSchedules.schedules || []
+      pmSchedules: pmSchedules.schedules || [], taxRate: taxRate
     }, status, reload);
-    renderErpStoresRegister(card, st, catalog, sales, zreports, drawer.drawer || null, status, reload);
+    renderErpStoresRegister(card, st, catalog, sales, zreports, drawer.drawer || null, status, reload, taxRate);
     renderErpStoresWorkforce(card, st, workforce, status, reload);
   } catch (error) {
     status.textContent = error.message;
@@ -20791,8 +22702,9 @@ async function renderErpStoresDetailView(card, st, status, reload) {
 // Dept 14 (Stores) Wave B: per-store P&L (read-only) + recurring
 // weekly shifts with a timeclock. The P&L never estimates: COGS is
 // null until completed batches exist, and unattributed sales are
-// reported, never allocated. Hours feed payroll when a pay run is
-// created -- this tab never creates a pay run.
+// reported, never allocated. Hours feed a draft pay run only
+// through the explicit feed action below; this tab never
+// approves or pays a run.
 function renderErpStoresPl(card, pl) {
   var title = document.createElement("h3");
   title.textContent = "Per-store P&L";
@@ -20833,7 +22745,7 @@ function renderErpStoresShifts(card, st, shifts, employees, roster, timeclock, s
   card.appendChild(title);
   var note = document.createElement("p");
   note.className = "admin-orders-empty";
-  note.textContent = "Recurring weekly templates — the same shifts repeat every week. Clock-in/out records hours here. Hours feed payroll when a pay run is created; this tab never creates a pay run.";
+  note.textContent = "Recurring weekly templates — the same shifts repeat every week. Clock-in/out records hours here. Feed closed hours into a draft pay run below; payroll still approves and pays on schedule — this tab never approves or pays a run.";
   card.appendChild(note);
   var openByEmployee = {};
   (timeclock || []).forEach(function (t) {
@@ -21039,10 +22951,98 @@ function renderErpStoresShifts(card, st, shifts, employees, roster, timeclock, s
   } else {
     tcList.forEach(function (t) {
       var p = document.createElement("p");
-      p.textContent = (t.employee_name || ("Employee #" + t.employee_id)) + " · " + (t.clock_in || "") + (t.clock_out ? " → " + t.clock_out + " · " + t.hours + " hours" : " · clocked in");
+      var fedNote = "";
+      if (t.payrun_line_id) fedNote = " · fed to pay run #" + (t.payrun_id === null || t.payrun_id === undefined ? "?" : t.payrun_id);
+      else if (t.clock_out) fedNote = " · not yet fed to payroll";
+      p.textContent = (t.employee_name || ("Employee #" + t.employee_id)) + " · " + (t.clock_in || "") + (t.clock_out ? " → " + t.clock_out + " · " + t.hours + " hours" : " · clocked in") + fedNote;
       card.appendChild(p);
     });
   }
+  // --- Feed closed timeclock hours to a draft pay run. ---
+  var feedTitle = document.createElement("h3");
+  feedTitle.textContent = "Feed timeclock to pay run";
+  card.appendChild(feedTitle);
+  var feedNote = document.createElement("p");
+  feedNote.className = "admin-orders-empty";
+  feedNote.textContent = "Closed, un-fed rows for one employee and period go onto a draft pay run at the payroll hourly rate, with Nevada overtime (over 8h/day, over 40h/week). Nothing feeds automatically — payroll still approves and pays on schedule.";
+  card.appendChild(feedNote);
+  var feedForm = document.createElement("div");
+  feedForm.className = "erp-form";
+  var feedEmpSelect = document.createElement("select");
+  if (!activeEmployees.length) {
+    var feedNoEmp = document.createElement("option");
+    feedNoEmp.value = "";
+    feedNoEmp.textContent = "No active employees — add them under HR first";
+    feedEmpSelect.appendChild(feedNoEmp);
+  } else {
+    activeEmployees.forEach(function (e) {
+      var opt = document.createElement("option");
+      opt.value = String(e.id);
+      opt.textContent = e.name + (e.role ? " — " + e.role : "");
+      feedEmpSelect.appendChild(opt);
+    });
+  }
+  feedEmpSelect.value = activeEmployees.length ? String(activeEmployees[0].id) : "";
+  feedForm.appendChild(erpField("Employee", feedEmpSelect));
+  function feedMondayOf(dateStr) {
+    var parts = (dateStr || "").split("-");
+    var d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
+    var day = (d.getDay() + 6) % 7;
+    d.setDate(d.getDate() - day);
+    function pad(n) { return (n < 10 ? "0" : "") + n; }
+    return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate());
+  }
+  var feedTodayStr = new Date().toISOString().slice(0, 10);
+  var feedMondayStr = feedMondayOf(feedTodayStr);
+  var feedStartInput = document.createElement("input");
+  feedStartInput.type = "text";
+  feedStartInput.value = feedMondayStr;
+  feedForm.appendChild(erpField("Period start (YYYY-MM-DD)", feedStartInput));
+  var feedEndInput = document.createElement("input");
+  feedEndInput.type = "text";
+  feedEndInput.value = shiftWeek(feedMondayStr, 6);
+  feedForm.appendChild(erpField("Period end (YYYY-MM-DD)", feedEndInput));
+  var feedPayInput = document.createElement("input");
+  feedPayInput.type = "text";
+  feedPayInput.placeholder = "YYYY-MM-DD";
+  feedForm.appendChild(erpField("Pay date (required when a new run is created)", feedPayInput));
+  var feedPayrollInput = document.createElement("input");
+  feedPayrollInput.type = "text";
+  feedPayrollInput.placeholder = "Payroll employee ID";
+  feedForm.appendChild(erpField("Payroll employee ID (optional — links this employee when the names differ)", feedPayrollInput));
+  var feedStatus = document.createElement("p");
+  feedStatus.style.color = "var(--muted)";
+  feedStatus.style.flex = "1 1 100%";
+  feedForm.appendChild(feedStatus);
+  var feedBtn = document.createElement("button");
+  feedBtn.type = "button";
+  feedBtn.textContent = "Feed to pay run";
+  feedBtn.addEventListener("click", function () {
+    if (!feedEmpSelect.value) { feedStatus.textContent = "Pick an employee first."; return; }
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(feedStartInput.value.trim()) || !/^\d{4}-\d{2}-\d{2}$/.test(feedEndInput.value.trim())) { feedStatus.textContent = "Period start and end must be YYYY-MM-DD."; return; }
+    var body = { employee_id: Number(feedEmpSelect.value), period_start: feedStartInput.value.trim(), period_end: feedEndInput.value.trim() };
+    if (feedPayInput.value.trim()) body.pay_date = feedPayInput.value.trim();
+    if (feedPayrollInput.value.trim()) body.payroll_employee_id = Number(feedPayrollInput.value.trim());
+    feedBtn.disabled = true;
+    feedStatus.textContent = "Feeding…";
+    erpPost("/api/erp/stores/" + st.id + "/timeclock/feed-payrun", body).then(function (data) {
+      var msg;
+      if (data && data.fed > 0 && data.run) {
+        msg = "Fed " + data.fed + " rows (" + (data.fed_line ? data.fed_line.hours : "?") + " hours) to pay run #" + data.run.id + " — gross " + erpMoney(data.fed_line ? data.fed_line.gross_cents : 0) + ".";
+      } else if (data && data.unmapped && data.unmapped.length) {
+        msg = "Nothing fed: " + data.unmapped.map(function (u) { return u.reason; }).join(", ") + ". " + (data.note || "");
+      } else {
+        msg = (data && data.note) || "Nothing fed.";
+      }
+      status.textContent = msg;
+      refreshDetail();
+    }).catch(function (error) {
+      feedStatus.textContent = error.message;
+      feedBtn.disabled = false;
+    });
+  });
+  feedForm.appendChild(feedBtn);
+  card.appendChild(feedForm);
 }
 // Dept 14 (Stores) Wave C: facilities & maintenance, loss prevention
 // (read-only shrink view reusing the Inventory shrinkage data, register
@@ -21600,6 +23600,55 @@ function renderErpStoresAdditionsWB(card, st, wb, status, reload) {
     });
     card.appendChild(saveBtn);
   });
+  // --- Sales tax: this store's rate for the register. ---
+  var taxRate = (wb && wb.taxRate) || null;
+  var taxTitle = document.createElement("h3");
+  taxTitle.textContent = "Sales tax — register rate";
+  card.appendChild(taxTitle);
+  var taxNote = document.createElement("p");
+  taxNote.className = "admin-orders-empty";
+  taxNote.textContent = taxRate && typeof taxRate.effective_rate_bps === "number"
+    ? "Register sales post tax-inclusively at " + (taxRate.effective_rate_bps / 1000).toFixed(3) + "% (" + (taxRate.effective_source === "store" ? "this store's rate" : "Clark County default") + "). A store rate applies from the next sale on; it never rewrites already-posted entries."
+    : "Sales-tax rate is unavailable right now.";
+  card.appendChild(taxNote);
+  var taxForm = document.createElement("div");
+  taxForm.className = "erp-form";
+  var taxInput = document.createElement("input");
+  taxInput.type = "text";
+  taxInput.value = (taxRate && taxRate.rate_bps !== null && taxRate.rate_bps !== undefined) ? (taxRate.rate_bps / 1000).toFixed(3) : "";
+  taxInput.placeholder = "8.375";
+  taxForm.appendChild(erpField("Store tax rate (%) — blank uses the Clark County default", taxInput));
+  var taxFormStatus = document.createElement("p");
+  taxFormStatus.style.color = "var(--muted)";
+  taxFormStatus.style.flex = "1 1 100%";
+  taxForm.appendChild(taxFormStatus);
+  var taxSaveBtn = document.createElement("button");
+  taxSaveBtn.type = "button";
+  taxSaveBtn.textContent = "Save tax rate";
+  taxSaveBtn.addEventListener("click", function () {
+    var v = taxInput.value.trim();
+    if (v === "") { taxFormStatus.textContent = "Enter a rate, or use Clear to go back to the default."; return; }
+    var bps = Math.round(parseFloat(v) * 1000);
+    if (!isFinite(bps) || bps < 0 || bps > 20000) { taxFormStatus.textContent = "Rate must be a number from 0 to 20 (percent)."; return; }
+    taxSaveBtn.disabled = true;
+    taxFormStatus.textContent = "Saving…";
+    erpPost("/api/erp/stores/" + st.id + "/tax-rate", { rate_bps: bps }).then(function () {
+      refreshDetail();
+    }).catch(function (error) { taxFormStatus.textContent = error.message; taxSaveBtn.disabled = false; });
+  });
+  taxForm.appendChild(taxSaveBtn);
+  var taxClearBtn = document.createElement("button");
+  taxClearBtn.type = "button";
+  taxClearBtn.textContent = "Clear — use Clark County default";
+  taxClearBtn.addEventListener("click", function () {
+    taxClearBtn.disabled = true;
+    taxFormStatus.textContent = "Clearing…";
+    erpPost("/api/erp/stores/" + st.id + "/tax-rate", { rate_bps: null }).then(function () {
+      refreshDetail();
+    }).catch(function (error) { taxFormStatus.textContent = error.message; taxClearBtn.disabled = false; });
+  });
+  taxForm.appendChild(taxClearBtn);
+  card.appendChild(taxForm);
   // --- Loss prevention: exception flags. ---
   var lpTitle = document.createElement("h3");
   lpTitle.textContent = "Loss prevention — exception flags";
@@ -21842,8 +23891,11 @@ function erpRegisterExpandTicket(ticket, bagCents) {
   var items = [];
   (ticket || []).forEach(function (line) {
     if (line.kind === "bag") {
-      items.push({ flavor: line.flavor, qty: line.qty,
-                   amount_cents: line.amount_cents });
+      var bagItem = { flavor: line.flavor, qty: line.qty,
+                      amount_cents: line.amount_cents };
+      if (line.lot) bagItem.lot = line.lot;
+      if (line.expiry) bagItem.expiry = line.expiry;
+      items.push(bagItem);
     } else if (line.kind === "pack3" || line.kind === "pack6") {
       (line.flavors || []).forEach(function (f) {
         items.push({ flavor: f, qty: 1, amount_cents: bagCents });
@@ -21880,13 +23932,17 @@ function erpRegisterZTotals(sales, dateStr) {
   });
   return totals;
 }
-function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, status, reload) {
+function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, status, reload, taxRate) {
+  card.className = (card.className ? card.className + " " : "") + "erp-register";
   var title = document.createElement("h3");
   title.textContent = "Register";
   card.appendChild(title);
   var note = document.createElement("p");
   note.className = "admin-orders-empty";
-  note.textContent = "Admin-only register for this store — no PINs; whoever is signed in to the ERP is the cashier. Completed sales post to the POS intake only, never to the accounting ledger. A sale posts once, under one sale key; re-posting the same key returns the original sale.";
+  var taxNote = (taxRate && typeof taxRate.effective_rate_bps === "number")
+    ? " Tax " + (taxRate.effective_rate_bps / 1000).toFixed(3) + "% (" + (taxRate.effective_source === "store" ? "this store's rate" : "Clark County default") + ")."
+    : "";
+  note.textContent = "Admin-only register for this store — no PINs; whoever is signed in to the ERP is the cashier. Completed sales post to the ledger when rung up." + taxNote + " A sale posts once, under one sale key; re-posting the same key returns the original sale. Scan a bag's QR code to ring it up, or charge the card on the store's Terminal reader.";
   card.appendChild(note);
   var regStatus = document.createElement("p");
   regStatus.style.color = "var(--muted)";
@@ -21903,7 +23959,12 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
   packNote.textContent = "One bag is " + erpMoney(catalog.bag_price_cents) + ". " + (catalog.pack_pricing_note || "");
   card.appendChild(packNote);
   var reg = { ticket: [], member: null, giftCode: "", giftBalance: null,
-              saleKey: null, register: "Register 1" };
+              saleKey: null, gcSaleKey: null, register: "Register 1" };
+  // PopRegister native bridge (iPhone app only): the app injects
+  // window.PopRegisterNative before this page loads. In a plain
+  // browser it is undefined and every native branch below stays off.
+  var hasNativeBridge = (typeof window.PopRegisterNative !== "undefined")
+    && !!window.PopRegisterNative && !!window.PopRegisterNative.request;
   function dollarsInput(placeholder) {
     var input = document.createElement("input");
     input.type = "text";
@@ -21950,18 +24011,71 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
     }).catch(function (error) { regStatus.textContent = error.message; closeBtn.disabled = false; });
   });
   card.appendChild(closeBtn);
+  // --- Scan a bag (GS1 Sunrise 2027: the bag's QR code rings it up). ---
+  var scanTitle = document.createElement("h3");
+  scanTitle.textContent = "Scan a bag";
+  card.appendChild(scanTitle);
+  var scanNote = document.createElement("p");
+  scanNote.className = "admin-orders-empty";
+  scanNote.textContent = "Scan the QR code on a bag — the flavor rings up at the bag price. Lot and expiry print on the ticket when the code carries them. A code with no match rings up nothing.";
+  card.appendChild(scanNote);
+  function onRegisterScan(code, scanStatus) {
+    var res = erpRegisterResolveScan(code, catalog);
+    if (!res) { scanStatus.textContent = "No item matches '" + code + "'."; return; }
+    var found = null;
+    reg.ticket.forEach(function (line) {
+      if (line.kind === "bag" && line.flavor === res.flavor
+          && (line.lot || "") === (res.lot || "")
+          && (line.expiry || "") === (res.expiry || "")) found = line;
+    });
+    if (found) { found.qty += 1; found.amount_cents += catalog.bag_price_cents; }
+    else reg.ticket.push({ kind: "bag", flavor: res.flavor, qty: 1,
+                           amount_cents: catalog.bag_price_cents,
+                           lot: res.lot || undefined,
+                           expiry: res.expiry || undefined });
+    scanStatus.textContent = "Added " + res.flavor + " — " + erpMoney(catalog.bag_price_cents)
+      + (res.lot ? " · lot " + res.lot : "")
+      + (res.expiry ? " · exp " + res.expiry : "");
+    drawTicket();
+  }
+  var scanBox = erpScanBox(onRegisterScan);
+  card.appendChild(scanBox);
+  // --- PopRegister native bridge: phone camera scan. ---
+  // (iPhone app only: WKWebView has no BarcodeDetector, so the scan
+  // box above shows no camera button there. The app's native camera
+  // fills that gap; the code still resolves through onRegisterScan,
+  // so a code with no match rings up nothing, exactly as in the browser.)
+  if (hasNativeBridge) {
+    var nativeScanBtn = document.createElement("button");
+    nativeScanBtn.type = "button";
+    nativeScanBtn.textContent = "Scan with phone camera";
+    nativeScanBtn.addEventListener("click", function () {
+      nativeScanBtn.disabled = true;
+      regStatus.textContent = "Opening phone camera — point it at the QR code on the bag…";
+      window.PopRegisterNative.request("scan", {}).then(function (res) {
+        nativeScanBtn.disabled = false;
+        if (res && res.code) onRegisterScan(res.code, regStatus);
+        else regStatus.textContent = "No code scanned.";
+      }).catch(function (error) {
+        nativeScanBtn.disabled = false;
+        regStatus.textContent = error.message || "Phone camera scan failed.";
+      });
+    });
+    card.appendChild(nativeScanBtn);
+  }
   // --- Flavor grid. ---
   var gridTitle = document.createElement("h3");
   gridTitle.textContent = "Flavors — " + erpMoney(catalog.bag_price_cents) + " a bag";
   card.appendChild(gridTitle);
   var grid = document.createElement("div");
+  grid.className = "erp-flavor-grid";
   catalog.flavors.forEach(function (f) {
     var b = document.createElement("button");
     b.type = "button";
     b.textContent = f.name + " — " + erpMoney(catalog.bag_price_cents) + (f.category ? " (" + f.category + ")" : "");
     b.addEventListener("click", function () {
       var found = null;
-      reg.ticket.forEach(function (line) { if (line.kind === "bag" && line.flavor === f.name) found = line; });
+      reg.ticket.forEach(function (line) { if (line.kind === "bag" && line.flavor === f.name && !line.lot && !line.expiry) found = line; });
       if (found) { found.qty += 1; found.amount_cents += catalog.bag_price_cents; }
       else reg.ticket.push({ kind: "bag", flavor: f.name, qty: 1, amount_cents: catalog.bag_price_cents });
       drawTicket();
@@ -22024,11 +24138,12 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
   ticketTitle.textContent = "Ticket";
   card.appendChild(ticketTitle);
   var ticketWrap = document.createElement("div");
+  ticketWrap.className = "erp-register-ticket";
   card.appendChild(ticketWrap);
   var receiptWrap = document.createElement("div");
   card.appendChild(receiptWrap);
   function lineLabel(line) {
-    if (line.kind === "bag") return line.flavor + " ×" + line.qty;
+    if (line.kind === "bag") return line.flavor + " ×" + line.qty + (line.lot ? " · lot " + line.lot : "") + (line.expiry ? " · exp " + line.expiry : "");
     return (line.kind === "pack6" ? "6-pack: " : "3-pack: ") + (line.flavors || []).join(", ");
   }
   function drawTicket() {
@@ -22067,7 +24182,7 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
   card.appendChild(memberTitle);
   var memberNote = document.createElement("p");
   memberNote.className = "admin-orders-empty";
-  memberNote.textContent = "Attach a loyalty member by scanning their PAL: QR code or typing a phone number, email, or name. Kernels are not credited here yet — credit them from the loyalty console after the sale (follow-up).";
+  memberNote.textContent = "Attach a loyalty member by scanning their PAL: QR code or typing a phone number, email, or name. Kernels are credited automatically on the completed sale (1 per $1 charged, cash + card only).";
   card.appendChild(memberNote);
   var memberInput = document.createElement("input");
   memberInput.type = "text";
@@ -22163,6 +24278,185 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
     cashTenderedInput.value = (total / 100).toFixed(2);
   });
   card.appendChild(cashExactBtn);
+  // --- Card reader (Stripe Terminal, internet readers). ---
+  var termTitle = document.createElement("h3");
+  termTitle.textContent = "Card reader (Stripe Terminal)";
+  card.appendChild(termTitle);
+  var termNote = document.createElement("p");
+  termNote.className = "admin-orders-empty";
+  termNote.textContent = hasNativeBridge
+    ? "Tap to Pay runs on this iPhone — connect it, then hold a customer's card to the phone. No reader connected? The card amount is recorded as typed and the sale still completes."
+    : "Charge the card portion on the store's Terminal reader (Stripe Reader S700 / WisePOS E on this Wi-Fi). No reader connected? The card amount is recorded as typed and the sale still completes. Tap to Pay on iPhone/Android and Bluetooth readers need a native app and cannot run in this browser register.";
+  card.appendChild(termNote);
+  var termStatus = document.createElement("p");
+  termStatus.style.color = "var(--muted)";
+  card.appendChild(termStatus);
+  var termReaderRow = document.createElement("div");
+  card.appendChild(termReaderRow);
+  var termReaderLabel = document.createElement("span");
+  termReaderLabel.textContent = "Reader: none connected";
+  termReaderRow.appendChild(termReaderLabel);
+  var term = { terminal: null, reader: null, clientSecret: null,
+              intentId: null, confirmedCents: 0 };
+  function erpLoadTerminalSdk() {
+    return new Promise(function (resolve, reject) {
+      if (typeof StripeTerminal !== "undefined") { resolve(); return; }
+      var s = document.createElement("script");
+      s.src = "https://js.stripe.com/terminal/v1/";
+      s.onload = function () { resolve(); };
+      s.onerror = function () { reject(new Error("Could not load the Stripe Terminal SDK — check the connection and try again.")); };
+      document.head.appendChild(s);
+    });
+  }
+  var termConnectBtn = document.createElement("button");
+  termConnectBtn.type = "button";
+  termConnectBtn.textContent = "Connect reader";
+  termConnectBtn.addEventListener("click", function () {
+    // --- PopRegister native bridge: Tap to Pay on this iPhone. ---
+    if (hasNativeBridge) {
+      termConnectBtn.disabled = true;
+      termStatus.textContent = "Connecting Tap to Pay on this iPhone…";
+      erpGet("/api/erp/stores/" + st.id + "/terminal/reader").then(function (saved) {
+        if (!saved || !saved.location_id) throw new Error("No Stripe location saved for this store — save the location id in the store's Terminal reader settings first.");
+        return window.PopRegisterNative.request("tap-pay-connect", { locationId: saved.location_id });
+      }).then(function () {
+        term.reader = { serialNumber: "tap-to-pay", label: "Tap to Pay on this iPhone" };
+        termReaderLabel.textContent = "Reader: Tap to Pay on this iPhone";
+        termStatus.textContent = "Tap to Pay ready — hold a card to this iPhone to take a payment.";
+        termConnectBtn.disabled = false;
+      }).catch(function (error) { termStatus.textContent = error.message; termConnectBtn.disabled = false; });
+      return;
+    }
+    termConnectBtn.disabled = true;
+    termStatus.textContent = "Loading Terminal…";
+    erpLoadTerminalSdk().then(function () {
+      if (!term.terminal) {
+        term.terminal = StripeTerminal.create({
+          onFetchConnectionToken: function (done) {
+            erpPost("/api/erp/stores/" + st.id + "/terminal/connection-token", {})
+              .then(function (d) { done(d.secret); })
+              .catch(function (e) { termStatus.textContent = e.message; });
+          },
+          onUnexpectedReaderDisconnect: function () {
+            term.reader = null;
+            termReaderLabel.textContent = "Reader: disconnected";
+            termStatus.textContent = "Reader disconnected — reconnect it, or record the card amount as typed.";
+          }
+        });
+      }
+      termStatus.textContent = "Looking for readers on this Wi-Fi…";
+      return term.terminal.discoverReaders({ deviceType: "internet" });
+    }).then(function (discoverResult) {
+      if (discoverResult.error) throw new Error(discoverResult.error.message || "Reader discovery failed.");
+      var readers = discoverResult.discoveredReaders || [];
+      if (!readers.length) throw new Error("No Terminal readers found on this Wi-Fi — check the reader is on and on the same network.");
+      return erpGet("/api/erp/stores/" + st.id + "/terminal/reader").then(function (saved) {
+        var pick = readers[0];
+        if (saved && saved.reader_id) {
+          readers.forEach(function (r) { if (r.serialNumber === saved.reader_id) pick = r; });
+        }
+        termStatus.textContent = "Connecting to " + (pick.label || pick.serialNumber) + "…";
+        return term.terminal.connectInternetReader({ serialNumber: pick.serialNumber }).then(function (connectResult) {
+          if (connectResult.error) throw new Error(connectResult.error.message || "Could not connect to the reader.");
+          term.reader = connectResult.reader;
+          termReaderLabel.textContent = "Reader: " + (term.reader.label || term.reader.serialNumber);
+          termStatus.textContent = "Reader connected.";
+          var saveBody = { reader_id: term.reader.serialNumber };
+          if (saved && saved.location_id) saveBody.location_id = saved.location_id;
+          return erpPost("/api/erp/stores/" + st.id + "/terminal/reader", saveBody);
+        });
+      });
+    }).catch(function (error) { termStatus.textContent = error.message; })
+      .then(function () { termConnectBtn.disabled = false; });
+  });
+  card.appendChild(termConnectBtn);
+  var termChargeBtn = document.createElement("button");
+  termChargeBtn.type = "button";
+  termChargeBtn.textContent = "Charge card on reader";
+  termChargeBtn.addEventListener("click", function () {
+    var cardAmt = erpRegisterDollarsToCents(cardInput.value);
+    if (!term.reader) { termStatus.textContent = "No reader connected — connect a reader first, or record the card amount as typed."; return; }
+    if (term.confirmedCents > 0) { termStatus.textContent = "Card already charged " + erpMoney(term.confirmedCents) + " for this sale."; return; }
+    if (cardAmt === null || cardAmt <= 0) { termStatus.textContent = "Enter a card amount first."; return; }
+    if (!reg.saleKey) reg.saleKey = "POS-" + Date.now() + "-" + Math.floor(Math.random() * 1000000);
+    var saleKey = reg.saleKey;
+    // --- PopRegister native bridge: Tap to Pay on this iPhone. ---
+    // Same shape as the browser reader path below: create the
+    // PaymentIntent, collect on the phone, confirm, lock the card
+    // input to the confirmed charge. The bridge only replaces the
+    // collect/process step (which the browser cannot do).
+    if (hasNativeBridge) {
+      termChargeBtn.disabled = true;
+      termStatus.textContent = "Creating payment…";
+      erpPost("/api/erp/stores/" + st.id + "/terminal/payment-intent", { amount_cents: cardAmt, sale_key: saleKey, reader_id: "tap-to-pay" })
+        .then(function (pi) {
+          if (pi.client_secret) { term.clientSecret = pi.client_secret; term.intentId = pi.payment_intent_id; }
+          else if (pi.duplicate && !term.clientSecret) { throw new Error("A payment is already open for this sale — cancel it from the Terminal payments list and try again."); }
+          termStatus.textContent = "Hold the card to this iPhone…";
+          return window.PopRegisterNative.request("tap-pay", { saleKey: saleKey, amountCents: cardAmt, clientSecret: term.clientSecret });
+        })
+        .then(function (tap) {
+          if (!tap || tap.status !== "succeeded") throw new Error("Payment did not complete (status: " + (tap && tap.status) + ").");
+          return erpPost("/api/erp/stores/" + st.id + "/terminal/confirm", { sale_key: saleKey, payment_intent_id: tap.paymentIntentId });
+        })
+        .then(function (cf) {
+          term.confirmedCents = cf.amount_cents;
+          cardInput.value = (cf.amount_cents / 100).toFixed(2);
+          cardInput.disabled = true;
+          termStatus.textContent = "Card charged " + erpMoney(cf.amount_cents) + " with Tap to Pay. The card amount is now locked to the confirmed charge.";
+          termChargeBtn.disabled = false;
+        })
+        .catch(function (error) { termStatus.textContent = error.message; termChargeBtn.disabled = false; });
+      return;
+    }
+    termChargeBtn.disabled = true;
+    termStatus.textContent = "Creating payment…";
+    erpPost("/api/erp/stores/" + st.id + "/terminal/payment-intent", { amount_cents: cardAmt, sale_key: saleKey, reader_id: term.reader.serialNumber })
+      .then(function (pi) {
+        if (pi.client_secret) { term.clientSecret = pi.client_secret; term.intentId = pi.payment_intent_id; }
+        else if (pi.duplicate && !term.clientSecret) { throw new Error("A payment is already open for this sale — cancel it from the Terminal payments list and try again."); }
+        termStatus.textContent = "Present the card on the reader…";
+        return term.terminal.collectPaymentMethod(term.clientSecret);
+      })
+      .then(function (collectResult) {
+        if (collectResult.error) throw new Error(collectResult.error.message || "Card collection failed.");
+        termStatus.textContent = "Processing payment…";
+        return term.terminal.processPayment(collectResult.paymentIntent);
+      })
+      .then(function (processResult) {
+        if (processResult.error) throw new Error(processResult.error.message || "Payment failed.");
+        if (!processResult.paymentIntent || processResult.paymentIntent.status !== "succeeded") throw new Error("Payment did not complete (status: " + (processResult.paymentIntent && processResult.paymentIntent.status) + ").");
+        return erpPost("/api/erp/stores/" + st.id + "/terminal/confirm", { sale_key: saleKey, payment_intent_id: processResult.paymentIntent.id });
+      })
+      .then(function (cf) {
+        term.confirmedCents = cf.amount_cents;
+        cardInput.value = (cf.amount_cents / 100).toFixed(2);
+        cardInput.disabled = true;
+        termStatus.textContent = "Card charged " + erpMoney(cf.amount_cents) + " on the reader. The card amount is now locked to the confirmed charge.";
+        termChargeBtn.disabled = false;
+      })
+      .catch(function (error) { termStatus.textContent = error.message; termChargeBtn.disabled = false; });
+  });
+  card.appendChild(termChargeBtn);
+  // --- PopRegister native bridge: token fetch + ready signal. ---
+  // (iPhone app only. The native Terminal SDK needs a connection
+  // token, and only this page holds the ERP session that can mint
+  // one — so the app asks the page, and the page answers through
+  // the bridge. bridge-ready tells the app the token provider can
+  // work; it is fire-and-forget, no reply expected.)
+  if (hasNativeBridge && window.PopRegisterNative.setNativeRequestHandler) {
+    window.PopRegisterNative.setNativeRequestHandler(function (type, payload) {
+      if (type === "fetch-connection-token") {
+        return erpPost("/api/erp/stores/" + st.id + "/terminal/connection-token", {}).then(function (d) { return d.secret; });
+      }
+      return Promise.reject(new Error("Unknown native request: " + type));
+    });
+    try {
+      if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
+        window.ReactNativeWebView.postMessage(JSON.stringify({ type: "bridge-ready", payload: { storeId: st.id } }));
+      }
+    } catch (e) { /* the app re-checks readiness on its own */ }
+  }
   var completeBtn = document.createElement("button");
   completeBtn.type = "button";
   completeBtn.textContent = "Complete sale";
@@ -22196,7 +24490,9 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
         sale_key: saleKey, register: reg.register,
         tender: erpRegisterTenderLabel(tenders), total_cents: total,
         items: erpRegisterExpandTicket(reg.ticket, catalog.bag_price_cents),
-        tenders: tenders, sold_at: new Date().toISOString()
+        tenders: tenders, sold_at: new Date().toISOString(),
+        member_id: reg.member ? reg.member.id : null,
+        member_email: reg.member ? (reg.member.email || "") : ""
       });
     }).then(function (data) {
       var change = (tendered !== null && cash > 0 && tendered > cash) ? tendered - cash : 0;
@@ -22205,12 +24501,27 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
       rTitle.textContent = "Receipt — sale " + saleKey;
       receiptWrap.appendChild(rTitle);
       var rTotal = document.createElement("p");
-      rTotal.textContent = "Total: " + erpMoney(total) + " · Tender: " + Object.keys(tenders).map(function (k) { return k + " " + erpMoney(tenders[k]); }).join(", ") + (change > 0 ? " · Change due: " + erpMoney(change) : "") + (reg.member ? " · Member: " + (reg.member.name || reg.member.email) : "") + (data && data.duplicate ? " · (already recorded — same sale key)" : "");
+      var ledgerNote = "";
+      if (data && data.ledger) {
+        if (data.ledger.status === "posted") ledgerNote = " · Posted to ledger entry #" + data.ledger.entry_id;
+        else if (data.ledger.status === "post_failed") ledgerNote = " · NOT posted to ledger: " + (data.ledger.error || "unknown error") + " — run the POS backfill after the period opens.";
+        else if (data.ledger.status === "voided") ledgerNote = " · Voided — never posts to the ledger.";
+        else if (data.ledger.status === "reversed") ledgerNote = " · Ledger reversed entry #" + data.ledger.entry_id;
+      }
+      rTotal.textContent = "Total: " + erpMoney(total) + " · Tender: " + Object.keys(tenders).map(function (k) { return k + " " + erpMoney(tenders[k]); }).join(", ") + (change > 0 ? " · Change due: " + erpMoney(change) : "") + (reg.member ? " · Member: " + (reg.member.name || reg.member.email) : "") + (data && data.duplicate ? " · (already recorded — same sale key)" : "") + ledgerNote;
+      if (data && data.kernels && data.kernels.credited > 0) {
+        rTotal.textContent += " · +" + data.kernels.credited + " Kernels";
+      }
       receiptWrap.appendChild(rTotal);
       var emailInput = document.createElement("input");
       emailInput.type = "email";
-      emailInput.placeholder = "Email for receipt (optional)";
-      receiptWrap.appendChild(erpField("Receipt email", emailInput));
+      emailInput.placeholder = "Email for receipt";
+      emailInput.value = (reg.member && reg.member.email) || "";
+      receiptWrap.appendChild(erpField("Receipt email (emailed by default)", emailInput));
+      var emailNote = document.createElement("p");
+      emailNote.className = "admin-orders-empty";
+      emailNote.textContent = "Receipts are emailed — no paper receipts. The member's email is filled in when one is attached.";
+      receiptWrap.appendChild(emailNote);
       var emailBtn = document.createElement("button");
       emailBtn.type = "button";
       emailBtn.textContent = "Email receipt";
@@ -22227,7 +24538,9 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
       newBtn.textContent = "New sale";
       newBtn.addEventListener("click", function () {
         reg.ticket = []; reg.member = null; reg.saleKey = null;
-        reg.giftCode = ""; reg.giftBalance = null;
+        reg.giftCode = ""; reg.giftBalance = null; reg.gcSaleKey = null;
+        term.confirmedCents = 0; term.clientSecret = null; term.intentId = null;
+        cardInput.disabled = false; termStatus.textContent = "";
         cashInput.value = ""; cardInput.value = ""; giftInput.value = "";
         giftCodeInput.value = ""; cashTenderedInput.value = "";
         giftBalanceLine.textContent = "";
@@ -22237,8 +24550,11 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
       receiptWrap.appendChild(newBtn);
       reg.ticket = []; reg.member = null; reg.saleKey = null;
       reg.giftCode = ""; reg.giftBalance = null;
+      term.confirmedCents = 0; term.clientSecret = null; term.intentId = null;
+      cardInput.disabled = false;
       drawTicket();
       regStatus.textContent = "Sale recorded.";
+      if (data && data.ledger && data.ledger.status === "post_failed") regStatus.textContent = "Sale recorded, but NOT posted to ledger: " + (data.ledger.error || "unknown error");
       completeBtn.disabled = false;
     }).catch(function (error) {
       regStatus.textContent = error.message + (gift > 0 ? " If the gift card was already debited for this sale key, completing again will not debit it twice — the same sale key is reused." : "");
@@ -22246,6 +24562,59 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
     });
   });
   card.appendChild(completeBtn);
+  // --- Sell gift card (issues a new card; posts as a liability, never income). ---
+  var gcSellTitle = document.createElement("h3");
+  gcSellTitle.textContent = "Sell gift card";
+  card.appendChild(gcSellTitle);
+  var gcSellNote = document.createElement("p");
+  gcSellNote.className = "admin-orders-empty";
+  gcSellNote.textContent = "Issues a new gift card on the spot. Amounts $5–$500, same as online. The sale posts to the gift-card liability, never as income, and the cash or card taken shows in the Z-report. Re-issuing with the same sale key returns the first card — never a second.";
+  card.appendChild(gcSellNote);
+  var gcSellAmount = dollarsInput("Amount, e.g. 25.00");
+  card.appendChild(erpField("Gift card amount ($)", gcSellAmount));
+  var gcSellTender = document.createElement("select");
+  [["cash", "Cash"], ["card", "Card"]].forEach(function (t) {
+    var opt = document.createElement("option");
+    opt.value = t[0];
+    opt.textContent = t[1];
+    gcSellTender.appendChild(opt);
+  });
+  card.appendChild(erpField("Paid by", gcSellTender));
+  var gcSellRecipient = document.createElement("input");
+  gcSellRecipient.type = "text";
+  gcSellRecipient.placeholder = "Recipient name (optional)";
+  card.appendChild(erpField("Recipient", gcSellRecipient));
+  var gcSellEmail = document.createElement("input");
+  gcSellEmail.type = "email";
+  gcSellEmail.placeholder = "Recipient email (optional — emails the card)";
+  card.appendChild(erpField("Recipient email", gcSellEmail));
+  var gcSellLine = document.createElement("p");
+  gcSellLine.className = "admin-orders-empty";
+  card.appendChild(gcSellLine);
+  var gcSellBtn = document.createElement("button");
+  gcSellBtn.type = "button";
+  gcSellBtn.textContent = "Sell gift card";
+  gcSellBtn.addEventListener("click", function () {
+    var amount = erpRegisterDollarsToCents(gcSellAmount.value);
+    if (amount === null || amount < 500 || amount > 50000) { regStatus.textContent = "Gift card amount must be $5.00–$500.00."; return; }
+    if (!reg.gcSaleKey) reg.gcSaleKey = "POS-GC-" + Date.now() + "-" + Math.floor(Math.random() * 1000000);
+    var saleKey = reg.gcSaleKey;
+    gcSellBtn.disabled = true;
+    regStatus.textContent = "Issuing gift card…";
+    erpPost("/api/erp/stores/" + st.id + "/gift-card-issue", {
+      sale_key: saleKey, amount_cents: amount, tender: gcSellTender.value,
+      register: reg.register,
+      recipient_name: gcSellRecipient.value.trim(),
+      recipient_email: gcSellEmail.value.trim()
+    }).then(function (data) {
+      reg.gcSaleKey = null;
+      gcSellLine.textContent = "Gift card " + data.code + " — " + erpMoney(data.balance_cents) + " balance." + (data.duplicate ? " (already issued — same sale key)" : "") + (data.ledger && data.ledger.status === "posted" ? " Posted to ledger entry #" + data.ledger.entry_id + "." : data.ledger && data.ledger.status === "post_failed" ? " NOT posted to ledger: " + (data.ledger.error || "") + " — run the POS backfill after the period opens." : "");
+      regStatus.textContent = "Gift card sold.";
+      gcSellBtn.disabled = false;
+      gcSellAmount.value = ""; gcSellRecipient.value = ""; gcSellEmail.value = "";
+    }).catch(function (error) { regStatus.textContent = error.message; gcSellBtn.disabled = false; });
+  });
+  card.appendChild(gcSellBtn);
   // --- Z-report closeout (posts to the existing endpoint). ---
   var zTitle = document.createElement("h3");
   zTitle.textContent = "Z-report closeout";
@@ -22305,7 +24674,7 @@ function renderErpStoresRegister(card, st, catalog, sales, zreports, drawer, sta
   if (zList.length) {
     var zExisting = document.createElement("p");
     zExisting.className = "admin-orders-empty";
-    zExisting.textContent = "Posted Z-reports: " + zList.map(function (z) { return z.report_date + " · " + z.register + " · total " + erpMoney(z.total_cents) + " · variance " + erpMoney(z.variance_cents); }).join(" | ");
+    zExisting.textContent = "Posted Z-reports: " + zList.map(function (z) { return z.report_date + " · " + z.register + " · total " + erpMoney(z.total_cents) + " · variance " + erpMoney(z.variance_cents) + erpStoresZLedgerText(z); }).join(" | ");
     card.appendChild(zExisting);
   }
 }
