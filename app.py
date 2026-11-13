@@ -570,6 +570,36 @@ def _erp_seed_staff_perms(conn):
                          (row[0], perm))
         conn.execute("UPDATE staff SET perms_migrated = 1 WHERE id = ?", (row[0],))
 
+def _sec_deactivate_demo_cards(conn):
+    """Startup migration (security, Nov 13 2026): deactivate any demo gift
+    card with a balance, and log it in the settings audit. Returns the
+    number deactivated. Defined BEFORE init_db on purpose: the first
+    version of this migration called _erp_settings_audit(), which is
+    defined later in this file — NameError aborted init_db on the live
+    DB (which had demo cards; the fresh test DB had none, so the suite
+    missed it) before the token_version migration ran, breaking every
+    authenticated request until this fix. The audit row is a raw INSERT
+    for the same reason. Idempotent: after the first run no rows match."""
+    try:
+        count = conn.execute(
+            "UPDATE gift_cards SET active = 0, balance_cents = 0"
+            " WHERE is_demo = 1 AND (active = 1 OR balance_cents > 0)"
+        ).rowcount
+    except sqlite3.OperationalError:
+        return 0
+    if count:
+        try:
+            conn.execute(
+                "INSERT INTO erp_settings_audit (actor, action, target_type,"
+                " target_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                ("system", "security.demo_cards_deactivated", "gift_cards", 0,
+                 "%d demo gift card(s) deactivated (balance zeroed)" % count,
+                 datetime.now(timezone.utc).isoformat()))
+        except sqlite3.OperationalError:
+            pass
+    return count
+
+
 def init_db():
     conn = db()
     conn.executescript(
@@ -1111,19 +1141,7 @@ def init_db():
     # Security (Nov 13 2026): demo gift cards must never be spendable.
     # Any demo card minted through /api/demo/gift-card before the redeem
     # paths excluded them is deactivated here (balance zeroed) on startup.
-    # Idempotent: after the first run no rows match the WHERE clause.
-    try:
-        _demo_deact = conn.execute(
-            "UPDATE gift_cards SET active = 0, balance_cents = 0"
-            " WHERE is_demo = 1 AND (active = 1 OR balance_cents > 0)"
-        ).rowcount
-        if _demo_deact:
-            _erp_settings_audit(
-                conn, "system", "security.demo_cards_deactivated",
-                "gift_cards", 0,
-                "%d demo gift card(s) deactivated (balance zeroed)" % _demo_deact)
-    except sqlite3.OperationalError:
-        pass
+    _sec_deactivate_demo_cards(conn)
     # Migration: PayPal subscriptions (v1, Oct 26 2026). Stripe rows keep
     # payment_provider 'stripe'; PayPal rows store the PayPal subscription id
     # and are never charged through Stripe (see subscription_renewals_run).
