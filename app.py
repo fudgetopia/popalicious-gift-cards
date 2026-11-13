@@ -582,6 +582,7 @@ def init_db():
             message TEXT,
             stripe_session_id TEXT,
             active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS redemptions (
@@ -878,6 +879,45 @@ def init_db():
         if "tenders_json" not in _ss_cols:
             conn.execute("ALTER TABLE erp_store_sales"
                          " ADD COLUMN tenders_json TEXT NOT NULL DEFAULT '{}'")
+    # Migration: POS ledger wiring + timeclock feed (Nov 2026).
+    # ledger_status/ledger_entry_id/ledger_error on POS sales track
+    # the intake posting; payrun_line_id links a fed timeclock row to
+    # its payrun line; payroll_employee_id links an HR employee to
+    # their payroll record for the feed; regular/ot hours + source +
+    # timeclock_ids mark fed payrun lines. Older rows read back with
+    # the defaults (unposted, unfed, unlinked, manual).
+    for _tbl, _cols in (
+            ("erp_store_sales", (
+                ("ledger_status", "TEXT NOT NULL DEFAULT 'unposted'"),
+                ("ledger_entry_id", "INTEGER"),
+                ("ledger_error", "TEXT NOT NULL DEFAULT ''"),
+                ("sale_kind", "TEXT NOT NULL DEFAULT 'popcorn'"),
+                ("member_id", "INTEGER"),
+                ("member_email", "TEXT NOT NULL DEFAULT ''"),
+                ("kernels_credited", "INTEGER NOT NULL DEFAULT 0"))),
+            ("gift_cards", (
+                ("created_by", "TEXT NOT NULL DEFAULT ''"),)),
+            ("erp_store_timeclock", (
+                ("payrun_line_id", "INTEGER"),)),
+            ("erp_hr_employees", (
+                ("payroll_employee_id", "INTEGER"),
+                ("payroll_eligible", "INTEGER NOT NULL DEFAULT 0"),)),
+            ("erp_hr_time_records", (
+                ("payrun_line_id", "INTEGER"),)),
+            ("erp_acct_payrun_lines", (
+                ("regular_hours", "REAL"),
+                ("ot_hours", "REAL"),
+                ("source", "TEXT NOT NULL DEFAULT ''"),
+                ("timeclock_ids", "TEXT NOT NULL DEFAULT '[]'")))):
+        if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table'"
+                " AND name=?", (_tbl,)).fetchone():
+            _have = [r["name"] for r in conn.execute(
+                "PRAGMA table_info(%s)" % _tbl).fetchall()]
+            for _col, _ddl in _cols:
+                if _col not in _have:
+                    conn.execute("ALTER TABLE %s ADD COLUMN %s %s"
+                                 % (_tbl, _col, _ddl))
     # Migration: layout_json on planograms + PM/dispatch columns on
     # maintenance (Stores Additions Wave B, Nov 2026). layout_json is
     # the shelf grid {shelves: [{name, feet, flavors: [...]}]}; the
@@ -1440,6 +1480,8 @@ def init_db():
             emergency_phone TEXT NOT NULL DEFAULT '',
             hire_date TEXT NOT NULL DEFAULT '',
             hourly_rate_cents INTEGER,
+            payroll_employee_id INTEGER,
+            payroll_eligible INTEGER NOT NULL DEFAULT 0,
             active INTEGER NOT NULL DEFAULT 1,
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
@@ -1545,6 +1587,7 @@ def init_db():
             cash_paid_cents INTEGER NOT NULL DEFAULT 0,
             paid_date TEXT NOT NULL DEFAULT '',
             paid_by TEXT NOT NULL DEFAULT '',
+            payrun_line_id INTEGER,
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_by TEXT NOT NULL DEFAULT '',
@@ -1554,6 +1597,225 @@ def init_db():
             ON erp_hr_time_records (event_id);
         CREATE INDEX IF NOT EXISTS idx_erp_hr_time_employee
             ON erp_hr_time_records (employee_id);
+        -- HR Additions 7: hiring + offboarding. erp_hr_applicants is
+        -- the hiring pipeline: one row per applicant, starting empty --
+        -- nothing is seeded. stage is one of applied / screening /
+        -- interview / offer / hired / rejected. hired_employee_id links
+        -- a hired applicant to the erp_hr_employees row the hire action
+        -- created. erp_hr_offboarding is one record per departure
+        -- (ONE per employee ever -- see the endpoint docstring), with
+        -- its checklist as separate rows in erp_hr_offboarding_items
+        -- seeded with the four standard labels on creation. Like the
+        -- other HR tables these are people records, NOT in
+        -- _ERP_RESET_TABLES -- a wipe must never erase them.
+        CREATE TABLE IF NOT EXISTS erp_hr_applicants (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT '',
+            email TEXT NOT NULL DEFAULT '',
+            phone TEXT NOT NULL DEFAULT '',
+            stage TEXT NOT NULL DEFAULT 'applied',
+            notes TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            applied_date TEXT NOT NULL DEFAULT '',
+            hired_employee_id INTEGER,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_applicants_stage
+            ON erp_hr_applicants (stage);
+        CREATE TABLE IF NOT EXISTS erp_hr_offboarding (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            exit_date TEXT NOT NULL DEFAULT '',
+            reason TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_offboarding_employee
+            ON erp_hr_offboarding (employee_id);
+        CREATE TABLE IF NOT EXISTS erp_hr_offboarding_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            offboarding_id INTEGER NOT NULL,
+            label TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            done_by TEXT NOT NULL DEFAULT '',
+            done_at TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_offboarding_items_parent
+            ON erp_hr_offboarding_items (offboarding_id);
+
+        -- HR Additions 6: document storage. One row per employee HR
+        -- document, base64 blob in data_b64. Employee HR documents
+        -- ONLY -- this is NOT a general file store: no other entity
+        -- type stores files here, and nothing is ever served to a
+        -- non-admin. 5 MB cap per file (checked on decoded bytes).
+        -- received_date is required; expiry_date blank means no
+        -- expiry. Like the rest of HR, this table is NOT in
+        -- _ERP_RESET_TABLES -- a wipe must never erase people records.
+        CREATE TABLE IF NOT EXISTS erp_hr_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL REFERENCES erp_hr_employees (id),
+            doc_type TEXT NOT NULL DEFAULT '',
+            filename TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            data_b64 TEXT NOT NULL DEFAULT '',
+            received_date TEXT NOT NULL DEFAULT '',
+            expiry_date TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            uploaded_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_documents_employee
+            ON erp_hr_documents (employee_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_documents_expiry
+            ON erp_hr_documents (expiry_date);
+        -- HR Additions 4: recurring schedules. erp_hr_recurring_events
+        -- is a template for events that repeat (weekly / biweekly /
+        -- monthly); erp_hr_recurring_instances is the idempotency link
+        -- (one row per generated event, UNIQUE on template +
+        -- occurrence_date) so re-running generate never duplicates an
+        -- instance. roster_json is the roster template: a list of
+        -- employee ids, each validated to exist at save time. The
+        -- anchor_date is the first occurrence: biweekly counts every
+        -- 2 weeks from it and nothing is generated before it. Both
+        -- tables are people records, NOT in _ERP_RESET_TABLES -- a
+        -- wipe must never erase them. Nothing is seeded.
+        CREATE TABLE IF NOT EXISTS erp_hr_recurring_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            frequency TEXT NOT NULL DEFAULT 'weekly',
+            weekday INTEGER,
+            day_of_month INTEGER,
+            time TEXT NOT NULL DEFAULT '',
+            anchor_date TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            roster_json TEXT NOT NULL DEFAULT '[]',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_hr_recurring_instances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER NOT NULL,
+            event_id INTEGER NOT NULL,
+            occurrence_date TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE (template_id, occurrence_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_rec_inst_template
+            ON erp_hr_recurring_instances (template_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_rec_inst_event
+            ON erp_hr_recurring_instances (event_id);
+        -- HR Additions 2 (item 2): performance review cycles +
+        -- reviews. Cycles start empty -- the admin creates them
+        -- (name, period, due date). A review links one employee to
+        -- one cycle with one reviewer; UNIQUE (cycle_id, employee_id)
+        -- means one review per employee per cycle. Rating is 1-5
+        -- (NULL while a draft has none yet) with fixed labels; the
+        -- notes are free text (strengths, growth areas, goals).
+        -- Status is draft -> submitted -> acknowledged; acknowledged
+        -- is final. Like the other HR tables these are people
+        -- records, NOT in _ERP_RESET_TABLES -- a wipe must never
+        -- erase them. Reviews carry no money: nothing here writes
+        -- erp_acct_* or any payroll table.
+        CREATE TABLE IF NOT EXISTS erp_hr_review_cycles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            period TEXT NOT NULL DEFAULT '',
+            due_date TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_hr_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            cycle_id INTEGER NOT NULL,
+            employee_id INTEGER NOT NULL,
+            reviewer_name TEXT NOT NULL DEFAULT '',
+            reviewer_email TEXT NOT NULL DEFAULT '',
+            rating INTEGER,
+            strengths TEXT NOT NULL DEFAULT '',
+            growth_areas TEXT NOT NULL DEFAULT '',
+            goals TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'draft',
+            acknowledged_by TEXT NOT NULL DEFAULT '',
+            acknowledged_at TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            UNIQUE (cycle_id, employee_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_reviews_cycle
+            ON erp_hr_reviews (cycle_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_reviews_employee
+            ON erp_hr_reviews (employee_id);
+        -- HR Additions 1: PTO / time-off tracking. erp_hr_pto_types
+        -- is the admin-configurable request-type list, seeded on first
+        -- use with vacation / sick / personal (a fixed TYPE list, not
+        -- invented employee data); inactive types stay on old requests
+        -- but are not offered for new ones. erp_hr_pto_balances holds
+        -- one admin-set annual grant per employee per type, in decimal
+        -- days as REAL, default 0 -- there is NO accrual rate and
+        -- nothing accrues automatically. erp_hr_pto_requests is the
+        -- draft -> pending -> approved/denied flow; days are the
+        -- inclusive calendar days of the span, also REAL. Balance is
+        -- computed live as granted - approved days, never stored.
+        -- PTO has no money in it: nothing here writes erp_acct_* or
+        -- any payroll table. Like the rest of HR, these tables are
+        -- NOT in _ERP_RESET_TABLES -- a wipe must never erase them.
+        CREATE TABLE IF NOT EXISTS erp_hr_pto_types (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_erp_hr_pto_types_name
+            ON erp_hr_pto_types (name);
+        CREATE TABLE IF NOT EXISTS erp_hr_pto_balances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            type_id INTEGER NOT NULL,
+            granted_days REAL NOT NULL DEFAULT 0,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            UNIQUE (employee_id, type_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_pto_balances_employee
+            ON erp_hr_pto_balances (employee_id);
+        CREATE TABLE IF NOT EXISTS erp_hr_pto_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            type_id INTEGER NOT NULL,
+            type_name TEXT NOT NULL DEFAULT '',
+            start_date TEXT NOT NULL DEFAULT '',
+            end_date TEXT NOT NULL DEFAULT '',
+            days REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'draft',
+            notes TEXT NOT NULL DEFAULT '',
+            requested_by TEXT NOT NULL DEFAULT '',
+            decided_by TEXT NOT NULL DEFAULT '',
+            decided_at TEXT NOT NULL DEFAULT '',
+            override_used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_pto_requests_employee
+            ON erp_hr_pto_requests (employee_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_pto_requests_status
+            ON erp_hr_pto_requests (status);
         -- Dept 13 (Quality & Food Safety) Wave A: recall plan + drill
         -- log, supplier COAs per lot, and HACCP plan records. Records
         -- start empty -- nothing is seeded. Like the HR/staff records,
@@ -1794,13 +2056,14 @@ def init_db():
             ON erp_store_transfers (status);
         CREATE INDEX IF NOT EXISTS idx_erp_store_transfers_item
             ON erp_store_transfers (item_id);
-        -- erp_store_sales: POS sales intake only. items_json is the
-        -- list of {flavor, qty, amount_cents} as posted; total_cents
-        -- is their sum. (store_id, sale_key) is unique so a POS retry
+        -- erp_store_sales: POS sales intake. items_json is the list
+        -- of {flavor, qty, amount_cents} as posted; total_cents is
+        -- their sum. (store_id, sale_key) is unique so a POS retry
         -- with the same client-supplied key is idempotent. Intake
-        -- NEVER touches the accounting ledger -- Dept 9 sales
-        -- auto-posting reads orders; POS sales are a separate feed
-        -- until the user decides how they post.
+        -- posts to the accounting ledger on intake (POS wiring, Nov
+        -- 2026): ledger_status tracks posted / unposted /
+        -- post_failed / reversed / voided, ledger_entry_id is the
+        -- journal entry, ledger_error the last posting failure.
         CREATE TABLE IF NOT EXISTS erp_store_sales (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             store_id INTEGER NOT NULL,
@@ -1811,12 +2074,42 @@ def init_db():
             items_json TEXT NOT NULL DEFAULT '[]',
             tenders_json TEXT NOT NULL DEFAULT '{}',
             sold_at TEXT NOT NULL DEFAULT '',
+            ledger_status TEXT NOT NULL DEFAULT 'unposted',
+            ledger_entry_id INTEGER,
+            ledger_error TEXT NOT NULL DEFAULT '',
+            sale_kind TEXT NOT NULL DEFAULT 'popcorn',
+            member_id INTEGER,
+            member_email TEXT NOT NULL DEFAULT '',
+            kernels_credited INTEGER NOT NULL DEFAULT 0,
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             UNIQUE (store_id, sale_key)
         );
         CREATE INDEX IF NOT EXISTS idx_erp_store_sales_store_date
             ON erp_store_sales (store_id, sold_at);
+        -- erp_terminal_payments: Stripe Terminal card-present charges
+        -- for the register. One row per PaymentIntent the register
+        -- creates; confirm() only ever flips a row to 'succeeded'
+        -- after Stripe itself says the intent succeeded. A sale's
+        -- card tender must equal its succeeded Terminal payments
+        -- (see stores_pos_sale); a charge with no completed sale is
+        -- visible here so it can be reconciled, never silently lost.
+        CREATE TABLE IF NOT EXISTS erp_terminal_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            sale_key TEXT NOT NULL DEFAULT '',
+            payment_intent_id TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'usd',
+            status TEXT NOT NULL DEFAULT 'created',
+            reader_id TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            confirmed_at TEXT NOT NULL DEFAULT '',
+            UNIQUE (payment_intent_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_terminal_payments_store_sale
+            ON erp_terminal_payments (store_id, sale_key);
         -- erp_store_zreports: one Z-report per (store, register, date).
         -- totals_json is {tender: cents}; variance_cents is computed
         -- as cash_count_cents minus the cash total, never trusted
@@ -1838,13 +2131,15 @@ def init_db():
         -- Dept 14 (Stores) Wave B: recurring weekly shift templates
         -- + timeclock. erp_store_shifts is the weekly template per
         -- store: weekday is 0=Monday..6=Sunday, times are HH:MM, role
-        -- is free text. employee_id links erp_hr_employees (never
-        -- erp_hr_events / erp_hr_time_records -- those are one-off
-        -- cash-paid event records, not shifts). erp_store_timeclock is
-        -- one row per clock-in: clock_out '' while open, hours computed
-        -- on clock-out. Hours are formally paid -- they are visible to
-        -- the Phase 1 payroll structure (erp_acct_payruns) but this
-        -- build NEVER creates a payrun or posts payroll from them.
+        -- is free text. erp_store_timeclock is one row per clock-in:
+        -- clock_out '' while open, hours computed on clock-out.
+        -- Hours are formally paid: the feed endpoint links closed
+        -- rows to a draft payrun (explicit admin action only);
+        -- clock-out itself NEVER creates a payrun or posts payroll.
+        -- payrun_line_id is the fed line, NULL until fed.
+        -- employee_id links erp_hr_employees (never erp_hr_events /
+        -- erp_hr_time_records -- those are one-off cash-paid event
+        -- records, not shifts).
         CREATE TABLE IF NOT EXISTS erp_store_shifts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             store_id INTEGER NOT NULL,
@@ -1869,6 +2164,7 @@ def init_db():
             clock_in TEXT NOT NULL,
             clock_out TEXT NOT NULL DEFAULT '',
             hours REAL,
+            payrun_line_id INTEGER,
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_by TEXT NOT NULL DEFAULT '',
@@ -2913,6 +3209,10 @@ def init_db():
             payrun_id INTEGER NOT NULL,
             employee_id INTEGER NOT NULL,
             hours REAL,
+            regular_hours REAL,
+            ot_hours REAL,
+            source TEXT NOT NULL DEFAULT '',
+            timeclock_ids TEXT NOT NULL DEFAULT '[]',
             gross_cents INTEGER NOT NULL DEFAULT 0,
             federal_cents INTEGER NOT NULL DEFAULT 0,
             ss_cents INTEGER NOT NULL DEFAULT 0,
@@ -11358,6 +11658,9 @@ def _hr_employee_payload(conn, row, with_items=False):
         "emergency_phone": row["emergency_phone"] or "",
         "hire_date": row["hire_date"] or "",
         "hourly_rate_cents": row["hourly_rate_cents"],
+        "payroll_employee_id": row["payroll_employee_id"],
+        "payroll_eligible": bool(row["payroll_eligible"])
+        if "payroll_eligible" in row.keys() else False,
         "active": bool(row["active"]),
         "linked": bool(row["staff_id"]),
         "staff_email": staff_email, "staff_active": staff_active,
@@ -12225,6 +12528,8 @@ def _hr_time_payload(row):
         "hours": row["hours"],
         "hourly_rate_cents": row["hourly_rate_cents"],
         "cash_owed_cents": owed, "cash_paid_cents": paid,
+        "payrun_line_id": row["payrun_line_id"]
+        if "payrun_line_id" in row.keys() else None,
         "remaining_cents": (owed - paid) if owed is not None else None,
         "paid_date": row["paid_date"] or "",
         "paid_by": row["paid_by"] or "",
@@ -12778,7 +13083,9 @@ def hr_pay_time_record(record_id):
     accumulates; the payload always shows remaining_cents. paid_date
     defaults to today (UTC) when blank; paid_by defaults to the admin
     who marks it. A record with no rate (owed NULL) can never be paid.
-    Cash record only -- no ledger, payroll, tax, or withholding row."""
+    Cash record only -- no ledger, payroll, tax, or withholding row.
+    A record already fed to a payrun (payrun_line_id set) is payroll
+    now, not cash, and can never be paid in cash (HR Additions 3)."""
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -12800,6 +13107,12 @@ def hr_pay_time_record(record_id):
     if not row:
         conn.close()
         return jsonify(error="time record not found"), 404
+    if row["payrun_line_id"] is not None:
+        conn.close()
+        return jsonify(error="time record #%d is fed to payrun"
+                       " line #%d -- it is payroll now, not"
+                       " cash; cash cannot be paid on it"
+                       % (record_id, row["payrun_line_id"])), 400
     owed = row["cash_owed_cents"]
     if owed is None:
         conn.close()
@@ -12822,6 +13135,2879 @@ def hr_pay_time_record(record_id):
     row = conn.execute("SELECT * FROM erp_hr_time_records WHERE id = ?",
                        (record_id,)).fetchone()
     payload = _hr_time_payload(row)
+    conn.close()
+    return jsonify(payload)
+
+
+# HR Additions 7: hiring + offboarding
+# Dept 12 (HR), item 7. Admin-only via _require_erp_admin(), like the
+# rest of HR.
+#
+# STAGE RULES -- enforced in hr_change_applicant_stage() and
+# hr_hire_applicant(), and stated in the UI:
+#   * stages are applied -> screening -> interview -> offer -> hired,
+#     plus rejected. Transitions are forward-only to the NEXT stage.
+#   * rejected can be set from ANY stage.
+#   * hired can only be reached from offer, and only through the hire
+#     action (which creates the employee record). The stage endpoint
+#     refuses a direct move to hired -- use the hire action.
+#   * a hired applicant is SEALED: update / stage-change return 409,
+#     EXCEPT notes may still be appended -- the supplied notes text is
+#     appended to the existing notes (newline-separated), never
+#     replacing the hiring record. Delete of a hired applicant is 409.
+#   * hire refuses twice (409 if already hired) and refuses unless the
+#     applicant is at offer (400 otherwise).
+# HIRE: creates the erp_hr_employees record from the applicant only --
+# name, email, role = role applied for, phone, hire_date = today (UTC)
+# unless the admin supplies one. NO data is invented: fields the
+# applicant lacks stay blank, exactly like manual employee creation.
+# The new employee's onboarding checklist is seeded from the
+# role-matching template when one exists, else the 5-item default --
+# exactly as manual creation does (same lookup, same helper).
+# OFFBOARDING: ONE record per employee EVER (409 on a second, even
+# after a completed one). A reactivated employee who leaves again is
+# the edge case: the existing record is reused (uncheck / re-check
+# its items, edit its reason) rather than creating a second record.
+# The four standard items are labels only -- checking "Revoke ERP
+# access" does NOT itself deactivate any login; the admin still
+# deactivates the login in Staff & permissions, and the item is only
+# a record that it was done. Offboarding never changes the existing
+# deactivate behaviour.
+HR_APPLICANT_STAGES = ("applied", "screening", "interview", "offer",
+                       "hired", "rejected")
+HR_APPLICANT_NEXT = {"applied": "screening", "screening": "interview",
+                     "interview": "offer"}
+HR_OFFBOARDING_ITEMS = ("Revoke ERP access", "Final pay settled",
+                        "Items returned", "Exit interview completed")
+
+
+def _hr_applicant_row(conn, applicant_id):
+    try:
+        applicant_id = int(applicant_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_applicants WHERE id = ?",
+                        (applicant_id,)).fetchone()
+
+
+def _hr_applicant_payload(row):
+    return {
+        "id": row["id"], "name": row["name"], "role": row["role"] or "",
+        "email": row["email"] or "", "phone": row["phone"] or "",
+        "stage": row["stage"], "notes": row["notes"] or "",
+        "source": row["source"] or "",
+        "applied_date": row["applied_date"] or "",
+        "hired_employee_id": row["hired_employee_id"],
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _hr_validate_applicant_fields(data, require_name_role=True):
+    """Validate applicant fields from a create/update body. Returns
+    (values-dict, error-string-or-None). At least one contact
+    (email and/or phone) is required on create."""
+    name = (data.get("name") or "").strip()
+    role = (data.get("role") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    phone = (data.get("phone") or "").strip()
+    notes = (data.get("notes") or "").strip()
+    source = (data.get("source") or "").strip()
+    applied_date = (data.get("applied_date") or "").strip()
+    if require_name_role:
+        if not name or len(name) > 100:
+            return None, "name must be 1-100 characters"
+        if not role or len(role) > 100:
+            return None, "role must be 1-100 characters"
+    else:
+        if "name" in data and (not name or len(name) > 100):
+            return None, "name must be 1-100 characters"
+        if "role" in data and (not role or len(role) > 100):
+            return None, "role must be 1-100 characters"
+    if email and not EMAIL_RE.match(email):
+        return None, "valid email required"
+    if len(email) > 200 or len(phone) > 100 or len(notes) > 2000 \
+            or len(source) > 200:
+        return None, "a field is too long"
+    if applied_date and not _hr_valid_hire_date(applied_date):
+        return None, "applied date must be YYYY-MM-DD"
+    return {"name": name, "role": role, "email": email, "phone": phone,
+            "notes": notes, "source": source,
+            "applied_date": applied_date}, None
+
+
+def _hr_role_onboarding_labels(conn, role):
+    """Role-template step list when a template matches the role
+    (case-insensitive), else None for the 5-item default. Same lookup
+    manual employee creation uses."""
+    if not role:
+        return None
+    trow = conn.execute(
+        "SELECT * FROM erp_hr_onboarding_templates"
+        " WHERE lower(role) = lower(?)", (role,)).fetchone()
+    if not trow:
+        return None
+    try:
+        labels = json.loads(trow["steps_json"] or "[]") or []
+    except (TypeError, ValueError):
+        labels = []
+    return labels or None
+
+
+def _hr_offboarding_items(conn, offboarding_id):
+    rows = conn.execute(
+        "SELECT id, offboarding_id, label, done, done_by, done_at,"
+        " created_at FROM erp_hr_offboarding_items"
+        " WHERE offboarding_id = ? ORDER BY id",
+        (offboarding_id,)).fetchall()
+    return [{"id": r["id"], "offboarding_id": r["offboarding_id"],
+             "label": r["label"], "done": bool(r["done"]),
+             "done_by": r["done_by"] or "", "done_at": r["done_at"] or "",
+             "created_at": r["created_at"]} for r in rows]
+
+
+def _hr_offboarding_payload(conn, row):
+    items = _hr_offboarding_items(conn, row["id"])
+    done = sum(1 for i in items if i["done"])
+    return {
+        "id": row["id"], "employee_id": row["employee_id"],
+        "exit_date": row["exit_date"] or "",
+        "reason": row["reason"] or "",
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+        "items": items, "done": done, "total": len(items),
+        "completed": bool(items) and done == len(items),
+    }
+
+
+@app.get("/api/erp/hr/applicants")
+def hr_list_applicants():
+    """List applicants, optionally filtered by ?stage=<stage>.
+    Starts empty -- nothing is seeded."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    stage = (request.args.get("stage") or "").strip()
+    if stage and stage not in HR_APPLICANT_STAGES:
+        return jsonify(error="unknown stage"), 400
+    conn = db()
+    if stage:
+        rows = conn.execute(
+            "SELECT * FROM erp_hr_applicants WHERE stage = ?"
+            " ORDER BY applied_date DESC, id DESC", (stage,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_hr_applicants"
+            " ORDER BY applied_date DESC, id DESC").fetchall()
+    out = [_hr_applicant_payload(r) for r in rows]
+    conn.close()
+    return jsonify(applicants=out)
+
+
+@app.post("/api/erp/hr/applicants")
+def hr_create_applicant():
+    """Create an applicant (201) at stage 'applied'. Name and role
+    are required; at least one contact (email and/or phone) is
+    required. applied_date defaults to today (UTC) when blank."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    vals, verr = _hr_validate_applicant_fields(data, require_name_role=True)
+    if verr:
+        return jsonify(error=verr), 400
+    if not vals["email"] and not vals["phone"]:
+        return jsonify(error="an email or phone number is required"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    applied_date = vals["applied_date"] or datetime.now(timezone.utc).date().isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_applicants (name, role, email, phone, stage,"
+        " notes, source, applied_date, hired_employee_id, created_by,"
+        " created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, 'applied', ?, ?, ?, NULL, ?, ?, '', '')",
+        (vals["name"], vals["role"], vals["email"], vals["phone"],
+         vals["notes"], vals["source"], applied_date, actor, now))
+    applicant_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.applicant_created", "hr_applicant",
+                     applicant_id, "applicant %s (%s)" % (vals["name"], vals["role"]))
+    conn.commit()
+    row = _hr_applicant_row(conn, applicant_id)
+    payload = _hr_applicant_payload(row)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.get("/api/erp/hr/applicants/<int:applicant_id>")
+def hr_get_applicant(applicant_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_applicant_row(conn, applicant_id)
+    if not row:
+        conn.close()
+        return jsonify(error="applicant not found"), 404
+    payload = _hr_applicant_payload(row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/applicants/<int:applicant_id>/update")
+def hr_update_applicant(applicant_id):
+    """Edit an applicant -- only provided fields change. A hired
+    applicant is sealed (409) except notes, which are APPENDED to the
+    existing notes (never replaced) so the hiring record stays intact."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _hr_applicant_row(conn, applicant_id)
+    if not row:
+        conn.close()
+        return jsonify(error="applicant not found"), 404
+    if row["stage"] == "hired":
+        keys = [k for k in data.keys() if k != "notes"]
+        if keys:
+            conn.close()
+            return jsonify(error="a hired applicant's record is sealed;"
+                           " only notes may be appended"), 409
+        if "notes" not in data or not (data.get("notes") or "").strip():
+            conn.close()
+            return jsonify(error="notes must not be blank"), 400
+        appended = ((row["notes"] or "") + "\n"
+                    + (data.get("notes") or "").strip()).strip()
+        if len(appended) > 2000:
+            conn.close()
+            return jsonify(error="notes must be 2000 characters or fewer"), 400
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute("UPDATE erp_hr_applicants SET notes = ?,"
+                     " updated_by = ?, updated_at = ? WHERE id = ?",
+                     (appended, actor, now, applicant_id))
+        _erp_staff_audit(conn, actor, "hr.applicant_notes_appended",
+                         "hr_applicant", applicant_id,
+                         "appended notes for hired applicant %s"
+                         % (row["name"] or ""))
+        conn.commit()
+        payload = _hr_applicant_payload(_hr_applicant_row(conn, applicant_id))
+        conn.close()
+        return jsonify(payload)
+    vals, verr = _hr_validate_applicant_fields(data, require_name_role=False)
+    if verr:
+        conn.close()
+        return jsonify(error=verr), 400
+    fields = ("name", "role", "email", "phone", "notes", "source",
+              "applied_date")
+    sets = []
+    args = []
+    changes = []
+    for f in fields:
+        if f in data and vals[f] != (row[f] or ""):
+            sets.append("%s = ?" % f)
+            args.append(vals[f])
+            changes.append("%s: %s -> %s" % (f, row[f] or "", vals[f]))
+    # Contact rule still holds after the edit: at least one of
+    # email / phone must remain.
+    new_email = vals["email"] if "email" in data else (row["email"] or "")
+    new_phone = vals["phone"] if "phone" in data else (row["phone"] or "")
+    if not new_email and not new_phone:
+        conn.close()
+        return jsonify(error="an email or phone number is required"), 400
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(applicant_id)
+        conn.execute("UPDATE erp_hr_applicants SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "hr.applicant_updated", "hr_applicant",
+                         applicant_id, "%s: %s"
+                         % (row["name"] or "", "; ".join(changes)))
+        conn.commit()
+    payload = _hr_applicant_payload(_hr_applicant_row(conn, applicant_id))
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/applicants/<int:applicant_id>/stage")
+def hr_change_applicant_stage(applicant_id):
+    """Move an applicant to the next stage (forward-only), or to
+    rejected from any stage. A move to hired is refused here -- use
+    the hire action. A hired applicant is sealed (409)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    target = (data.get("stage") or "").strip()
+    if target not in HR_APPLICANT_STAGES:
+        return jsonify(error="stage must be one of: %s"
+                       % ", ".join(HR_APPLICANT_STAGES)), 400
+    conn = db()
+    row = _hr_applicant_row(conn, applicant_id)
+    if not row:
+        conn.close()
+        return jsonify(error="applicant not found"), 404
+    if row["stage"] == "hired":
+        conn.close()
+        return jsonify(error="a hired applicant's record is sealed"), 409
+    if target == "hired":
+        conn.close()
+        return jsonify(error="use the hire action to move an applicant"
+                       " to hired"), 400
+    if target == row["stage"]:
+        conn.close()
+        return jsonify(error="applicant is already at stage %s" % target), 400
+    if target != "rejected" and HR_APPLICANT_NEXT.get(row["stage"]) != target:
+        conn.close()
+        return jsonify(error="stage can only move forward to %s"
+                       % (HR_APPLICANT_NEXT.get(row["stage"]) or "hired")
+                       + " (or to rejected)"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_hr_applicants SET stage = ?, updated_by = ?,"
+                 " updated_at = ? WHERE id = ?",
+                 (target, actor, now, applicant_id))
+    _erp_staff_audit(conn, actor, "hr.applicant_stage_changed",
+                     "hr_applicant", applicant_id,
+                     "%s: %s -> %s" % (row["name"] or "", row["stage"], target))
+    conn.commit()
+    payload = _hr_applicant_payload(_hr_applicant_row(conn, applicant_id))
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/applicants/<int:applicant_id>/hire")
+def hr_hire_applicant(applicant_id):
+    """Hire an applicant (admin only). The applicant must be at offer
+    (400 otherwise); already-hired is 409. Creates the
+    erp_hr_employees record from the applicant only -- name, email,
+    role = role applied for, phone, hire_date = today (UTC) unless the
+    admin supplies one. Fields the applicant lacks stay blank, exactly
+    like manual employee creation; nothing is invented. Seeds the new
+    employee's onboarding checklist from the role-matching template
+    when one exists, else the 5-item default. Sets the applicant stage
+    to hired and links it to the new employee id."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    hire_date = (data.get("hire_date") or "").strip()
+    if hire_date and not _hr_valid_hire_date(hire_date):
+        return jsonify(error="hire date must be YYYY-MM-DD"), 400
+    conn = db()
+    row = _hr_applicant_row(conn, applicant_id)
+    if not row:
+        conn.close()
+        return jsonify(error="applicant not found"), 404
+    if row["stage"] == "hired" or row["hired_employee_id"]:
+        conn.close()
+        return jsonify(error="applicant has already been hired"), 409
+    if row["stage"] != "offer":
+        conn.close()
+        return jsonify(error="only an applicant at offer can be hired"
+                       " (currently %s)" % row["stage"]), 400
+    if not hire_date:
+        hire_date = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_employees (staff_id, name, email, role,"
+        " department, phone, emergency_contact, emergency_phone, hire_date,"
+        " hourly_rate_cents, active, created_by, created_at,"
+        " updated_by, updated_at)"
+        " VALUES (NULL, ?, ?, ?, '', ?, '', '', ?, NULL, 1, ?, ?, '', '')",
+        (row["name"], row["email"] or "", row["role"] or "",
+         row["phone"] or "", hire_date, actor, now))
+    employee_id = cur.lastrowid
+    _hr_seed_onboarding(conn, employee_id, now,
+                        _hr_role_onboarding_labels(conn, row["role"] or ""))
+    conn.execute("UPDATE erp_hr_applicants SET stage = 'hired',"
+                 " hired_employee_id = ?, updated_by = ?, updated_at = ?"
+                 " WHERE id = ?",
+                 (employee_id, actor, now, applicant_id))
+    _erp_staff_audit(conn, actor, "hr.employee_created", "hr_employee",
+                     employee_id, "hired from applicant #%d (%s)"
+                     % (applicant_id, row["name"] or ""))
+    _erp_staff_audit(conn, actor, "hr.applicant_hired", "hr_applicant",
+                     applicant_id, "hired %s as employee #%d"
+                     % (row["name"] or "", employee_id))
+    conn.commit()
+    emp_row = _hr_get_employee(conn, employee_id)
+    payload = _hr_employee_payload(conn, emp_row, with_items=True)
+    payload["applicant_id"] = applicant_id
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.delete("/api/erp/hr/applicants/<int:applicant_id>")
+def hr_delete_applicant(applicant_id):
+    """Delete an applicant (admin only). A hired applicant's record is
+    kept as the hiring record -- 409, never deleted."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_applicant_row(conn, applicant_id)
+    if not row:
+        conn.close()
+        return jsonify(error="applicant not found"), 404
+    if row["stage"] == "hired":
+        conn.close()
+        return jsonify(error="a hired applicant's record is kept as the"
+                       " hiring record and cannot be deleted"), 409
+    conn.execute("DELETE FROM erp_hr_applicants WHERE id = ?",
+                 (applicant_id,))
+    _erp_staff_audit(conn, actor, "hr.applicant_deleted", "hr_applicant",
+                     applicant_id, "deleted applicant %s (%s)"
+                     % (row["name"] or "", row["role"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/hr/employees/<int:employee_id>/offboarding")
+def hr_get_offboarding(employee_id):
+    """The employee's offboarding record (with its items), or null
+    when none exists yet. One record per employee ever."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_employee(conn, employee_id)
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    off = conn.execute(
+        "SELECT * FROM erp_hr_offboarding WHERE employee_id = ?"
+        " ORDER BY id LIMIT 1", (employee_id,)).fetchone()
+    payload = _hr_offboarding_payload(conn, off) if off else None
+    conn.close()
+    return jsonify(employee_id=employee_id, offboarding=payload)
+
+
+@app.get("/api/erp/hr/offboarding/<int:offboarding_id>")
+def hr_get_offboarding_one(offboarding_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_hr_offboarding WHERE id = ?",
+                       (offboarding_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="offboarding record not found"), 404
+    payload = _hr_offboarding_payload(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/employees/<int:employee_id>/offboarding")
+def hr_create_offboarding(employee_id):
+    """Start offboarding for an employee (201). One record per
+    employee EVER -- a second is 409 even after a completed one (see
+    the section header). Seeds the four standard items, all
+    unchecked. exit_date defaults to today (UTC) when blank."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    exit_date = (data.get("exit_date") or "").strip()
+    reason = (data.get("reason") or "").strip()
+    if exit_date and not _hr_valid_hire_date(exit_date):
+        return jsonify(error="exit date must be YYYY-MM-DD"), 400
+    if len(reason) > 500:
+        return jsonify(error="reason must be 500 characters or fewer"), 400
+    conn = db()
+    row = _hr_get_employee(conn, employee_id)
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    existing = conn.execute(
+        "SELECT id FROM erp_hr_offboarding WHERE employee_id = ?",
+        (employee_id,)).fetchone()
+    if existing:
+        conn.close()
+        return jsonify(error="this employee already has an offboarding"
+                       " record"), 409
+    if not exit_date:
+        exit_date = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_offboarding (employee_id, exit_date, reason,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, '', '')",
+        (employee_id, exit_date, reason, actor, now))
+    offboarding_id = cur.lastrowid
+    for label in HR_OFFBOARDING_ITEMS:
+        conn.execute(
+            "INSERT INTO erp_hr_offboarding_items (offboarding_id, label,"
+            " done, done_by, done_at, created_at)"
+            " VALUES (?, ?, 0, '', '', ?)",
+            (offboarding_id, label, now))
+    _erp_staff_audit(conn, actor, "hr.offboarding_created", "hr_employee",
+                     employee_id, "started offboarding for %s"
+                     % (row["name"] or ""))
+    conn.commit()
+    off = conn.execute("SELECT * FROM erp_hr_offboarding WHERE id = ?",
+                       (offboarding_id,)).fetchone()
+    payload = _hr_offboarding_payload(conn, off)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.post("/api/erp/hr/offboarding-items/<int:item_id>/check")
+def hr_check_offboarding_item(item_id):
+    """Check an offboarding item off: stamps who did it and when.
+    Manual by design. Checking "Revoke ERP access" only RECORDS that
+    it was done -- it does NOT deactivate any login; the admin still
+    deactivates the login in Staff & permissions."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    item = conn.execute(
+        "SELECT id, offboarding_id, label, done"
+        " FROM erp_hr_offboarding_items WHERE id = ?",
+        (item_id,)).fetchone()
+    if not item:
+        conn.close()
+        return jsonify(error="offboarding item not found"), 404
+    if item["done"]:
+        conn.close()
+        return jsonify(ok=True, already_done=True)
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_hr_offboarding_items SET done = 1,"
+                 " done_by = ?, done_at = ? WHERE id = ?",
+                 (actor, now, item_id))
+    _erp_staff_audit(conn, actor, "hr.offboarding_item_checked",
+                     "hr_offboarding", item["offboarding_id"],
+                     "checked off %r" % item["label"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, done_by=actor, done_at=now)
+
+
+@app.post("/api/erp/hr/offboarding-items/<int:item_id>/uncheck")
+def hr_uncheck_offboarding_item(item_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    item = conn.execute(
+        "SELECT id, offboarding_id, label, done"
+        " FROM erp_hr_offboarding_items WHERE id = ?",
+        (item_id,)).fetchone()
+    if not item:
+        conn.close()
+        return jsonify(error="offboarding item not found"), 404
+    if not item["done"]:
+        conn.close()
+        return jsonify(ok=True, already_unchecked=True)
+    conn.execute("UPDATE erp_hr_offboarding_items SET done = 0,"
+                 " done_by = '', done_at = '' WHERE id = ?",
+                 (item_id,))
+    _erp_staff_audit(conn, actor, "hr.offboarding_item_unchecked",
+                     "hr_offboarding", item["offboarding_id"],
+                     "unchecked %r" % item["label"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# HR Additions 6: document storage. Admin-only via _require_erp_admin().
+# Employee HR documents ONLY -- this is NOT a general file store: no
+# other entity type can store files here, and the blob is never served
+# to a non-admin. One row per file, base64 blob in data_b64; list and
+# metadata views NEVER return the blob -- only the download endpoint
+# does. 5 MB cap per file, checked on the DECODED bytes (<= 5,242,880);
+# the base64 text itself is capped at ~7 MB so an oversized payload is
+# rejected before decoding. doc_type is free text: the suggestion list
+# is a UI hint only; an uncommon type is accepted, never rejected.
+# Metadata update can NEVER replace the blob; deletion is permanent
+# and audited. erp_hr_documents is NOT in _ERP_RESET_TABLES.
+_HR_DOCUMENT_MAX_BYTES = 5242880
+_HR_DOCUMENT_MAX_B64_CHARS = 7000000
+_HR_DOCUMENT_TYPES = (
+    "I-9", "W-4", "Food handler card", "Driver's license", "Passport",
+    "Direct deposit form", "Offer letter", "NDA", "Training certificate",
+    "Other",
+)
+
+
+def _hr_document_meta(row, employee_name=""):
+    """Metadata for one document -- NEVER includes the blob."""
+    return {"id": row["id"], "employee_id": row["employee_id"],
+            "employee_name": employee_name,
+            "doc_type": row["doc_type"] or "",
+            "filename": row["filename"] or "",
+            "mime_type": row["mime_type"] or "application/octet-stream",
+            "size_bytes": row["size_bytes"],
+            "received_date": row["received_date"] or "",
+            "expiry_date": row["expiry_date"] or None,
+            "notes": row["notes"] or "",
+            "uploaded_by": row["uploaded_by"] or "",
+            "created_at": row["created_at"],
+            "updated_by": row["updated_by"] or "",
+            "updated_at": row["updated_at"] or ""}
+
+
+def _hr_document_meta_fields(data, current=None):
+    """Validate doc_type / received_date / expiry_date / notes.
+    `current` is the existing row for updates (omitted fields keep
+    their value); None for uploads (received_date required). Returns
+    the cleaned dict, or (error_response, status) on a bad value."""
+    if current is None:
+        doc_type = (data.get("doc_type") or "").strip()
+        received = (data.get("received_date") or "").strip()
+        expiry = data.get("expiry_date") or ""
+        notes = (data.get("notes") or "").strip()
+    else:
+        doc_type = (data.get("doc_type", current["doc_type"]) or "").strip()
+        received = (data.get("received_date",
+                             current["received_date"]) or "").strip()
+        expiry = data.get("expiry_date", current["expiry_date"]) or ""
+        notes = (data.get("notes", current["notes"]) or "").strip()
+    if not isinstance(expiry, str):
+        return jsonify(error="expiry_date must be YYYY-MM-DD"), 400
+    expiry = expiry.strip()
+    if not doc_type or len(doc_type) > 100:
+        return jsonify(error="doc_type must be 1-100 characters"), 400
+    if not received:
+        return jsonify(error="received_date is required"), 400
+    if not _hr_valid_hire_date(received):
+        return jsonify(error="received_date must be YYYY-MM-DD"), 400
+    if expiry and not _hr_valid_hire_date(expiry):
+        return jsonify(error="expiry_date must be YYYY-MM-DD"), 400
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    return {"doc_type": doc_type, "received_date": received,
+            "expiry_date": expiry, "notes": notes}
+
+
+def _hr_get_document(conn, document_id):
+    try:
+        document_id = int(document_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_documents WHERE id = ?",
+                        (document_id,)).fetchone()
+
+
+@app.post("/api/erp/hr/employees/<int:employee_id>/documents")
+def hr_upload_document(employee_id):
+    """Upload one HR document for an employee (201). The employee must
+    exist (404 otherwise). Rejects, before storing anything: a missing
+    or blank filename, an empty file, invalid base64, a base64 payload
+    over ~7 MB of text, and a decoded file over 5 MB."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    if "employee_id" in data and data.get("employee_id") is not None:
+        try:
+            if int(data.get("employee_id")) != employee_id:
+                return jsonify(
+                    error="employee_id in body does not match the URL"), 400
+        except (TypeError, ValueError):
+            return jsonify(error="employee_id must be a number"), 400
+    fields = _hr_document_meta_fields(data)
+    if isinstance(fields, tuple):
+        return fields
+    filename = (data.get("filename") or "").strip()
+    if not filename or len(filename) > 255:
+        return jsonify(error="filename must be 1-255 characters"), 400
+    if "/" in filename or "\\" in filename:
+        return jsonify(error="filename must not contain a path"), 400
+    mime_type = (data.get("mime_type") or "").strip() or "application/octet-stream"
+    if len(mime_type) > 200:
+        return jsonify(error="mime_type must be 200 characters or fewer"), 400
+    raw_b64 = data.get("data_b64")
+    if not isinstance(raw_b64, str) or not raw_b64.strip():
+        return jsonify(error="data_b64 is required"), 400
+    if len(raw_b64) > _HR_DOCUMENT_MAX_B64_CHARS:
+        return jsonify(error="file is too large (5 MB maximum)"), 400
+    try:
+        decoded = base64.b64decode(raw_b64, validate=True)
+    except ValueError:
+        return jsonify(error="data_b64 is not valid base64"), 400
+    if not decoded:
+        return jsonify(error="file is empty"), 400
+    if len(decoded) > _HR_DOCUMENT_MAX_BYTES:
+        return jsonify(error="file is too large (5 MB maximum)"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    if not _hr_get_employee(conn, employee_id):
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    cur = conn.execute(
+        "INSERT INTO erp_hr_documents (employee_id, doc_type, filename,"
+        " mime_type, size_bytes, data_b64, received_date, expiry_date,"
+        " notes, uploaded_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (employee_id, fields["doc_type"], filename, mime_type, len(decoded),
+         base64.b64encode(decoded).decode("ascii"), fields["received_date"],
+         fields["expiry_date"], fields["notes"], actor, now, actor, now))
+    _erp_staff_audit(conn, actor, "hr.document_uploaded", "hr_document",
+                     cur.lastrowid, "%s (%s) for employee #%d" % (
+                         filename, fields["doc_type"], employee_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_documents WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(document=_hr_document_meta(row)), 201
+
+
+@app.get("/api/erp/hr/employees/<int:employee_id>/documents")
+def hr_list_documents(employee_id):
+    """Metadata for one employee's HR documents, oldest first. The
+    blob is NEVER returned here."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_documents WHERE employee_id = ? ORDER BY id",
+        (employee_id,)).fetchall()
+    conn.close()
+    return jsonify(documents=[_hr_document_meta(r, emp["name"])
+                              for r in rows])
+
+
+@app.get("/api/erp/hr/documents/<int:document_id>")
+def hr_get_document(document_id):
+    """One document's metadata -- WITHOUT the blob. Use the download
+    endpoint for the file bytes."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_document(conn, document_id)
+    if not row:
+        conn.close()
+        return jsonify(error="document not found"), 404
+    emp = _hr_get_employee(conn, row["employee_id"])
+    name = emp["name"] if emp else ""
+    conn.close()
+    return jsonify(document=_hr_document_meta(row, name))
+
+
+@app.get("/api/erp/hr/documents/<int:document_id>/download")
+def hr_download_document(document_id):
+    """Download one document: metadata + the base64 blob. Admin-only;
+    this is the ONLY endpoint that ever returns the blob."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_document(conn, document_id)
+    if not row:
+        conn.close()
+        return jsonify(error="document not found"), 404
+    emp = _hr_get_employee(conn, row["employee_id"])
+    name = emp["name"] if emp else ""
+    payload = _hr_document_meta(row, name)
+    payload["data_b64"] = row["data_b64"] or ""
+    conn.close()
+    return jsonify(document=payload)
+
+
+@app.post("/api/erp/hr/documents/<int:document_id>/update")
+def hr_update_document(document_id):
+    """Edit a document's metadata (doc_type, received_date,
+    expiry_date, notes). The blob can NEVER be replaced here --
+    data_b64 in the body is ignored entirely; re-upload to replace
+    a file."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _hr_get_document(conn, document_id)
+    if not row:
+        conn.close()
+        return jsonify(error="document not found"), 404
+    fields = _hr_document_meta_fields(data, current=row)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_documents SET doc_type = ?, received_date = ?,"
+        " expiry_date = ?, notes = ?, updated_by = ?, updated_at = ?"
+        " WHERE id = ?",
+        (fields["doc_type"], fields["received_date"], fields["expiry_date"],
+         fields["notes"], actor, now, document_id))
+    _erp_staff_audit(conn, actor, "hr.document_updated", "hr_document",
+                     document_id, "%s (%s)" % (row["filename"],
+                                               fields["doc_type"]))
+    conn.commit()
+    row = _hr_get_document(conn, document_id)
+    conn.close()
+    return jsonify(document=_hr_document_meta(row))
+
+
+@app.post("/api/erp/hr/documents/<int:document_id>/delete")
+def hr_delete_document(document_id):
+    """Delete a document PERMANENTLY -- the file bytes go with it.
+    Audited."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_document(conn, document_id)
+    if not row:
+        conn.close()
+        return jsonify(error="document not found"), 404
+    conn.execute("DELETE FROM erp_hr_documents WHERE id = ?", (document_id,))
+    _erp_staff_audit(conn, actor, "hr.document_deleted", "hr_document",
+                     document_id, "%s (%s) for employee #%d -- deleted"
+                     " permanently" % (row["filename"], row["doc_type"],
+                                       row["employee_id"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/hr/documents/expiring")
+def hr_expiring_documents():
+    """Documents expiring in the next 30 days, plus already-expired
+    ones flagged separately, sorted by expiry_date. Each item carries
+    days_until_expiry (negative when expired)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    today = datetime.now(timezone.utc).date()
+    horizon = (today + timedelta(days=30)).isoformat()
+    conn = db()
+    rows = conn.execute(
+        "SELECT d.*, e.name AS employee_name FROM erp_hr_documents d"
+        " JOIN erp_hr_employees e ON e.id = d.employee_id"
+        " WHERE d.expiry_date <> '' AND d.expiry_date <= ?"
+        " ORDER BY d.expiry_date, d.id", (horizon,)).fetchall()
+    conn.close()
+    expired = []
+    expiring = []
+    for r in rows:
+        item = _hr_document_meta(r, r["employee_name"])
+        try:
+            delta = (datetime.strptime(r["expiry_date"], "%Y-%m-%d").date()
+                     - today).days
+        except ValueError:
+            delta = 0
+        item["days_until_expiry"] = delta
+        (expired if delta < 0 else expiring).append(item)
+    return jsonify(expiring=expiring, expired=expired)
+
+
+# ---------------- HR Additions 5: employee self-service ----------------
+# GET /api/erp/hr/me only: an admin or staff member sees exactly ONE
+# record -- their own -- resolved server-side on every request. /me
+# takes no id parameter and no employee_id is ever trusted from a
+# payload or URL. Resolution: (1) the staff login row id ->
+# erp_hr_employees.staff_id; (2) exact email match (case-insensitive,
+# trimmed) against erp_hr_employees.email. Ambiguous or no match ->
+# 404 with a clear message, never a guess. Read-only: no writes, no
+# admin functions, and the response never names another employee.
+# PTO, performance reviews, recurring schedules and documents are
+# built by parallel subsystems: each is read DEFENSIVELY
+# (sqlite_master check first, only columns that exist are read) and
+# returns empty lists when its table is absent, so /me works before
+# those land and keeps working if one is renamed away. The candidate
+# table names below are the erp_hr_* names those subsystems are
+# expected to use; a table under a different name is simply not seen
+# (documented, not guessed at).
+_HR_ME_OPTIONAL_TABLES = {
+    "pto_balances": ("erp_hr_pto_balances", "erp_hr_pto_balance"),
+    "pto_requests": ("erp_hr_pto_requests", "erp_hr_pto_request"),
+    "reviews": ("erp_hr_reviews", "erp_hr_performance_reviews"),
+    "schedules": ("erp_hr_recurring_events", "erp_hr_schedules", "erp_hr_recurring_schedules"),
+    "documents": ("erp_hr_documents", "erp_hr_employee_documents"),
+}
+
+
+def _hr_me_optional_rows(conn, table, employee_id):
+    """Rows of one optional parallel-subsystem table for one employee.
+
+    Returns (rows, table_exists). [] when the table is absent (the
+    parallel subsystem has not landed), when it has no employee
+    column, or when it has no rows for this person. The employee
+    column is whichever of employee_id / staff_id / employee the
+    table defines. `table` comes only from _HR_ME_OPTIONAL_TABLES,
+    never from a request, so the name is safe to interpolate."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,)).fetchone()
+    if not exists:
+        return [], False
+    cols = [r[1] for r in conn.execute(
+        "PRAGMA table_info(%s)" % table).fetchall()]
+    emp_col = next((c for c in ("employee_id", "staff_id", "employee")
+                    if c in cols), None)
+    if emp_col is None:
+        return [], True
+    rows = conn.execute(
+        "SELECT * FROM %s WHERE %s = ? ORDER BY id" % (table, emp_col),
+        (employee_id,)).fetchall()
+    return [dict(r) for r in rows], True
+
+
+def _hr_me_optional_category(conn, category, employee_id):
+    """First existing table for a category: (rows, table_exists)."""
+    for table in _HR_ME_OPTIONAL_TABLES[category]:
+        rows, exists = _hr_me_optional_rows(conn, table, employee_id)
+        if exists:
+            return rows, True
+    return [], False
+
+
+def _hr_me_resolve(conn):
+    """Resolve the caller to ONE erp_hr_employees row.
+
+    Returns (row, None) or (None, (response, status)). Precedence
+    mirrors _erp_role: an admin member resolves as the admin first
+    (their staff row, same email e.g. Matt/DJ, gives the staff_id
+    link when one exists); otherwise the staff session resolves by
+    its staff row id -> erp_hr_employees.staff_id. Either way the
+    fallback is an exact email match (case-insensitive, trimmed).
+    Ambiguous or no match -> 404 with a clear message, never a
+    guess."""
+    staff_id = None
+    email = ""
+    user = _current_member()
+    if user and _is_admin(user):
+        email = user["email"] or ""
+    else:
+        staff = _staff_from_request()
+        if staff:
+            staff_id = staff["id"]
+            email = (staff["email"] or "")
+    if staff_id is None and email:
+        srow = conn.execute(
+            "SELECT id FROM staff"
+            " WHERE lower(trim(email)) = lower(trim(?))",
+            (email,)).fetchone()
+        if srow:
+            staff_id = srow["id"]
+    if staff_id:
+        row = conn.execute(
+            "SELECT * FROM erp_hr_employees WHERE staff_id = ?",
+            (staff_id,)).fetchone()
+        if row:
+            return row, None
+    if email:
+        rows = conn.execute(
+            "SELECT * FROM erp_hr_employees"
+            " WHERE lower(trim(email)) = lower(trim(?))",
+            (email,)).fetchall()
+        if len(rows) == 1:
+            return rows[0], None
+        if len(rows) > 1:
+            return None, (jsonify(error="more than one HR record matches"
+                                   " your login; ask an admin to fix the"
+                                   " duplicate"), 404)
+    return None, (jsonify(error="no HR record is linked to your login;"
+                           " ask an admin to link one"), 404)
+
+
+@app.get("/api/erp/hr/me")
+def hr_me():
+    """Self-service: the caller's own HR record only (200).
+
+    Gated by _require_erp(): admin or staff, never wholesale and
+    never anonymous. The caller is re-resolved server-side on every
+    request (see _hr_me_resolve); /me takes no id. Profile, own
+    roster (events assigned, upcoming + past), own time records with
+    cash totals, and -- when the parallel subsystems have landed --
+    own PTO, reviews, recurring schedules and documents. Anything
+    absent comes back as an empty list with its *_available flag
+    false; nothing here names another employee."""
+    _, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    emp, err_resp = _hr_me_resolve(conn)
+    if err_resp:
+        conn.close()
+        return err_resp
+    emp_id = emp["id"]
+    roster_rows = conn.execute(
+        "SELECT s.id AS assign_id, s.role AS assignment_role,"
+        " s.assigned_at, e.id AS event_id, e.name, e.date, e.location"
+        " FROM erp_hr_event_staff s"
+        " JOIN erp_hr_events e ON e.id = s.event_id"
+        " WHERE s.employee_id = ? ORDER BY e.date, e.name",
+        (emp_id,)).fetchall()
+    today = datetime.now(timezone.utc).date().isoformat()
+    roster = [{
+        "assign_id": r["assign_id"], "event_id": r["event_id"],
+        "name": r["name"] or "", "date": r["date"] or "",
+        "location": r["location"] or "",
+        "assignment_role": r["assignment_role"] or "",
+        "assigned_at": r["assigned_at"] or "",
+    } for r in roster_rows]
+    event_names = {r["id"]: r["name"] or "" for r in conn.execute(
+        "SELECT id, name FROM erp_hr_events").fetchall()}
+    rec_rows = conn.execute(
+        "SELECT * FROM erp_hr_time_records WHERE employee_id = ?"
+        " ORDER BY id DESC", (emp_id,)).fetchall()
+    time_records = []
+    for r in rec_rows:
+        payload = _hr_time_payload(r)
+        payload["event_name"] = event_names.get(r["event_id"], "")
+        time_records.append(payload)
+    pto_balances, pto_available = _hr_me_optional_category(
+        conn, "pto_balances", emp_id)
+    pto_requests, pto_req_available = _hr_me_optional_category(
+        conn, "pto_requests", emp_id)
+    reviews, reviews_available = _hr_me_optional_category(
+        conn, "reviews", emp_id)
+    schedules, schedules_available = _hr_me_optional_category(
+        conn, "schedules", emp_id)
+    documents, documents_available = _hr_me_optional_category(
+        conn, "documents", emp_id)
+    out = {
+        "employee": _hr_employee_payload(conn, emp),
+        "pto_available": bool(pto_available or pto_req_available),
+        "pto_balances": pto_balances,
+        "pto_requests": pto_requests,
+        "reviews_available": reviews_available,
+        "reviews": reviews,
+        "schedules_available": schedules_available,
+        "schedules": schedules,
+        "documents_available": documents_available,
+        "documents": documents,
+        "roster": roster,
+        "roster_upcoming": [a for a in roster
+                            if a["date"] and a["date"] >= today],
+        "roster_past": [a for a in roster
+                        if not a["date"] or a["date"] < today],
+        "time_records": time_records,
+        "time_totals": _hr_employee_time_totals(conn, emp_id),
+    }
+    conn.close()
+    return jsonify(out)
+
+
+# HR Additions 4: recurring schedules
+# Templates generate plain one-off erp_hr_events on demand (explicit
+# POST .../generate) -- there is no background job and no auto-run.
+# Idempotency comes from erp_hr_recurring_instances, UNIQUE on
+# (template_id, occurrence_date): re-running generate over the same
+# range creates only the missing occurrences. Editing a template
+# NEVER rewrites already-generated events -- only future generations
+# use the new template. Deleting a template is refused (409) once
+# any instance exists; the admin deletes the generated events first
+# via the existing event delete. Roster copy at generation skips
+# inactive employees (an inactive person is never assigned, same as
+# the one-off assign rule). erp_hr_events has no time-of-day column,
+# so the template time is shown on the template/instances but is not
+# stored on the generated event row.
+HR_RECURRING_FREQUENCIES = ("weekly", "biweekly", "monthly")
+HR_RECURRING_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday",
+                         "Friday", "Saturday", "Sunday")
+
+
+def _hr_recurring_int(value):
+    """Coerce an int (or digit string) or return None. Booleans are
+    not ints here."""
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hr_recurring_valid_time(value):
+    """Blank, or HH:MM on a 24-hour clock."""
+    if not value:
+        return True
+    return re.match(r"^([01][0-9]|2[0-3]):[0-5][0-9]$", value) is not None
+
+
+def _hr_recurring_fields(conn, data, base):
+    """Validate a template body merged over `base` (the existing row
+    for updates, defaults for creates). Returns (fields, None) or
+    (None, error-string). weekday is 0=Mon..6=Sun for weekly/biweekly;
+    day_of_month 1-31 for monthly; the other is stored NULL. The
+    anchor_date must agree with the schedule (same weekday for
+    weekly/biweekly, same day-of-month for monthly) and is the first
+    occurrence -- nothing is generated before it. Every roster id
+    must be an existing employee at save time."""
+    merged = dict(base)
+    for key in ("title", "frequency", "weekday", "day_of_month", "time",
+                "anchor_date", "location", "roster_ids"):
+        if key in data:
+            merged[key] = data[key]
+    title = (merged.get("title") or "")
+    if not isinstance(title, str):
+        return None, "title must be text"
+    title = title.strip()
+    if not title or len(title) > 200:
+        return None, "title must be 1-200 characters"
+    frequency = merged.get("frequency") or ""
+    if frequency not in HR_RECURRING_FREQUENCIES:
+        return None, "frequency must be weekly, biweekly or monthly"
+    weekday = None
+    day_of_month = None
+    if frequency in ("weekly", "biweekly"):
+        weekday = _hr_recurring_int(merged.get("weekday"))
+        if weekday is None or weekday < 0 or weekday > 6:
+            return None, "weekday must be 0 (Monday) to 6 (Sunday)"
+    else:
+        day_of_month = _hr_recurring_int(merged.get("day_of_month"))
+        if day_of_month is None or day_of_month < 1 or day_of_month > 31:
+            return None, "day_of_month must be 1-31"
+    time_text = merged.get("time") or ""
+    if not isinstance(time_text, str):
+        return None, "time must be text"
+    time_text = time_text.strip()
+    if len(time_text) > 5 or not _hr_recurring_valid_time(time_text):
+        return None, "time must be blank or HH:MM (24-hour)"
+    anchor_date = (merged.get("anchor_date") or "")
+    if not isinstance(anchor_date, str):
+        return None, "anchor_date must be text"
+    anchor_date = anchor_date.strip()
+    if not anchor_date or not _hr_valid_hire_date(anchor_date):
+        return None, "anchor_date must be YYYY-MM-DD"
+    anchor = datetime.strptime(anchor_date, "%Y-%m-%d").date()
+    if frequency in ("weekly", "biweekly") and anchor.weekday() != weekday:
+        return None, ("anchor_date must fall on the template weekday"
+                       " (%s)" % HR_RECURRING_WEEKDAYS[weekday])
+    if frequency == "monthly" and anchor.day != day_of_month:
+        return None, ("anchor_date must fall on day %d of the month"
+                       % day_of_month)
+    location = merged.get("location") or ""
+    if not isinstance(location, str):
+        return None, "location must be text"
+    location = location.strip()
+    if len(location) > 200:
+        return None, "location must be 200 characters or fewer"
+    roster_ids = merged.get("roster_ids")
+    if roster_ids is None:
+        roster_ids = []
+    if not isinstance(roster_ids, list):
+        return None, "roster_ids must be a list of employee ids"
+    clean_ids = []
+    for raw in roster_ids:
+        employee_id = _hr_recurring_int(raw)
+        if employee_id is None:
+            return None, "roster_ids must be employee ids"
+        if employee_id not in clean_ids:
+            clean_ids.append(employee_id)
+    for employee_id in clean_ids:
+        if not _hr_get_employee(conn, employee_id):
+            return None, "employee not found: %d" % employee_id
+    return {"title": title, "frequency": frequency, "weekday": weekday,
+            "day_of_month": day_of_month, "time": time_text,
+            "anchor_date": anchor_date, "location": location,
+            "roster_ids": clean_ids}, None
+
+
+def _hr_recurring_dict(conn, row):
+    try:
+        roster_ids = json.loads(row["roster_json"] or "[]")
+    except ValueError:
+        roster_ids = []
+    if not isinstance(roster_ids, list):
+        roster_ids = []
+    names = []
+    for employee_id in roster_ids:
+        emp = _hr_get_employee(conn, employee_id)
+        names.append(emp["name"] if emp else "Employee #%s" % employee_id)
+    instance_count = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_recurring_instances"
+        " WHERE template_id = ?", (row["id"],)).fetchone()[0]
+    return {
+        "id": row["id"], "title": row["title"],
+        "frequency": row["frequency"], "weekday": row["weekday"],
+        "day_of_month": row["day_of_month"],
+        "weekday_name": (HR_RECURRING_WEEKDAYS[row["weekday"]]
+                         if row["weekday"] is not None else ""),
+        "time": row["time"] or "", "anchor_date": row["anchor_date"] or "",
+        "location": row["location"] or "", "roster_ids": roster_ids,
+        "roster_names": names, "instance_count": instance_count,
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _hr_get_recurring(conn, template_id):
+    try:
+        template_id = int(template_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_recurring_events"
+                        " WHERE id = ?", (template_id,)).fetchone()
+
+
+def _hr_recurring_occurrences(row, date_from, date_to):
+    """Occurrence dates in [date_from, date_to] for a template row.
+    Weekly: same weekday. Biweekly: same weekday every 2 weeks from
+    the anchor. Monthly: same day-of-month, skipping months where
+    that day does not exist (the 31st skips February and 30-day
+    months). Nothing before the anchor is ever returned."""
+    anchor = datetime.strptime(row["anchor_date"], "%Y-%m-%d").date()
+    out = []
+    if row["frequency"] in ("weekly", "biweekly"):
+        step = 7 if row["frequency"] == "weekly" else 14
+        day = max(date_from, anchor)
+        while day.weekday() != row["weekday"]:
+            day += timedelta(days=1)
+        if row["frequency"] == "biweekly":
+            while (day - anchor).days % 14 != 0:
+                day += timedelta(days=7)
+        while day <= date_to:
+            out.append(day)
+            day += timedelta(days=step)
+    else:
+        year, month = date_from.year, date_from.month
+        while (year, month) <= (date_to.year, date_to.month):
+            try:
+                day = datetime(year, month, row["day_of_month"]).date()
+            except ValueError:
+                day = None
+            if (day is not None and anchor <= day <= date_to
+                    and day >= date_from):
+                out.append(day)
+            month += 1
+            if month == 13:
+                month = 1
+                year += 1
+    return out
+
+
+@app.get("/api/erp/hr/recurring-events")
+def hr_list_recurring_events():
+    """Every recurring template, by title. The list starts empty --
+    no templates are ever seeded."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_recurring_events ORDER BY title, id"
+    ).fetchall()
+    out = [_hr_recurring_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(templates=out)
+
+
+@app.post("/api/erp/hr/recurring-events")
+def hr_create_recurring_event():
+    """Create a recurring template (201). Validates frequency,
+    weekday/day-of-month, HH:MM time, anchor agreement, and that
+    every roster id is an existing employee."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    fields, error = _hr_recurring_fields(conn, data, {
+        "title": "", "frequency": "", "weekday": None,
+        "day_of_month": None, "time": "", "anchor_date": "",
+        "location": "", "roster_ids": []})
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_recurring_events (title, frequency, weekday,"
+        " day_of_month, time, anchor_date, location, roster_json,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')",
+        (fields["title"], fields["frequency"], fields["weekday"],
+         fields["day_of_month"], fields["time"], fields["anchor_date"],
+         fields["location"], json.dumps(fields["roster_ids"]), actor, now))
+    template_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.recurring_created",
+                     "hr_recurring_event", template_id,
+                     "created recurring template %r (%s)"
+                     % (fields["title"], fields["frequency"]))
+    conn.commit()
+    row = _hr_get_recurring(conn, template_id)
+    payload = _hr_recurring_dict(conn, row)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.get("/api/erp/hr/recurring-events/<int:template_id>")
+def hr_get_recurring_event(template_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_recurring(conn, template_id)
+    if not row:
+        conn.close()
+        return jsonify(error="recurring template not found"), 404
+    payload = _hr_recurring_dict(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/recurring-events/<int:template_id>/update")
+def hr_update_recurring_event(template_id):
+    """Edit a template -- only provided fields change. Editing NEVER
+    rewrites already-generated events or instances; only future
+    generations use the new template."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _hr_get_recurring(conn, template_id)
+    if not row:
+        conn.close()
+        return jsonify(error="recurring template not found"), 404
+    try:
+        base_roster = json.loads(row["roster_json"] or "[]")
+    except ValueError:
+        base_roster = []
+    base = {"title": row["title"], "frequency": row["frequency"],
+            "weekday": row["weekday"], "day_of_month": row["day_of_month"],
+            "time": row["time"] or "", "anchor_date": row["anchor_date"],
+            "location": row["location"] or "", "roster_ids": base_roster}
+    fields, error = _hr_recurring_fields(conn, data, base)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_recurring_events SET title = ?, frequency = ?,"
+        " weekday = ?, day_of_month = ?, time = ?, anchor_date = ?,"
+        " location = ?, roster_json = ?, updated_by = ?, updated_at = ?"
+        " WHERE id = ?",
+        (fields["title"], fields["frequency"], fields["weekday"],
+         fields["day_of_month"], fields["time"], fields["anchor_date"],
+         fields["location"], json.dumps(fields["roster_ids"]), actor, now,
+         template_id))
+    _erp_staff_audit(conn, actor, "hr.recurring_updated",
+                     "hr_recurring_event", template_id,
+                     "updated recurring template %r (already-generated"
+                     " events unchanged)" % (fields["title"],))
+    conn.commit()
+    row = _hr_get_recurring(conn, template_id)
+    payload = _hr_recurring_dict(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/recurring-events/<int:template_id>/delete")
+def hr_delete_recurring_event(template_id):
+    """Delete a template ONLY when no instances were generated (409
+    otherwise): the admin deletes the generated events first via the
+    existing event delete, then the template."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_recurring(conn, template_id)
+    if not row:
+        conn.close()
+        return jsonify(error="recurring template not found"), 404
+    n_instances = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_recurring_instances"
+        " WHERE template_id = ?", (template_id,)).fetchone()[0]
+    if n_instances:
+        conn.close()
+        return jsonify(error="template has %d generated event(s) and"
+                       " cannot be deleted; delete the generated events"
+                       " first" % n_instances), 409
+    conn.execute("DELETE FROM erp_hr_recurring_events WHERE id = ?",
+                 (template_id,))
+    _erp_staff_audit(conn, actor, "hr.recurring_deleted",
+                     "hr_recurring_event", template_id,
+                     "deleted recurring template %r" % (row["title"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/hr/recurring-events/<int:template_id>/instances")
+def hr_list_recurring_instances(template_id):
+    """The events this template generated, by occurrence date, each
+    with its roster. The template time is included (generated event
+    rows carry no time of day)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_recurring(conn, template_id)
+    if not row:
+        conn.close()
+        return jsonify(error="recurring template not found"), 404
+    rows = conn.execute(
+        "SELECT i.occurrence_date AS occurrence_date, e.*"
+        " FROM erp_hr_recurring_instances i"
+        " JOIN erp_hr_events e ON e.id = i.event_id"
+        " WHERE i.template_id = ? ORDER BY i.occurrence_date, e.id",
+        (template_id,)).fetchall()
+    out = []
+    for r in rows:
+        payload = _hr_event_payload(conn, r, with_roster=True)
+        payload["occurrence_date"] = r["occurrence_date"]
+        payload["template_time"] = row["time"] or ""
+        out.append(payload)
+    conn.close()
+    return jsonify(template_id=template_id, time=row["time"] or "",
+                   instances=out)
+
+
+@app.post("/api/erp/hr/recurring-events/<int:template_id>/generate")
+def hr_generate_recurring_events(template_id):
+    """Generate concrete events for each occurrence in
+    [date_from, date_to]. IDEMPOTENT: an occurrence already linked
+    in erp_hr_recurring_instances is counted as already_existing
+    and never duplicated; only the missing ones are created, each
+    with the template roster copied (active employees only)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    date_from = (data.get("date_from") or "").strip()
+    date_to = (data.get("date_to") or "").strip()
+    if not date_from or not _hr_valid_hire_date(date_from):
+        return jsonify(error="date_from must be YYYY-MM-DD"), 400
+    if not date_to or not _hr_valid_hire_date(date_to):
+        return jsonify(error="date_to must be YYYY-MM-DD"), 400
+    start = datetime.strptime(date_from, "%Y-%m-%d").date()
+    end = datetime.strptime(date_to, "%Y-%m-%d").date()
+    if start > end:
+        return jsonify(error="date_from must not be after date_to"), 400
+    conn = db()
+    row = _hr_get_recurring(conn, template_id)
+    if not row:
+        conn.close()
+        return jsonify(error="recurring template not found"), 404
+    try:
+        roster_ids = json.loads(row["roster_json"] or "[]")
+    except ValueError:
+        roster_ids = []
+    generated = 0
+    already_existing = 0
+    generated_event_ids = []
+    roster_copied = 0
+    now = datetime.now(timezone.utc).isoformat()
+    for occurrence in _hr_recurring_occurrences(row, start, end):
+        occurrence_text = occurrence.isoformat()
+        existing = conn.execute(
+            "SELECT event_id FROM erp_hr_recurring_instances"
+            " WHERE template_id = ? AND occurrence_date = ?",
+            (template_id, occurrence_text)).fetchone()
+        if existing:
+            already_existing += 1
+            continue
+        cur = conn.execute(
+            "INSERT INTO erp_hr_events (name, date, location, created_by,"
+            " created_at, updated_by, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, '', '')",
+            (row["title"], occurrence_text, row["location"] or "",
+             actor, now))
+        event_id = cur.lastrowid
+        conn.execute(
+            "INSERT INTO erp_hr_recurring_instances (template_id,"
+            " event_id, occurrence_date, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (template_id, event_id, occurrence_text, now))
+        for employee_id in roster_ids:
+            emp = _hr_get_employee(conn, employee_id)
+            if not emp or not emp["active"]:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO erp_hr_event_staff (event_id,"
+                " employee_id, role, assigned_by, assigned_at)"
+                " VALUES (?, ?, '', ?, ?)",
+                (event_id, employee_id, actor, now))
+            roster_copied += 1
+        generated += 1
+        generated_event_ids.append(event_id)
+    _erp_staff_audit(conn, actor, "hr.recurring_generated",
+                     "hr_recurring_event", template_id,
+                     "generated %d event(s) for %r %s..%s"
+                     " (%d already existed)"
+                     % (generated, row["title"], date_from, date_to,
+                        already_existing))
+    conn.commit()
+    conn.close()
+    return jsonify(template_id=template_id, generated=generated,
+                   already_existing=already_existing,
+                   generated_event_ids=generated_event_ids,
+                   roster_copied=roster_copied)
+
+
+
+# HR Additions 3: event-staff payroll feed (Nov 2026) -- OPT-IN per person,
+# cash stays the default. An HR employee is payroll-eligible only when an
+# admin explicitly flips payroll_eligible ON (which requires a rate on the
+# employee record); the flag defaults OFF and flipping it OFF is always
+# allowed. Feeding is an explicit admin action only: UNFED
+# erp_hr_time_records for one eligible employee + period go into a DRAFT
+# payrun through the EXISTING Accounting payrun path (same tables, same
+# _acct_payroll_compute_line withholding, same approve -> pay flow) --
+# nothing here posts to the ledger directly and no second payroll engine
+# is built. OT reuses the store-settings thresholds via _stores_ot_settings
+# and the shared Nevada splitter _stores_nevada_ot, grouped by Mon-Sun
+# week on each record's EVENT date (no second OT rule). The payrun line
+# reuses the timeclock_ids column: for source='hr_event_time' it holds
+# the fed erp_hr_time_record ids (not store timeclock ids). A fed record
+# stays visible as fed (payrun_line_id) and can never be paid in cash.
+@app.post("/api/erp/hr/employees/<int:employee_id>/payroll-eligibility")
+def hr_set_payroll_eligibility(employee_id):
+    """Flip payroll_eligible ON/OFF for one HR employee (admin only).
+    ON requires an hourly rate on the employee record (not NULL, > 0)
+    -- else 400. OFF is always allowed. Cash stays the default: the
+    flag is OFF unless an admin explicitly opts this person in."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    if "payroll_eligible" not in data:
+        return jsonify(error="payroll_eligible is required"), 400
+    val = data.get("payroll_eligible")
+    if isinstance(val, bool):
+        eligible = 1 if val else 0
+    elif val in (0, 1):
+        eligible = int(val)
+    else:
+        return jsonify(error="payroll_eligible must be true or false"), 400
+    conn = db()
+    row = _hr_get_employee(conn, employee_id)
+    if not row:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    if eligible and (row["hourly_rate_cents"] is None
+                     or int(row["hourly_rate_cents"]) <= 0):
+        conn.close()
+        return jsonify(error="cannot opt in to payroll without an hourly"
+                       " rate -- set hourly_rate_cents first"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_employees SET payroll_eligible = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (eligible, actor, now, employee_id))
+    _erp_staff_audit(conn, actor, "hr.employee_payroll_eligibility",
+                     "hr_employee", employee_id,
+                     "%s payroll eligibility %s for %s"
+                     % ("enabled" if eligible else "disabled",
+                        "" if eligible else "(cash record only)",
+                        row["name"] or ""))
+    conn.commit()
+    row = _hr_get_employee(conn, employee_id)
+    payload = _hr_employee_payload(conn, row, with_items=True)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/time-records/feed-payrun")
+def hr_feed_time_records_payrun():
+    """Explicit admin action: feed UNFED erp_hr_time_records for one
+    payroll-eligible employee + period into a DRAFT payrun (created when
+    none is open for the period, else attached to the existing draft),
+    mirroring stores_timeclock_feed_payrun. The employee must be
+    payroll-eligible (400 otherwise -- cash record only). Resolution to
+    a payroll employee reuses _stores_resolve_payroll_employee: a stored
+    link wins, then an exact normalized-name match; unmapped / ambiguous
+    / not_hourly / inactive / unrated feeds nothing and no rate is ever
+    estimated. Gross uses the PAYROLL employee's hourly rate (not the
+    per-record cash snapshot). Hours group by Mon-Sun week on the EVENT
+    date and split regular/OT with _stores_nevada_ot under the
+    store-settings thresholds from _stores_ot_settings. A row feeds
+    exactly one line; re-feed is a no-op for fed rows. Feeding targets
+    DRAFT runs only (409 otherwise) and refuses overlapping runs. A
+    record with cash already paid can never be fed (400) -- it is part
+    cash, not cleanly payroll. Nothing here posts to the ledger: the
+    payrun itself still flows through the existing approve -> pay flow."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    try:
+        hr_id = int(data.get("employee_id") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="employee_id is required"), 400
+    hr = conn.execute(
+        "SELECT * FROM erp_hr_employees WHERE id = ?", (hr_id,)).fetchone()
+    if not hr:
+        conn.close()
+        return jsonify(error="employee not found"), 400
+    start = (data.get("period_start") or "").strip()
+    end = (data.get("period_end") or "").strip()
+    if not _acct_valid_date(start) or not _acct_valid_date(end) or start > end:
+        conn.close()
+        return jsonify(error="period_start and period_end must be YYYY-MM-DD with start on or before end"), 400
+    pay_date = (data.get("pay_date") or "").strip()
+    run_id = data.get("payrun_id")
+    if run_id is not None:
+        try:
+            run_id = int(run_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="payrun_id must be an integer"), 400
+    if not int(hr["payroll_eligible"] or 0):
+        conn.close()
+        return jsonify(error="employee is not payroll-eligible -- cash record only"), 400
+    # Un-fed records for this employee whose EVENT date falls in the
+    # period (a record with no event date cannot be placed in a period).
+    rows = conn.execute(
+        "SELECT t.*, ev.date AS event_date FROM erp_hr_time_records t"
+        " JOIN erp_hr_events ev ON ev.id = t.event_id"
+        " WHERE t.employee_id = ? AND t.payrun_line_id IS NULL"
+        " AND ev.date != '' AND ev.date >= ? AND ev.date <= ?"
+        " ORDER BY ev.date, t.id",
+        (hr_id, start, end)).fetchall()
+    fed_rows = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_time_records t"
+        " JOIN erp_hr_events ev ON ev.id = t.event_id"
+        " WHERE t.employee_id = ? AND t.payrun_line_id IS NOT NULL"
+        " AND ev.date != '' AND ev.date >= ? AND ev.date <= ?",
+        (hr_id, start, end)).fetchone()[0]
+    undated_rows = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_time_records t"
+        " JOIN erp_hr_events ev ON ev.id = t.event_id"
+        " WHERE t.employee_id = ? AND t.payrun_line_id IS NULL"
+        " AND ev.date = ''",
+        (hr_id,)).fetchone()[0]
+    if not rows:
+        conn.close()
+        return jsonify(fed=0, fed_line=None, run=None,
+                       unmapped=[], already_fed=fed_rows,
+                       undated_rows=undated_rows,
+                       note="no un-fed time records for this employee"
+                            " in this period")
+    cash_paid = [r for r in rows if int(r["cash_paid_cents"] or 0) > 0]
+    if cash_paid:
+        conn.close()
+        return jsonify(error="time record #%d already has cash paid --"
+                       " it cannot be fed to payroll" % cash_paid[0]["id"]), 400
+    emp, flag = _stores_resolve_payroll_employee(
+        conn, hr, data.get("payroll_employee_id"))
+    if flag:
+        conn.close()
+        return jsonify(fed=0, fed_line=None, run=None,
+                       unmapped=[{"reason": flag,
+                                  "timeclock_ids": [r["id"] for r in rows],
+                                  "time_record_ids": [r["id"] for r in rows],
+                                  "hours": round(sum(float(r["hours"] or 0)
+                                                    for r in rows), 2)}],
+                       already_fed=fed_rows, undated_rows=undated_rows,
+                       note="employee has no usable hourly payroll record"
+                            " (%s) -- nothing was fed, no rate estimated"
+                            % flag)
+    # OT: group by Mon-Sun week on the event date, Nevada split.
+    thresholds = _stores_ot_settings(conn)
+    weeks = {}
+    for r in rows:
+        day = (r["event_date"] or "")[:10]
+        bounds = _stores_week_bounds(day)
+        if not bounds:
+            continue
+        monday = bounds[0]
+        weekday = datetime.strptime(day, "%Y-%m-%d").date().weekday()
+        weeks.setdefault(monday, [0.0] * 7)
+        weeks[monday][weekday] = round(
+            weeks[monday][weekday] + float(r["hours"] or 0), 2)
+    regular = 0.0
+    ot = 0.0
+    for day_hours in weeks.values():
+        split = _stores_nevada_ot(
+            day_hours, thresholds["weekly_threshold_hours"],
+            thresholds["daily_threshold_hours"])
+        regular = round(regular + split["regular_hours"], 2)
+        ot = round(ot + split["ot_hours"], 2)
+    total_hours = round(regular + ot, 2)
+    rate = int(emp["rate_cents"])
+    gross = int(regular * rate + ot * rate * 1.5 + 0.5)
+    if gross <= 0:
+        conn.close()
+        return jsonify(error="fed hours produce no gross pay"), 400
+    tax_year = int(start[:4])
+    # Target run: explicit draft, the open draft for the period, or a
+    # new draft. Attaching to a non-draft run is refused.
+    run = None
+    if run_id is not None:
+        run = conn.execute(
+            "SELECT * FROM erp_acct_payruns WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            conn.close()
+            return jsonify(error="payrun not found"), 404
+        if run["status"] != "draft":
+            conn.close()
+            return jsonify(error="payrun %d is %s, not draft -- only draft runs accept fed lines" % (run_id, run["status"])), 409
+        if run["period_start"] != start or run["period_end"] != end:
+            conn.close()
+            return jsonify(error="payrun %d covers %s to %s, not the requested period %s to %s" % (run_id, run["period_start"], run["period_end"], start, end)), 400
+    else:
+        run = conn.execute(
+            "SELECT * FROM erp_acct_payruns WHERE period_start = ?"
+            " AND period_end = ? AND status = 'draft' ORDER BY id LIMIT 1",
+            (start, end)).fetchone()
+    if run is None:
+        if not _acct_valid_date(pay_date):
+            conn.close()
+            return jsonify(error="pay_date must be YYYY-MM-DD"), 400
+        if pay_date < end:
+            conn.close()
+            return jsonify(error="pay_date must be on or after period_end"), 400
+    # One line per employee per run, and no line in any overlapping run.
+    if run is not None:
+        same = conn.execute(
+            "SELECT 1 FROM erp_acct_payrun_lines WHERE payrun_id = ?"
+            " AND employee_id = ? LIMIT 1",
+            (run["id"], emp["id"])).fetchone()
+        if same:
+            conn.close()
+            return jsonify(error="payrun %d already has a line for %s %s -- un-feed it first" % (run["id"], emp["first_name"], emp["last_name"])), 409
+    clash = conn.execute(
+        "SELECT 1 FROM erp_acct_payrun_lines l"
+        " JOIN erp_acct_payruns r ON r.id = l.payrun_id"
+        " WHERE l.employee_id = ? AND r.period_start <= ?"
+        " AND r.period_end >= ? LIMIT 1",
+        (emp["id"], end, start)).fetchone()
+    if clash:
+        conn.close()
+        return jsonify(error="employee %s %s already has a pay run overlapping this period" % (emp["first_name"], emp["last_name"])), 400
+    ytd_before = _acct_payroll_ytd_cents(conn, emp["id"], tax_year)
+    calc, error = _acct_payroll_compute_line(conn, emp, gross, ytd_before,
+                                             tax_year)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    if run is None:
+        cur = conn.execute(
+            "INSERT INTO erp_acct_payruns (period_start, period_end, pay_date,"
+            " status, gross_cents, federal_withheld_cents, ss_cents,"
+            " medicare_cents, employer_tax_cents, employer_ss_cents,"
+            " employer_medicare_cents, net_cents, journal_entry_id, approved_by,"
+            " approved_at, paid_at, created_at)"
+            " VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', NULL,"
+            " NULL, ?)",
+            (start, end, pay_date, calc["gross_cents"],
+             calc["federal_cents"], calc["ss_cents"],
+             calc["medicare_cents"], calc["employer_tax_cents"],
+             calc["employer_ss_cents"], calc["employer_medicare_cents"],
+             calc["net_cents"], now))
+        run = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                           (cur.lastrowid,)).fetchone()
+    else:
+        conn.execute(
+            "UPDATE erp_acct_payruns SET gross_cents = gross_cents + ?,"
+            " federal_withheld_cents = federal_withheld_cents + ?,"
+            " ss_cents = ss_cents + ?, medicare_cents = medicare_cents + ?,"
+            " employer_tax_cents = employer_tax_cents + ?,"
+            " employer_ss_cents = employer_ss_cents + ?,"
+            " employer_medicare_cents = employer_medicare_cents + ?,"
+            " net_cents = net_cents + ? WHERE id = ?",
+            (calc["gross_cents"], calc["federal_cents"], calc["ss_cents"],
+             calc["medicare_cents"], calc["employer_tax_cents"],
+             calc["employer_ss_cents"], calc["employer_medicare_cents"],
+             calc["net_cents"], run["id"]))
+        run = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                           (run["id"],)).fetchone()
+    rec_ids = [r["id"] for r in rows]
+    stub = {
+        "employee_name": emp["first_name"] + " " + emp["last_name"],
+        "pay_type": emp["pay_type"],
+        "pay_schedule": emp["pay_schedule"],
+        "filing_status": emp["filing_status"],
+        "period_start": start, "period_end": end,
+        "pay_date": run["pay_date"],
+        "hours": total_hours, "regular_hours": regular, "ot_hours": ot,
+        "rate_cents": rate,
+        "gross_cents": calc["gross_cents"],
+        "federal_cents": calc["federal_cents"],
+        "ss_cents": calc["ss_cents"],
+        "medicare_cents": calc["medicare_cents"],
+        "net_cents": calc["net_cents"],
+        "ytd_gross_cents": ytd_before + gross,
+        "source": "hr_event_time",
+        "time_record_ids": rec_ids,
+        "timeclock_ids": rec_ids,
+    }
+    cur = conn.execute(
+        "INSERT INTO erp_acct_payrun_lines (payrun_id, employee_id,"
+        " hours, regular_hours, ot_hours, source, timeclock_ids,"
+        " gross_cents, federal_cents, ss_cents, medicare_cents,"
+        " net_cents, pay_stub_json, created_at)"
+        " VALUES (?, ?, ?, ?, ?, 'hr_event_time', ?, ?, ?, ?, ?, ?, ?, ?)",
+        (run["id"], emp["id"], total_hours, regular, ot,
+         json.dumps(rec_ids), calc["gross_cents"], calc["federal_cents"],
+         calc["ss_cents"], calc["medicare_cents"], calc["net_cents"],
+         json.dumps(stub), now))
+    line_id = cur.lastrowid
+    for rec_id in rec_ids:
+        conn.execute(
+            "UPDATE erp_hr_time_records SET payrun_line_id = ? WHERE id = ?",
+            (line_id, rec_id))
+    _acct_audit(conn, actor, "payroll.run.feed", "payroll_run", run["id"],
+                "fed %d HR event time records (%s %s) %.2f hours"
+                " (%.2f regular + %.2f OT) gross %d line #%d"
+                % (len(rec_ids), emp["first_name"],
+                   emp["last_name"], total_hours, regular, ot,
+                   gross, line_id))
+    conn.commit()
+    run_row = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                           (run["id"],)).fetchone()
+    out = _acct_payrun_dict(conn, run_row)
+    line = conn.execute(
+        "SELECT * FROM erp_acct_payrun_lines WHERE id = ?",
+        (line_id,)).fetchone()
+    line_d = dict(line)
+    try:
+        line_d["pay_stub"] = json.loads(line["pay_stub_json"] or "{}")
+    except (ValueError, TypeError):
+        line_d["pay_stub"] = {}
+    try:
+        line_d["timeclock_ids"] = json.loads(line["timeclock_ids"] or "[]")
+    except (ValueError, TypeError):
+        line_d["timeclock_ids"] = []
+    conn.close()
+    return jsonify(run=out, fed=len(rec_ids), fed_line=line_d,
+                   unmapped=[], already_fed=fed_rows,
+                   undated_rows=undated_rows,
+                   regular_hours=regular, ot_hours=ot)
+
+
+# HR Additions 2: performance reviews
+# Admin-only via _require_erp_admin() for creates/edits/submits and
+# the admin list -- "admin" is never a grantable perm, so no staff
+# member can reach those. Two endpoints are different on purpose:
+# the per-employee list and acknowledge accept any ERP caller
+# (_require_erp()) but only for the caller's OWN reviews -- the
+# caller must resolve to the reviewed employee via their staff_id
+# link or an exact email match (the loyalty-console actor-mapping
+# precedent in _erp_loyalty_actor_staff_id). Anyone who cannot be
+# resolved to that employee gets 403. The acknowledge button itself
+# lives in the self-service view (a separate subsystem); the admin
+# detail view here shows status only and never acknowledges on the
+# employee's behalf. Rating labels are fixed -- never invented per
+# review -- and travel with the number in every payload.
+HR_REVIEW_RATINGS = {
+    1: "Needs improvement",
+    2: "Developing",
+    3: "Meets expectations",
+    4: "Exceeds expectations",
+    5: "Exceptional",
+}
+HR_REVIEW_STATUSES = ("draft", "submitted", "acknowledged")
+
+
+def _hr_review_rating_label(rating):
+    """Fixed label for a 1-5 rating, or '' when no rating is set."""
+    if rating is None:
+        return ""
+    return HR_REVIEW_RATINGS.get(int(rating), "")
+
+
+def _hr_parse_rating(value):
+    """1-5 int, None for 'no rating yet' (drafts only), False = invalid."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return False
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return False
+    if value not in HR_REVIEW_RATINGS:
+        return False
+    return value
+
+
+def _hr_get_review_cycle(conn, cycle_id):
+    try:
+        cycle_id = int(cycle_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_review_cycles WHERE id = ?",
+                        (cycle_id,)).fetchone()
+
+
+def _hr_get_review(conn, review_id):
+    try:
+        review_id = int(review_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_reviews WHERE id = ?",
+                        (review_id,)).fetchone()
+
+
+def _hr_review_cycle_payload(conn, row):
+    count = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_reviews WHERE cycle_id = ?",
+        (row["id"],)).fetchone()[0]
+    return {
+        "id": row["id"], "name": row["name"],
+        "period": row["period"] or "", "due_date": row["due_date"] or "",
+        "review_count": count,
+        "created_by": row["created_by"] or "", "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _hr_review_payload(conn, row):
+    cycle = _hr_get_review_cycle(conn, row["cycle_id"])
+    emp = _hr_get_employee(conn, row["employee_id"])
+    return {
+        "id": row["id"], "cycle_id": row["cycle_id"],
+        "cycle_name": (cycle["name"] if cycle else ""),
+        "employee_id": row["employee_id"],
+        "employee_name": (emp["name"] if emp else ""),
+        "reviewer_name": row["reviewer_name"] or "",
+        "reviewer_email": row["reviewer_email"] or "",
+        "rating": row["rating"],
+        "rating_label": _hr_review_rating_label(row["rating"]),
+        "strengths": row["strengths"] or "",
+        "growth_areas": row["growth_areas"] or "",
+        "goals": row["goals"] or "",
+        "status": row["status"],
+        "acknowledged_by": row["acknowledged_by"] or "",
+        "acknowledged_at": row["acknowledged_at"] or "",
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _hr_resolve_caller_employee(conn):
+    """The erp_hr_employees row for the current ERP caller, or None.
+
+    Staff_id link wins; otherwise an exact (case-insensitive) email
+    match against the employee record -- the same mapping the
+    loyalty console uses (_erp_loyalty_actor_staff_id). A caller
+    with no employee record (e.g. an admin whose email matches no
+    employee) resolves to None and can never pass an ownership check.
+    """
+    email, staff_id = _erp_loyalty_actor_staff_id(conn)
+    if staff_id:
+        row = conn.execute(
+            "SELECT * FROM erp_hr_employees WHERE staff_id = ?",
+            (staff_id,)).fetchone()
+        if row:
+            return row
+    if email:
+        row = conn.execute(
+            "SELECT * FROM erp_hr_employees WHERE LOWER(email) = LOWER(?)",
+            (email,)).fetchone()
+        if row:
+            return row
+    return None
+
+
+def _hr_review_check_notes(data):
+    """Validate the free-text review fields. Returns (values, error)."""
+    reviewer_name = (data.get("reviewer_name") or "").strip()
+    reviewer_email = (data.get("reviewer_email") or "").strip().lower()
+    strengths = (data.get("strengths") or "").strip()
+    growth_areas = (data.get("growth_areas") or "").strip()
+    goals = (data.get("goals") or "").strip()
+    if len(reviewer_name) > 200 or len(reviewer_email) > 200:
+        return None, "reviewer name and email must be 200 characters or fewer"
+    if reviewer_email and not EMAIL_RE.match(reviewer_email):
+        return None, "reviewer_email must be a valid email"
+    for label, value in (("strengths", strengths),
+                         ("growth_areas", growth_areas), ("goals", goals)):
+        if len(value) > 10000:
+            return None, "%s must be 10000 characters or fewer" % label
+    return {
+        "reviewer_name": reviewer_name, "reviewer_email": reviewer_email,
+        "strengths": strengths, "growth_areas": growth_areas,
+        "goals": goals,
+    }, None
+
+
+@app.get("/api/erp/hr/review-cycles")
+def hr_list_review_cycles():
+    """Review cycles, newest first. Starts empty; the admin adds them."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_review_cycles ORDER BY id DESC").fetchall()
+    out = [_hr_review_cycle_payload(conn, r) for r in rows]
+    conn.close()
+    return jsonify(cycles=out)
+
+
+@app.post("/api/erp/hr/review-cycles")
+def hr_create_review_cycle():
+    """Create a review cycle (201). Name is required; due_date is a
+    real YYYY-MM-DD date or blank (no due date yet)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    period = (data.get("period") or "").strip()
+    due_date = (data.get("due_date") or "").strip()
+    if not name:
+        return jsonify(error="cycle name is required"), 400
+    if len(name) > 200 or len(period) > 100:
+        return jsonify(error="name must be 200 characters or fewer;"
+                       " period 100 or fewer"), 400
+    if not _hr_valid_hire_date(due_date):
+        return jsonify(error="due_date must be YYYY-MM-DD"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_review_cycles (name, period, due_date,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, '', '')",
+        (name, period, due_date, actor, now))
+    cycle_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.review_cycle_created",
+                     "hr_review_cycle", cycle_id, "created review cycle %r"
+                     % name)
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_review_cycles WHERE id = ?",
+                       (cycle_id,)).fetchone()
+    payload = _hr_review_cycle_payload(conn, row)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.get("/api/erp/hr/review-cycles/<int:cycle_id>")
+def hr_get_review_cycle_route(cycle_id):
+    """One cycle, with its review count."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_review_cycle(conn, cycle_id)
+    if not row:
+        conn.close()
+        return jsonify(error="review cycle not found"), 404
+    payload = _hr_review_cycle_payload(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.get("/api/erp/hr/reviews")
+def hr_list_reviews():
+    """Admin list: every review, optionally filtered by cycle_id
+    and/or employee_id. Non-admins never reach this endpoint -- they
+    use the per-employee list, which scopes to their own record."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    query = "SELECT * FROM erp_hr_reviews WHERE 1 = 1"
+    params = []
+    cycle_id = request.args.get("cycle_id")
+    if cycle_id:
+        try:
+            params.append(int(cycle_id))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="cycle_id must be an id"), 400
+        query += " AND cycle_id = ?"
+    employee_id = request.args.get("employee_id")
+    if employee_id:
+        try:
+            params.append(int(employee_id))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="employee_id must be an id"), 400
+        query += " AND employee_id = ?"
+    rows = conn.execute(query + " ORDER BY id DESC", params).fetchall()
+    out = [_hr_review_payload(conn, r) for r in rows]
+    conn.close()
+    return jsonify(reviews=out)
+
+
+@app.post("/api/erp/hr/reviews")
+def hr_create_review():
+    """Create a review in draft (201). employee_id + cycle_id must
+    exist; reviewer_name is required (free text -- the admin picks a
+    real person from existing employees/staff, never an invented
+    name). Rating is optional on a draft (set it before submitting)
+    and must be 1-5 when given. One review per employee per cycle
+    (409 on a second one)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    try:
+        employee_id = int(data.get("employee_id"))
+        cycle_id = int(data.get("cycle_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="employee_id and cycle_id are required"), 400
+    rating = _hr_parse_rating(data.get("rating"))
+    if rating is False:
+        return jsonify(error="rating must be 1-5"), 400
+    values, verr = _hr_review_check_notes(data)
+    if verr:
+        return jsonify(error=verr), 400
+    if not values["reviewer_name"]:
+        return jsonify(error="reviewer_name is required"), 400
+    conn = db()
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    cycle = _hr_get_review_cycle(conn, cycle_id)
+    if not cycle:
+        conn.close()
+        return jsonify(error="review cycle not found"), 404
+    dup = conn.execute(
+        "SELECT id FROM erp_hr_reviews WHERE cycle_id = ? AND employee_id = ?",
+        (cycle_id, employee_id)).fetchone()
+    if dup:
+        conn.close()
+        return jsonify(error="this employee already has a review in"
+                       " this cycle"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_reviews (cycle_id, employee_id, reviewer_name,"
+        " reviewer_email, rating, strengths, growth_areas, goals, status,"
+        " acknowledged_by, acknowledged_at, created_by, created_at,"
+        " updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', '', '', ?, ?, '', '')",
+        (cycle_id, employee_id, values["reviewer_name"],
+         values["reviewer_email"], rating, values["strengths"],
+         values["growth_areas"], values["goals"], actor, now))
+    review_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.review_created", "hr_review",
+                     review_id, "created a draft review for %s in cycle %r"
+                     % (emp["name"] or "", cycle["name"] or ""))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_reviews WHERE id = ?",
+                       (review_id,)).fetchone()
+    payload = _hr_review_payload(conn, row)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.get("/api/erp/hr/reviews/<int:review_id>")
+def hr_get_review_route(review_id):
+    """One review: admin, or the reviewed employee themself. Any
+    other caller gets 403 -- reviews are never visible across
+    employees."""
+    _, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_review(conn, review_id)
+    if not row:
+        conn.close()
+        return jsonify(error="review not found"), 404
+    if _erp_role() != "admin":
+        mine = _hr_resolve_caller_employee(conn)
+        if not mine or mine["id"] != row["employee_id"]:
+            conn.close()
+            return jsonify(error="only the reviewed employee can"
+                           " view this review"), 403
+    payload = _hr_review_payload(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.get("/api/erp/hr/employees/<int:employee_id>/reviews")
+def hr_list_employee_reviews(employee_id):
+    """That employee's reviews only. Admins may list any employee;
+    a non-admin caller sees this only when the employee IS them
+    (staff_id link or exact email match); anyone else gets 403, so
+    there is no cross-employee list for non-admins."""
+    _, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    if _erp_role() != "admin":
+        mine = _hr_resolve_caller_employee(conn)
+        if not mine or mine["id"] != employee_id:
+            conn.close()
+            return jsonify(error="employees can only view their own"
+                           " reviews"), 403
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_reviews WHERE employee_id = ? ORDER BY id DESC",
+        (employee_id,)).fetchall()
+    out = [_hr_review_payload(conn, r) for r in rows]
+    conn.close()
+    return jsonify(reviews=out, employee_id=employee_id)
+
+
+@app.post("/api/erp/hr/reviews/<int:review_id>/update")
+def hr_update_review(review_id):
+    """Edit a draft or submitted review (rating, reviewer, notes).
+    Acknowledged reviews are final (400). The cycle and employee
+    links never change -- create a new review instead."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    rating = None
+    rating_given = "rating" in data
+    if rating_given:
+        rating = _hr_parse_rating(data.get("rating"))
+        if rating is False:
+            return jsonify(error="rating must be 1-5"), 400
+    values, verr = _hr_review_check_notes(data)
+    if verr:
+        return jsonify(error=verr), 400
+    conn = db()
+    row = _hr_get_review(conn, review_id)
+    if not row:
+        conn.close()
+        return jsonify(error="review not found"), 404
+    if row["status"] == "acknowledged":
+        conn.close()
+        return jsonify(error="acknowledged reviews are final and"
+                       " cannot be edited"), 400
+    # Only overwrite fields the request actually supplies; an absent
+    # reviewer_name keeps the stored one, an explicit blank is 400.
+    reviewer_name = values["reviewer_name"]
+    if "reviewer_name" in data and not reviewer_name:
+        conn.close()
+        return jsonify(error="reviewer_name is required"), 400
+    if "reviewer_name" not in data:
+        reviewer_name = row["reviewer_name"]
+    reviewer_email = (values["reviewer_email"]
+                      if "reviewer_email" in data else row["reviewer_email"])
+    strengths = (values["strengths"] if "strengths" in data
+                 else row["strengths"])
+    growth_areas = (values["growth_areas"] if "growth_areas" in data
+                    else row["growth_areas"])
+    goals = values["goals"] if "goals" in data else row["goals"]
+    if "reviewer_email" in data and reviewer_email             and not EMAIL_RE.match(reviewer_email):
+        conn.close()
+        return jsonify(error="reviewer_email must be a valid email"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_reviews SET reviewer_name = ?, reviewer_email = ?,"
+        " rating = ?, strengths = ?, growth_areas = ?, goals = ?,"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (reviewer_name, reviewer_email,
+         rating if rating_given else row["rating"],
+         strengths, growth_areas, goals, actor, now, review_id))
+    _erp_staff_audit(conn, actor, "hr.review_updated", "hr_review",
+                     review_id, "updated review #%d (status %s)"
+                     % (review_id, row["status"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_reviews WHERE id = ?",
+                       (review_id,)).fetchone()
+    payload = _hr_review_payload(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/reviews/<int:review_id>/submit")
+def hr_submit_review(review_id):
+    """draft -> submitted. A review can only be submitted once it has
+    a rating (1-5) and a reviewer -- the employee is acknowledging a
+    finished review, not a blank one."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_review(conn, review_id)
+    if not row:
+        conn.close()
+        return jsonify(error="review not found"), 404
+    if row["status"] != "draft":
+        conn.close()
+        return jsonify(error="only a draft review can be submitted"), 400
+    if row["rating"] is None or not (row["reviewer_name"] or "").strip():
+        conn.close()
+        return jsonify(error="a review needs a rating (1-5) and a reviewer"
+                       " before it can be submitted"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_reviews SET status = 'submitted', updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (actor, now, review_id))
+    _erp_staff_audit(conn, actor, "hr.review_submitted", "hr_review",
+                     review_id, "submitted review #%d" % review_id)
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_reviews WHERE id = ?",
+                       (review_id,)).fetchone()
+    payload = _hr_review_payload(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/reviews/<int:review_id>/acknowledge")
+def hr_acknowledge_review(review_id):
+    """submitted -> acknowledged, by the reviewed employee themself.
+
+    Gated by _require_erp() plus an ownership check: the caller must
+    resolve to the reviewed employee via their staff_id link or an
+    exact email match. An admin (or any other employee) who is not
+    the reviewed employee gets 403 -- nobody acknowledges on the
+    employee's behalf. The acknowledge button lives in the
+    self-service view (separate subsystem); this endpoint is the
+    shared path it calls. Re-acknowledging is a no-op."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_review(conn, review_id)
+    if not row:
+        conn.close()
+        return jsonify(error="review not found"), 404
+    mine = _hr_resolve_caller_employee(conn)
+    if not mine or mine["id"] != row["employee_id"]:
+        conn.close()
+        return jsonify(error="only the reviewed employee can"
+                       " acknowledge this review"), 403
+    if row["status"] == "acknowledged":
+        payload = _hr_review_payload(conn, row)
+        payload["already_acknowledged"] = True
+        conn.close()
+        return jsonify(payload)
+    if row["status"] != "submitted":
+        conn.close()
+        return jsonify(error="only a submitted review can be"
+                       " acknowledged"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_reviews SET status = 'acknowledged',"
+        " acknowledged_by = ?, acknowledged_at = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (actor, now, actor, now, review_id))
+    _erp_staff_audit(conn, actor, "hr.review_acknowledged", "hr_review",
+                     review_id, "review #%d acknowledged by the employee"
+                     % review_id)
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_reviews WHERE id = ?",
+                       (review_id,)).fetchone()
+    payload = _hr_review_payload(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+# HR Additions 1: PTO / time-off tracking. Admin-only via
+# _require_erp_admin(), like the rest of HR. Request types are an
+# admin-configurable list (erp_hr_pto_types), seeded on first use with
+# vacation / sick / personal and no balances anywhere: every balance
+# starts at 0 and only an admin grant moves it -- there is NO accrual
+# rate and nothing accrues automatically. Days are decimal days as
+# REAL: a request's days are the inclusive calendar days from
+# start_date to end_date (2026-12-09..2026-12-11 is 3 days); the REAL
+# type leaves room for half-days later. Balance is computed live as
+# granted - approved days, never stored, so it cannot drift.
+# Flow: draft -> pending -> approved/denied. The approver must differ
+# from the requester (403, the bill-pay self-approve pattern). Approve
+# WARNS (never blocks) when approved time overlaps a scheduled event
+# the person is rostered for, and REFUSES a balance below zero unless
+# the admin passes override_allowed=true, which is audited. PTO has no
+# money in it: nothing here writes erp_acct_* or any payroll table.
+# Like the rest of HR, these tables are NOT in _ERP_RESET_TABLES.
+HR_PTO_DEFAULT_TYPES = ("vacation", "sick", "personal")
+HR_PTO_STATUSES = ("draft", "pending", "approved", "denied")
+
+
+def _hr_pto_seed_types(conn):
+    """Seed the three default request types on first use (fixed list,
+    not invented employee data). INSERT OR IGNORE: safe to call on
+    every PTO endpoint."""
+    now = datetime.now(timezone.utc).isoformat()
+    for name in HR_PTO_DEFAULT_TYPES:
+        conn.execute(
+            "INSERT OR IGNORE INTO erp_hr_pto_types (name, active,"
+            " created_by, created_at) VALUES (?, 1, '', ?)",
+            (name, now))
+
+
+def _hr_pto_type_dict(row):
+    return {"id": row["id"], "name": row["name"],
+            "active": bool(row["active"]),
+            "created_by": row["created_by"] or "",
+            "created_at": row["created_at"]}
+
+
+def _hr_pto_resolve_type(conn, data):
+    """Resolve a request type from {"type_id": n} or {"type": name}
+    (name matched case-insensitively). None when not found."""
+    tid = data.get("type_id")
+    if tid is not None and tid != "":
+        try:
+            tid = int(tid)
+        except (TypeError, ValueError):
+            return None
+        return conn.execute("SELECT * FROM erp_hr_pto_types WHERE id = ?",
+                            (tid,)).fetchone()
+    name = (data.get("type") or "").strip().lower()
+    if not name:
+        return None
+    return conn.execute(
+        "SELECT * FROM erp_hr_pto_types WHERE lower(name) = ?",
+        (name,)).fetchone()
+
+
+def _hr_pto_parse_days(value):
+    """A grant day count: a real number >= 0. False = invalid.
+    Booleans are rejected (True would parse as 1)."""
+    if value is None or value == "" or isinstance(value, bool):
+        return False
+    try:
+        days = float(value)
+    except (TypeError, ValueError):
+        return False
+    if days < 0:
+        return False
+    return days
+
+
+def _hr_pto_span_days(start_date, end_date):
+    """Inclusive calendar days from start to end (same day = 1)."""
+    start = datetime.strptime(start_date, "%Y-%m-%d")
+    end = datetime.strptime(end_date, "%Y-%m-%d")
+    return float((end - start).days + 1)
+
+
+def _hr_pto_warnings(conn, employee_id, start_date, end_date):
+    """Events the person is rostered for whose date falls inside the
+    requested span. Warnings only -- callers never block on these."""
+    rows = conn.execute(
+        "SELECT e.id, e.name, e.date FROM erp_hr_event_staff s"
+        " JOIN erp_hr_events e ON e.id = s.event_id"
+        " WHERE s.employee_id = ? AND e.date >= ? AND e.date <= ?"
+        " ORDER BY e.date, e.name",
+        (employee_id, start_date, end_date)).fetchall()
+    return [{"event_id": r["id"], "event_name": r["name"] or "",
+             "event_date": r["date"] or ""} for r in rows]
+
+
+def _hr_pto_approved_days(conn, employee_id, type_id):
+    row = conn.execute(
+        "SELECT COALESCE(SUM(days), 0) AS total FROM erp_hr_pto_requests"
+        " WHERE employee_id = ? AND type_id = ? AND status = 'approved'",
+        (employee_id, type_id)).fetchone()
+    return float(row["total"] or 0)
+
+
+def _hr_pto_balance_for(conn, employee_id, type_row):
+    grow = conn.execute(
+        "SELECT granted_days FROM erp_hr_pto_balances"
+        " WHERE employee_id = ? AND type_id = ?",
+        (employee_id, type_row["id"])).fetchone()
+    granted = float(grow["granted_days"]) if grow else 0.0
+    approved = _hr_pto_approved_days(conn, employee_id, type_row["id"])
+    return {"type_id": type_row["id"], "type": type_row["name"],
+            "granted_days": granted, "approved_days": approved,
+            "remaining_days": granted - approved}
+
+
+def _hr_pto_request_dict(conn, row):
+    return {"id": row["id"], "employee_id": row["employee_id"],
+            "type_id": row["type_id"], "type": row["type_name"] or "",
+            "start_date": row["start_date"] or "",
+            "end_date": row["end_date"] or "",
+            "days": float(row["days"]),
+            "status": row["status"],
+            "notes": row["notes"] or "",
+            "requested_by": row["requested_by"] or "",
+            "decided_by": row["decided_by"] or "",
+            "decided_at": row["decided_at"] or "",
+            "override_used": bool(row["override_used"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"] or "",
+            "warnings": _hr_pto_warnings(
+                conn, row["employee_id"], row["start_date"] or "",
+                row["end_date"] or "")}
+
+
+def _hr_pto_get_request(conn, req_id):
+    try:
+        req_id = int(req_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_pto_requests WHERE id = ?",
+                        (req_id,)).fetchone()
+
+
+@app.get("/api/erp/hr/pto-types")
+def hr_pto_list_types():
+    """The admin-configurable request-type list, seeded on first use
+    with vacation / sick / personal. Inactive types stay listed
+    (marked inactive) so old requests keep their label."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    _hr_pto_seed_types(conn)
+    conn.commit()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_pto_types ORDER BY name").fetchall()
+    out = [_hr_pto_type_dict(r) for r in rows]
+    conn.close()
+    return jsonify(types=out)
+
+
+@app.post("/api/erp/hr/pto-types")
+def hr_pto_create_type():
+    """Add a request type. Names are unique (case-insensitive) -- a
+    second add of the same name is a 409, even for an inactive type."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    if len(name) > 100:
+        return jsonify(error="name must be 100 characters or fewer"), 400
+    conn = db()
+    _hr_pto_seed_types(conn)
+    existing = conn.execute(
+        "SELECT * FROM erp_hr_pto_types WHERE lower(name) = ?",
+        (name.lower(),)).fetchone()
+    if existing:
+        conn.close()
+        return jsonify(error="a PTO type named '%s' already exists" % name), 409
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_pto_types (name, active, created_by, created_at)"
+        " VALUES (?, 1, ?, ?)", (name, actor, now))
+    _erp_staff_audit(conn, actor, "hr.pto_type_created", "hr_pto_type",
+                     cur.lastrowid, "PTO type '%s' added" % name)
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_pto_types WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    payload = _hr_pto_type_dict(row)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.post("/api/erp/hr/pto-types/<int:type_id>/deactivate")
+def hr_pto_deactivate_type(type_id):
+    """Retire a request type: it stops being offered for new requests
+    but stays on old ones. Already-inactive is a 400."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_hr_pto_types WHERE id = ?",
+                       (type_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="PTO type not found"), 404
+    if not row["active"]:
+        conn.close()
+        return jsonify(error="PTO type '%s' is already inactive"
+                       % row["name"]), 400
+    conn.execute("UPDATE erp_hr_pto_types SET active = 0 WHERE id = ?",
+                 (type_id,))
+    _erp_staff_audit(conn, actor, "hr.pto_type_deactivated", "hr_pto_type",
+                     type_id, "PTO type '%s' deactivated" % row["name"])
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_pto_types WHERE id = ?",
+                       (type_id,)).fetchone()
+    payload = _hr_pto_type_dict(row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.get("/api/erp/hr/employees/<int:employee_id>/pto-balance")
+def hr_pto_balance(employee_id):
+    """Per-type balances for one employee: granted (admin-set, starts
+    at 0) minus approved days, live-computed so it cannot drift."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    _hr_pto_seed_types(conn)
+    conn.commit()
+    types = conn.execute(
+        "SELECT * FROM erp_hr_pto_types WHERE active = 1"
+        " ORDER BY name").fetchall()
+    out = [_hr_pto_balance_for(conn, employee_id, t) for t in types]
+    conn.close()
+    return jsonify(employee_id=employee_id, balances=out)
+
+
+@app.post("/api/erp/hr/employees/<int:employee_id>/pto-grant")
+def hr_pto_grant(employee_id):
+    """Set an employee's annual grant (decimal days, REAL) for one
+    type. Admin-only; there is no accrual and no default above 0."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    days = _hr_pto_parse_days(data.get("granted_days"))
+    if days is False:
+        return jsonify(error="granted_days must be a number, 0 or more"), 400
+    conn = db()
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    _hr_pto_seed_types(conn)
+    type_row = _hr_pto_resolve_type(conn, data)
+    if not type_row:
+        conn.close()
+        return jsonify(error="unknown PTO type"), 400
+    if not type_row["active"]:
+        conn.close()
+        return jsonify(error="PTO type '%s' is inactive"
+                       % type_row["name"]), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO erp_hr_pto_balances (employee_id, type_id,"
+        " granted_days, updated_by, updated_at) VALUES (?, ?, ?, ?, ?)"
+        " ON CONFLICT(employee_id, type_id) DO UPDATE SET"
+        " granted_days = excluded.granted_days,"
+        " updated_by = excluded.updated_by,"
+        " updated_at = excluded.updated_at",
+        (employee_id, type_row["id"], days, actor, now))
+    _erp_staff_audit(conn, actor, "hr.pto_grant_set", "hr_pto_balance",
+                     employee_id, "PTO grant for %s set to %.2f days for %s"
+                     % (type_row["name"], days, emp["name"]))
+    conn.commit()
+    payload = _hr_pto_balance_for(conn, employee_id, type_row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.get("/api/erp/hr/pto-requests")
+def hr_pto_list_requests():
+    """All PTO requests, optionally filtered by employee_id / status.
+    Each row carries its overlap warnings."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    if status and status not in HR_PTO_STATUSES:
+        return jsonify(error="status must be draft, pending, approved"
+                       " or denied"), 400
+    employee_id = request.args.get("employee_id")
+    if employee_id is not None and employee_id != "":
+        try:
+            employee_id = int(employee_id)
+        except (TypeError, ValueError):
+            return jsonify(error="employee_id must be a number"), 400
+    else:
+        employee_id = None
+    conn = db()
+    where = []
+    args = []
+    if status:
+        where.append("status = ?")
+        args.append(status)
+    if employee_id is not None:
+        where.append("employee_id = ?")
+        args.append(employee_id)
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_pto_requests"
+        + (" WHERE " + " AND ".join(where) if where else "")
+        + " ORDER BY id DESC", args).fetchall()
+    out = [_hr_pto_request_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(requests=out)
+
+
+@app.post("/api/erp/hr/pto-requests")
+def hr_pto_create_request():
+    """Create a time-off request as a DRAFT. Days are the inclusive
+    calendar days of the span. The response carries overlap warnings
+    for rostered events inside the span -- warnings only, never a
+    block."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    try:
+        employee_id = int(data.get("employee_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="employee_id must be a number"), 400
+    start_date = (data.get("start_date") or "").strip()
+    end_date = (data.get("end_date") or "").strip()
+    if not start_date or not _hr_valid_hire_date(start_date):
+        return jsonify(error="start_date must be YYYY-MM-DD"), 400
+    if not end_date or not _hr_valid_hire_date(end_date):
+        return jsonify(error="end_date must be YYYY-MM-DD"), 400
+    if end_date < start_date:
+        return jsonify(error="end_date must be on or after start_date"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 1000:
+        return jsonify(error="notes must be 1000 characters or fewer"), 400
+    conn = db()
+    emp = _hr_get_employee(conn, employee_id)
+    if not emp:
+        conn.close()
+        return jsonify(error="employee not found"), 404
+    _hr_pto_seed_types(conn)
+    type_row = _hr_pto_resolve_type(conn, data)
+    if not type_row:
+        conn.close()
+        return jsonify(error="unknown PTO type"), 400
+    if not type_row["active"]:
+        conn.close()
+        return jsonify(error="PTO type '%s' is inactive"
+                       % type_row["name"]), 400
+    days = _hr_pto_span_days(start_date, end_date)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_pto_requests (employee_id, type_id, type_name,"
+        " start_date, end_date, days, status, notes, requested_by,"
+        " decided_by, decided_at, override_used, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, '', '', 0, ?, ?)",
+        (employee_id, type_row["id"], type_row["name"], start_date,
+         end_date, days, notes, actor, now, now))
+    _erp_staff_audit(conn, actor, "hr.pto_request_created", "hr_pto_request",
+                     cur.lastrowid, "PTO request #%d: %s %.2f days %s..%s"
+                     " for %s (draft)"
+                     % (cur.lastrowid, type_row["name"], days, start_date,
+                        end_date, emp["name"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_hr_pto_requests WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    payload = _hr_pto_request_dict(conn, row)
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.post("/api/erp/hr/pto-requests/<int:req_id>/submit")
+def hr_pto_submit_request(req_id):
+    """Move a draft to pending, ready for another admin to decide.
+    Any admin may submit; the approver still cannot be the requester."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    req = _hr_pto_get_request(conn, req_id)
+    if not req:
+        conn.close()
+        return jsonify(error="PTO request not found"), 404
+    if req["status"] != "draft":
+        conn.close()
+        return jsonify(error="only a draft request can be submitted"
+                       " (status: %s)" % req["status"]), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_hr_pto_requests SET status = 'pending',"
+                 " updated_at = ? WHERE id = ?", (now, req_id))
+    _erp_staff_audit(conn, actor, "hr.pto_request_submitted",
+                     "hr_pto_request", req_id,
+                     "PTO request #%d submitted for approval (requested by"
+                     " %s)" % (req_id, req["requested_by"] or ""))
+    conn.commit()
+    row = _hr_pto_get_request(conn, req_id)
+    payload = _hr_pto_request_dict(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/pto-requests/<int:req_id>/approve")
+def hr_pto_approve_request(req_id):
+    """Approve a pending request. The approver must differ from the
+    requester (403, the bill-pay self-approve pattern). Approval
+    refuses a balance below zero unless override_allowed is true --
+    an override is recorded on the request and in the audit log.
+    Overlap warnings are returned but never block approval."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    override = bool(data.get("override_allowed"))
+    conn = db()
+    req = _hr_pto_get_request(conn, req_id)
+    if not req:
+        conn.close()
+        return jsonify(error="PTO request not found"), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify(error="only a pending request can be approved"
+                       " (status: %s)" % req["status"]), 400
+    if (actor or "") == (req["requested_by"] or ""):
+        conn.close()
+        return jsonify(error="you cannot approve your own time-off"
+                       " request; another admin must approve it"), 403
+    type_row = conn.execute(
+        "SELECT * FROM erp_hr_pto_types WHERE id = ?",
+        (req["type_id"],)).fetchone()
+    if not type_row:
+        conn.close()
+        return jsonify(error="PTO type no longer exists"), 400
+    balance = _hr_pto_balance_for(conn, req["employee_id"], type_row)
+    remaining_after = balance["remaining_days"] - float(req["days"])
+    if remaining_after < 0 and not override:
+        warnings = _hr_pto_warnings(
+            conn, req["employee_id"], req["start_date"], req["end_date"])
+        conn.close()
+        return jsonify(error="approving %.2f days would take the %s"
+                       " balance to %.2f days below zero; pass"
+                       " override_allowed to approve anyway"
+                       % (float(req["days"]), type_row["name"],
+                          remaining_after),
+                       balance=balance, warnings=warnings), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_pto_requests SET status = 'approved',"
+        " decided_by = ?, decided_at = ?, override_used = ?,"
+        " updated_at = ? WHERE id = ?",
+        (actor, now, 1 if override else 0, now, req_id))
+    _erp_staff_audit(conn, actor, "hr.pto_request_approved",
+                     "hr_pto_request", req_id,
+                     "PTO request #%d approved by %s (requested by %s)"
+                     "%s" % (req_id, actor or "", req["requested_by"] or "",
+                             " -- OVERRIDE: balance went negative"
+                             if override else ""))
+    conn.commit()
+    row = _hr_pto_get_request(conn, req_id)
+    payload = _hr_pto_request_dict(conn, row)
+    payload["balance"] = _hr_pto_balance_for(conn, req["employee_id"],
+                                             type_row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/pto-requests/<int:req_id>/deny")
+def hr_pto_deny_request(req_id):
+    """Deny a pending request. Posts nothing; the decision is by an
+    admin other than the requester, like approval."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    req = _hr_pto_get_request(conn, req_id)
+    if not req:
+        conn.close()
+        return jsonify(error="PTO request not found"), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify(error="only a pending request can be denied"
+                       " (status: %s)" % req["status"]), 400
+    if (actor or "") == (req["requested_by"] or ""):
+        conn.close()
+        return jsonify(error="you cannot deny your own time-off request;"
+                       " another admin must decide it"), 403
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_pto_requests SET status = 'denied',"
+        " decided_by = ?, decided_at = ?, updated_at = ? WHERE id = ?",
+        (actor, now, now, req_id))
+    _erp_staff_audit(conn, actor, "hr.pto_request_denied",
+                     "hr_pto_request", req_id,
+                     "PTO request #%d denied by %s (requested by %s)"
+                     % (req_id, actor or "", req["requested_by"] or ""))
+    conn.commit()
+    row = _hr_pto_get_request(conn, req_id)
+    payload = _hr_pto_request_dict(conn, row)
     conn.close()
     return jsonify(payload)
 
@@ -14757,6 +17943,14 @@ def _stores_sale_dict(row):
     return d
 
 
+def _stores_pos_ledger_view(row):
+    # Ledger posting state for a POS sale row, for the intake response
+    # and the register receipt.
+    return {"status": row["ledger_status"] or "unposted",
+            "entry_id": row["ledger_entry_id"],
+            "error": row["ledger_error"] or ""}
+
+
 def _stores_zreport_dict(row):
     d = dict(row)
     try:
@@ -15151,8 +18345,12 @@ def stores_pos_sale(store_id):
     Items carry flavor + qty + amount_cents; amounts must be whole
     cents. An optional tenders object {cash, card, gift_card} in
     cents records a split tender and must sum to the total; it is
-    what the Z-report totals by tender. Never touches the
-    accounting ledger."""
+    what the Z-report totals by tender. Intake posts to the ledger
+    (POS wiring, Nov 2026): a locked period leaves the sale
+    intake-only with ledger_status 'post_failed' and the error, never
+    a silent skip -- the backfill endpoint retries it once the
+    period is open. A re-posted duplicate retries the posting when
+    the original never posted."""
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -15170,12 +18368,54 @@ def stores_pos_sale(store_id):
     if not sale_key:
         conn.close()
         return jsonify(error="sale_key is required"), 400
+    member_id = None
+    member_email = ""
+    if data.get("member_id") is not None:
+        member_id = _stores_int(data.get("member_id"))
+        if member_id is None or member_id <= 0:
+            conn.close()
+            return jsonify(
+                error="member_id must be a positive integer"), 400
+    if data.get("member_email") is not None:
+        member_email = str(data.get("member_email") or "").strip()[:200]
     existing = conn.execute(
         "SELECT * FROM erp_store_sales WHERE store_id = ? AND sale_key = ?",
         (store_id, sale_key)).fetchone()
     if existing:
+        # A register retry of a sale whose first intake never posted
+        # (locked period, bad tender) retries the posting -- a voided
+        # sale never posts.
+        ledger = _stores_pos_ledger_view(existing)
+        if existing["ledger_status"] in ("unposted", "post_failed") \
+                and not _acct_pos_sale_voided(conn, store_id, sale_key):
+            _eid, _status, _error = _acct_post_pos_sale(
+                conn, actor, store_id, existing)
+            if _status == "posted":
+                conn.execute(
+                    "UPDATE erp_store_sales SET ledger_status = 'posted',"
+                    " ledger_entry_id = ?, ledger_error = '' WHERE id = ?",
+                    (_eid, existing["id"]))
+            elif _error:
+                conn.execute(
+                    "UPDATE erp_store_sales SET ledger_status = 'post_failed',"
+                    " ledger_error = ? WHERE id = ?",
+                    (_error, existing["id"]))
+            conn.commit()
+            existing = conn.execute(
+                "SELECT * FROM erp_store_sales WHERE id = ?",
+                (existing["id"],)).fetchone()
+            ledger = _stores_pos_ledger_view(existing)
+        _stores_credit_pos_kernels(conn, store_id, existing)
+        conn.commit()
+        existing = conn.execute(
+            "SELECT * FROM erp_store_sales WHERE id = ?",
+            (existing["id"],)).fetchone()
         conn.close()
-        return jsonify(sale=_stores_sale_dict(existing), duplicate=True)
+        return jsonify(sale=_stores_sale_dict(existing), duplicate=True,
+                       ledger=ledger,
+                       kernels={"credited": int(
+                           existing["kernels_credited"] or 0),
+                                "member_id": existing["member_id"]})
     items = data.get("items")
     if not isinstance(items, list) or not items:
         conn.close()
@@ -15198,8 +18438,29 @@ def stores_pos_sale(store_id):
         if amount is None or amount < 0:
             conn.close()
             return jsonify(error="each item amount_cents must be a whole number of cents, 0 or more"), 400
-        cleaned.append({"flavor": flavor, "qty": qty,
-                        "amount_cents": amount})
+        # GS1 traceability (Sunrise 2027): a scanned bag may carry
+        # a lot (AI 10) and an expiry (AI 17). Both ride on the item
+        # when present; a malformed value is rejected, never stored.
+        item = {"flavor": flavor, "qty": qty, "amount_cents": amount}
+        if it.get("lot") is not None:
+            lot = it.get("lot")
+            if not isinstance(lot, str) or not lot.strip() \
+                    or len(lot) > 64:
+                conn.close()
+                return jsonify(
+                    error="each item lot must be a string of"
+                    " 1-64 characters"), 400
+            item["lot"] = lot.strip()
+        if it.get("expiry") is not None:
+            expiry = it.get("expiry")
+            if not isinstance(expiry, str) \
+                    or not _legal_valid_date(expiry):
+                conn.close()
+                return jsonify(
+                    error="each item expiry must be a YYYY-MM-DD"
+                    " date"), 400
+            item["expiry"] = expiry
+        cleaned.append(item)
         total += amount
     if "total_cents" in data and data.get("total_cents") is not None:
         stated = _stores_int(data.get("total_cents"))
@@ -15228,6 +18489,23 @@ def stores_pos_sale(store_id):
             conn.close()
             return jsonify(
                 error="tenders must sum to the sale total"), 400
+    # Terminal tie-in: when a Terminal charge was confirmed for this
+    # sale key, the card tender must equal the confirmed charge --
+    # the card amount is never a typed-in number. With no confirmed
+    # charge the card tender is record-only, as before. A confirmed
+    # charge also forbids completing the sale with no card tender
+    # at all, so a charge can never become an orphan by accident.
+    _term_total = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) AS total"
+        " FROM erp_terminal_payments WHERE store_id = ?"
+        " AND sale_key = ? AND status = 'succeeded'",
+        (store_id, sale_key)).fetchone()
+    _term_total = int(_term_total["total"] or 0)
+    if _term_total > 0 and int(tenders.get("card") or 0) != _term_total:
+        conn.close()
+        return jsonify(
+            error="card tender does not match the confirmed"
+            " Terminal charge"), 400
     register = (data.get("register") or "").strip()
     tender = (data.get("tender") or "").strip()
     sold_at = (data.get("sold_at") or data.get("timestamp") or "").strip()
@@ -15237,15 +18515,182 @@ def stores_pos_sale(store_id):
     cur = conn.execute(
         "INSERT INTO erp_store_sales (store_id, sale_key, register, tender,"
         " total_cents, items_json, tenders_json, sold_at, created_by,"
-        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        " created_at, sale_kind, member_id, member_email, kernels_credited)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'popcorn', ?, ?, 0)",
         (store_id, sale_key, register, tender, total,
-         json.dumps(cleaned), json.dumps(tenders), sold_at, actor, now))
+         json.dumps(cleaned), json.dumps(tenders), sold_at, actor, now,
+         member_id, member_email))
     row = conn.execute(
         "SELECT * FROM erp_store_sales WHERE id = ?",
         (cur.lastrowid,)).fetchone()
+    # Post to the ledger on intake. A failure (locked period, unknown
+    # tender) leaves the sale intake-only with the error recorded --
+    # the sale itself is still 201, and the backfill retries it. A
+    # sale voided before intake never posts.
+    ledger = _stores_pos_ledger_view(row)
+    if _acct_pos_sale_voided(conn, store_id, sale_key):
+        conn.execute(
+            "UPDATE erp_store_sales SET ledger_status = 'voided'"
+            " WHERE id = ?", (row["id"],))
+    else:
+        _eid, _status, _error = _acct_post_pos_sale(
+            conn, actor, store_id, row)
+        if _status == "posted":
+            conn.execute(
+                "UPDATE erp_store_sales SET ledger_status = 'posted',"
+                " ledger_entry_id = ?, ledger_error = '' WHERE id = ?",
+                (_eid, row["id"]))
+        elif _error:
+            conn.execute(
+                "UPDATE erp_store_sales SET ledger_status = 'post_failed',"
+                " ledger_error = ? WHERE id = ?",
+                (_error, row["id"]))
+    _stores_credit_pos_kernels(conn, store_id, row)
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_store_sales WHERE id = ?",
+        (row["id"],)).fetchone()
+    ledger = _stores_pos_ledger_view(row)
+    conn.close()
+    return jsonify(sale=_stores_sale_dict(row), ledger=ledger,
+                   kernels={"credited": int(row["kernels_credited"] or 0),
+                            "member_id": row["member_id"]}), 201
+
+
+@app.post("/api/erp/stores/<int:store_id>/pos-sales/backfill")
+def stores_pos_sales_backfill(store_id):
+    """Admin-only repair: post intake sales recorded before the POS
+    ledger wiring (or while their period was locked), idempotently.
+    Also retries the ledger reversal for fully-voided sales whose
+    reversal failed at void time (e.g. today was locked then).
+    Per-sale failures are counted, never abort the run."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    counts = {"posted": 0, "already_posted": 0, "skipped_voided": 0,
+              "skipped_zero": 0, "skipped_gift_card": 0,
+              "failed": 0, "reversed": 0,
+              "reversal_failed": 0, "failures": []}
+    for sale in conn.execute(
+            "SELECT * FROM erp_store_sales WHERE store_id = ? ORDER BY id",
+            (store_id,)).fetchall():
+        key = "pos:%d:%s" % (store_id, sale["sale_key"])
+        if (sale["sale_kind"] if "sale_kind" in sale.keys()
+                else "popcorn") == "gift_card":
+            # A gift-card sale is a liability, never income: its only
+            # ledger posting is giftcard:<code>. Retry that posting
+            # when it never posted (e.g. the period was locked); never
+            # route it through the retail-income posting.
+            voided = _acct_pos_sale_voided(conn, store_id, sale["sale_key"])
+            if voided:
+                counts["skipped_voided"] += 1
+                if sale["ledger_status"] != "voided":
+                    conn.execute(
+                        "UPDATE erp_store_sales SET ledger_status = 'voided'"
+                        " WHERE id = ?", (sale["id"],))
+                continue
+            _gc = _stores_gift_card_for_sale(conn, store_id, sale["sale_key"])
+            if _gc is None:
+                counts["failed"] += 1
+                counts["failures"].append(
+                    {"source_key": key,
+                     "error": "gift card record missing for gift-card sale"})
+                continue
+            _gc_key = "giftcard:%s" % (_gc["code"] or "")
+            _gc_post = _acct_sale_posted(conn, _gc_key)
+            if _gc_post and _gc_post["status"] == "posted":
+                counts["skipped_gift_card"] += 1
+                if sale["ledger_status"] != "posted":
+                    conn.execute(
+                        "UPDATE erp_store_sales SET ledger_status = 'posted',"
+                        " ledger_entry_id = ?, ledger_error = '' WHERE id = ?",
+                        (_gc_post["journal_entry_id"], sale["id"]))
+                continue
+            _geid, _gstatus, _gerror = _acct_post_gift_card_purchase(
+                conn, actor, _gc)
+            if _gstatus == "posted":
+                counts["posted"] += 1
+                conn.execute(
+                    "UPDATE erp_store_sales SET ledger_status = 'posted',"
+                    " ledger_entry_id = ?, ledger_error = '' WHERE id = ?",
+                    (_geid, sale["id"]))
+            elif _gstatus == "already_posted":
+                counts["skipped_gift_card"] += 1
+            else:
+                counts["failed"] += 1
+                counts["failures"].append(
+                    {"source_key": _gc_key, "error": _gerror})
+                conn.execute(
+                    "UPDATE erp_store_sales SET ledger_status = 'post_failed',"
+                    " ledger_error = ? WHERE id = ?",
+                    (_gerror, sale["id"]))
+            continue
+        posted = _acct_sale_posted(conn, key)
+        voided = _acct_pos_sale_voided(conn, store_id, sale["sale_key"])
+        if posted:
+            # A posted or reversed sale never re-posts. A fully-voided
+            # sale whose reversal failed at void time gets its
+            # reversal retried here.
+            counts["already_posted"] += 1
+            if posted["status"] == "posted" and voided:
+                void = conn.execute(
+                    "SELECT * FROM erp_store_voids WHERE store_id = ?"
+                    " AND sale_key = ? ORDER BY id DESC LIMIT 1",
+                    (store_id, sale["sale_key"])).fetchone()
+                if void and int(void["amount_cents"] or 0) == int(
+                        sale["total_cents"] or 0):
+                    _rev, _rerr = _stores_reverse_pos_sale(
+                        conn, actor, store_id, sale, posted)
+                    if _rev:
+                        counts["reversed"] += 1
+                    else:
+                        counts["reversal_failed"] += 1
+                        counts["failures"].append(
+                            {"source_key": key, "error": _rerr})
+            continue
+        if voided:
+            counts["skipped_voided"] += 1
+            if sale["ledger_status"] != "voided":
+                conn.execute(
+                    "UPDATE erp_store_sales SET ledger_status = 'voided'"
+                    " WHERE id = ?", (sale["id"],))
+            continue
+        if int(sale["total_cents"] or 0) <= 0:
+            counts["skipped_zero"] += 1
+            continue
+        _eid, _status, _error = _acct_post_pos_sale(
+            conn, actor, store_id, sale)
+        if _status == "posted":
+            counts["posted"] += 1
+            conn.execute(
+                "UPDATE erp_store_sales SET ledger_status = 'posted',"
+                " ledger_entry_id = ?, ledger_error = '' WHERE id = ?",
+                (_eid, sale["id"]))
+        elif _status == "already_posted":
+            counts["already_posted"] += 1
+        else:
+            counts["failed"] += 1
+            counts["failures"].append({"source_key": key, "error": _error})
+            conn.execute(
+                "UPDATE erp_store_sales SET ledger_status = 'post_failed',"
+                " ledger_error = ? WHERE id = ?",
+                (_error, sale["id"]))
+    _acct_audit(conn, actor, "sale.backfill", "sale_post", 0,
+                "pos store %d posted %d already_posted %d skipped_voided %d"
+                " skipped_zero %d skipped_gift_card %d failed %d reversed %d"
+                " reversal_failed %d"
+                % (store_id, counts["posted"], counts["already_posted"],
+                   counts["skipped_voided"], counts["skipped_zero"],
+                   counts["skipped_gift_card"],
+                   counts["failed"], counts["reversed"],
+                   counts["reversal_failed"]))
     conn.commit()
     conn.close()
-    return jsonify(sale=_stores_sale_dict(row)), 201
+    return jsonify(counts=counts)
 
 
 @app.get("/api/erp/stores/<int:store_id>/sales")
@@ -15283,6 +18728,40 @@ def stores_sales_list(store_id):
                    daily_totals=[{"date": t["day"], "sale_count": t["n"],
                                   "total_cents": int(t["total"] or 0)}
                                  for t in totals])
+
+
+def _stores_z_posted(conn, store_id, register, report_date):
+    """Ledger tie-out for one Z-report: the posted POS entries behind
+    this register/day, from erp_acct_sale_posts (status 'posted')."""
+    posted_total = 0
+    posted_count = 0
+    entry_ids = []
+    for sale in conn.execute(
+            "SELECT * FROM erp_store_sales WHERE store_id = ?"
+            " AND register = ? AND substr(sold_at, 1, 10) = ?",
+            (store_id, register, report_date)).fetchall():
+        if (sale["sale_kind"] if "sale_kind" in sale.keys()
+                else "popcorn") == "gift_card":
+            # A gift-card sale posts as a liability under
+            # giftcard:<code>, not pos:<key> -- follow the intake row
+            # to its real posting so the tie-out still works.
+            _gc = conn.execute(
+                "SELECT code FROM gift_cards WHERE stripe_session_id = ?",
+                ("pos:%d:%s" % (store_id, sale["sale_key"]),)).fetchone()
+            _key = "giftcard:%s" % (_gc["code"] if _gc else "")
+        else:
+            _key = "pos:%d:%s" % (store_id, sale["sale_key"])
+        row = conn.execute(
+            "SELECT journal_entry_id, amount_cents FROM erp_acct_sale_posts"
+            " WHERE source_key = ? AND status = 'posted'",
+            (_key,)).fetchone()
+        if row:
+            posted_total += int(row["amount_cents"] or 0)
+            posted_count += 1
+            entry_ids.append(row["journal_entry_id"])
+    return {"posted_total_cents": posted_total,
+            "posted_sale_count": posted_count,
+            "posted_entry_ids": entry_ids}
 
 
 @app.post("/api/erp/stores/<int:store_id>/z-report")
@@ -15342,9 +18821,12 @@ def stores_zreport_create(store_id):
     row = conn.execute(
         "SELECT * FROM erp_store_zreports WHERE id = ?",
         (cur.lastrowid,)).fetchone()
+    out = _stores_zreport_dict(row)
+    out.update(_stores_z_posted(conn, store_id, register, report_date))
+    out["posted_ties"] = out["posted_total_cents"] == out["total_cents"]
     conn.commit()
     conn.close()
-    return jsonify(zreport=_stores_zreport_dict(row)), 201
+    return jsonify(zreport=out), 201
 
 
 @app.get("/api/erp/stores/<int:store_id>/z-reports")
@@ -15362,8 +18844,15 @@ def stores_zreports_list(store_id):
     rows = conn.execute(
         "SELECT * FROM erp_store_zreports WHERE store_id = ?"
         " ORDER BY report_date DESC, id DESC", (store_id,)).fetchall()
+    out = []
+    for r in rows:
+        d = _stores_zreport_dict(r)
+        d.update(_stores_z_posted(conn, store_id, r["register"],
+                                  r["report_date"]))
+        d["posted_ties"] = d["posted_total_cents"] == d["total_cents"]
+        out.append(d)
     conn.close()
-    return jsonify(zreports=[_stores_zreport_dict(r) for r in rows])
+    return jsonify(zreports=out)
 
 
 # ---------------------------------------------------------------- Dept 14 (Stores) Wave B
@@ -15430,10 +18919,12 @@ def _stores_timeclock_row(conn, row_id):
     return conn.execute(
         "SELECT t.*, e.name AS employee_name, s.weekday AS shift_weekday,"
         " s.start_time AS shift_start, s.end_time AS shift_end,"
-        " s.role AS shift_role, s.store_id AS shift_store_id"
+        " s.role AS shift_role, s.store_id AS shift_store_id,"
+        " l.payrun_id AS payrun_id"
         " FROM erp_store_timeclock t"
         " LEFT JOIN erp_hr_employees e ON e.id = t.employee_id"
         " LEFT JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " LEFT JOIN erp_acct_payrun_lines l ON l.id = t.payrun_line_id"
         " WHERE t.id = ?", (row_id,)).fetchone()
 
 
@@ -15531,15 +19022,39 @@ def stores_pl(store_id):
     p_params = [store_id]
     posted = conn.execute(
         "SELECT COALESCE(SUM(amount_cents), 0) AS rev, COUNT(*) AS n"
-        " FROM erp_acct_sale_posts WHERE store_id = ?"
+        " FROM erp_acct_sale_posts WHERE store_id = ? AND status = 'posted'"
         + _range_where("posted_at", p_params), p_params).fetchone()
     pos_params = [store_id]
     pos_rows = conn.execute(
         "SELECT * FROM erp_store_sales WHERE store_id = ?"
         + _range_where("sold_at", pos_params), pos_params).fetchall()
-    pos_rev = sum(int(r["total_cents"] or 0) for r in pos_rows)
+    # Posted sales already count in posted revenue: the POS feed below
+    # counts only sales with no sale-posts row at all, so nothing is
+    # double-counted. A reversed sale keeps its row (status 'reversed')
+    # and stays out: its revenue posted, then reversed to zero. Bags
+    # still count every intake sale (COGS is about bags sold, posted
+    # or not).
+    _posted_keys = set()
+    _pk_params = [store_id]
+    for _pk in conn.execute(
+            "SELECT source_key FROM erp_acct_sale_posts"
+            " WHERE store_id = ?"
+            + _range_where("posted_at", _pk_params),
+            _pk_params).fetchall():
+        _prefix = "pos:%d:" % store_id
+        if _pk["source_key"].startswith(_prefix):
+            _posted_keys.add(_pk["source_key"][len(_prefix):])
+    pos_rev = sum(int(r["total_cents"] or 0) for r in pos_rows
+                  if r["sale_key"] not in _posted_keys
+                  and (r["sale_kind"] if "sale_kind" in r.keys()
+                       else "popcorn") != "gift_card")
     bags = 0.0
     for r in pos_rows:
+        # A gift-card sale is not a bag sold: its intake item is the
+        # card itself, and counting it would inflate COGS.
+        if (r["sale_kind"] if "sale_kind" in r.keys()
+                else "popcorn") == "gift_card":
+            continue
         try:
             items = json.loads(r["items_json"] or "[]") or []
         except (TypeError, ValueError):
@@ -15553,6 +19068,7 @@ def stores_pl(store_id):
     unattributed = conn.execute(
         "SELECT COALESCE(SUM(amount_cents), 0) AS rev, COUNT(*) AS n"
         " FROM erp_acct_sale_posts WHERE store_id IS NULL"
+        " AND status = 'posted'"
         + _range_where("posted_at", u_params), u_params).fetchone()
     blended, n_batches, prod_bags, prod_cost = _erp_blended_cost_per_bag(conn)
     conn.close()
@@ -15560,8 +19076,9 @@ def stores_pl(store_id):
     revenue = int(posted["rev"] or 0) + pos_rev
     gross = round(revenue - cogs, 2) if cogs is not None else None
     notes = [
-        "Posted ledger revenue is $0 until POS intake is wired to the "
-        "ledger (follow-up); POS sales are a separate feed for now.",
+        "POS sales post to the ledger on intake; posted revenue "
+        "includes them and the POS feed below counts only sales not "
+        "yet posted, so no sale is counted twice.",
         ("COGS uses the blended production cost per bag across completed "
          "batches (all-time basis); no per-flavor cost is assumed."
          if blended is not None else
@@ -15831,7 +19348,8 @@ def stores_clock_in(store_id):
 def stores_clock_out(store_id):
     """Clock out. clock_out must be after clock_in (default now);
     hours are computed here and stored. This never creates a payrun
-    or posts payroll -- hours feed payroll when a run is created."""
+    or posts payroll -- closed hours feed a draft payrun only
+    through the explicit feed endpoint below."""
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -15886,8 +19404,9 @@ def stores_clock_out(store_id):
 @app.get("/api/erp/stores/<int:store_id>/timeclock")
 def stores_timeclock_list(store_id):
     """Timeclock rows for a store, newest first. ?from= / ?to= filter
-    on the clock-in date (YYYY-MM-DD). Hours here feed payroll when a
-    pay run is created -- listing them creates no run."""
+    on the clock-in date (YYYY-MM-DD). Hours here feed a draft payrun
+    only through the explicit feed endpoint -- listing them creates
+    no run. payrun_id is the run a fed row landed in, else null."""
     _, err = _require_erp_admin()
     if err:
         return err
@@ -15913,14 +19432,342 @@ def stores_timeclock_list(store_id):
     rows = conn.execute(
         "SELECT t.*, e.name AS employee_name, s.weekday AS shift_weekday,"
         " s.start_time AS shift_start, s.end_time AS shift_end,"
-        " s.role AS shift_role, s.store_id AS shift_store_id"
+        " s.role AS shift_role, s.store_id AS shift_store_id,"
+        " l.payrun_id AS payrun_id"
         " FROM erp_store_timeclock t"
         " LEFT JOIN erp_hr_employees e ON e.id = t.employee_id"
         " LEFT JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " LEFT JOIN erp_acct_payrun_lines l ON l.id = t.payrun_line_id"
         " WHERE s.store_id = ?" + where +
         " ORDER BY t.clock_in DESC, t.id DESC", params).fetchall()
     conn.close()
     return jsonify(timeclock=[_stores_timeclock_dict(r) for r in rows])
+
+
+def _stores_normalize_name(value):
+    return " ".join((value or "").strip().lower().split())
+
+
+def _stores_resolve_payroll_employee(conn, hr_employee,
+                                     payroll_employee_id=None):
+    """Resolve an HR employee to a payroll employee (erp_acct_employees)
+    for the timeclock feed. Returns (payroll_row, None) or
+    (None, flag) where flag is unmapped / ambiguous / not_hourly /
+    inactive / unrated. An explicit payroll_employee_id is validated
+    and stored on the HR row; otherwise a stored link wins, then an
+    exact normalized name match against payroll employees (exactly
+    one match, stored for next time). Never estimates a rate: a
+    salary employee or one with no usable hourly rate is flagged,
+    not fed."""
+    if payroll_employee_id is not None:
+        try:
+            pid = int(payroll_employee_id)
+        except (TypeError, ValueError):
+            return None, "unmapped"
+        emp = conn.execute(
+            "SELECT * FROM erp_acct_employees WHERE id = ?", (pid,)).fetchone()
+        if not emp:
+            return None, "unmapped"
+        conn.execute(
+            "UPDATE erp_hr_employees SET payroll_employee_id = ? WHERE id = ?",
+            (pid, hr_employee["id"]))
+    elif hr_employee["payroll_employee_id"]:
+        emp = conn.execute(
+            "SELECT * FROM erp_acct_employees WHERE id = ?",
+            (hr_employee["payroll_employee_id"],)).fetchone()
+        if not emp:
+            return None, "unmapped"
+    else:
+        want = _stores_normalize_name(hr_employee["name"])
+        matches = [r for r in conn.execute(
+            "SELECT * FROM erp_acct_employees").fetchall()
+            if _stores_normalize_name(
+                (r["first_name"] or "") + " " + (r["last_name"] or ""))
+            == want]
+        if not matches:
+            return None, "unmapped"
+        if len(matches) > 1:
+            return None, "ambiguous"
+        emp = matches[0]
+        conn.execute(
+            "UPDATE erp_hr_employees SET payroll_employee_id = ? WHERE id = ?",
+            (emp["id"], hr_employee["id"]))
+    if not emp["active"]:
+        return None, "inactive"
+    if emp["pay_type"] != "hourly":
+        return None, "not_hourly"
+    if int(emp["rate_cents"] or 0) <= 0:
+        return None, "unrated"
+    return emp, None
+
+
+@app.post("/api/erp/stores/<int:store_id>/timeclock/feed-payrun")
+def stores_timeclock_feed_payrun(store_id):
+    """Explicit admin action: feed CLOSED, un-fed timeclock rows for
+    one employee + period into a DRAFT payrun (created when none is
+    open for the period, else attached to the existing draft). Hours
+    -> gross uses the hourly rate from the payroll employee record;
+    rows that cannot be resolved to an hourly payroll employee are
+    flagged unmapped / ambiguous / not_hourly / inactive / unrated
+    and never estimated. OT splits daily over 8h and weekly over
+    40h (Nevada, thresholds from erp_store_settings). A row feeds
+    exactly one line; re-feed is a no-op for fed rows. Feeding
+    targets DRAFT runs only. HR event-staff cash records
+    (erp_hr_time_records) are never touched -- store timeclock ->
+    payroll only."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    try:
+        hr_id = int(data.get("employee_id") or 0)
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="employee_id is required"), 400
+    hr = conn.execute(
+        "SELECT * FROM erp_hr_employees WHERE id = ?", (hr_id,)).fetchone()
+    if not hr:
+        conn.close()
+        return jsonify(error="employee not found"), 400
+    start = (data.get("period_start") or "").strip()
+    end = (data.get("period_end") or "").strip()
+    if not _acct_valid_date(start) or not _acct_valid_date(end) or start > end:
+        conn.close()
+        return jsonify(error="period_start and period_end must be YYYY-MM-DD with start on or before end"), 400
+    pay_date = (data.get("pay_date") or "").strip()
+    run_id = data.get("payrun_id")
+    if run_id is not None:
+        try:
+            run_id = int(run_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="payrun_id must be an integer"), 400
+    # Closed, un-fed rows for this employee in this store + period.
+    rows = conn.execute(
+        "SELECT t.* FROM erp_store_timeclock t"
+        " JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " WHERE s.store_id = ? AND t.employee_id = ?"
+        " AND t.clock_out != '' AND t.hours IS NOT NULL"
+        " AND t.payrun_line_id IS NULL"
+        " AND substr(t.clock_in, 1, 10) >= ?"
+        " AND substr(t.clock_in, 1, 10) <= ?"
+        " ORDER BY t.clock_in, t.id",
+        (store_id, hr_id, start, end)).fetchall()
+    open_rows = conn.execute(
+        "SELECT COUNT(*) FROM erp_store_timeclock t"
+        " JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " WHERE s.store_id = ? AND t.employee_id = ?"
+        " AND t.clock_out = ''"
+        " AND substr(t.clock_in, 1, 10) >= ?"
+        " AND substr(t.clock_in, 1, 10) <= ?",
+        (store_id, hr_id, start, end)).fetchone()[0]
+    fed_rows = conn.execute(
+        "SELECT COUNT(*) FROM erp_store_timeclock t"
+        " JOIN erp_store_shifts s ON s.id = t.shift_id"
+        " WHERE s.store_id = ? AND t.employee_id = ?"
+        " AND t.payrun_line_id IS NOT NULL"
+        " AND substr(t.clock_in, 1, 10) >= ?"
+        " AND substr(t.clock_in, 1, 10) <= ?",
+        (store_id, hr_id, start, end)).fetchone()[0]
+    if not rows:
+        conn.close()
+        return jsonify(fed=0, fed_line=None, run=None,
+                       unmapped=[], open_rows=open_rows,
+                       already_fed=fed_rows,
+                       note="no closed un-fed timeclock rows for this"
+                            " employee in this period")
+    emp, flag = _stores_resolve_payroll_employee(
+        conn, hr, data.get("payroll_employee_id"))
+    if flag:
+        conn.close()
+        return jsonify(fed=0, fed_line=None, run=None,
+                       unmapped=[{"reason": flag,
+                                  "timeclock_ids": [r["id"] for r in rows],
+                                  "hours": round(sum(float(r["hours"] or 0)
+                                                    for r in rows), 2)}],
+                       open_rows=open_rows, already_fed=fed_rows,
+                       note="employee has no usable hourly payroll record"
+                            " (%s) -- nothing was fed, no rate estimated"
+                            % flag)
+    # OT: group by Mon-Sun week, daily hours per weekday, Nevada split.
+    thresholds = _stores_ot_settings(conn)
+    weeks = {}
+    for r in rows:
+        day = (r["clock_in"] or "")[:10]
+        bounds = _stores_week_bounds(day)
+        if not bounds:
+            continue
+        monday = bounds[0]
+        weekday = datetime.strptime(day, "%Y-%m-%d").date().weekday()
+        weeks.setdefault(monday, [0.0] * 7)
+        weeks[monday][weekday] = round(
+            weeks[monday][weekday] + float(r["hours"] or 0), 2)
+    regular = 0.0
+    ot = 0.0
+    for day_hours in weeks.values():
+        split = _stores_nevada_ot(
+            day_hours, thresholds["weekly_threshold_hours"],
+            thresholds["daily_threshold_hours"])
+        regular = round(regular + split["regular_hours"], 2)
+        ot = round(ot + split["ot_hours"], 2)
+    total_hours = round(regular + ot, 2)
+    rate = int(emp["rate_cents"])
+    gross = int(regular * rate + ot * rate * 1.5 + 0.5)
+    if gross <= 0:
+        conn.close()
+        return jsonify(error="fed hours produce no gross pay"), 400
+    tax_year = int(start[:4])
+    # Target run: explicit draft, the open draft for the period, or a
+    # new draft. Attaching to a non-draft run is refused.
+    run = None
+    if run_id is not None:
+        run = conn.execute(
+            "SELECT * FROM erp_acct_payruns WHERE id = ?", (run_id,)).fetchone()
+        if not run:
+            conn.close()
+            return jsonify(error="payrun not found"), 404
+        if run["status"] != "draft":
+            conn.close()
+            return jsonify(error="payrun %d is %s, not draft -- only draft runs accept fed lines" % (run_id, run["status"])), 409
+        if run["period_start"] != start or run["period_end"] != end:
+            conn.close()
+            return jsonify(error="payrun %d covers %s to %s, not the requested period %s to %s" % (run_id, run["period_start"], run["period_end"], start, end)), 400
+    else:
+        run = conn.execute(
+            "SELECT * FROM erp_acct_payruns WHERE period_start = ?"
+            " AND period_end = ? AND status = 'draft' ORDER BY id LIMIT 1",
+            (start, end)).fetchone()
+    if run is None:
+        if not _acct_valid_date(pay_date):
+            conn.close()
+            return jsonify(error="pay_date must be YYYY-MM-DD"), 400
+        if pay_date < end:
+            conn.close()
+            return jsonify(error="pay_date must be on or after period_end"), 400
+    # One line per employee per run, and no line in any overlapping run.
+    if run is not None:
+        same = conn.execute(
+            "SELECT 1 FROM erp_acct_payrun_lines WHERE payrun_id = ?"
+            " AND employee_id = ? LIMIT 1",
+            (run["id"], emp["id"])).fetchone()
+        if same:
+            conn.close()
+            return jsonify(error="payrun %d already has a line for %s %s -- un-feed it first" % (run["id"], emp["first_name"], emp["last_name"])), 409
+    clash = conn.execute(
+        "SELECT 1 FROM erp_acct_payrun_lines l"
+        " JOIN erp_acct_payruns r ON r.id = l.payrun_id"
+        " WHERE l.employee_id = ? AND r.period_start <= ?"
+        " AND r.period_end >= ? LIMIT 1",
+        (emp["id"], end, start)).fetchone()
+    if clash:
+        conn.close()
+        return jsonify(error="employee %s %s already has a pay run overlapping this period" % (emp["first_name"], emp["last_name"])), 400
+    ytd_before = _acct_payroll_ytd_cents(conn, emp["id"], tax_year)
+    calc, error = _acct_payroll_compute_line(conn, emp, gross, ytd_before,
+                                             tax_year)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    if run is None:
+        cur = conn.execute(
+            "INSERT INTO erp_acct_payruns (period_start, period_end, pay_date,"
+            " status, gross_cents, federal_withheld_cents, ss_cents,"
+            " medicare_cents, employer_tax_cents, employer_ss_cents,"
+            " employer_medicare_cents, net_cents, journal_entry_id, approved_by,"
+            " approved_at, paid_at, created_at)"
+            " VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', NULL,"
+            " NULL, ?)",
+            (start, end, pay_date, calc["gross_cents"],
+             calc["federal_cents"], calc["ss_cents"],
+             calc["medicare_cents"], calc["employer_tax_cents"],
+             calc["employer_ss_cents"], calc["employer_medicare_cents"],
+             calc["net_cents"], now))
+        run = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                           (cur.lastrowid,)).fetchone()
+    else:
+        conn.execute(
+            "UPDATE erp_acct_payruns SET gross_cents = gross_cents + ?,"
+            " federal_withheld_cents = federal_withheld_cents + ?,"
+            " ss_cents = ss_cents + ?, medicare_cents = medicare_cents + ?,"
+            " employer_tax_cents = employer_tax_cents + ?,"
+            " employer_ss_cents = employer_ss_cents + ?,"
+            " employer_medicare_cents = employer_medicare_cents + ?,"
+            " net_cents = net_cents + ? WHERE id = ?",
+            (calc["gross_cents"], calc["federal_cents"], calc["ss_cents"],
+             calc["medicare_cents"], calc["employer_tax_cents"],
+             calc["employer_ss_cents"], calc["employer_medicare_cents"],
+             calc["net_cents"], run["id"]))
+        run = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                           (run["id"],)).fetchone()
+    tc_ids = [r["id"] for r in rows]
+    stub = {
+        "employee_name": emp["first_name"] + " " + emp["last_name"],
+        "pay_type": emp["pay_type"],
+        "pay_schedule": emp["pay_schedule"],
+        "filing_status": emp["filing_status"],
+        "period_start": start, "period_end": end,
+        "pay_date": run["pay_date"],
+        "hours": total_hours, "regular_hours": regular, "ot_hours": ot,
+        "rate_cents": rate,
+        "gross_cents": calc["gross_cents"],
+        "federal_cents": calc["federal_cents"],
+        "ss_cents": calc["ss_cents"],
+        "medicare_cents": calc["medicare_cents"],
+        "net_cents": calc["net_cents"],
+        "ytd_gross_cents": ytd_before + gross,
+        "source": "store_timeclock",
+        "timeclock_store_id": store_id,
+        "timeclock_store_name": store["name"],
+        "timeclock_ids": tc_ids,
+    }
+    cur = conn.execute(
+        "INSERT INTO erp_acct_payrun_lines (payrun_id, employee_id,"
+        " hours, regular_hours, ot_hours, source, timeclock_ids,"
+        " gross_cents, federal_cents, ss_cents, medicare_cents,"
+        " net_cents, pay_stub_json, created_at)"
+        " VALUES (?, ?, ?, ?, ?, 'store_timeclock', ?, ?, ?, ?, ?, ?, ?, ?)",
+        (run["id"], emp["id"], total_hours, regular, ot,
+         json.dumps(tc_ids), calc["gross_cents"], calc["federal_cents"],
+         calc["ss_cents"], calc["medicare_cents"], calc["net_cents"],
+         json.dumps(stub), now))
+    line_id = cur.lastrowid
+    for tc_id in tc_ids:
+        conn.execute(
+            "UPDATE erp_store_timeclock SET payrun_line_id = ? WHERE id = ?",
+            (line_id, tc_id))
+    _acct_audit(conn, actor, "payroll.run.feed", "payroll_run", run["id"],
+                "fed %d timeclock rows (store %d, %s %s) %.2f hours"
+                " (%.2f regular + %.2f OT) gross %d line #%d"
+                % (len(tc_ids), store_id, emp["first_name"],
+                   emp["last_name"], total_hours, regular, ot,
+                   gross, line_id))
+    conn.commit()
+    run_row = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                           (run["id"],)).fetchone()
+    out = _acct_payrun_dict(conn, run_row)
+    line = conn.execute(
+        "SELECT * FROM erp_acct_payrun_lines WHERE id = ?",
+        (line_id,)).fetchone()
+    line_d = dict(line)
+    try:
+        line_d["pay_stub"] = json.loads(line["pay_stub_json"] or "{}")
+    except (ValueError, TypeError):
+        line_d["pay_stub"] = {}
+    try:
+        line_d["timeclock_ids"] = json.loads(line["timeclock_ids"] or "[]")
+    except (ValueError, TypeError):
+        line_d["timeclock_ids"] = []
+    conn.close()
+    return jsonify(run=out, fed=len(tc_ids), fed_line=line_d,
+                   unmapped=[], open_rows=open_rows,
+                   already_fed=fed_rows)
 
 
 # ---------------------------------------------------------------- Dept 14 (Stores) Wave C
@@ -16464,10 +20311,49 @@ def stores_void_create(store_id):
         (store_id, fields["register"], fields["sale_key"],
          fields["amount_cents"], fields["reason"],
          fields["actor"] or actor, actor, now, actor, now))
+    # Ledger reversal: a full void of a posted sale reverses in the
+    # ledger (reversing entry, never delete). A partial void, or a
+    # sale that never posted, gets no automatic reversal -- the
+    # recorded total no longer matches what changed hands, so the
+    # ledger needs a human; an unposted sale is marked voided so the
+    # backfill skips it. A reversal refused today (locked period) is
+    # retried by the POS backfill endpoint.
+    reversal = {"status": "no_sale"}
+    sale = conn.execute(
+        "SELECT * FROM erp_store_sales WHERE store_id = ? AND sale_key = ?",
+        (store_id, fields["sale_key"])).fetchone()
+    if sale:
+        key = "pos:%d:%s" % (store_id, fields["sale_key"])
+        posted = _acct_sale_posted(conn, key)
+        if posted and posted["status"] == "posted":
+            if int(fields["amount_cents"] or 0) == int(
+                    sale["total_cents"] or 0):
+                _rev, _rerr = _stores_reverse_pos_sale(
+                    conn, actor, store_id, sale, posted)
+                if _rev:
+                    reversal = {"status": "reversed",
+                                "reversing_entry_id": _rev}
+                else:
+                    reversal = {"status": "reversal_failed",
+                                "error": _rerr}
+            else:
+                reversal = {"status": "partial_void",
+                            "error": "partial void -- no automatic ledger"
+                                     " reversal; correct the ledger by hand"}
+        elif posted and posted["status"] == "reversed":
+            reversal = {"status": "already_reversed"}
+        else:
+            conn.execute(
+                "UPDATE erp_store_sales SET ledger_status = 'voided'"
+                " WHERE id = ?", (sale["id"],))
+            reversal = {"status": "voided_unposted",
+                        "error": "sale never posted -- marked voided so"
+                                 " the backfill skips it"}
     row = _stores_void_row(conn, cur.lastrowid)
     conn.commit()
     conn.close()
-    return jsonify(void=_stores_void_dict(row)), 201
+    return jsonify(void=_stores_void_dict(row),
+                   ledger_reversal=reversal), 201
 
 
 @app.get("/api/erp/stores/<int:store_id>/voids")
@@ -17790,6 +21676,205 @@ def stores_gift_card_redeem(store_id):
                    new_balance_cents=new_balance)
 
 
+
+@app.post("/api/erp/stores/<int:store_id>/gift-card-issue")
+def stores_gift_card_issue(store_id):
+    """Staff-gated gift-card SALE at the register (the companion to
+    gift-card-redeem). Issues a new card with issue_unique_code(),
+    records the register sale key instead of a Stripe session id, and
+    posts the sale as a liability (Dr 1010 / Cr 2350) -- never income.
+    Amount mirrors the online checkout: open amount within
+    MIN_AMOUNT_CENTS..MAX_AMOUNT_CENTS ($5..$500). Idempotent on
+    sale_key: a retry returns the first issued card, never a second.
+    The sale is also recorded as a POS intake row (sale_kind
+    'gift_card') so the Z-report and drawer see the cash/card taken;
+    the generic POS posting skips gift-card rows (carve-out), and the
+    POS backfill retries only the liability posting. No Kernels: a
+    gift-card sale is not a popcorn purchase. The recipient email is
+    optional; when given and valid, the card is emailed (best-effort,
+    never fails the sale)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    if store["status"] != "open":
+        conn.close()
+        return jsonify(error="store is closed"), 400
+    sale_key = (data.get("sale_key") or "").strip()
+    amount = _stores_int(data.get("amount_cents"))
+    tender = (data.get("tender") or "").strip()
+    if not sale_key:
+        conn.close()
+        return jsonify(error="sale_key is required"), 400
+    if amount is None or amount < MIN_AMOUNT_CENTS \
+            or amount > MAX_AMOUNT_CENTS:
+        conn.close()
+        return jsonify(
+            error="amount_cents must be between $%d and $%d"
+            % (MIN_AMOUNT_CENTS // 100, MAX_AMOUNT_CENTS // 100)), 400
+    if tender not in ("cash", "card"):
+        conn.close()
+        return jsonify(error="tender must be cash or card"), 400
+    purchaser = (data.get("purchaser_name") or "").strip()[:120]
+    recipient = (data.get("recipient_name") or "").strip()[:120]
+    recipient_email = (data.get("recipient_email") or "").strip()[:200]
+    message = (data.get("message") or "").strip()[:500]
+    if recipient_email and not EMAIL_RE.match(recipient_email):
+        conn.close()
+        return jsonify(error="recipient_email must be a valid email"), 400
+    session_key = "pos:%d:%s" % (store_id, sale_key)
+    existing = conn.execute(
+        "SELECT * FROM gift_cards WHERE stripe_session_id = ?",
+        (session_key,)).fetchone()
+    if existing:
+        # Idempotent retry: never issue a second card. Retry the
+        # liability posting if the first attempt never posted.
+        _eid, _status, _error = _acct_post_gift_card_purchase(
+            conn, actor, existing)
+        if _status == "posted":
+            conn.execute(
+                "UPDATE erp_store_sales SET ledger_status = 'posted',"
+                " ledger_entry_id = ?, ledger_error = ''"
+                " WHERE store_id = ? AND sale_key = ?",
+                (_eid, store_id, sale_key))
+        elif _error:
+            conn.execute(
+                "UPDATE erp_store_sales SET ledger_status = 'post_failed',"
+                " ledger_error = ? WHERE store_id = ? AND sale_key = ?",
+                (_error, store_id, sale_key))
+        conn.commit()
+        sale_row = conn.execute(
+            "SELECT * FROM erp_store_sales WHERE store_id = ?"
+            " AND sale_key = ?",
+            (store_id, sale_key)).fetchone()
+        conn.close()
+        return jsonify(code=existing["code"],
+                       amount_cents=int(existing["amount_cents"] or 0),
+                       balance_cents=int(existing["balance_cents"] or 0),
+                       duplicate=True,
+                       sale=(_stores_sale_dict(sale_row)
+                             if sale_row else None),
+                       ledger=(_stores_pos_ledger_view(sale_row)
+                               if sale_row else {"status": "unposted",
+                                                "entry_id": None,
+                                                "error": ""}))
+    code = issue_unique_code()
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT INTO gift_cards (code, amount_cents, balance_cents,"
+        " purchaser_name, purchaser_email, recipient_name, recipient_email,"
+        " message, stripe_session_id, active, created_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+        (code, amount, amount, purchaser, "",
+         recipient, recipient_email, message, session_key, actor, now))
+    row = conn.execute(
+        "SELECT * FROM gift_cards WHERE code = ?", (code,)).fetchone()
+    # POS intake row (sale_kind 'gift_card'): the Z-report and drawer
+    # see the money taken; the generic POS posting skips this kind.
+    cur = conn.execute(
+        "INSERT INTO erp_store_sales (store_id, sale_key, register, tender,"
+        " total_cents, items_json, tenders_json, sold_at, created_by,"
+        " created_at, sale_kind, member_id, member_email, kernels_credited)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'gift_card', NULL, '', 0)",
+        (store_id, sale_key,
+         (data.get("register") or "").strip() or "Register 1",
+         tender, amount,
+         json.dumps([{"flavor": "Gift card", "qty": 1,
+                      "amount_cents": amount}]),
+         json.dumps({tender: amount}), now, actor, now))
+    sale_row = conn.execute(
+        "SELECT * FROM erp_store_sales WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    _eid, _status, _error = _acct_post_gift_card_purchase(conn, actor, row)
+    if _status == "posted":
+        conn.execute(
+            "UPDATE erp_store_sales SET ledger_status = 'posted',"
+            " ledger_entry_id = ?, ledger_error = '' WHERE id = ?",
+            (_eid, sale_row["id"]))
+    elif _error:
+        conn.execute(
+            "UPDATE erp_store_sales SET ledger_status = 'post_failed',"
+            " ledger_error = ? WHERE id = ?",
+            (_error, sale_row["id"]))
+    conn.commit()
+    sale_row = conn.execute(
+        "SELECT * FROM erp_store_sales WHERE id = ?",
+        (sale_row["id"],)).fetchone()
+    conn.close()
+    # Best-effort email to the recipient (never fails the sale).
+    if recipient_email:
+        try:
+            send_gift_card_email(recipient_email,
+                                 purchaser or "Pop-A-Licious",
+                                 recipient or "there", code, message)
+        except Exception:
+            pass
+    return jsonify(code=code, amount_cents=amount, balance_cents=amount,
+                   sale=_stores_sale_dict(sale_row),
+                   ledger=_stores_pos_ledger_view(sale_row)), 201
+
+
+@app.get("/api/erp/stores/<int:store_id>/tax-rate")
+def stores_tax_rate_get(store_id):
+    """This store's sales-tax rate for the register + POS posting. A
+    set store rate wins; otherwise the Clark County default applies.
+    Rates are data on the percent x1000 scale (8375 = 8.375%),
+    exactly like erp_acct_tax_rates -- never hardcoded here."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    out = _stores_tax_rate_view(conn, store_id)
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/stores/<int:store_id>/tax-rate")
+def stores_tax_rate_set(store_id):
+    """Set this store's rate (whole basis points on the percent x1000
+    scale, 0..20000) or clear it (rate_bps null) to fall back to the
+    Clark County default. A set rate applies to register sales from
+    the next posting on; it never rewrites already-posted entries."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    if "rate_bps" not in data:
+        conn.close()
+        return jsonify(
+            error="rate_bps is required (integer, or null to clear)"), 400
+    if data.get("rate_bps") is None:
+        conn.execute("DELETE FROM erp_store_settings WHERE key = ?",
+                     (_stores_tax_rate_key(store_id),))
+    else:
+        v = _stores_int(data.get("rate_bps"))
+        if v is None or v < 0 or v > 20000:
+            conn.close()
+            return jsonify(
+                error="rate_bps must be a whole number between 0 and 20000"), 400
+        conn.execute(
+            "INSERT INTO erp_store_settings (key, value) VALUES (?, ?)"
+            " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_stores_tax_rate_key(store_id), str(v)))
+    conn.commit()
+    out = _stores_tax_rate_view(conn, store_id)
+    conn.close()
+    return jsonify(out)
+
+
 @app.get("/api/erp/stores/<int:store_id>/drawer")
 def stores_drawer_state(store_id):
     """Drawer state for a store: the open drawer for ?register=
@@ -18133,11 +22218,17 @@ def stores_receipt_email(store_id):
         return jsonify(error="sale not found"), 404
     sale_d = _stores_sale_dict(sale)
     conn.close()
-    lines = "".join(
-        "<li>%s &times; %s &mdash; %s</li>" % (
+    def _receipt_line(i):
+        extra = ""
+        if i.get("lot") or i.get("expiry"):
+            extra = " (lot %s%s)" % (
+                i.get("lot") or "",
+                (", exp %s" % i.get("expiry")) if i.get("expiry")
+                else "")
+        return ("<li>%s &times; %s &mdash; %s%s</li>" % (
             (i.get("flavor") or ""), i.get("qty"),
-            erp_money_html(int(i.get("amount_cents") or 0)))
-        for i in sale_d.get("items", []))
+            erp_money_html(int(i.get("amount_cents") or 0)), extra))
+    lines = "".join(_receipt_line(i) for i in sale_d.get("items", []))
     tenders = sale_d.get("tenders") or {}
     tender_lines = "".join(
         "<li>%s: %s</li>" % (k, erp_money_html(int(v)))
@@ -18160,6 +22251,404 @@ def stores_receipt_email(store_id):
     except Exception as exc:
         return jsonify(error="receipt email failed: %s" % exc), 502
     return jsonify(ok=True, sale_key=sale_key, email=email)
+
+
+# ---------- Stripe Terminal (internet readers) — Apple POS ----------
+# The register is a web page, so only the Terminal JavaScript SDK
+# path works here: internet (smart) readers — Stripe Reader S700 and
+# BBPOS WisePOS E. Tap to Pay on iPhone/Android and Bluetooth readers
+# (Reader M2, WisePad 3) need Stripe's native iOS/Android SDKs and
+# cannot run from a browser; they are a future native-app step, not
+# attempted here. The reader is a runtime setting (serial + label),
+# never hardcoded, so either smart reader works with the same code.
+_TERMINAL_TEST_DOUBLE = None
+
+
+def _terminal_dict(row):
+    return {"id": row["id"], "store_id": row["store_id"],
+            "sale_key": row["sale_key"],
+            "payment_intent_id": row["payment_intent_id"],
+            "amount_cents": int(row["amount_cents"] or 0),
+            "currency": row["currency"] or "usd",
+            "status": row["status"] or "",
+            "reader_id": row["reader_id"] or "",
+            "created_by": row["created_by"] or "",
+            "created_at": row["created_at"] or "",
+            "confirmed_at": row["confirmed_at"] or ""}
+
+
+def _terminal_connection_token():
+    """Create a Terminal ConnectionToken secret. Returns (secret, error)."""
+    if _TERMINAL_TEST_DOUBLE is not None:
+        out = _TERMINAL_TEST_DOUBLE("connection_token", {}) or {}
+        return out.get("secret") or None, out.get("error")
+    try:
+        token = stripe.terminal.ConnectionToken.create()
+        return token.secret, None
+    except stripe.error.StripeError as exc:
+        return None, str(exc)
+
+
+def _terminal_create_intent(amount_cents, sale_key):
+    """Create a card_present PaymentIntent. Returns (intent, error)."""
+    if _TERMINAL_TEST_DOUBLE is not None:
+        out = _TERMINAL_TEST_DOUBLE(
+            "create_intent",
+            {"amount_cents": amount_cents,
+             "sale_key": sale_key}) or {}
+        return out.get("intent"), out.get("error")
+    try:
+        intent = stripe.PaymentIntent.create(
+            amount=amount_cents, currency="usd",
+            payment_method_types=["card_present"],
+            capture_method="automatic",
+            metadata={"sale_key": sale_key or ""})
+        return {"id": intent.id, "client_secret": intent.client_secret,
+                "amount": intent.amount, "currency": intent.currency,
+                "status": intent.status}, None
+    except stripe.error.StripeError as exc:
+        return None, str(exc)
+
+
+def _terminal_retrieve_intent(intent_id):
+    """Retrieve a PaymentIntent from Stripe. Returns (intent, error)."""
+    if _TERMINAL_TEST_DOUBLE is not None:
+        out = _TERMINAL_TEST_DOUBLE(
+            "retrieve_intent", {"payment_intent_id": intent_id}) or {}
+        return out.get("intent"), out.get("error")
+    try:
+        intent = stripe.PaymentIntent.retrieve(intent_id)
+        return {"id": intent.id, "client_secret": intent.client_secret,
+                "amount": intent.amount, "currency": intent.currency,
+                "status": intent.status}, None
+    except stripe.error.StripeError as exc:
+        return None, str(exc)
+
+
+def _terminal_cancel_intent(intent_id):
+    """Cancel a PaymentIntent at Stripe. Returns (intent, error)."""
+    if _TERMINAL_TEST_DOUBLE is not None:
+        out = _TERMINAL_TEST_DOUBLE(
+            "cancel_intent", {"payment_intent_id": intent_id}) or {}
+        return out.get("intent"), out.get("error")
+    try:
+        intent = stripe.PaymentIntent.cancel(intent_id)
+        return {"id": intent.id, "client_secret": intent.client_secret,
+                "amount": intent.amount, "currency": intent.currency,
+                "status": intent.status}, None
+    except stripe.error.StripeError as exc:
+        return None, str(exc)
+
+
+def _terminal_reader_key(store_id):
+    return "terminal_reader_id_%d" % int(store_id)
+
+
+def _terminal_location_key(store_id):
+    return "terminal_location_id_%d" % int(store_id)
+
+
+@app.post("/api/erp/stores/<int:store_id>/terminal/connection-token")
+def stores_terminal_connection_token(store_id):
+    """Terminal ConnectionToken for the register's JS SDK. Admin-only;
+    the secret is short-lived and scoped to Terminal, never a key."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    conn.close()
+    secret, error = _terminal_connection_token()
+    if error:
+        return jsonify(
+            error="terminal connection token failed: %s" % error), 502
+    return jsonify(secret=secret)
+
+
+@app.get("/api/erp/stores/<int:store_id>/terminal/reader")
+def stores_terminal_reader_get(store_id):
+    """The store's preferred Terminal reader (serial + label) and
+    Stripe location id, or empty when none is saved."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    rows = {r["key"]: r["value"] for r in conn.execute(
+        "SELECT key, value FROM erp_store_settings"
+        " WHERE key IN (?, ?)",
+        (_terminal_reader_key(store_id),
+         _terminal_location_key(store_id))).fetchall()}
+    conn.close()
+    return jsonify(reader_id=rows.get(_terminal_reader_key(store_id), ""),
+                   location_id=rows.get(
+                       _terminal_location_key(store_id), ""))
+
+
+@app.post("/api/erp/stores/<int:store_id>/terminal/reader")
+def stores_terminal_reader_set(store_id):
+    """Save (or clear) the store's preferred Terminal reader: the
+    internet reader's serial number + label, and its Stripe location
+    id. Null clears a field. The reader is a runtime setting;
+    nothing here names a reader model."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    for field, key in (("reader_id", _terminal_reader_key(store_id)),
+                       ("location_id",
+                        _terminal_location_key(store_id))):
+        if field not in data:
+            continue
+        value = data.get(field)
+        if value is None:
+            conn.execute("DELETE FROM erp_store_settings WHERE key = ?",
+                         (key,))
+        else:
+            value = str(value).strip()
+            if not value or len(value) > 200:
+                conn.close()
+                return jsonify(
+                    error="%s must be a string of 1-200 characters"
+                    % field), 400
+            conn.execute(
+                "INSERT INTO erp_store_settings (key, value)"
+                " VALUES (?, ?) ON CONFLICT(key) DO UPDATE"
+                " SET value = excluded.value", (key, value))
+    conn.commit()
+    rows = {r["key"]: r["value"] for r in conn.execute(
+        "SELECT key, value FROM erp_store_settings"
+        " WHERE key IN (?, ?)",
+        (_terminal_reader_key(store_id),
+         _terminal_location_key(store_id))).fetchall()}
+    conn.close()
+    return jsonify(reader_id=rows.get(_terminal_reader_key(store_id), ""),
+                   location_id=rows.get(
+                       _terminal_location_key(store_id), ""))
+
+
+@app.post("/api/erp/stores/<int:store_id>/terminal/payment-intent")
+def stores_terminal_payment_intent(store_id):
+    """Create a card_present PaymentIntent for the ticket's card
+    portion. Idempotent per sale_key: a live intent already created
+    for this sale is returned again (duplicate:true, no
+    client_secret -- the register keeps the secret from the first
+    call) so a retry never creates a second charge. The intent is
+    only an authorization until the reader collects it; confirm()
+    verifies the charge."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    amount = _stores_int(data.get("amount_cents"))
+    sale_key = (data.get("sale_key") or "").strip()
+    reader_id = (data.get("reader_id") or "").strip()[:200]
+    if amount is None or amount <= 0:
+        conn.close()
+        return jsonify(
+            error="amount_cents must be a positive integer"), 400
+    if not sale_key:
+        conn.close()
+        return jsonify(error="sale_key is required"), 400
+    existing = conn.execute(
+        "SELECT * FROM erp_terminal_payments WHERE store_id = ?"
+        " AND sale_key = ? AND status != 'canceled'"
+        " ORDER BY id LIMIT 1",
+        (store_id, sale_key)).fetchone()
+    if existing:
+        conn.close()
+        out = _terminal_dict(existing)
+        out["duplicate"] = True
+        return jsonify(out)
+    intent, error = _terminal_create_intent(amount, sale_key)
+    if error:
+        conn.close()
+        return jsonify(
+            error="terminal payment intent failed: %s" % error), 502
+    if not intent or not intent.get("id"):
+        conn.close()
+        return jsonify(error="terminal payment intent failed"), 502
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_terminal_payments (store_id, sale_key,"
+        " payment_intent_id, amount_cents, currency, status, reader_id,"
+        " created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (store_id, sale_key, intent["id"], amount,
+         intent.get("currency") or "usd", intent.get("status") or "",
+         reader_id, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_terminal_payments WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    out = _terminal_dict(row)
+    out["client_secret"] = intent.get("client_secret") or ""
+    return jsonify(out), 201
+
+
+@app.post("/api/erp/stores/<int:store_id>/terminal/confirm")
+def stores_terminal_confirm(store_id):
+    """Verify a Terminal charge with Stripe and record it against
+    the sale key. Idempotent: confirming an already-succeeded
+    payment returns the record (duplicate:true) and never
+    double-records. Only a Stripe 'succeeded' intent whose amount
+    matches the recorded amount confirms; anything else is refused
+    and the row keeps the intent's real status."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    sale_key = (data.get("sale_key") or "").strip()
+    intent_id = (data.get("payment_intent_id") or "").strip()
+    if not sale_key or not intent_id:
+        conn.close()
+        return jsonify(
+            error="sale_key and payment_intent_id are required"), 400
+    row = conn.execute(
+        "SELECT * FROM erp_terminal_payments WHERE store_id = ?"
+        " AND payment_intent_id = ?",
+        (store_id, intent_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="terminal payment not found"), 404
+    if (row["sale_key"] or "") != sale_key:
+        conn.close()
+        return jsonify(
+            error="payment intent belongs to a different sale"), 400
+    if (row["status"] or "") == "succeeded":
+        conn.close()
+        out = _terminal_dict(row)
+        out["duplicate"] = True
+        return jsonify(out)
+    intent, error = _terminal_retrieve_intent(intent_id)
+    if error:
+        conn.close()
+        return jsonify(
+            error="terminal payment lookup failed: %s" % error), 502
+    if not intent:
+        conn.close()
+        return jsonify(error="terminal payment not found"), 404
+    status = intent.get("status") or ""
+    if status != "succeeded":
+        conn.execute(
+            "UPDATE erp_terminal_payments SET status = ? WHERE id = ?",
+            (status, row["id"]))
+        conn.commit()
+        conn.close()
+        return jsonify(
+            error="terminal payment is not complete (status: %s)"
+            % status, status=status), 402
+    if int(intent.get("amount") or -1) != int(row["amount_cents"] or 0):
+        conn.close()
+        return jsonify(
+            error="terminal payment amount does not match the"
+            " recorded amount"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_terminal_payments SET status = 'succeeded',"
+        " confirmed_at = ? WHERE id = ?", (now, row["id"]))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_terminal_payments WHERE id = ?",
+        (row["id"],)).fetchone()
+    conn.close()
+    return jsonify(_terminal_dict(row))
+
+
+@app.post("/api/erp/stores/<int:store_id>/terminal/payment-intent/cancel")
+def stores_terminal_payment_intent_cancel(store_id):
+    """Cancel a Terminal PaymentIntent that never completed (e.g. the
+    register lost the client secret on a retry). A succeeded charge
+    can never be cancelled here -- that is a refund, not a cancel."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    intent_id = (data.get("payment_intent_id") or "").strip()
+    if not intent_id:
+        conn.close()
+        return jsonify(error="payment_intent_id is required"), 400
+    row = conn.execute(
+        "SELECT * FROM erp_terminal_payments WHERE store_id = ?"
+        " AND payment_intent_id = ?",
+        (store_id, intent_id)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="terminal payment not found"), 404
+    if (row["status"] or "") == "succeeded":
+        conn.close()
+        return jsonify(
+            error="a succeeded charge cannot be cancelled"), 409
+    if (row["status"] or "") == "canceled":
+        conn.close()
+        return jsonify(_terminal_dict(row))
+    intent, error = _terminal_cancel_intent(intent_id)
+    if error:
+        conn.close()
+        return jsonify(
+            error="terminal payment cancel failed: %s" % error), 502
+    status = (intent or {}).get("status") or "canceled"
+    conn.execute(
+        "UPDATE erp_terminal_payments SET status = ? WHERE id = ?",
+        (status, row["id"]))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_terminal_payments WHERE id = ?",
+        (row["id"],)).fetchone()
+    conn.close()
+    return jsonify(_terminal_dict(row))
+
+
+@app.get("/api/erp/stores/<int:store_id>/terminal/payments")
+def stores_terminal_payments_list(store_id):
+    """Latest Terminal payments for the store (or one sale_key), so
+    a charge with no completed sale can be found and reconciled."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    if not _stores_require_store(conn, store_id):
+        conn.close()
+        return jsonify(error="store not found"), 404
+    sale_key = (request.args.get("sale_key") or "").strip()
+    if sale_key:
+        rows = conn.execute(
+            "SELECT * FROM erp_terminal_payments WHERE store_id = ?"
+            " AND sale_key = ? ORDER BY id DESC LIMIT 50",
+            (store_id, sale_key)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_terminal_payments WHERE store_id = ?"
+            " ORDER BY id DESC LIMIT 50",
+            (store_id,)).fetchall()
+    conn.close()
+    return jsonify(payments=[_terminal_dict(r) for r in rows])
 
 
 @app.get("/api/admin/staff/<int:staff_id>")
@@ -24656,7 +29145,7 @@ def erp_acct_void_invoice(invoice_id):
 # liability view reports.
 ERP_ACCT_GIFT_CARD_LIABILITY_CODE = "2350"
 ERP_ACCT_SALE_POST_KINDS = ("online_stripe", "online_paypal", "wholesale",
-                            "gift_card")
+                            "gift_card", "pos")
 
 
 def _acct_ensure_sale_posts_table(conn):
@@ -24680,9 +29169,8 @@ def _acct_ensure_sale_posts_table(conn):
     # Databases created before this column existed get it via
     # ALTER -- CREATE TABLE IF NOT EXISTS never adds a column.
     # store_id stays NULL for online/wholesale sales; POS sales set
-    # it only when the intake is wired to the ledger (follow-up,
-    # not this build), so NULL here means "unattributed", never
-    # "online".
+    # it when the intake posts (wired Nov 2026), so NULL here means
+    # "unattributed", never "online".
     _sp_cols = [r[1] for r in conn.execute(
         "PRAGMA table_info(erp_acct_sale_posts)").fetchall()]
     if "store_id" not in _sp_cols:
@@ -24709,8 +29197,7 @@ def _acct_record_sale_post(conn, actor, source_key, kind, ref_id, entry_id,
                            invoice_id, status, amount_cents, tax_cents, note,
                            store_id=None):
     """store_id is NULL for online/wholesale sales (no store). POS sales
-    will pass their store id here only when the intake is wired to the
-    ledger (follow-up, not this build) -- nothing in this build sets it."""
+    pass their store id here (intake wiring, Nov 2026)."""
     now = datetime.now(timezone.utc).isoformat()
     conn.execute(
         "INSERT INTO erp_acct_sale_posts (source_key, kind, ref_id,"
@@ -24783,6 +29270,281 @@ def _acct_post_online_sale(conn, actor, kind, row):
                 "%s %s entry #%d amount %d tax %d"
                 % (kind, source_key, entry_id, base, tax))
     return entry_id, "posted", None
+
+
+def _acct_pos_sale_voided(conn, store_id, sale_key):
+    """True when any void-log row names this sale (full or partial).
+    A voided sale never auto-posts: the recorded total is no longer
+    the amount that changed hands, so the ledger needs a human."""
+    return conn.execute(
+        "SELECT 1 FROM erp_store_voids WHERE store_id = ?"
+        " AND sale_key = ? LIMIT 1",
+        (store_id, sale_key)).fetchone() is not None
+
+
+# ---------- Phase 2: per-store tax rate + POS Kernels ----------
+
+def _stores_tax_rate_key(store_id):
+    """erp_store_settings key for one store's register tax rate."""
+    return "tax_rate_bps_%d" % int(store_id)
+
+
+def _stores_tax_rate_bps(conn, store_id):
+    """This store's own tax rate (percent x1000 scale, e.g. 8375 =
+    8.375%), or None when no store rate is set. A stored value outside
+    0..20000 reads back as unset -- never a crash, never a guess."""
+    row = conn.execute(
+        "SELECT value FROM erp_store_settings WHERE key = ?",
+        (_stores_tax_rate_key(store_id),)).fetchone()
+    if not row:
+        return None
+    try:
+        v = int(row["value"])
+    except (TypeError, ValueError):
+        return None
+    if v < 0 or v > 20000:
+        return None
+    return v
+
+
+def _stores_effective_tax_rate_bps(conn, store_id, date):
+    """(rate_bps, source) for a POS sale: the store's own rate when
+    set, else the Clark County default for the sale date. (None,
+    'none') when neither exists -- the caller reports it, never
+    invents a rate."""
+    rate = _stores_tax_rate_bps(conn, store_id)
+    if rate is not None:
+        return rate, "store"
+    default = _acct_tax_rate_bps(conn, ERP_ACCT_TAX_DEFAULT_JURISDICTION,
+                                 date)
+    if default is not None:
+        return default, "default"
+    return None, "none"
+
+
+def _stores_tax_rate_view(conn, store_id):
+    """Tax-rate payload for the store settings UI: the store rate (or
+    null), the effective rate the register will use, and the default
+    it falls back to."""
+    rate = _stores_tax_rate_bps(conn, store_id)
+    today = datetime.now(timezone.utc).date().isoformat()
+    default = _acct_tax_rate_bps(conn, ERP_ACCT_TAX_DEFAULT_JURISDICTION,
+                                 today)
+    effective = rate if rate is not None else default
+    return {"store_id": store_id,
+            "rate_bps": rate,
+            "effective_rate_bps": effective,
+            "effective_source": ("store" if rate is not None
+                                 else ("default" if default is not None
+                                       else "none")),
+            "default_rate_bps": default,
+            "default_jurisdiction": ERP_ACCT_TAX_DEFAULT_JURISDICTION}
+
+
+def _stores_pos_charged_cents(sale):
+    """New money charged on a POS sale: cash + card tender. Gift-card
+    tender is not charged -- it spends an existing balance, exactly
+    like the online gift-card discount that lowers amount_total. This
+    is the Kernels base (1 per $1 charged), and it is 0 for a sale
+    paid entirely with a gift card."""
+    tenders = {}
+    try:
+        tenders = json.loads(sale["tenders_json"] or "{}") or {}
+    except (TypeError, ValueError):
+        tenders = {}
+    if not tenders:
+        single = (sale["tender"] or "").strip()
+        if single in ("cash", "card"):
+            return int(sale["total_cents"] or 0)
+        return 0
+    return int(tenders.get("cash") or 0) + int(tenders.get("card") or 0)
+
+
+def _stores_resolve_pos_member(conn, member_id, member_email):
+    """Resolve a register member to a users row, exactly like the
+    online/loyalty actor mapping: member_id wins when it resolves;
+    otherwise an exact email match. No match (or a deactivated
+    account) -> None: Kernels are never credited to a guessed member."""
+    if member_id:
+        row = conn.execute(
+            "SELECT id, email, active FROM users WHERE id = ?",
+            (member_id,)).fetchone()
+        if row:
+            return row if row["active"] else None
+    if member_email:
+        row = conn.execute(
+            "SELECT id, email, active FROM users WHERE email = ?",
+            (member_email,)).fetchone()
+        if row:
+            return row if row["active"] else None
+    return None
+
+
+def _stores_credit_pos_kernels(conn, store_id, sale):
+    """Credit Kernels for one completed POS sale, idempotently. The
+    base is the charged amount (cash + card, whole dollars), 1 Kernel
+    per $1 -- the same rule and reason as online purchases. Gift-card
+    sales earn nothing (no popcorn purchase); a sale with no member
+    earns nothing; a sale that already credited earns nothing again.
+    Returns the kernels credited (0 when none). The caller commits."""
+    kind = sale["sale_kind"] if "sale_kind" in sale.keys() else "popcorn"
+    if kind == "gift_card":
+        return 0
+    if int(sale["kernels_credited"] or 0) > 0:
+        return 0
+    member = _stores_resolve_pos_member(
+        conn,
+        sale["member_id"] if "member_id" in sale.keys() else None,
+        sale["member_email"] if "member_email" in sale.keys() else "")
+    if not member:
+        return 0
+    charged = _stores_pos_charged_cents(sale)
+    kernels = charged // 100 * KERNELS_PER_DOLLAR
+    if kernels <= 0:
+        return 0
+    _credit_kernels(conn, member["id"], kernels, "purchase",
+                    order_ref="pos:%d:%s" % (store_id, sale["sale_key"]))
+    conn.execute(
+        "UPDATE erp_store_sales SET kernels_credited = ? WHERE id = ?",
+        (kernels, sale["id"]))
+    return kernels
+
+
+def _stores_gift_card_for_sale(conn, store_id, sale_key):
+    """The gift card issued for one register gift-card sale, by the
+    sale key recorded instead of a Stripe session id."""
+    return conn.execute(
+        "SELECT * FROM gift_cards WHERE stripe_session_id = ?",
+        ("pos:%d:%s" % (store_id, sale_key),)).fetchone()
+
+
+def _acct_post_pos_sale(conn, actor, store_id, sale):
+    """Post one POS intake sale to the ledger, reusing the online
+    retail pattern: tender cash/card -> Dr 1010, gift-card tender ->
+    Dr 2350 Gift Card Liability, Cr 4000 retail income, tax extracted
+    tax-inclusively at the store's rate (or the Clark County default
+    when the store has none) on the sale date -> Cr 2100 (the register
+    has no separate tax line, same as online checkout). A gift-card
+    sale never reaches this function as income: sale_kind 'gift_card'
+    rows are liabilities posted by _acct_post_gift_card_purchase, and
+    this function returns 'skipped_gift_card' for them.
+    Returns (entry_id, 'posted'|'already_posted', None) or
+    (None, None, error). The caller commits. No sale_posts row is
+    written on failure, so a later backfill retries the sale; the
+    failure is audited as sale.post_failed and the sale row keeps
+    ledger_status 'post_failed' with the error."""
+    _acct_ensure_sale_posts_table(conn)
+    source_key = "pos:%d:%s" % (store_id, sale["sale_key"])
+    if _acct_sale_posted(conn, source_key):
+        return None, "already_posted", None
+    if (sale["sale_kind"] if "sale_kind" in sale.keys()
+            else "popcorn") == "gift_card":
+        return None, "skipped_gift_card", None
+    total = int(sale["total_cents"] or 0)
+    if total <= 0:
+        return None, None, "sale total is zero"
+    tenders = {}
+    try:
+        tenders = json.loads(sale["tenders_json"] or "{}") or {}
+    except (TypeError, ValueError):
+        tenders = {}
+    if not tenders:
+        # Pre-split sales: the whole total rode on one tender string.
+        single = (sale["tender"] or "").strip()
+        if single in ("cash", "card"):
+            tenders = {"cash": total}
+        elif single == "gift_card":
+            tenders = {"gift_card": total}
+        else:
+            return None, None, (
+                "unknown tender %r on sale %s -- cash, card, or gift_card"
+                " only; correct the sale before it can post"
+                % (single, sale["sale_key"]))
+    cash = int(tenders.get("cash") or 0) + int(tenders.get("card") or 0)
+    gc = int(tenders.get("gift_card") or 0)
+    if cash < 0 or gc < 0 or cash + gc != total:
+        return None, None, (
+            "tender split does not add up to the sale total for %s"
+            % sale["sale_key"])
+    date = _acct_sale_date(sale["sold_at"])
+    rate_bps, rate_source = _stores_effective_tax_rate_bps(
+        conn, store_id, date)
+    if rate_bps is None:
+        return None, None, ("no tax rate in effect for store %d on %s"
+                            " (no store rate, no %s rate)"
+                            % (store_id, date,
+                               ERP_ACCT_TAX_DEFAULT_JURISDICTION))
+    tax = _acct_compute_tax_inclusive_cents(total, rate_bps)
+    income = total - tax
+    cash_id = _acct_account_id_by_code(conn, ERP_ACCT_CASH_CODE)
+    gc_id = _acct_account_id_by_code(conn, ERP_ACCT_GIFT_CARD_LIABILITY_CODE)
+    income_id = _acct_account_id_by_code(conn, ERP_ACCT_RETAIL_INCOME_CODE)
+    tax_id = _acct_account_id_by_code(conn, ERP_ACCT_TAX_PAYABLE_CODE) if tax else None
+    if not cash_id or not gc_id or not income_id or (tax and not tax_id):
+        return None, None, "chart of accounts is missing a required account"
+    memo = "POS sale %s (store %d)" % (sale["sale_key"], store_id)
+    raw = []
+    if cash > 0:
+        raw.append({"account_id": cash_id, "debit_cents": cash,
+                    "credit_cents": 0, "memo": memo})
+    if gc > 0:
+        raw.append({"account_id": gc_id, "debit_cents": gc,
+                    "credit_cents": 0,
+                    "memo": "Gift card redemption on " + memo})
+    raw.append({"account_id": income_id, "debit_cents": 0,
+                "credit_cents": income, "memo": memo})
+    if tax:
+        raw.append({"account_id": tax_id, "debit_cents": 0,
+                    "credit_cents": tax, "memo": "Sales tax on " + memo})
+    entry_id, error = _acct_post_entry(conn, actor, date, memo, "sale",
+                                       source_key, raw)
+    if error:
+        _acct_audit(conn, actor, "sale.post_failed", "sale_post",
+                    int(sale["id"]),
+                    "pos %s failed: %s" % (source_key, error))
+        return None, None, error
+    _acct_record_sale_post(conn, actor, source_key, "pos", sale["id"],
+                           entry_id, None, "posted", total, tax,
+                           "tax %.3f%% (%s)"
+                           % (rate_bps / 1000.0,
+                              "store rate" if rate_source == "store"
+                              else ERP_ACCT_TAX_DEFAULT_JURISDICTION),
+                           store_id=store_id)
+    _acct_audit(conn, actor, "sale.post", "sale_post", entry_id,
+                "pos %s entry #%d amount %d tax %d"
+                % (source_key, entry_id, total, tax))
+    return entry_id, "posted", None
+
+
+def _stores_reverse_pos_sale(conn, actor, store_id, sale, post_row):
+    """Reverse a posted POS sale in the ledger (reversing entry, never
+    delete). Returns (reversing_entry_id, None) or (None, error). The
+    caller commits. Marks the sale-posts row 'reversed' and the sale
+    'reversed' on success. Refused when today falls in a locked
+    period -- the POS backfill endpoint retries it then."""
+    entry = conn.execute(
+        "SELECT * FROM erp_acct_journal WHERE id = ?",
+        (post_row["journal_entry_id"],)).fetchone()
+    if not entry:
+        return None, "original journal entry not found"
+    if entry["reversed_by"]:
+        return None, "sale already reversed by entry #%d" % entry["reversed_by"]
+    source_key = "pos:%d:%s" % (store_id, sale["sale_key"])
+    memo = "Void POS sale %s (store %d)" % (sale["sale_key"], store_id)
+    new_id, error = _acct_reverse_entry(conn, actor, entry, memo, "sale",
+                                        source_key)
+    if error:
+        return None, error
+    conn.execute(
+        "UPDATE erp_acct_sale_posts SET status = 'reversed'"
+        " WHERE id = ?", (post_row["id"],))
+    conn.execute(
+        "UPDATE erp_store_sales SET ledger_status = 'reversed',"
+        " ledger_entry_id = ?, ledger_error = '' WHERE id = ?",
+        (new_id, sale["id"]))
+    _acct_audit(conn, actor, "sale.void", "sale_post", post_row["id"],
+                "pos %s reversed by entry #%d" % (source_key, new_id))
+    return new_id, None
 
 
 def _acct_post_gift_card_purchase(conn, actor, row):
@@ -25016,6 +29778,15 @@ def _acct_sales_status(conn):
             " AND g.is_demo = 0 AND COALESCE(g.amount_cents, 0) > 0"
             " AND NOT EXISTS (SELECT 1 FROM erp_acct_sale_posts s"
             " WHERE s.source_key = 'giftcard:' || g.code)").fetchone()[0],
+        "pos": conn.execute(
+            "SELECT COUNT(*) FROM erp_store_sales s"
+            " WHERE COALESCE(s.total_cents, 0) > 0"
+            " AND COALESCE(s.sale_kind, 'popcorn') != 'gift_card'"
+            " AND NOT EXISTS (SELECT 1 FROM erp_acct_sale_posts p"
+            " WHERE p.source_key = 'pos:' || s.store_id || ':' || s.sale_key)"
+            " AND NOT EXISTS (SELECT 1 FROM erp_store_voids v"
+            " WHERE v.store_id = s.store_id AND v.sale_key = s.sale_key)"
+            ).fetchone()[0],
     }
     skipped = {
         "skipped_invoiced": conn.execute(
@@ -29851,6 +34622,10 @@ def _acct_payrun_dict(conn, run):
             ld["pay_stub"] = json.loads(line["pay_stub_json"] or "{}")
         except (ValueError, TypeError):
             ld["pay_stub"] = {}
+        try:
+            ld["timeclock_ids"] = json.loads(line["timeclock_ids"] or "[]")
+        except (ValueError, TypeError):
+            ld["timeclock_ids"] = []
         emp = conn.execute(
             "SELECT first_name, last_name FROM erp_acct_employees"
             " WHERE id = ?", (line["employee_id"],)).fetchone()
@@ -30242,6 +35017,97 @@ def erp_acct_pay_payroll_run(run_id):
     out = _acct_payrun_dict(conn, row)
     conn.close()
     return jsonify(run=out, journal_entry_id=entry_id)
+
+
+@app.post("/api/erp/accounting/payroll/runs/<int:run_id>/lines/<int:line_id>/unfeed")
+def erp_acct_payroll_line_unfeed(run_id, line_id):
+    """Un-feed a store-timeclock line: allowed only while the run is
+    still draft. The line is deleted, its run totals are recomputed
+    from the remaining lines, and its timeclock rows are unlinked so
+    they can be fed again. The payroll flow itself (approve -> pay ->
+    posting) is unchanged."""
+    actor, err = _erp_check_perm("payroll.write")
+    if err:
+        return err
+    conn = db()
+    run = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    if not run:
+        conn.close()
+        return jsonify(error="pay run not found"), 404
+    if run["status"] != "draft":
+        conn.close()
+        return jsonify(error="pay run %d is %s, not draft -- only draft runs can be un-fed" % (run_id, run["status"])), 409
+    line = conn.execute(
+        "SELECT * FROM erp_acct_payrun_lines WHERE id = ? AND payrun_id = ?",
+        (line_id, run_id)).fetchone()
+    if not line:
+        conn.close()
+        return jsonify(error="pay run line not found"), 404
+    if (line["source"] or "") != "store_timeclock":
+        conn.close()
+        return jsonify(error="only store-timeclock lines can be un-fed"), 400
+    emp = conn.execute(
+        "SELECT first_name, last_name FROM erp_acct_employees"
+        " WHERE id = ?", (line["employee_id"],)).fetchone()
+    emp_name = ((emp["first_name"] + " " + emp["last_name"]) if emp
+                else ("employee #%d" % line["employee_id"]))
+    try:
+        tc_ids = json.loads(line["timeclock_ids"] or "[]") or []
+    except (TypeError, ValueError):
+        tc_ids = []
+    for tc_id in tc_ids:
+        conn.execute(
+            "UPDATE erp_store_timeclock SET payrun_line_id = NULL"
+            " WHERE id = ? AND payrun_line_id = ?",
+            (tc_id, line_id))
+    conn.execute("DELETE FROM erp_acct_payrun_lines WHERE id = ?",
+                 (line_id,))
+    # Recompute the run totals from the remaining lines. Employer SS
+    # equals employee SS by construction, and employer Medicare is
+    # the base 1.45% on gross (the 0.9% additional Medicare is
+    # employee-only, never an employer share).
+    fica = _acct_payroll_fica(conn, int(run["period_start"][:4]))
+    if fica is None:
+        conn.close()
+        return jsonify(error="no FICA table for tax year %s"
+                       % run["period_start"][:4]), 400
+    remaining = conn.execute(
+        "SELECT * FROM erp_acct_payrun_lines WHERE payrun_id = ?",
+        (run_id,)).fetchall()
+    totals = {
+        "gross_cents": sum(int(l["gross_cents"] or 0) for l in remaining),
+        "federal_cents": sum(int(l["federal_cents"] or 0) for l in remaining),
+        "ss_cents": sum(int(l["ss_cents"] or 0) for l in remaining),
+        "medicare_cents": sum(int(l["medicare_cents"] or 0)
+                              for l in remaining),
+        "net_cents": sum(int(l["net_cents"] or 0) for l in remaining),
+    }
+    totals["employer_ss_cents"] = totals["ss_cents"]
+    totals["employer_medicare_cents"] = sum(
+        _acct_round_div(int(l["gross_cents"] or 0)
+                        * fica["medicare_rate_bps"], 10000)
+        for l in remaining)
+    totals["employer_tax_cents"] = (totals["employer_ss_cents"]
+                                    + totals["employer_medicare_cents"])
+    conn.execute(
+        "UPDATE erp_acct_payruns SET gross_cents = ?,"
+        " federal_withheld_cents = ?, ss_cents = ?, medicare_cents = ?,"
+        " employer_tax_cents = ?, employer_ss_cents = ?,"
+        " employer_medicare_cents = ?, net_cents = ? WHERE id = ?",
+        (totals["gross_cents"], totals["federal_cents"],
+         totals["ss_cents"], totals["medicare_cents"],
+         totals["employer_tax_cents"], totals["employer_ss_cents"],
+         totals["employer_medicare_cents"], totals["net_cents"], run_id))
+    _acct_audit(conn, actor, "payroll.run.unfeed", "payroll_run", run_id,
+                "un-fed line #%d (%s, %d timeclock rows) from draft run #%d"
+                % (line_id, emp_name, len(tc_ids), run_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    out = _acct_payrun_dict(conn, row)
+    conn.close()
+    return jsonify(run=out, unlinked=len(tc_ids))
 
 
 @app.get("/api/erp/accounting/payroll/tax-filings")
@@ -32662,9 +37528,19 @@ def _erp_recipe_nutrition(conn, recipe_id):
     ingredients = "; ".join(
         (ln["ingredients_text"] or "").strip()
         for ln in detail if ln.get("ingredients_text"))
-    allergens = "; ".join(
-        (ln["allergens_text"] or "").strip()
-        for ln in detail if ln.get("allergens_text"))
+    # Allergens: dedupe across lines (two ingredients can both list
+    # Soy -- the label's Contains line must name each allergen once).
+    # Split each line's text on commas/semicolons, keep first-seen
+    # order and original casing, match case-insensitively.
+    _seen_allergens = set()
+    _allergen_list = []
+    for ln in detail:
+        for _part in re.split(r"[,;]", ln.get("allergens_text") or ""):
+            _name = _part.strip()
+            if _name and _name.lower() not in _seen_allergens:
+                _seen_allergens.add(_name.lower())
+                _allergen_list.append(_name)
+    allergens = ", ".join(_allergen_list)
     return {"recipe_id": recipe_id, "recipe_name": recipe["name"],
             "version": version, "batch_size_bags": bags,
             "batch_grams": batch_grams,
@@ -35424,6 +40300,20 @@ assert "erp_hr_event_staff" not in _ERP_RESET_TABLES, \
     "erp_hr_event_staff must survive the reset (HR roster)"
 assert "erp_hr_time_records" not in _ERP_RESET_TABLES, \
     "erp_hr_time_records must survive the reset (HR time records)"
+# HR Additions 1: PTO types, grants and requests are people records
+# like the Wave A/B tables -- a wipe must never erase them.
+assert "erp_hr_pto_types" not in _ERP_RESET_TABLES, \
+    "erp_hr_pto_types must survive the reset (PTO types)"
+assert "erp_hr_pto_balances" not in _ERP_RESET_TABLES, \
+    "erp_hr_pto_balances must survive the reset (PTO grants)"
+assert "erp_hr_pto_requests" not in _ERP_RESET_TABLES, \
+    "erp_hr_pto_requests must survive the reset (PTO requests)"
+# HR Additions 2: review cycles and reviews are people records
+# like the Wave A/B tables -- a wipe must never erase them.
+assert "erp_hr_review_cycles" not in _ERP_RESET_TABLES, \
+    "erp_hr_review_cycles must survive the reset (HR review cycles)"
+assert "erp_hr_reviews" not in _ERP_RESET_TABLES, \
+    "erp_hr_reviews must survive the reset (HR reviews)"
 # Dept 13 (Quality & Food Safety) Wave A: the recall plan, drill log,
 # supplier COAs and HACCP records are food-safety records -- a wipe must
 # never erase them.
