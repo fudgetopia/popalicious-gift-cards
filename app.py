@@ -24,9 +24,11 @@ import sqlite3
 import string
 import subprocess
 import tempfile
+import threading
 import time
 import zipfile
 import unicodedata
+import collections
 import hmac
 import hashlib
 import base64
@@ -504,6 +506,7 @@ _SUBSCRIPTION_REMINDER_BODY = """\
 stripe.api_key = STRIPE_SECRET_KEY
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 _cors_origins = "*" if CORS_ORIGINS.strip() == "*" else [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 CORS(app, origins=_cors_origins, supports_credentials=True,
      allow_headers=["Content-Type", "Authorization", "X-ERP-Request"])
@@ -1105,6 +1108,22 @@ def init_db():
             conn.execute(f"ALTER TABLE {_t} ADD COLUMN is_demo INTEGER NOT NULL DEFAULT 0")
         except sqlite3.OperationalError:
             pass
+    # Security (Nov 13 2026): demo gift cards must never be spendable.
+    # Any demo card minted through /api/demo/gift-card before the redeem
+    # paths excluded them is deactivated here (balance zeroed) on startup.
+    # Idempotent: after the first run no rows match the WHERE clause.
+    try:
+        _demo_deact = conn.execute(
+            "UPDATE gift_cards SET active = 0, balance_cents = 0"
+            " WHERE is_demo = 1 AND (active = 1 OR balance_cents > 0)"
+        ).rowcount
+        if _demo_deact:
+            _erp_settings_audit(
+                conn, "system", "security.demo_cards_deactivated",
+                "gift_cards", 0,
+                "%d demo gift card(s) deactivated (balance zeroed)" % _demo_deact)
+    except sqlite3.OperationalError:
+        pass
     # Migration: PayPal subscriptions (v1, Oct 26 2026). Stripe rows keep
     # payment_provider 'stripe'; PayPal rows store the PayPal subscription id
     # and are never charged through Stripe (see subscription_renewals_run).
@@ -3598,6 +3617,20 @@ def init_db():
     if "tax_jurisdiction" not in _inv_cols:
         conn.execute("ALTER TABLE erp_acct_invoices ADD COLUMN"
                      " tax_jurisdiction TEXT NOT NULL DEFAULT 'Clark County'")
+    # Security (Nov 13 2026): per-user token version (bumped on every
+    # password change, invalidating all outstanding tokens) and a denylist
+    # for tokens invalidated by logout. Lives at the END of init_db on
+    # purpose: erp_wholesale_users is created by a later executescript, so
+    # an earlier ALTER would silently no-op on it.
+    for _t in ("users", "staff", "erp_wholesale_users"):
+        try:
+            conn.execute(f"ALTER TABLE {_t} ADD COLUMN token_version INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS erp_token_denylist ("
+        " jti TEXT PRIMARY KEY, kind TEXT NOT NULL, user_id INTEGER NOT NULL,"
+        " expires_at TEXT NOT NULL, created_at TEXT NOT NULL)")
     conn.commit()
     conn.close()
 
@@ -4058,12 +4091,17 @@ def balance():
     code = (request.args.get("code") or "").strip().upper()
     if not code:
         return jsonify(error="code is required"), 400
+    _err = _auth_throttle_check("giftcard-ip", _client_ip(), max_fails=20)
+    if _err:
+        return _err
     conn = db()
     row = conn.execute(
-        "SELECT code, balance_cents, active FROM gift_cards WHERE code = ?", (code,)
+        "SELECT code, balance_cents, active FROM gift_cards"
+        " WHERE code = ? AND is_demo = 0", (code,)
     ).fetchone()
     conn.close()
     if not row or not row["active"]:
+        _auth_throttle_fail("giftcard-ip", _client_ip())
         return jsonify(error="gift card not found"), 404
     return jsonify(code=row["code"], balance_cents=row["balance_cents"])
 
@@ -4079,22 +4117,28 @@ def redeem():
 
     if not code or amount <= 0:
         return jsonify(error="code and a positive amount_cents are required"), 400
+    _err = _auth_throttle_check("giftcard-ip", _client_ip(), max_fails=20)
+    if _err:
+        return _err
 
     conn = db()
     row = conn.execute(
-        "SELECT code, balance_cents, active FROM gift_cards WHERE code = ?", (code,)
+        "SELECT code, balance_cents, active FROM gift_cards"
+        " WHERE code = ? AND is_demo = 0", (code,)
     ).fetchone()
     if not row or not row["active"]:
+        _auth_throttle_fail("giftcard-ip", _client_ip())
         conn.close()
         return jsonify(error="gift card not found"), 404
 
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "UPDATE gift_cards SET balance_cents = balance_cents - ?"
-        " WHERE code = ? AND balance_cents >= ?",
+        " WHERE code = ? AND balance_cents >= ? AND is_demo = 0",
         (amount, code, amount),
     )
     if not cur.rowcount:
+        _auth_throttle_fail("giftcard-ip", _client_ip())
         conn.close()
         return jsonify(error="insufficient balance"), 402
     conn.execute(
@@ -4323,7 +4367,8 @@ def validate_discount():
         return jsonify(type="promo", code=code, label=p["label"], description=p["description"])
     conn = db()
     row = conn.execute(
-        "SELECT balance_cents, active FROM gift_cards WHERE code = ?", (code,)
+        "SELECT balance_cents, active FROM gift_cards"
+        " WHERE code = ? AND is_demo = 0", (code,)
     ).fetchone()
     if row and row["active"]:
         conn.close()
@@ -4931,8 +4976,8 @@ def printful_shipping_rates():
             timeout=20,
         )
         resp = r.json()
-    except Exception as e:
-        return jsonify(error=f"printful rates failed: {e}"), 502
+    except Exception:
+        return jsonify(error="printful rates failed"), 502
     if r.status_code != 200:
         return jsonify(error=f"printful error {r.status_code}"), 502
     rates = []
@@ -5004,8 +5049,12 @@ def _dollars(cents):
 
 # ---------------------------------------------------------------- shared order math
 
-def _compute_order(data):
+def _compute_order(data, allow_demo=False):
     """Validate a cart + discount code; shared by the Stripe and PayPal checkouts.
+
+    allow_demo is True ONLY for demo_checkout: demo gift cards are valid
+    there and nowhere else (security, Nov 13 2026 — a demo card must never
+    buy anything real).
 
     Returns (order, None) on success, or (None, (response, status)) on error.
     order keys: items, merchandise_total, email, shipping_cents, shipping_label,
@@ -5150,9 +5199,18 @@ def _compute_order(data):
                 order["reward_discount_cents"], total)
             conn.close()
         else:
-            row = conn.execute(
-                "SELECT balance_cents, active FROM gift_cards WHERE code = ?", (code,)
-            ).fetchone()
+            # Demo gift cards are never spendable in a real checkout
+            # (security, Nov 13 2026); only demo_checkout passes
+            # allow_demo=True.
+            if allow_demo:
+                row = conn.execute(
+                    "SELECT balance_cents, active FROM gift_cards WHERE code = ?",
+                    (code,)).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT balance_cents, active FROM gift_cards"
+                    " WHERE code = ? AND is_demo = 0",
+                    (code,)).fetchone()
             conn.close()
             if not row or not row["active"]:
                 return None, (jsonify(error="gift card not found"), 404)
@@ -6067,8 +6125,86 @@ def _require_auth_ready():
         return jsonify(error="accounts are not set up yet"), 503
     return None
 
+def _token_version(table, user_id):
+    """Current token version for a user row (0 when missing/unknown)."""
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT token_version FROM %s WHERE id = ?" % table,
+            (user_id,)).fetchone()
+        conn.close()
+        return int((row or [0])[0] or 0)
+    except Exception:
+        return 0
+
+
+def _token_deny(jti, kind, user_id, max_age_seconds):
+    """Record a logged-out token so it can never be used again."""
+    try:
+        conn = db()
+        now = datetime.now(timezone.utc)
+        conn.execute("DELETE FROM erp_token_denylist WHERE expires_at <= ?",
+                     (now.isoformat(),))
+        conn.execute(
+            "INSERT OR IGNORE INTO erp_token_denylist"
+            " (jti, kind, user_id, expires_at, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (jti, kind, user_id,
+             (now + timedelta(seconds=max_age_seconds)).isoformat(),
+             now.isoformat()))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _token_denied(jti):
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT 1 FROM erp_token_denylist WHERE jti = ? AND expires_at > ?",
+            (jti, datetime.now(timezone.utc).isoformat())).fetchone()
+        conn.close()
+        return bool(row)
+    except Exception:
+        return False
+
+
+def _deny_token_from_request(kind):
+    """Deny the token the caller is logging out with (member or staff).
+    Best-effort: a logout must never fail because revocation did."""
+    try:
+        if kind == "staff":
+            s = _staff_serializer()
+            token = request.cookies.get(STAFF_COOKIE, "")
+            if not token:
+                auth = request.headers.get("Authorization", "")
+                if auth.lower().startswith("bearer "):
+                    token = auth[7:].strip()
+            max_age = 12 * 3600
+            id_key = "sid"
+        else:
+            s = _auth_serializer()
+            token = request.cookies.get(SESSION_COOKIE, "")
+            if not token:
+                auth = request.headers.get("Authorization", "")
+                if auth.lower().startswith("bearer "):
+                    token = auth[7:].strip()
+            max_age = 30 * 24 * 3600
+            id_key = "uid"
+        if not s or not token:
+            return
+        payload = s.loads(token, max_age=max_age)
+        if payload.get("jti"):
+            _token_deny(payload["jti"], kind, payload.get(id_key), max_age)
+    except Exception:
+        pass
+
+
 def _issue_auth_token(user_id):
-    return _auth_serializer().dumps({"uid": user_id})
+    return _auth_serializer().dumps(
+        {"uid": user_id, "v": _token_version("users", user_id),
+         "jti": secrets.token_urlsafe(16)})
 
 def _auth_user_from_token(token):
     s = _auth_serializer()
@@ -6080,9 +6216,17 @@ def _auth_user_from_token(token):
         return None
     conn = db()
     row = conn.execute(
-        "SELECT id, email, name FROM users WHERE id = ? AND active = 1", (payload.get("uid"),)
+        "SELECT id, email, name, token_version FROM users WHERE id = ? AND active = 1",
+        (payload.get("uid"),)
     ).fetchone()
     conn.close()
+    if not row:
+        return None
+    # A token minted before a password change (version bump) is dead.
+    if payload.get("v", 0) != int(row["token_version"] or 0):
+        return None
+    if payload.get("jti") and _token_denied(payload["jti"]):
+        return None
     return row
 
 # Sessions live in a secure HttpOnly cookie set by the backend (never in
@@ -6271,6 +6415,13 @@ def auth_forgot_password():
         return err
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
+    # Throttle reset emails per address (stops email bombing); the
+    # response stays ok=True either way so nothing is revealed.
+    if _auth_throttle_check("forgot-member", email) \
+            or _auth_throttle_check("forgot-member-ip", _client_ip(), max_fails=20):
+        return jsonify(ok=True)
+    _auth_throttle_fail("forgot-member", email)
+    _auth_throttle_fail("forgot-member-ip", _client_ip())
     conn = db()
     row = conn.execute(
         "SELECT id, name, active FROM users WHERE email = ?", (email,)
@@ -6312,13 +6463,126 @@ def auth_reset_password():
         conn.close()
         return jsonify(error="this reset link has expired — request a new one"), 400
     conn.execute(
-        "UPDATE users SET password_hash = ? WHERE id = ?",
+        "UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
         (generate_password_hash(password), row["user_id"]),
     )
     conn.execute("UPDATE password_reset_tokens SET used = 1 WHERE token = ?", (token,))
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+# ---- failed-attempt throttling (security, Nov 13 2026) ----
+# In-memory buckets: the app runs as a single Flask process on Railway, so
+# one process-wide store covers all requests. A bucket holds failure
+# timestamps for one (scope, key); a success clears the account bucket.
+# Login buckets: 5 failures in 15 minutes per account, 20 per IP (a shared
+# office IP is not locked out by one person's typos).
+_AUTH_FAILS = {}
+_AUTH_FAILS_LOCK = threading.Lock()
+
+
+def _client_ip():
+    """Best-effort client IP. Railway terminates TLS and sets
+    X-Forwarded-For (first entry is the client); the container is only
+    reachable through Railway's router, so that header is router-set.
+    Falls back to remote_addr (tests / direct runs)."""
+    xff = (request.headers.get("X-Forwarded-For") or "").strip()
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.remote_addr or ""
+
+
+def _auth_throttle_check(scope, key, max_fails=5, window_seconds=900):
+    """Return (response, 429) when (scope, key) failed too often, else None."""
+    now = time.time()
+    with _AUTH_FAILS_LOCK:
+        dq = _AUTH_FAILS.setdefault((scope, key), collections.deque())
+        while dq and dq[0] <= now - window_seconds:
+            dq.popleft()
+        if len(dq) >= max_fails:
+            retry = int(dq[0] + window_seconds - now) + 1
+            return jsonify(
+                error="too many failed attempts — try again in %d minute(s)"
+                % max(1, (retry + 59) // 60)
+            ), 429
+    return None
+
+
+def _auth_throttle_fail(scope, key):
+    with _AUTH_FAILS_LOCK:
+        _AUTH_FAILS.setdefault((scope, key), collections.deque()).append(time.time())
+
+
+def _auth_throttle_clear(scope, key):
+    with _AUTH_FAILS_LOCK:
+        _AUTH_FAILS.pop((scope, key), None)
+
+
+def _login_throttle_check(scope, key):
+    """Check both the per-account and per-IP buckets for a login scope."""
+    return _auth_throttle_check(scope, key) \
+        or _auth_throttle_check(scope + "-ip", _client_ip(), max_fails=20)
+
+
+def _login_throttle_fail(scope, key):
+    _auth_throttle_fail(scope, key)
+    _auth_throttle_fail(scope + "-ip", _client_ip())
+
+
+# ---- CSRF guard (security, Nov 13 2026) ----
+# A state-changing request that rides on a session cookie must prove it came
+# from our own pages: the Authorization header (a Bearer token is never sent
+# cross-site by a browser), the X-ERP-Request header (a custom header needs
+# a CORS preflight the attacker's origin cannot pass), or an allowlisted
+# Origin. Auth and public endpoints are exempt — they do not rely on an
+# existing session (login calls may even carry a stale cookie). Logout is
+# exempt by design: logging a victim out is a nuisance, not a breach, and
+# the shared logout must work on the cookie alone. GET/HEAD/OPTIONS never
+# change state and are exempt.
+_CSRF_EXEMPT_EXACT = {
+    "/api/auth/login", "/api/admin/login", "/api/loyalty/staff/login",
+    "/api/wholesale/login",
+    "/api/auth/forgot-password", "/api/loyalty/staff/forgot-password",
+    "/api/wholesale/forgot-password",
+    "/api/auth/reset-password", "/api/loyalty/staff/reset-password",
+    "/api/wholesale/set-password",
+    "/api/auth/erp-handoff",
+    "/api/auth/logout", "/api/loyalty/staff/logout",
+    "/api/subscriptions/request",
+}
+_CSRF_EXEMPT_PREFIXES = (
+    "/api/demo/", "/api/gift-cards/", "/api/track/",
+    "/api/stripe/", "/api/paypal/", "/api/printful/", "/api/shipping/",
+    "/api/discounts/",
+)
+_CSRF_ALLOWED_ORIGINS = {
+    "https://pop-a-licious.com",
+    "https://erp.pop-a-licious.com",
+    "https://muse.ai",
+}
+
+
+@app.before_request
+def _csrf_guard():
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return None
+    path = request.path or ""
+    if path in _CSRF_EXEMPT_EXACT:
+        return None
+    for prefix in _CSRF_EXEMPT_PREFIXES:
+        if path.startswith(prefix):
+            return None
+    if request.headers.get("Authorization"):
+        return None
+    if request.headers.get("X-ERP-Request", "") == "1":
+        return None
+    if request.cookies.get(SESSION_COOKIE) or request.cookies.get(STAFF_COOKIE):
+        origin = (request.headers.get("Origin") or "").strip()
+        if origin in _CSRF_ALLOWED_ORIGINS:
+            return None
+        return jsonify(error="missing request header"), 403
+    return None
+
 
 @app.post("/api/auth/login")
 def auth_login():
@@ -6327,6 +6591,9 @@ def auth_login():
         return err
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
+    err = _login_throttle_check("login-member", email)
+    if err:
+        return err
     password = data.get("password") or ""
     conn = db()
     row = conn.execute(
@@ -6337,6 +6604,7 @@ def auth_login():
     if not row or not row["password_hash"] or not check_password_hash(
         row["password_hash"], password
     ):
+        _login_throttle_fail("login-member", email)
         conn.close()
         return jsonify(error="email or password is incorrect"), 401
     if not row["active"]:
@@ -6380,6 +6648,7 @@ def auth_login():
     conn.commit()
     conn.close()
     token = _issue_auth_token(row["id"])
+    _auth_throttle_clear("login-member", email)
     resp = jsonify(name=row["name"], email=row["email"], token=token,
                    kernels_earned=kernels_earned,
                    anniversary_credited=anniversary_credited)
@@ -6399,6 +6668,9 @@ def admin_login():
         return err
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
+    err = _login_throttle_check("login-admin", email)
+    if err:
+        return err
     password = data.get("password") or ""
     if email not in ADMIN_EMAILS:
         return jsonify(error="not an admin email"), 403
@@ -6411,10 +6683,12 @@ def admin_login():
     if not row or not row["password_hash"] or not check_password_hash(
         row["password_hash"], password
     ):
+        _login_throttle_fail("login-admin", email)
         return jsonify(error="email or password is incorrect"), 401
     if not row["active"]:
         return jsonify(error="this account has been deactivated"), 403
     token = _issue_auth_token(row["id"])
+    _auth_throttle_clear("login-admin", email)
     resp = jsonify(name=row["name"], email=row["email"], token=token, is_admin=True)
     return _set_session_cookie(resp, token)
 
@@ -6423,6 +6697,7 @@ def auth_logout():
     err = _require_auth_ready()
     if err:
         return err
+    _deny_token_from_request("member")
     return _clear_session_cookie(jsonify(ok=True))
 
 @app.get("/api/auth/me")
@@ -6543,6 +6818,8 @@ def google_callback():
     email = (info.get("email") or "").strip().lower()
     name = (info.get("name") or "").strip()
     if not google_id or not email:
+        return jsonify(error="Google sign-in failed"), 502
+    if not info.get("email_verified"):
         return jsonify(error="Google sign-in failed"), 502
     conn = db()
     row = conn.execute(
@@ -6720,7 +6997,9 @@ def _staff_serializer():
     return URLSafeTimedSerializer(AUTH_SECRET, salt="popalicious-staff")
 
 def _issue_staff_token(staff_id):
-    return _staff_serializer().dumps({"sid": staff_id})
+    return _staff_serializer().dumps(
+        {"sid": staff_id, "v": _token_version("staff", staff_id),
+         "jti": secrets.token_urlsafe(16)})
 
 def _staff_from_request():
     s = _staff_serializer()
@@ -6738,10 +7017,17 @@ def _staff_from_request():
         return None
     conn = db()
     row = conn.execute(
-        "SELECT id, email, name FROM staff WHERE id = ? AND active = 1 AND verified = 1",
+        "SELECT id, email, name, token_version FROM staff"
+        " WHERE id = ? AND active = 1 AND verified = 1",
         (payload.get("sid"),),
     ).fetchone()
     conn.close()
+    if not row:
+        return None
+    if payload.get("v", 0) != int(row["token_version"] or 0):
+        return None
+    if payload.get("jti") and _token_denied(payload["jti"]):
+        return None
     return row
 
 def _require_staff():
@@ -6760,7 +7046,9 @@ def _wholesale_serializer():
 
 
 def _issue_wholesale_token(user_id):
-    return _wholesale_serializer().dumps({"wid": user_id})
+    return _wholesale_serializer().dumps(
+        {"wid": user_id, "v": _token_version("erp_wholesale_users", user_id),
+         "jti": secrets.token_urlsafe(16)})
 
 
 def _wholesale_user_from_request():
@@ -6788,6 +7076,10 @@ def _wholesale_user_from_request():
         (payload.get("wid"),)).fetchone()
     conn.close()
     if not user:
+        return None, None
+    if payload.get("v", 0) != int(user["token_version"] or 0):
+        return None, None
+    if payload.get("jti") and _token_denied(payload["jti"]):
         return None, None
     if not user["account_active"] or user["account_status"] == "deactivated":
         return None, None
@@ -7005,6 +7297,11 @@ def staff_forgot_password():
         return err
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
+    if _auth_throttle_check("forgot-staff", email) \
+            or _auth_throttle_check("forgot-staff-ip", _client_ip(), max_fails=20):
+        return jsonify(ok=True)
+    _auth_throttle_fail("forgot-staff", email)
+    _auth_throttle_fail("forgot-staff-ip", _client_ip())
     conn = db()
     row = conn.execute(
         "SELECT id, name, active FROM staff WHERE email = ?", (email,)
@@ -7046,7 +7343,7 @@ def staff_reset_password():
         conn.close()
         return jsonify(error="this reset link has expired — request a new one"), 400
     conn.execute(
-        "UPDATE staff SET password_hash = ? WHERE id = ?",
+        "UPDATE staff SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
         (generate_password_hash(password), row["staff_id"]),
     )
     conn.execute("UPDATE staff_password_reset_tokens SET used = 1 WHERE token = ?", (token,))
@@ -7061,6 +7358,9 @@ def staff_login():
         return err
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
+    err = _login_throttle_check("login-staff", email)
+    if err:
+        return err
     password = data.get("password") or ""
     conn = db()
     row = conn.execute(
@@ -7068,6 +7368,7 @@ def staff_login():
         (email,),
     ).fetchone()
     if not row or not check_password_hash(row["password_hash"], password):
+        _login_throttle_fail("login-staff", email)
         conn.close()
         return jsonify(error="invalid staff login"), 401
     if not row["verified"]:
@@ -7078,6 +7379,7 @@ def staff_login():
     conn.commit()
     conn.close()
     staff_token = _issue_staff_token(row["id"])
+    _auth_throttle_clear("login-staff", email)
     return _set_staff_cookie(
         jsonify(ok=True, name=row["name"], email=row["email"],
                 occasion_credits=occasion_credits, token=staff_token),
@@ -7086,6 +7388,7 @@ def staff_login():
 
 @app.post("/api/loyalty/staff/logout")
 def staff_logout():
+    _deny_token_from_request("staff")
     return _clear_staff_cookie(jsonify(ok=True))
 
 @app.get("/api/orders/mine")
@@ -7349,7 +7652,7 @@ def staff_set_password():
         conn.close()
         return jsonify(error="invalid or expired link"), 400
     conn.execute(
-        "UPDATE staff SET password_hash = ?, verified = 1 WHERE id = ?",
+        "UPDATE staff SET password_hash = ?, token_version = token_version + 1, verified = 1 WHERE id = ?",
         (generate_password_hash(new), row["staff_id"]),
     )
     conn.execute("DELETE FROM staff_verification_tokens WHERE token = ?", (token,))
@@ -7488,7 +7791,7 @@ def staff_change_password():
         conn.close()
         return jsonify(error="current password is incorrect"), 401
     conn.execute(
-        "UPDATE staff SET password_hash = ? WHERE id = ?",
+        "UPDATE staff SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
         (generate_password_hash(new), staff["id"]),
     )
     conn.commit()
@@ -8294,7 +8597,7 @@ def admin_create_staff():
     if old:
         conn.execute(
             "UPDATE staff SET name = ?, password_hash = ?, verified = 0,"
-            " active = 1 WHERE id = ?",
+            " active = 1, token_version = token_version + 1 WHERE id = ?",
             (name or email.split("@")[0], generate_password_hash(password), old["id"]),
         )
         staff_id = old["id"]
@@ -11249,7 +11552,7 @@ def erp_loyalty_password():
         conn.close()
         return jsonify(error="current password is incorrect"), 401
     conn.execute(
-        "UPDATE staff SET password_hash = ? WHERE id = ?",
+        "UPDATE staff SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
         (generate_password_hash(new), staff_id),
     )
     conn.commit()
@@ -11307,9 +11610,10 @@ def admin_dashboard():
         "SELECT COUNT(*) AS c, COALESCE(SUM(amount_total_cents), 0) AS s"
         " FROM paypal_orders WHERE status != 'captured'").fetchone()
     gift_cards_sold = conn.execute(
-        "SELECT COUNT(*) AS c FROM gift_cards").fetchone()["c"]
+        "SELECT COUNT(*) AS c FROM gift_cards WHERE is_demo = 0").fetchone()["c"]
     gift_cards_outstanding = conn.execute(
-        "SELECT COALESCE(SUM(balance_cents), 0) AS s FROM gift_cards WHERE active = 1").fetchone()["s"]
+        "SELECT COALESCE(SUM(balance_cents), 0) AS s FROM gift_cards"
+        " WHERE active = 1 AND is_demo = 0").fetchone()["s"]
     members = conn.execute(
         "SELECT COUNT(*) AS c FROM users WHERE verified = 1").fetchone()["c"]
     kernels_issued = conn.execute(
@@ -11559,7 +11863,7 @@ def admin_reset_staff_password(staff_id):
         conn.close()
         return jsonify(error="staff member is inactive -- reactivate first"), 400
     conn.execute(
-        "UPDATE staff SET password_hash = ? WHERE id = ?",
+        "UPDATE staff SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
         (generate_password_hash(temp), staff_id))
     conn.execute(
         "UPDATE staff_password_reset_tokens SET used = 1"
@@ -17040,7 +17344,7 @@ def _quality_sop_import_actor():
     actor, err = _require_erp_admin()
     if err is None:
         return actor, None
-    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+    if CRON_SECRET and hmac.compare_digest(request.headers.get("X-Cron-Secret", ""), CRON_SECRET):
         return "cron", None
     return None, err
 
@@ -21865,7 +22169,8 @@ def stores_gift_card_redeem(store_id):
         (code, sale_key)).fetchone()
     if prior:
         row = conn.execute(
-            "SELECT balance_cents FROM gift_cards WHERE code = ?",
+            "SELECT balance_cents FROM gift_cards"
+            " WHERE code = ? AND is_demo = 0",
             (code,)).fetchone()
         conn.close()
         return jsonify(code=code,
@@ -21875,14 +22180,14 @@ def stores_gift_card_redeem(store_id):
                        duplicate=True)
     row = conn.execute(
         "SELECT code, balance_cents, active FROM gift_cards"
-        " WHERE code = ?", (code,)).fetchone()
+        " WHERE code = ? AND is_demo = 0", (code,)).fetchone()
     if not row or not row["active"]:
         conn.close()
         return jsonify(error="gift card not found"), 404
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "UPDATE gift_cards SET balance_cents = balance_cents - ?"
-        " WHERE code = ? AND balance_cents >= ?",
+        " WHERE code = ? AND balance_cents >= ? AND is_demo = 0",
         (amount, code, amount))
     if not cur.rowcount:
         conn.close()
@@ -25440,7 +25745,12 @@ def demo_checkout():
     Stripe, no Shippo label, no balance consumption. Order is saved with
     is_demo=1 and [DEMO] emails are sent."""
     data = request.get_json(force=True) or {}
-    order, err = _compute_order(data)
+    _err = _auth_throttle_check("demo-ip", _client_ip(),
+                                max_fails=20, window_seconds=3600)
+    if _err:
+        return _err
+    _auth_throttle_fail("demo-ip", _client_ip())
+    order, err = _compute_order(data, allow_demo=True)
     if err:
         return err[0], err[1]
     mark_abandoned_converted(data.get("email"))
@@ -25507,6 +25817,11 @@ def demo_checkout():
 def demo_gift_card():
     """Demo-mode gift card purchase: validated like the real flow, no Stripe."""
     data = request.get_json(force=True) or {}
+    _err = _auth_throttle_check("demo-ip", _client_ip(),
+                                max_fails=20, window_seconds=3600)
+    if _err:
+        return _err
+    _auth_throttle_fail("demo-ip", _client_ip())
     try:
         amount = int(data.get("amount_cents", 0))
     except (TypeError, ValueError):
@@ -25564,6 +25879,11 @@ def demo_fundraiser_order():
     """Demo-mode fundraiser supporter purchase: validated like the real flow,
     but no Stripe, no Shippo, no ticker entry, no sponsor matching."""
     data = request.get_json(force=True) or {}
+    _err = _auth_throttle_check("demo-ip", _client_ip(),
+                                max_fails=20, window_seconds=3600)
+    if _err:
+        return _err
+    _auth_throttle_fail("demo-ip", _client_ip())
     fcode = (data.get("fundraiser_code") or "").strip().upper()
     scode = (data.get("seller_referral_code") or "").strip().upper()
     customer_name = (data.get("customer_name") or "").strip()[:120]
@@ -25686,6 +26006,11 @@ def demo_subscription():
     if not user:
         return jsonify(error="login required"), 401
     data = request.get_json(force=True) or {}
+    _err = _auth_throttle_check("demo-ip", _client_ip(),
+                                max_fails=20, window_seconds=3600)
+    if _err:
+        return _err
+    _auth_throttle_fail("demo-ip", _client_ip())
     frequency = (data.get("frequency") or "").strip()
     ship = data.get("shipping") or {}
     if not isinstance(ship, dict):
@@ -26622,6 +26947,54 @@ def _erp_is_bot_wall(html):
     return any(m in low for m in markers)
 
 
+def _erp_public_url_ok(url):
+    """True when url is an http(s) URL whose host resolves ONLY to public IPs.
+
+    SSRF guard, Nov 13 2026: the old check inspected the literal hostname
+    only when it parsed as an IP, so a DNS name resolving to a private
+    address — or a public URL that 302s to one — sailed through. This
+    resolves the hostname and rejects loopback, private (RFC1918/CGNAT),
+    link-local, multicast, reserved, and unspecified addresses on every
+    resolved result. Fail-closed: a DNS failure is a rejection.
+    """
+    from urllib.parse import urlparse
+    import ipaddress
+    import socket
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme not in ("http", "https") or not host:
+        return False
+    if host == "localhost" or host.endswith(".local"):
+        return False
+
+    def _bad(ip):
+        return (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+    try:
+        ip = ipaddress.ip_address(host)
+        return not _bad(ip)
+    except ValueError:
+        pass  # not a literal IP — resolve it below
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except (socket.gaierror, UnicodeError):
+        return False
+    if not infos:
+        return False
+    for _fam, _typ, _proto, _canon, sockaddr in infos:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            return False
+        if _bad(ip):
+            return False
+    return True
+
+
 @app.post("/api/erp/items/fetch-url")
 def erp_fetch_url():
     """Fetch a supplier listing and return what could be pulled from it.
@@ -26629,41 +27002,43 @@ def erp_fetch_url():
     Admin-only. Returns name, price, package size, nutrition facts,
     and ingredients for the staff to review in the item form — nothing
     is saved by this call.
-    Rejects non-http(s) URLs and localhost/private-IP hosts.
+    Rejects non-http(s) URLs and hosts that resolve to non-public IPs,
+    follows at most 3 redirects (each re-validated), and caps the body
+    at 2 MB.
     """
     actor, err = _require_erp_admin()
     if err:
         return err
     data = request.get_json(force=True) or {}
     url = (data.get("url") or "").strip()
-    try:
-        from urllib.parse import urlparse
-        import ipaddress
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
-        if parsed.scheme not in ("http", "https") or not host:
-            raise ValueError("bad url")
-        if host == "localhost" or host.endswith(".local"):
-            raise ValueError("local host")
-        try:
-            ip = ipaddress.ip_address(host)
-            if ip.is_private or ip.is_loopback or ip.is_link_local \
-                    or ip.is_reserved:
-                raise ValueError("private ip")
-        except ValueError as e:
-            if str(e) in ("local host", "private ip"):
-                raise
-    except ValueError:
+    if not _erp_public_url_ok(url):
         return jsonify(error="a public http(s) product URL is required"), 400
     try:
-        resp = requests.get(url, timeout=15,
-                            headers={"User-Agent":
-                                     "Pop-A-Licious ERP item importer"})
+        resp = None
+        current = url
+        for _hop in range(4):
+            resp = requests.get(current, timeout=15, allow_redirects=False,
+                                headers={"User-Agent":
+                                         "Pop-A-Licious ERP item importer"})
+            if resp.status_code not in (301, 302, 303, 307, 308):
+                break
+            nxt = (getattr(resp, "headers", {}) or {}).get("Location", "")
+            if not nxt:
+                break
+            current = requests.compat.urljoin(current, nxt)
+            if not _erp_public_url_ok(current):
+                return jsonify(
+                    error="a public http(s) product URL is required"), 400
+        else:
+            return jsonify(error="too many redirects"), 502
     except Exception:
         return jsonify(error="could not fetch that URL"), 502
-    if resp.status_code != 200:
-        return jsonify(error="listing returned HTTP %d" % resp.status_code), \
-            502
+    if resp is None or resp.status_code != 200:
+        return jsonify(error="listing returned HTTP %d"
+                       % (resp.status_code if resp is not None else 0)), 502
+    body = getattr(resp, "content", None)
+    if body is not None and len(body) > 2 * 1024 * 1024:
+        return jsonify(error="that page is too large to import"), 502
     if _erp_is_bot_wall(resp.text):
         return jsonify(error="that site blocked the automated read with a"
                               " bot check, so no product details came back —"
@@ -30055,7 +30430,7 @@ def erp_acct_sales_backfill():
     Also accepts the cron secret (same pattern as the subscription
     renewal cron) so a nightly job can call it without an admin token."""
     actor = None
-    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+    if CRON_SECRET and hmac.compare_digest(request.headers.get("X-Cron-Secret", ""), CRON_SECRET):
         actor = "cron"
     else:
         actor, err = _erp_check_perm("accounting.write")
@@ -32337,7 +32712,7 @@ def erp_acct_qb_snapshot_upload():
     as qb.snapshot_upload. The snapshot contents are never logged --
     the audit detail and the response carry counts only."""
     actor = None
-    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+    if CRON_SECRET and hmac.compare_digest(request.headers.get("X-Cron-Secret", ""), CRON_SECRET):
         actor = "cron"
     else:
         actor, err = _erp_check_perm("accounting.write")
@@ -32396,7 +32771,7 @@ def erp_acct_qb_snapshot_download():
     stored. The snapshot holds QuickBooks financial data: it is
     returned only to an admin session or the cron secret, never to
     anonymous or customer callers, and it is never logged."""
-    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+    if CRON_SECRET and hmac.compare_digest(request.headers.get("X-Cron-Secret", ""), CRON_SECRET):
         pass
     else:
         actor, err = _erp_check_perm("accounting.write")
@@ -32650,7 +33025,7 @@ def _qb_pull_auth():
     """qb.manage admin session OR the cron secret, same pattern as the
     sales backfill / qb-snapshot upload. Returns (actor, None) when
     allowed, else (None, (resp, code))."""
-    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+    if CRON_SECRET and hmac.compare_digest(request.headers.get("X-Cron-Secret", ""), CRON_SECRET):
         return "cron", None
     actor, err = _erp_check_perm("qb.manage")
     return actor, err
@@ -34521,7 +34896,7 @@ def erp_acct_tax_checklist_set(filing_id):
 
 
 def _acct_tax_remind_auth():
-    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+    if CRON_SECRET and hmac.compare_digest(request.headers.get("X-Cron-Secret", ""), CRON_SECRET):
         return "cron", None
     return _erp_check_perm("tax.write")
 
@@ -36338,7 +36713,7 @@ def erp_acct_migrate_import():
     # idempotent on erp_acct_migration_links, so a cron-triggered
     # import is as safe as an admin-triggered one.
     actor = None
-    if CRON_SECRET and request.headers.get("X-Cron-Secret", "") == CRON_SECRET:
+    if CRON_SECRET and hmac.compare_digest(request.headers.get("X-Cron-Secret", ""), CRON_SECRET):
         actor = "cron"
     else:
         actor, err = _erp_check_perm("accounting.write")
@@ -41338,6 +41713,9 @@ def _send_order_declined_email(to_email, order_number, business_name, note):
 def wholesale_login():
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
+    err = _login_throttle_check("login-wholesale", email)
+    if err:
+        return err
     password = data.get("password") or ""
     conn = db()
     user = conn.execute(
@@ -41347,6 +41725,7 @@ def wholesale_login():
         " WHERE LOWER(wu.email) = ?", (email,)).fetchone()
     if not user or not user["password_hash"] or \
             not check_password_hash(user["password_hash"], password):
+        _login_throttle_fail("login-wholesale", email)
         conn.close()
         return jsonify(error="invalid email or password"), 401
     if not user["active"] or not user["account_active"] \
@@ -41356,6 +41735,7 @@ def wholesale_login():
     token = _issue_wholesale_token(user["id"])
     out = {"token": token, "email": user["email"],
            "account_id": user["account_id"], "account_name": user["account_name"]}
+    _auth_throttle_clear("login-wholesale", email)
     conn.close()
     return jsonify(out)
 
@@ -41381,7 +41761,7 @@ def wholesale_set_password():
         return jsonify(error="invite token has expired — ask for a new invitation"), 410
     now = datetime.now(timezone.utc).isoformat()
     conn.execute("UPDATE erp_wholesale_users SET password_hash = ?, invite_token = '',"
-                 " invite_expires_at = '', active = 1 WHERE id = ?",
+                 " invite_expires_at = '', active = 1, token_version = token_version + 1 WHERE id = ?",
                  (generate_password_hash(password), user["id"]))
     conn.execute("UPDATE erp_wholesale_accounts SET account_status = 'active'"
                  " WHERE id = ? AND account_status = 'invited'", (user["account_id"],))
@@ -41413,6 +41793,11 @@ def _send_wholesale_reset_email(to_email, business_name, link):
 def wholesale_forgot_password():
     data = request.get_json(force=True) or {}
     email = (data.get("email") or "").strip().lower()
+    if _auth_throttle_check("forgot-wholesale", email) \
+            or _auth_throttle_check("forgot-wholesale-ip", _client_ip(), max_fails=20):
+        return jsonify(ok=True)
+    _auth_throttle_fail("forgot-wholesale", email)
+    _auth_throttle_fail("forgot-wholesale-ip", _client_ip())
     # Always return ok — never reveal whether an email is registered.
     if email and EMAIL_RE.match(email):
         conn = db()
@@ -43376,6 +43761,7 @@ def _edi_sftp_send(cfg, x12_text):
     user = (cfg.get("sftp_user") or "").strip()
     key = (cfg.get("sftp_key_path") or "").strip()
     remote = (cfg.get("sftp_remote_path") or "").strip()
+    remote = remote.replace("\n", "").replace("\r", "")
     port = str(cfg.get("sftp_port") or "22").strip()
     if not host:
         return False, "no SFTP host configured for partner"
