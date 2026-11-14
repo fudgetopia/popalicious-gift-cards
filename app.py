@@ -5528,6 +5528,8 @@ def create_order_checkout():
             )
             discounts = [{"coupon": coupon.id}]
     except stripe.error.StripeError as e:
+        app.logger.exception("stripe coupon create failed for promo %s discount %s",
+                             order["promo_code"], order["promo_discount_cents"])
         return jsonify(error=_stripe_error_message(e)), 502
 
     line_items = [
@@ -5591,7 +5593,9 @@ def create_order_checkout():
             },
             return_url=f"{SITE_URL}/#order-success?session_id={{CHECKOUT_SESSION_ID}}",
         )
-    except stripe.error.StripeError:
+    except stripe.error.StripeError as e:
+        app.logger.exception("stripe session create failed for promo %s discount %s discounts %s: %s",
+                             order["promo_code"], order["promo_discount_cents"], discounts, e)
         return jsonify(error="the payment service could not start checkout"), 502
     return jsonify(client_secret=session.client_secret, gift_card_discount_cents=order["gift_card_discount_cents"])
 
