@@ -148,6 +148,7 @@ PROMOS = {
         "type": "percent", "percent_off": 15,
         "label": 'National Hot & Spicy Day',
         "description": '15% off Nashville Hot, Cheddar Jalapeño',
+        "flavors": ["Nashville Hot", "Cheddar Jalapeño"],
         "windows": [["2027-01-16", "2027-01-16"]],
     },
     'POPCORN19': {
@@ -160,186 +161,217 @@ PROMOS = {
         "type": "percent", "percent_off": 15,
         "label": 'National Cheese Lovers Day',
         "description": '15% off Cheddar, White Cheddar, Garlic Parmesan',
+        "flavors": ["Cheddar", "White Cheddar", "Garlic Parmesan"],
         "windows": [["2027-01-20", "2027-01-20"]],
     },
     'HOTSAUCE22': {
         "type": "percent", "percent_off": 15,
         "label": 'National Hot Sauce Day',
         "description": '15% off Nashville Hot, Cheddar Jalapeño, Buffalo Ranch',
+        "flavors": ["Nashville Hot", "Cheddar Jalapeño", "Buffalo Ranch"],
         "windows": [["2027-01-22", "2027-01-22"]],
     },
     'PIZZA09': {
         "type": "percent", "percent_off": 15,
         "label": 'National Pizza Day',
         "description": '15% off Pizza',
+        "flavors": ["Pizza"],
         "windows": [["2027-02-09", "2027-02-09"]],
     },
     'CHEDDAR13': {
         "type": "percent", "percent_off": 15,
         "label": 'National Cheddar Day',
         "description": '15% off Cheddar, White Cheddar',
+        "flavors": ["Cheddar", "White Cheddar"],
         "windows": [["2027-02-13", "2027-02-13"]],
     },
     'STRAWBERRY27': {
         "type": "percent", "percent_off": 15,
         "label": 'National Strawberry Day',
         "description": '15% off Strawberry Cheesecake',
+        "flavors": ["Strawberry Cheesecake"],
         "windows": [["2027-02-27", "2027-02-27"]],
     },
     'CREME06': {
         "type": "percent", "percent_off": 15,
         "label": 'National Oreo Day',
         "description": "15% off Cookies N' Creme",
+        "flavors": ["Cookie and Cream"],
         "windows": [["2027-03-06", "2027-03-06"]],
     },
     'RANCH10': {
         "type": "percent", "percent_off": 15,
         "label": 'National Ranch Day',
         "description": '15% off Buffalo Ranch',
+        "flavors": ["Buffalo Ranch"],
         "windows": [["2027-03-10", "2027-03-10"]],
     },
     'SALTVIN14': {
         "type": "percent", "percent_off": 15,
         "label": 'National Potato Chip Day',
         "description": '15% off Salt & Vinegar',
+        "flavors": ["Salt and Vinegar"],
         "windows": [["2027-03-14", "2027-03-14"]],
     },
     'CARAMEL05': {
         "type": "percent", "percent_off": 15,
         "label": 'National Caramel Day',
         "description": '15% off Caramel',
+        "flavors": ["Caramel"],
         "windows": [["2027-04-05", "2027-04-05"]],
     },
     'CARAMELPOP06': {
         "type": "percent", "percent_off": 15,
         "label": 'National Caramel Popcorn Day',
         "description": '15% off Caramel',
+        "flavors": ["Caramel"],
         "windows": [["2027-04-06", "2027-04-06"]],
     },
     'GARLIC19': {
         "type": "percent", "percent_off": 15,
         "label": 'National Garlic Day',
         "description": '15% off Garlic Butter, Garlic Parmesan',
+        "flavors": ["Garlic Butter", "Garlic Parmesan"],
         "windows": [["2027-04-19", "2027-04-19"]],
     },
     'BURGER28': {
         "type": "percent", "percent_off": 15,
         "label": 'National Hamburger Day',
         "description": '15% off Cheeseburger',
+        "flavors": ["Cheeseburger"],
         "windows": [["2027-05-28", "2027-05-28"]],
     },
     'CHEESE04': {
         "type": "percent", "percent_off": 15,
         "label": 'National Cheese Day',
         "description": '15% off Cheddar, White Cheddar, Garlic Parmesan',
+        "flavors": ["Cheddar", "White Cheddar", "Garlic Parmesan"],
         "windows": [["2027-06-04", "2027-06-04"]],
     },
     'CHURRO06': {
         "type": "percent", "percent_off": 15,
         "label": 'National Churro Day',
         "description": '15% off Churro',
+        "flavors": ["Churro"],
         "windows": [["2027-06-06", "2027-06-06"]],
     },
     'ALIEN02': {
         "type": "percent", "percent_off": 15,
         "label": 'World UFO Day',
         "description": '15% off Alien Mix',
+        "flavors": ["Alien Mix"],
         "windows": [["2027-07-02", "2027-07-02"]],
     },
     'SUGAR09': {
         "type": "percent", "percent_off": 15,
         "label": 'National Sugar Cookie Day',
         "description": '15% off Sugar Cookie',
+        "flavors": ["Sugar Cookie"],
         "windows": [["2027-07-09", "2027-07-09"]],
     },
     'WING29': {
         "type": "percent", "percent_off": 15,
         "label": 'National Chicken Wing Day',
         "description": '15% off Buffalo Ranch',
+        "flavors": ["Buffalo Ranch"],
         "windows": [["2027-07-29", "2027-07-29"]],
     },
     'CHEESECAKE30': {
         "type": "percent", "percent_off": 15,
         "label": 'National Cheesecake Day',
         "description": '15% off Strawberry Cheesecake',
+        "flavors": ["Strawberry Cheesecake"],
         "windows": [["2027-07-30", "2027-07-30"]],
     },
     'HOTSPICY19': {
         "type": "percent", "percent_off": 15,
         "label": 'National Hot & Spicy Day',
         "description": '15% off Nashville Hot, Cheddar Jalapeño, Buffalo Ranch',
+        "flavors": ["Nashville Hot", "Cheddar Jalapeño", "Buffalo Ranch"],
         "windows": [["2027-08-19", "2027-08-19"]],
     },
     'LEMONADE20': {
         "type": "percent", "percent_off": 15,
         "label": 'National Lemonade Day',
         "description": '15% off Lemonade',
+        "flavors": ["Lemonade"],
         "windows": [["2027-08-20", "2027-08-20"]],
     },
     'BACON20': {
         "type": "percent", "percent_off": 15,
         "label": 'National Bacon Lovers Day',
         "description": '15% off Bacon',
+        "flavors": ["Bacon"],
         "windows": [["2027-08-20", "2027-08-20"]],
     },
     'BANANA29': {
         "type": "percent", "percent_off": 15,
         "label": 'National Banana Pudding Day',
         "description": '15% off Banana Pudding',
+        "flavors": ["Banana Pudding"],
         "windows": [["2027-08-29", "2027-08-29"]],
     },
     'MUDDY31': {
         "type": "percent", "percent_off": 15,
         "label": 'National Trail Mix Day',
         "description": '15% off Muddy Buddy',
+        "flavors": ["Muddy Buddy"],
         "windows": [["2027-08-31", "2027-08-31"]],
     },
     'CHEESEPIZZA05': {
         "type": "percent", "percent_off": 15,
         "label": 'National Cheese Pizza Day',
         "description": '15% off Pizza',
+        "flavors": ["Pizza"],
         "windows": [["2027-09-05", "2027-09-05"]],
     },
     'CHEESEBURGER18': {
         "type": "percent", "percent_off": 15,
         "label": 'National Cheeseburger Day',
         "description": '15% off Cheeseburger',
+        "flavors": ["Cheeseburger"],
         "windows": [["2027-09-18", "2027-09-18"]],
     },
     'HOMEMADE01': {
         "type": "percent", "percent_off": 15,
         "label": 'National Homemade Cookies Day',
         "description": "15% off Snickerdoodle, Sugar Cookie, Cookies N' Creme",
+        "flavors": ["Snickerdoodle", "Sugar Cookie", "Cookie and Cream"],
         "windows": [["2027-10-01", "2027-10-01"]],
     },
     'CINNAMON04': {
         "type": "percent", "percent_off": 15,
         "label": 'National Cinnamon Roll Day',
         "description": '15% off Cinnamon Roll',
+        "flavors": ["Cinnamon Roll"],
         "windows": [["2027-10-04", "2027-10-04"]],
     },
     'PICKLE14': {
         "type": "percent", "percent_off": 15,
         "label": 'National Pickle Day',
         "description": '15% off Dill Pickle',
+        "flavors": ["Dill Pickle"],
         "windows": [["2026-11-14", "2026-11-14"]],
     },
     'CAKE26': {
         "type": "percent", "percent_off": 15,
         "label": 'National Cake Day',
         "description": '15% off Birthday Cake',
+        "flavors": ["Birthday Cake"],
         "windows": [["2026-11-26", "2026-11-26"]],
     },
     'COOKIE04': {
         "type": "percent", "percent_off": 15,
         "label": 'National Cookie Day',
         "description": "15% off Cookies N' Creme, Sugar Cookie, Snickerdoodle",
+        "flavors": ["Cookie and Cream", "Sugar Cookie", "Snickerdoodle"],
         "windows": [["2026-12-04", "2026-12-04"]],
     },
     'BACON30': {
         "type": "percent", "percent_off": 15,
         "label": 'National Bacon Day',
         "description": '15% off Bacon',
+        "flavors": ["Bacon"],
         "windows": [["2026-12-30", "2026-12-30"]],
     },
     # Bundle days: any 3 bags for $20 (=$4 off per set of 3 at $8/bag).
@@ -429,6 +461,31 @@ def _promo_bundle_bags(items, promo):
             continue
         n += int(it.get("quantity", 0))
     return n
+
+
+def _promo_percent_discount_cents(items, promo):
+    """Eligible-merchandise cents + discount cents for a percent promo.
+
+    Only popcorn bags whose normalized name is one of the promo's flavors
+    count; a promo with no "flavors" key is sitewide and counts every
+    popcorn bag. Shipping, merch and bundles never count, so the discount
+    is a percent of eligible merchandise only (Nov 14 2026 fix: the old
+    paths discounted the whole cart incl. shipping — a session-wide Stripe
+    percent_off coupon, and PayPal (merch + ship) * percent).
+    Floor division, matching the subscription path's existing rule.
+    """
+    allowed = promo.get("flavors")
+    allowed_keys = {_promo_bag_key(f) for f in allowed} if allowed else None
+    flavor_keys = {_promo_bag_key(f) for f in FLAVORS}
+    eligible = 0
+    for it in items:
+        key = _promo_bag_key(it.get("name", ""))
+        if key not in flavor_keys:
+            continue
+        if allowed_keys is not None and key not in allowed_keys:
+            continue
+        eligible += int(it.get("amount_cents", 0)) * int(it.get("quantity", 0))
+    return eligible, eligible * int(promo.get("percent_off", 0)) // 100
 
 
 # National-day promo calendar (user-approved Oct 29, 2026;
@@ -4526,7 +4583,8 @@ def validate_discount():
                            description=p["description"],
                            bundle_size=int(p.get("bundle_size", 3)),
                            bundle_price_cents=int(p.get("bundle_price_cents", 2000)))
-        return jsonify(type="promo", code=code, label=p["label"], description=p["description"])
+        return jsonify(type="promo", code=code, label=p["label"], description=p["description"],
+                       percent_off=p.get("percent_off"), flavors=p.get("flavors"))
     conn = db()
     row = conn.execute(
         "SELECT balance_cents, active FROM gift_cards"
@@ -5273,6 +5331,8 @@ def _compute_order(data, allow_demo=False):
         "promo_code": "",
         "promo_label": "",
         "promo_percent_off": 0,
+        "promo_discount_cents": 0,
+        "promo_flavors": None,
         "promo_bundle_cents": 0,
         "gift_card_code": "",
         "gift_card_discount_cents": 0,
@@ -5297,6 +5357,17 @@ def _compute_order(data, allow_demo=False):
         order["promo_label"] = promo["description"]
         if promo["type"] == "percent":
             order["promo_percent_off"] = promo["percent_off"]
+            order["promo_flavors"] = promo.get("flavors")
+            _eligible_cents, _disc_cents = _promo_percent_discount_cents(items, promo)
+            order["promo_discount_cents"] = _disc_cents
+            if _disc_cents <= 0:
+                # A percent promo with nothing eligible in the cart discounts
+                # $0 — reject instead of checking out with a dead code.
+                if promo.get("flavors"):
+                    return None, (jsonify(error="this code is %d%% off %s — add one to your cart"
+                                           % (promo["percent_off"], ", ".join(promo["flavors"]))), 400)
+                return None, (jsonify(error="this code is %d%% off popcorn — add a bag to your cart"
+                                       % promo["percent_off"]), 400)
         elif promo["type"] == "free_shipping":
             if total < promo["min_subtotal_cents"]:
                 return None, (jsonify(error="free shipping needs a $50+ order"), 400)
@@ -5415,8 +5486,11 @@ def create_order_checkout():
     discounts = []
     try:
         if order["discount_kind"] == "promo" and order["promo_percent_off"]:
+            # amount_off, not percent_off: a session-wide percent coupon
+            # would discount shipping and non-featured flavors too.
             coupon = stripe.Coupon.create(
-                percent_off=order["promo_percent_off"],
+                amount_off=order["promo_discount_cents"],
+                currency="usd",
                 duration="once",
                 max_redemptions=1,
                 redeem_by=int(datetime.now(timezone.utc).timestamp()) + 86400,
@@ -5542,7 +5616,7 @@ def paypal_create_order():
     merch = order["merchandise_total"]
     ship = order["shipping_cents"]
     if order["discount_kind"] == "promo" and order["promo_percent_off"]:
-        disc = round((merch + ship) * order["promo_percent_off"] / 100)
+        disc = order["promo_discount_cents"]
     elif order["discount_kind"] == "promo" and order["promo_bundle_cents"]:
         disc = order["promo_bundle_cents"]
     elif order["discount_kind"] == "gift_card":
@@ -11019,6 +11093,7 @@ def mkt_promos_list():
             "description": promo.get("description") or "",
             "type": promo.get("type") or "",
             "percent_off": promo.get("percent_off"),
+            "flavors": promo.get("flavors"),
             "min_subtotal_cents": promo.get("min_subtotal_cents"),
             "windows": promo.get("windows") or [],
             "disabled": bool(ov and ov["disabled"]),
@@ -26416,7 +26491,7 @@ def _validate_subscription_checkout(data, user, full, require_payment_method=Tru
             if one_time.get("promo_bundle_cents"):
                 discount_cents = one_time["promo_bundle_cents"]
             else:
-                discount_cents = one_time["merchandise_total"] * one_time["promo_percent_off"] // 100
+                discount_cents = one_time["promo_discount_cents"]
         elif one_time["discount_kind"] == "gift_card":
             discount_cents = one_time["gift_card_discount_cents"]
         elif one_time["discount_kind"] == "reward":
@@ -26698,13 +26773,20 @@ def _sub_checkout_session_line_items(plan):
                 remaining -= take
         elif one_time["discount_kind"] == "promo":
             percent = one_time["promo_percent_off"]
-            raws = [r - r * percent // 100 for _, r in raw]
+            _allowed = one_time.get("promo_flavors")
+            _allowed_keys = {_promo_bag_key(f) for f in _allowed} if _allowed else None
+            _flavor_keys = {_promo_bag_key(f) for f in FLAVORS}
+            def _is_eligible(_name):
+                _k = _promo_bag_key(_name)
+                return _k in _flavor_keys and (_allowed_keys is None or _k in _allowed_keys)
+            raws = [r - r * percent // 100 if _is_eligible(n) else r for n, r in raw]
             # Floor per item can leave a small shortfall vs the
-            # floor-division net; take it off the largest line (which
-            # always has room: every line is at least a bag price).
+            # floor-division net; take it off the largest ELIGIBLE line
+            # (which always has room: every line is at least a bag price).
             residual = plan["one_time_net_cents"] - sum(raws)
-            if residual:
-                j = max(range(len(raws)), key=lambda i: raw[i][1])
+            _eligible_idx = [i for i, (n, _) in enumerate(raw) if _is_eligible(n)]
+            if residual and _eligible_idx:
+                j = max(_eligible_idx, key=lambda i: raw[i][1])
                 raws[j] += residual
         elif one_time["discount_kind"] in ("gift_card", "reward"):
             if one_time["discount_kind"] == "gift_card":
@@ -27495,7 +27577,7 @@ def demo_checkout():
     total -= order["gift_card_discount_cents"]
     total -= order["reward_discount_cents"]
     if order["promo_percent_off"]:
-        total = int(round(total * (100 - order["promo_percent_off"]) / 100))
+        total -= order["promo_discount_cents"]
     total -= order.get("promo_bundle_cents", 0)
     total = max(total, 0)
 
