@@ -5570,15 +5570,18 @@ def create_order_checkout():
     try:
         # Embedded checkout: the payment form renders inside our checkout page,
         # so customers never leave the site (no redirect to stripe.com).
-        session = stripe.checkout.Session.create(
+        # Stripe forbids allow_promotion_codes together with discounts in one
+        # call — even as False — so the parameter is omitted entirely when a
+        # backend coupon is applied (the promo-code box stays off by default
+        # then, and discounts can never be combined). With no coupon the box
+        # stays on. Found live Nov 14, 2026: passing both 502'd every
+        # coupon-discounted card checkout ("You may only specify one of these
+        # parameters: allow_promotion_codes, discounts").
+        session_kwargs = dict(
             mode="payment",
             ui_mode="embedded",
             line_items=line_items,
             discounts=discounts,
-            # A backend-applied discount means the Stripe promo-code box stays off
-            # so discounts can never be combined.
-            allow_promotion_codes=not (order["gift_card_code"] or order["promo_code"]
-                                       or order["reward_code"]),
             customer_email=order["email"] or None,
             shipping_address_collection={"allowed_countries": ["US"]},
             phone_number_collection={"enabled": True},
@@ -5593,6 +5596,9 @@ def create_order_checkout():
             },
             return_url=f"{SITE_URL}/#order-success?session_id={{CHECKOUT_SESSION_ID}}",
         )
+        if not discounts:
+            session_kwargs["allow_promotion_codes"] = True
+        session = stripe.checkout.Session.create(**session_kwargs)
     except stripe.error.StripeError as e:
         app.logger.exception("stripe session create failed for promo %s discount %s discounts %s: %s",
                              order["promo_code"], order["promo_discount_cents"], discounts, e)
