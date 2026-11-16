@@ -47540,6 +47540,19 @@ def _faire_request(method, path, params=None, json_body=None, access_token=None,
                                  timeout=30, allow_redirects=False)
     except Exception as e:
         return 0, {"error": str(e)}
+    # TEMP DIAGNOSTIC (Nov 16, 2026): Faire answers the /orders call with
+    # HTTP 400 now that the 401 is fixed; log the error body so the cause
+    # can be read from the Railway logs. Logs status, method, path,
+    # params and body only — NEVER headers or the token. Remove once the
+    # 400 cause is found and fixed.
+    if resp.status_code >= 400:
+        try:
+            _body = resp.text[:500]
+        except Exception:
+            _body = "<unreadable>"
+        print("FAIRE_DIAG status=%s method=%s path=%s params=%s body=%s"
+              % (resp.status_code, method, path, params or {}, _body),
+              flush=True)
     try:
         data = resp.json()
     except (TypeError, ValueError):
