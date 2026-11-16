@@ -47540,19 +47540,6 @@ def _faire_request(method, path, params=None, json_body=None, access_token=None,
                                  timeout=30, allow_redirects=False)
     except Exception as e:
         return 0, {"error": str(e)}
-    # TEMP DIAGNOSTIC (Nov 16, 2026): Faire answers the /orders call with
-    # HTTP 400 now that the 401 is fixed; log the error body so the cause
-    # can be read from the Railway logs. Logs status, method, path,
-    # params and body only — NEVER headers or the token. Remove once the
-    # 400 cause is found and fixed.
-    if resp.status_code >= 400:
-        try:
-            _body = resp.text[:500]
-        except Exception:
-            _body = "<unreadable>"
-        print("FAIRE_DIAG status=%s method=%s path=%s params=%s body=%s"
-              % (resp.status_code, method, path, params or {}, _body),
-              flush=True)
     try:
         data = resp.json()
     except (TypeError, ValueError):
@@ -48004,7 +47991,9 @@ def erp_faire_sync():
     max_seen = None
     stopped = False
     while True:
-        params = {"updated_at_min": watermark, "sort_by": "UPDATED_AT", "limit": 100}
+        # Faire caps limit at 50 — limit=100 answers HTTP 400
+        # ("limit must be within [10, 50]", found live Nov 16, 2026).
+        params = {"updated_at_min": watermark, "sort_by": "UPDATED_AT", "limit": 50}
         if cursor:
             params["cursor"] = cursor
         status, data = _faire_request("GET", "/orders", params=params,
