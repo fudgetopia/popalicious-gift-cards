@@ -47829,6 +47829,16 @@ def _faire_import_order(conn, order, actor):
         conn, retailer, order.get("customer") or {},
         order.get("payment_terms") or "", actor)
     if not acct:
+        # TEMP DIAGNOSTIC (Nov 16, 2026): two live orders (NEW +
+        # IN_TRANSIT) arrive with no retailer name, so they cannot be
+        # matched to a wholesale account. Log the payload shape so the
+        # real field can be found. Logs order keys + retailer/customer
+        # content only — NEVER headers or the token. Remove once the
+        # retailer-name source is found and fixed.
+        print("FAIRE_DIAG no-retailer-name order=%s state=%s keys=%s retailer=%s customer=%s"
+              % (faire_id, state, sorted(order.keys()),
+                 repr(retailer)[:400], repr(order.get("customer") or {})[:400]),
+              flush=True)
         _faire_log(conn, faire_id, display_id, state, "error", [], [], "",
                    "retailer has no name")
         return {"outcome": "error", "faire_order_id": faire_id,
@@ -47984,6 +47994,17 @@ def erp_faire_sync():
     run_start = datetime.now(timezone.utc)
     if not watermark:
         watermark = (run_start - timedelta(days=7)).isoformat()
+    # Admin re-run window: POST {"since": "<ISO 8601>"} to re-pull orders
+    # updated at or after that time (the stored watermark is still
+    # advanced from what this run actually sees). Used Nov 16, 2026 to
+    # re-fetch two orders that errored on a missing retailer name.
+    _since = ((request.get_json(silent=True) or {}).get("since") or "")
+    if isinstance(_since, str) and _since.strip():
+        try:
+            datetime.fromisoformat(_since.strip().replace("Z", "+00:00"))
+            watermark = _since.strip()
+        except (TypeError, ValueError):
+            pass
     summary = {"imported": 0, "skipped": 0, "already_seen": 0, "qb_pushed": 0,
                "qb_skipped": 0, "errors": [], "stopped_on_429": False,
                "orders": []}
