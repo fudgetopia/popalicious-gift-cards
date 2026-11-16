@@ -47482,6 +47482,13 @@ _QB_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
 # watermark is only
 # advanced on a complete run, so the next run re-pulls from the same point
 # (duplicate protection comes from the faire_order_id UNIQUE link).
+# Retailer name (Nov 16, 2026): the /orders list carries only
+# retailer_id — the retailer object often arrives empty — so the import
+# resolves the account name retailer.name -> GET /retailers/<id> ->
+# ship-to address name -> buyer first+last name, flagging the order for
+# review whenever a fallback names the account. /orders caps limit at
+# 50 (100 answers HTTP 400). POST {"since": "<ISO>"} re-pulls from a
+# given time instead of the stored watermark (admin re-run window).
 
 _FAIRE_BASE_URL = "https://www.faire.com/external-api/v2"
 _FAIRE_TOKEN_URL = "https://www.faire.com/api/external-api-oauth2/token"
@@ -47744,6 +47751,49 @@ def _faire_payment_terms(raw):
     return raw
 
 
+def _faire_resolve_retailer(order, token, is_oauth):
+    """Find a name (and address) for the wholesale account of a Faire order.
+    The /orders list payload carries only retailer_id — the retailer
+    object itself usually arrives with a name, but live orders Nov 16,
+    2026 arrived with retailer={} and no name. Fallback chain:
+    retailer.name -> GET /retailers/<retailer_id> -> order ship-to
+    address name -> buyer first+last name. Returns (name, address, source)
+    with source one of retailer / retailer_lookup / ship_to / customer,
+    or (None, {}, None) when nothing names the buyer. A failed retailer
+    lookup falls through to the next source instead of failing."""
+    retailer = order.get("retailer") or {}
+    name = ((retailer.get("name") or "").strip()
+            if isinstance(retailer, dict) else "")
+    if name:
+        return name, ((retailer.get("address") or {})
+                      if isinstance(retailer, dict) else {}), "retailer"
+    rid = str(order.get("retailer_id") or "").strip()
+    if rid:
+        status, data = _faire_request("GET", "/retailers/%s" % rid,
+                                      access_token=token, is_oauth=is_oauth)
+        if status == 200 and isinstance(data, dict):
+            r = data.get("retailer") if isinstance(
+                data.get("retailer"), dict) else data
+            rname = ((r.get("name") or "").strip()
+                     if isinstance(r, dict) else "")
+            if rname:
+                return rname, ((r.get("address") or {})
+                               if isinstance(r, dict) else {}), "retailer_lookup"
+    ship = order.get("address") or {}
+    sname = ((ship.get("name") or "").strip()
+             if isinstance(ship, dict) else "")
+    if sname:
+        return sname, ship, "ship_to"
+    customer = order.get("customer") or {}
+    if not isinstance(customer, dict):
+        customer = {}
+    cname = " ".join(p for p in ((customer.get("first_name") or ""),
+                                 (customer.get("last_name") or "")) if p).strip()
+    if cname:
+        return cname, (ship if isinstance(ship, dict) else {}), "customer"
+    return None, {}, None
+
+
 def _faire_match_or_create_account(conn, retailer, customer, payment_terms, actor):
     """Match a Faire retailer to a wholesale account by name (case-insensitive);
     create it with the $4/$4 defaults when new. Returns (account_row, created)."""
@@ -47785,7 +47835,7 @@ def _faire_log(conn, faire_order_id, display_id, state, outcome, matched,
     return cur.lastrowid
 
 
-def _faire_import_order(conn, order, actor):
+def _faire_import_order(conn, order, actor, token=None, is_oauth=False):
     """Import one Faire order. Returns a result dict for the summary/log.
     Never raises for a bad order — problems are recorded, not fatal."""
     faire_id = str(order.get("id") or "")
@@ -47824,26 +47874,16 @@ def _faire_import_order(conn, order, actor):
                    "unknown state %s" % (state or "?"))
         return {"outcome": "skipped", "faire_order_id": faire_id,
                 "display_id": display_id, "state": state}
-    retailer = order.get("retailer") or {}
-    acct, created = _faire_match_or_create_account(
-        conn, retailer, order.get("customer") or {},
-        order.get("payment_terms") or "", actor)
-    if not acct:
-        # TEMP DIAGNOSTIC (Nov 16, 2026): two live orders (NEW +
-        # IN_TRANSIT) arrive with no retailer name, so they cannot be
-        # matched to a wholesale account. Log the payload shape so the
-        # real field can be found. Logs order keys + retailer/customer
-        # content only — NEVER headers or the token. Remove once the
-        # retailer-name source is found and fixed.
-        print("FAIRE_DIAG no-retailer-name order=%s state=%s keys=%s retailer=%s customer=%s"
-              % (faire_id, state, sorted(order.keys()),
-                 repr(retailer)[:400], repr(order.get("customer") or {})[:400]),
-              flush=True)
+    name, addr, name_source = _faire_resolve_retailer(order, token, is_oauth)
+    if not name:
         _faire_log(conn, faire_id, display_id, state, "error", [], [], "",
                    "retailer has no name")
         return {"outcome": "error", "faire_order_id": faire_id,
                 "display_id": display_id, "state": state,
                 "error": "retailer has no name"}
+    acct, created = _faire_match_or_create_account(
+        conn, {"name": name, "address": addr}, order.get("customer") or {},
+        order.get("payment_terms") or "", actor)
     matched, unmatched = [], []
     for it in order.get("items") or []:
         if not isinstance(it, dict):
@@ -47879,6 +47919,15 @@ def _faire_import_order(conn, order, actor):
                 "unmatched": unmatched, "needs_review": True}
     notes = ["Faire %s" % display_id]
     needs_review = False
+    if name_source == "retailer_lookup":
+        needs_review = True
+        notes.append("retailer name from Faire retailer lookup")
+    elif name_source == "ship_to":
+        needs_review = True
+        notes.append("retailer name missing — account named from ship-to name")
+    elif name_source == "customer":
+        needs_review = True
+        notes.append("retailer name missing — account named from buyer name")
     if unmatched:
         needs_review = True
         notes.append("unmatched lines skipped: %s" % ", ".join(
@@ -48052,7 +48101,7 @@ def erp_faire_sync():
             if upd and (max_seen is None or upd > max_seen):
                 max_seen = upd
             try:
-                res = _faire_import_order(conn, o, actor)
+                res = _faire_import_order(conn, o, actor, token, is_oauth)
             except Exception as e:
                 res = {"outcome": "error",
                        "faire_order_id": str(o.get("id") or ""),
