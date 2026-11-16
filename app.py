@@ -47467,13 +47467,18 @@ _QB_API_BASE = "https://quickbooks.api.intuit.com/v3/company"
 # for an access token at the token endpoint; the token is stored in
 # erp_faire_oauth and sent as X-FAIRE-OAUTH-ACCESS-TOKEN. The
 # Brand-Portal API key (FAIRE_ACCESS_TOKEN env) is kept as a fallback and
-# is sent as X-FAIRE-ACCESS-TOKEN. Every call also sends
-# X-FAIRE-APP-CREDENTIALS (Base64 "applicationId:applicationSecret" from
-# FAIRE_APP_ID / FAIRE_APP_SECRET). There is no /authenticate endpoint in
-# Faire's docs. Header variants tried live with the Brand-Portal key:
-# OAuth header only -> 401; BOTH headers -> 401; API-key header only ->
-# 401 — the key itself never authenticated, hence the OAuth flow.
-# A 429 stops the poll immediately; the
+# is sent as X-FAIRE-ACCESS-TOKEN. Faire confirmed Nov 16, 2026 that a
+# static Brand-Portal token must be sent ALONE under X-FAIRE-ACCESS-TOKEN:
+# do NOT send X-FAIRE-APP-CREDENTIALS or X-FAIRE-OAUTH-ACCESS-TOKEN with
+# it — mixing those headers makes Faire treat the request as OAuth and
+# answer 401. The Nov 10 "API-key header only -> 401" trial still sent
+# X-FAIRE-APP-CREDENTIALS on every call, which is why it 401'd; the
+# token itself was never the problem. The OAuth flow (stored token sent
+# as X-FAIRE-OAUTH-ACCESS-TOKEN together with X-FAIRE-APP-CREDENTIALS)
+# is kept for completeness but does not apply to this setup — the user
+# is on a static token. Calls use HTTPS with redirects disabled: some
+# HTTP clients drop custom headers on a redirect. There is no
+# /authenticate endpoint in Faire's docs. A 429 stops the poll immediately; the
 # watermark is only
 # advanced on a complete run, so the next run re-pulls from the same point
 # (duplicate protection comes from the faire_order_id UNIQUE link).
@@ -47502,26 +47507,37 @@ def _faire_request(method, path, params=None, json_body=None, access_token=None,
     """One Faire API call. Returns (status_code, parsed_json_dict).
     With _FAIRE_TEST_DOUBLE set, the double answers instead of the network:
     double(method, path, params, json_body, headers) -> (status, dict).
-    The token header depends on where the token came from: a stored OAuth
-    token goes under X-FAIRE-OAUTH-ACCESS-TOKEN; the Brand-Portal key
-    (FAIRE_ACCESS_TOKEN env) goes under X-FAIRE-ACCESS-TOKEN."""
-    app_id = os.environ.get("FAIRE_APP_ID", "").strip()
-    app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
-    creds = base64.b64encode(("%s:%s" % (app_id, app_secret)).encode("utf-8")).decode("ascii")
-    headers = {"X-FAIRE-APP-CREDENTIALS": creds}
-    if access_token:
-        if is_oauth:
+    Header shape (Faire, Nov 16, 2026): a static Brand-Portal token goes
+    ALONE under X-FAIRE-ACCESS-TOKEN — sending X-FAIRE-APP-CREDENTIALS
+    (or X-FAIRE-OAUTH-ACCESS-TOKEN) with it makes Faire treat the call
+    as OAuth and answer 401. A stored OAuth token keeps the documented
+    OAuth shape: X-FAIRE-APP-CREDENTIALS plus X-FAIRE-OAUTH-ACCESS-TOKEN.
+    Redirects are disabled: some HTTP clients drop custom headers on a
+    redirect, so a 3xx surfaces as an error instead of being followed."""
+    if is_oauth:
+        app_id = os.environ.get("FAIRE_APP_ID", "").strip()
+        app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
+        creds = base64.b64encode(("%s:%s" % (app_id, app_secret)).encode("utf-8")).decode("ascii")
+        headers = {"X-FAIRE-APP-CREDENTIALS": creds}
+        if access_token:
             headers["X-FAIRE-OAUTH-ACCESS-TOKEN"] = access_token
-        else:
-            headers["X-FAIRE-ACCESS-TOKEN"] = access_token
+    elif access_token:
+        headers = {"X-FAIRE-ACCESS-TOKEN": access_token}
+    else:
+        app_id = os.environ.get("FAIRE_APP_ID", "").strip()
+        app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
+        creds = base64.b64encode(("%s:%s" % (app_id, app_secret)).encode("utf-8")).decode("ascii")
+        headers = {"X-FAIRE-APP-CREDENTIALS": creds}
     if _FAIRE_TEST_DOUBLE is not None:
         return _FAIRE_TEST_DOUBLE(method, path, params or {}, json_body, headers)
     url = _FAIRE_BASE_URL + path
     try:
         if method == "GET":
-            resp = requests.get(url, params=params or {}, headers=headers, timeout=30)
+            resp = requests.get(url, params=params or {}, headers=headers,
+                                timeout=30, allow_redirects=False)
         else:
-            resp = requests.post(url, json=json_body or {}, headers=headers, timeout=30)
+            resp = requests.post(url, json=json_body or {}, headers=headers,
+                                 timeout=30, allow_redirects=False)
     except Exception as e:
         return 0, {"error": str(e)}
     try:
@@ -47622,8 +47638,11 @@ def _faire_authenticate():
     Returns (token, error, is_oauth). Precedence: (1) a stored OAuth
     token from the authorization-code flow; (2) the Brand-Portal access
     token from FAIRE_ACCESS_TOKEN; (3) a 'not configured' error. An
-    OAuth token is sent as X-FAIRE-OAUTH-ACCESS-TOKEN; the Brand-Portal
-    key is sent as X-FAIRE-ACCESS-TOKEN."""
+    OAuth token is sent as X-FAIRE-OAUTH-ACCESS-TOKEN with
+    X-FAIRE-APP-CREDENTIALS; the Brand-Portal key is sent ALONE as
+    X-FAIRE-ACCESS-TOKEN (Faire, Nov 16, 2026). The static token is
+    stripped of whitespace and of a leading "Bearer " prefix, both of
+    which Faire lists as 401 causes."""
     app_id = os.environ.get("FAIRE_APP_ID", "").strip()
     app_secret = os.environ.get("FAIRE_APP_SECRET", "").strip()
     if not app_id or not app_secret:
@@ -47636,6 +47655,8 @@ def _faire_authenticate():
     if row and (row["access_token"] or ""):
         return row["access_token"], None, True
     token = os.environ.get("FAIRE_ACCESS_TOKEN", "").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
     if not token:
         return None, ("Faire access token not configured — generate one in the "
                       "Faire Brand Portal (Settings, Integrations) and set "
