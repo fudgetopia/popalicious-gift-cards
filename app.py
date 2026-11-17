@@ -47672,13 +47672,76 @@ def _faire_authenticate():
 
 
 def _faire_norm_name(s):
-    """Normalize a flavor/product name for matching: ASCII, upper, single spaces."""
+    """Normalize a flavor/product name for matching: ASCII, upper, single spaces.
+    '&' reads as 'and' (Faire writes 'Salt & Vinegar'), a standalone 'N' is
+    the colloquial 'and' (Cookies N Cream), and a trailing 'Popcorn' is
+    packaging language, not part of the flavor name — all three blocked real
+    matches until Nov 17, 2026 (two live orders imported short)."""
     ascii_s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii")
+    ascii_s = ascii_s.replace("&", " AND ")
     norm = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9 ]", " ", ascii_s.upper())).strip()
+    norm = re.sub(r"\bN\b", "AND", norm)
+    if norm.endswith(" POPCORN"):
+        norm = norm[:-len(" POPCORN")]
     # Same alias the label matching uses: Cookies N' Creme is Cookie and Cream.
-    if norm in ("COOKIES N CREME", "COOKIES AND CREAM"):
+    if norm in ("COOKIES AND CREME", "COOKIES AND CREAM"):
         return "COOKIE AND CREAM"
     return norm
+
+
+# UPC-A / GTIN-14 -> flavor, from gs1-qr-data.csv (Nov 17, 2026). Secondary
+# fallback only: name matching runs first and wins. 766429062677 is
+# DELIBERATELY absent — the GS1 list says it is Strawberry Cheesecake, but
+# Faire's live orders name it Salt & Vinegar (its pre-Oct-26 code), so a
+# UPC-only match would mislabel it. Nashville Hot has no UPC.
+_FAIRE_UPC_FLAVORS = {
+    "602581038160": "Alien Mix",
+    "00602581038160": "Alien Mix",
+    "602581038092": "Bacon",
+    "00602581038092": "Bacon",
+    "669423097006": "Banana Pudding",
+    "00669423097006": "Banana Pudding",
+    "794969412447": "Birthday Cake",
+    "00794969412447": "Birthday Cake",
+    "766429062714": "Buffalo Ranch",
+    "00766429062714": "Buffalo Ranch",
+    "602581038177": "Caramel",
+    "00602581038177": "Caramel",
+    "794969412454": "Cheddar",
+    "00794969412454": "Cheddar",
+    "794969412461": "Cheddar Jalapeño",
+    "00794969412461": "Cheddar Jalapeño",
+    "602581038184": "Cheeseburger",
+    "00602581038184": "Cheeseburger",
+    "602581038245": "Churro",
+    "00602581038245": "Churro",
+    "669423097044": "Cinnamon Roll",
+    "00669423097044": "Cinnamon Roll",
+    "766429062653": "Cookie and Cream",
+    "00766429062653": "Cookie and Cream",
+    "669423097020": "Dill Pickle",
+    "00669423097020": "Dill Pickle",
+    "766429062646": "Garlic Butter",
+    "00766429062646": "Garlic Butter",
+    "794969412478": "Garlic Parmesan",
+    "00794969412478": "Garlic Parmesan",
+    "602581038191": "Kettle Corn",
+    "00602581038191": "Kettle Corn",
+    "602581038207": "Lemonade",
+    "00602581038207": "Lemonade",
+    "794969412485": "Muddy Buddy",
+    "00794969412485": "Muddy Buddy",
+    "669423097037": "Pizza",
+    "00669423097037": "Pizza",
+    "602581038009": "Salt and Vinegar",
+    "00602581038009": "Salt and Vinegar",
+    "602581038214": "Snickerdoodle",
+    "00602581038214": "Snickerdoodle",
+    "602581038153": "Sugar Cookie",
+    "00602581038153": "Sugar Cookie",
+    "766429062660": "White Cheddar",
+    "00766429062660": "White Cheddar",
+}
 
 
 def _faire_money_cents(price):
@@ -47723,6 +47786,13 @@ def _faire_match_flavor(conn, sku, product_name, variant_name):
     if candidates:
         candidates.sort(reverse=True)
         return candidates[0][1]
+    # UPC fallback (secondary only — name matching above wins): the line
+    # carried a UPC instead of a POP-* SKU. 766429062677 is not in the map
+    # by design (see _FAIRE_UPC_FLAVORS) — it must resolve by name.
+    if sku_norm:
+        flavor = _FAIRE_UPC_FLAVORS.get(sku_norm)
+        if flavor:
+            return flavor
     return None
 
 
@@ -47835,6 +47905,72 @@ def _faire_log(conn, faire_order_id, display_id, state, outcome, matched,
     return cur.lastrowid
 
 
+def _faire_backfill_lines(conn, wholesale_order_id, order):
+    """Append lines a first import dropped because they did not match a flavor
+    then. Returns (added, still_unmatched). Only appends what the ERP order
+    does not already cover (by flavor + quantity), never touches lines
+    already on the order, and never re-prices them. The caller only runs
+    this for an importable Faire state."""
+    orow = conn.execute(
+        "SELECT * FROM erp_wholesale_orders WHERE id = ?",
+        (wholesale_order_id,)).fetchone()
+    if not orow:
+        return [], []
+    acct = conn.execute(
+        "SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+        (orow["account_id"],)).fetchone()
+    if not acct:
+        return [], []
+    covered = {}
+    for r in conn.execute(
+            "SELECT flavor_name, qty_bags FROM erp_wholesale_order_lines"
+            " WHERE order_id = ?", (wholesale_order_id,)).fetchall():
+        covered[r["flavor_name"]] = covered.get(r["flavor_name"], 0) + float(r["qty_bags"] or 0)
+    added = []
+    still = []
+    for it in order.get("items") or []:
+        if not isinstance(it, dict) or it.get("excluded"):
+            continue
+        if str(it.get("state") or "").upper() == "CANCELED":
+            continue
+        try:
+            qty = float(it.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            continue
+        flavor = _faire_match_flavor(conn, it.get("sku"), it.get("product_name"),
+                                     it.get("variant_name"))
+        if not flavor:
+            still.append({"sku": it.get("sku") or "",
+                          "product_name": it.get("product_name") or "",
+                          "variant_name": it.get("variant_name") or "",
+                          "qty": qty})
+            continue
+        add_qty = qty - covered.get(flavor, 0)
+        if add_qty <= 0:
+            continue
+        unit, _cat = _wholesale_flavor_price(conn, acct, flavor, add_qty)
+        conn.execute(
+            "INSERT INTO erp_wholesale_order_lines (order_id, flavor_name, qty_bags,"
+            " unit_price_cents, line_total_cents) VALUES (?, ?, ?, ?, ?)",
+            (wholesale_order_id, flavor, add_qty, unit, int(round(add_qty * unit))))
+        covered[flavor] = covered.get(flavor, 0) + add_qty
+        added.append({"flavor_name": flavor, "qty_bags": add_qty,
+                      "unit_price_cents": unit,
+                      "line_total_cents": int(round(add_qty * unit)),
+                      "faire_price_cents": _faire_money_cents(it.get("price"))})
+    if added:
+        note = "dropped lines backfilled %s: %s" % (
+            datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            ", ".join("%s x%s" % (a["flavor_name"], a["qty_bags"]) for a in added))
+        conn.execute(
+            "UPDATE erp_wholesale_orders SET notes = CASE WHEN notes IS NULL OR notes = ''"
+            " THEN ? ELSE notes || '; ' || ? END WHERE id = ?",
+            (note, note, wholesale_order_id))
+    return added, still
+
+
 def _faire_import_order(conn, order, actor, token=None, is_oauth=False):
     """Import one Faire order. Returns a result dict for the summary/log.
     Never raises for a bad order — problems are recorded, not fatal."""
@@ -47848,7 +47984,10 @@ def _faire_import_order(conn, order, actor, token=None, is_oauth=False):
             "SELECT * FROM erp_faire_orders WHERE faire_order_id = ?",
             (faire_id,)).fetchone()
     if existing:
-        # Already imported: track the Faire state, never touch the ERP order.
+        # Already imported: track the Faire state. The ERP order itself is
+        # never re-priced or re-named — except for lines the first import
+        # dropped because they did not match a flavor then (backfill, Nov 17,
+        # 2026: the matcher was fixed after two orders imported short).
         changed = (existing["state"] or "") != state
         conn.execute("UPDATE erp_faire_orders SET state = ?, last_seen_at = ? WHERE id = ?",
                      (state, now, existing["id"]))
@@ -47857,6 +47996,29 @@ def _faire_import_order(conn, order, actor, token=None, is_oauth=False):
             note = "Faire state changed to CANCELED — ERP order left as-is for review"
             conn.execute("UPDATE erp_faire_orders SET needs_review = 1 WHERE id = ?",
                          (existing["id"],))
+        backfilled = []
+        still_unmatched = []
+        if state in _FAIRE_IMPORTABLE_STATES and existing["wholesale_order_id"]:
+            backfilled, still_unmatched = _faire_backfill_lines(
+                conn, existing["wholesale_order_id"], order)
+        if backfilled:
+            if still_unmatched:
+                conn.execute("UPDATE erp_faire_orders SET needs_review = 1 WHERE id = ?",
+                             (existing["id"],))
+            _faire_log(conn, faire_id, display_id, state, "backfilled",
+                       backfilled, still_unmatched, "",
+                       "dropped lines backfilled after matcher fix: %s"
+                       % ", ".join("%s x%s" % (b["flavor_name"], b["qty_bags"])
+                                   for b in backfilled))
+            _onumber = conn.execute(
+                "SELECT order_number FROM erp_wholesale_orders WHERE id = ?",
+                (existing["wholesale_order_id"],)).fetchone()
+            return {"outcome": "backfilled", "faire_order_id": faire_id,
+                    "display_id": display_id, "state": state,
+                    "order_id": existing["wholesale_order_id"],
+                    "order_number": _onumber["order_number"] if _onumber else "",
+                    "matched": backfilled, "unmatched": still_unmatched,
+                    "needs_review": bool(still_unmatched), "note": note}
         _faire_log(conn, faire_id, display_id, state,
                    "state_updated" if changed else "already_seen",
                    [], [], "", note)
@@ -48054,7 +48216,8 @@ def erp_faire_sync():
             watermark = _since.strip()
         except (TypeError, ValueError):
             pass
-    summary = {"imported": 0, "skipped": 0, "already_seen": 0, "qb_pushed": 0,
+    summary = {"imported": 0, "skipped": 0, "already_seen": 0, "backfilled": 0,
+               "qb_pushed": 0,
                "qb_skipped": 0, "errors": [], "stopped_on_429": False,
                "orders": []}
     cursor = None
@@ -48120,6 +48283,8 @@ def erp_faire_sync():
                 "needs_review": bool(res.get("needs_review"))})
             if res["outcome"] == "imported":
                 summary["imported"] += 1
+            elif res["outcome"] == "backfilled":
+                summary["backfilled"] += 1
             elif res["outcome"] in ("already_seen", "state_updated"):
                 summary["already_seen"] += 1
             elif res["outcome"] in ("skipped", "no_matched_lines"):
