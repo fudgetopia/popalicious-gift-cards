@@ -13584,6 +13584,7 @@ function erpNewWholesaleOrderForm() {
   var dueDate = erpTextInput("due_date", "YYYY-MM-DD");
   dueDate.type = "date";
   form.appendChild(erpField("Due date", dueDate));
+  form.appendChild(erpField("PO number (blank = account default, else auto-generated)", erpTextInput("po_number", "")));
   form.appendChild(erpField("Notes (optional)", erpTextInput("notes", "")));
 
   var linesWrap = document.createElement("div");
@@ -13637,6 +13638,7 @@ function erpNewWholesaleOrderForm() {
       account_id: Number(acctSel.value),
       order_date: orderDate.value || undefined,
       due_date: dueDate.value || undefined,
+      po_number: form.po_number.value.trim(),
       notes: form.notes.value.trim(),
       lines: lines
     }).then(function (res) {
@@ -13754,12 +13756,30 @@ function erpNewAccountForm() {
   status.className = "erp-form-status";
   var nameInput = erpTextInput("name", "Account name", true);
   form.appendChild(erpField("Name", nameInput));
+  form.appendChild(erpField("Address", erpTextInput("address", "")));
   form.appendChild(erpField("Contact", erpTextInput("contact_name", "Buyer name")));
-  form.appendChild(erpField("Contact person (portal login name)", erpTextInput("contact_person", "")));
+  form.appendChild(erpField("Phone", erpTextInput("phone", "")));
   var emailInput = erpTextInput("email", "buyer@example.com");
   emailInput.type = "email";
   form.appendChild(erpField("Email", emailInput));
-  form.appendChild(erpField("Phone", erpTextInput("phone", "")));
+  var billTitle = document.createElement("p");
+  billTitle.style.fontWeight = "800";
+  billTitle.style.margin = "14px 0 4px";
+  billTitle.textContent = "Billing (invoices go here)";
+  form.appendChild(billTitle);
+  var billingNameInput = erpTextInput("billing_name", "");
+  form.appendChild(erpField("Billing name", billingNameInput));
+  var billingEmailInput = erpTextInput("billing_email", "");
+  billingEmailInput.type = "email";
+  form.appendChild(erpField("Billing email", billingEmailInput));
+  var sameAsBtn = document.createElement("button");
+  sameAsBtn.type = "button";
+  sameAsBtn.textContent = "Same as contact";
+  sameAsBtn.addEventListener("click", function () {
+    billingNameInput.value = form.contact_name.value.trim();
+    billingEmailInput.value = emailInput.value.trim();
+  });
+  form.appendChild(sameAsBtn);
   form.appendChild(erpField("Price/bag ($)", erpTextInput("price_per_bag", "4.00")));
   var savoryPriceInput = erpTextInput("savory_price", "4.00");
   var sweetPriceInput = erpTextInput("sweet_price", "4.00");
@@ -13808,7 +13828,7 @@ function erpNewAccountForm() {
   var locTitle = document.createElement("p");
   locTitle.style.fontWeight = "800";
   locTitle.style.margin = "14px 0 4px";
-  locTitle.textContent = "Main delivery location (customer adds more in their profile)";
+  locTitle.textContent = "Main delivery location";
   form.appendChild(locTitle);
   form.appendChild(erpField("Location name", erpTextInput("location_name", "e.g. Main store")));
   form.appendChild(erpField("Street", erpTextInput("street", "")));
@@ -13825,13 +13845,9 @@ function erpNewAccountForm() {
   activeInput.type = "checkbox";
   activeInput.checked = true;
   form.appendChild(erpField("Active", activeInput));
-  var staffManagedInput = document.createElement("input");
-  staffManagedInput.type = "checkbox";
-  form.appendChild(erpField("We create this customer's orders", staffManagedInput));
-  var staffManagedHint = document.createElement("p");
-  staffManagedHint.className = "erp-form-status";
-  staffManagedHint.textContent = "Staff-managed: the customer doesn't need to verify a portal account. Employees create their orders and send invoices.";
-  form.appendChild(staffManagedHint);
+  // Nov 17, 2026: every customer is staff-managed — employees create their
+  // orders and customers never need a portal account — so there is no
+  // staff-managed checkbox anymore.
   var submit = document.createElement("button");
   submit.type = "submit";
   submit.textContent = "Create account";
@@ -13846,16 +13862,16 @@ function erpNewAccountForm() {
     }
     var payload = {
       name: name,
+      address: form.address.value.trim(),
       contact_name: form.contact_name.value.trim(),
-      contact_person: form.contact_person.value.trim(),
+      billing_name: billingNameInput.value.trim(),
+      billing_email: billingEmailInput.value.trim(),
       email: emailInput.value.trim(),
       phone: form.phone.value.trim(),
       payment_terms: form.payment_terms.value.trim(),
       default_po: form.default_po.value.trim(),
       notes: form.notes.value.trim(),
       active: activeInput.checked,
-      pricing_mode: (form.querySelector('input[name="pricing_mode"]:checked') || {}).value || "bag",
-      staff_managed: staffManagedInput.checked,
       credit_hold: creditHoldInput.checked,
       location_name: form.location_name.value.trim(),
       street: form.street.value.trim(),
@@ -13959,10 +13975,10 @@ function renderErpAccountDetail(body) {
     var meta = document.createElement("div");
     meta.className = "erp-detail-meta";
     ["Contact: " + (a.contact_name || "—"),
-     "Contact person: " + (a.contact_person || "—"),
      "Email: " + (a.email || "—"),
      "Phone: " + (a.phone || "—"),
      "Address: " + (a.address || "—"),
+     "Billing: " + ((a.billing_name || "—") + " <" + (a.billing_email || "—") + ">"),
      "Price/bag: " + (a.price_per_bag_cents ? erpMoney(a.price_per_bag_cents) : "—"),
      "Pricing: " + (((a.pricing_mode || "bag") === "case") ? "Per case (12 bags)" : "Per bag"),
      "Savory: " + (a.savory_price_cents ? erpMoney(a.savory_price_cents) : "—") +
@@ -13970,8 +13986,7 @@ function renderErpAccountDetail(body) {
        (((a.pricing_mode || "bag") === "case" && a.savory_price_cents && a.sweet_price_cents)
          ? "  (cases: " + erpMoney(a.savory_price_cents * 12) + " · " + erpMoney(a.sweet_price_cents * 12) + ")" : ""),
      "Default PO: " + (a.default_po || "—"),
-     "Portal: " + (a.account_status || "active"),
-     "Ordering: " + (a.staff_managed ? "We create their orders" : "Customer orders in the portal"),
+     "Ordering: We create their orders",
      "Terms: " + (a.payment_terms || "—"),
      "Orders: " + orders.length,
      "Credit limit: " + (a.credit_limit_cents === null || a.credit_limit_cents === undefined ? "No limit" : erpMoney(a.credit_limit_cents)),
@@ -13995,31 +14010,11 @@ function renderErpAccountDetail(body) {
     if (erpCan("accounts.write")) {
       var etool = document.createElement("div");
       etool.className = "erp-toolbar";
-      // Phase 5: invite the customer to the ordering portal — skipped for
-      // staff-managed accounts: we create their orders, so the customer
-      // never needs to verify a portal account.
-      if (!a.staff_managed) {
-        var inviteBtn = document.createElement("button");
-        inviteBtn.type = "button";
-        inviteBtn.textContent = "Invite to portal";
-        inviteBtn.addEventListener("click", function () {
-          inviteBtn.disabled = true;
-          setAdminDetailStatus("Sending invitation…");
-          erpPost("/api/erp/wholesale-accounts/" + encodeURIComponent(String(a.id)) + "/invite?reveal=1", {
-            portal_url: location.origin + location.pathname
-          }).then(function (res) {
-            setAdminDetailStatus("Invitation sent to " + res.email + "." +
-              (res.invite_link ? " Invite link (copy to customer): " + res.invite_link : ""));
-          }).catch(function (error) {
-            setAdminDetailStatus(error.message, true);
-          }).finally(function () { inviteBtn.disabled = false; });
-        });
-        etool.appendChild(inviteBtn);
-      } else {
-        var smNote = document.createElement("span");
-        smNote.textContent = "Staff-managed — we create their orders; no portal invite needed.";
-        etool.appendChild(smNote);
-      }
+      // Nov 17, 2026: portal invites are off — customers never need a portal
+      // account, employees create all their orders. No Invite button anymore.
+      var smNote = document.createElement("span");
+      smNote.textContent = "Staff-managed — we create their orders; no portal invite needed.";
+      etool.appendChild(smNote);
       // Edit sits next to Deactivate so the two account actions are together.
       var editBtn = document.createElement("button");
       editBtn.type = "button";
@@ -14190,7 +14185,7 @@ function erpRenderAccountAddresses(container, accountId) {
     } else {
       var e = document.createElement("p");
       e.className = "admin-orders-empty";
-      e.textContent = "No delivery locations yet — the customer adds them in their portal profile.";
+      e.textContent = "No delivery locations yet.";
       container.appendChild(e);
     }
   }).catch(function (error) {
@@ -14206,6 +14201,9 @@ function erpEditAccountForm(a) {
   var nameInput = erpTextInput("name", "Account name", true);
   nameInput.value = a.name || "";
   form.appendChild(erpField("Name", nameInput));
+  var addressInput = erpTextInput("address", "");
+  addressInput.value = a.address || "";
+  form.appendChild(erpField("Address", addressInput));
   var contactInput = erpTextInput("contact_name", "");
   contactInput.value = a.contact_name || "";
   form.appendChild(erpField("Contact", contactInput));
@@ -14216,9 +14214,26 @@ function erpEditAccountForm(a) {
   var phoneInput = erpTextInput("phone", "");
   phoneInput.value = a.phone || "";
   form.appendChild(erpField("Phone", phoneInput));
-  var contactPersonEditInput = erpTextInput("contact_person", "");
-  contactPersonEditInput.value = a.contact_person || "";
-  form.appendChild(erpField("Contact person (portal login name)", contactPersonEditInput));
+  var billEditTitle = document.createElement("p");
+  billEditTitle.style.fontWeight = "800";
+  billEditTitle.style.margin = "14px 0 4px";
+  billEditTitle.textContent = "Billing (invoices go here)";
+  form.appendChild(billEditTitle);
+  var billingNameEditInput = erpTextInput("billing_name", "");
+  billingNameEditInput.value = a.billing_name || "";
+  form.appendChild(erpField("Billing name", billingNameEditInput));
+  var billingEmailEditInput = erpTextInput("billing_email", "");
+  billingEmailEditInput.type = "email";
+  billingEmailEditInput.value = a.billing_email || "";
+  form.appendChild(erpField("Billing email", billingEmailEditInput));
+  var sameAsEditBtn = document.createElement("button");
+  sameAsEditBtn.type = "button";
+  sameAsEditBtn.textContent = "Same as contact";
+  sameAsEditBtn.addEventListener("click", function () {
+    billingNameEditInput.value = contactInput.value.trim();
+    billingEmailEditInput.value = emailInput.value.trim();
+  });
+  form.appendChild(sameAsEditBtn);
   var savoryEditInput = erpTextInput("savory_price", "4.00");
   if (a.savory_price_cents) savoryEditInput.value = (Number(a.savory_price_cents) / 100).toFixed(2);
   form.appendChild(erpField("Savory price/bag ($)", savoryEditInput));
@@ -14283,14 +14298,7 @@ function erpEditAccountForm(a) {
   activeInput.type = "checkbox";
   activeInput.checked = !!a.active;
   form.appendChild(erpField("Active", activeInput));
-  var staffManagedEditInput = document.createElement("input");
-  staffManagedEditInput.type = "checkbox";
-  staffManagedEditInput.checked = !!a.staff_managed;
-  form.appendChild(erpField("We create this customer's orders", staffManagedEditInput));
-  var staffManagedEditHint = document.createElement("p");
-  staffManagedEditHint.className = "erp-form-status";
-  staffManagedEditHint.textContent = "Staff-managed: the customer doesn't need to verify a portal account. Employees create their orders and send invoices.";
-  form.appendChild(staffManagedEditHint);
+  // Nov 17, 2026: every customer is staff-managed — no checkbox anymore.
   var submit = document.createElement("button");
   submit.type = "submit";
   submit.textContent = "Save account";
@@ -14305,8 +14313,10 @@ function erpEditAccountForm(a) {
     }
     var payload = {
       name: name,
+      address: addressInput.value.trim(),
       contact_name: contactInput.value.trim(),
-      contact_person: contactPersonEditInput.value.trim(),
+      billing_name: billingNameEditInput.value.trim(),
+      billing_email: billingEmailEditInput.value.trim(),
       email: emailInput.value.trim(),
       phone: phoneInput.value.trim(),
       payment_terms: termsInput.value.trim(),
@@ -14314,7 +14324,6 @@ function erpEditAccountForm(a) {
       notes: notesInput.value.trim(),
       active: activeInput.checked,
       pricing_mode: (form.querySelector('input[name="pricing_mode"]:checked') || {}).value || "bag",
-      staff_managed: staffManagedEditInput.checked,
       credit_hold: creditHoldEditInput.checked
     };
     var priceFields = [["savory_price", "savory_price_cents", savoryEditInput.value.trim()],
