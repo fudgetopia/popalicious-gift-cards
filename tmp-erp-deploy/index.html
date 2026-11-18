@@ -304,14 +304,14 @@ button { font-family: inherit; }
         #erpPrintView .label { zoom: 1 !important; }
         /* Print uses a plain block/float layout, not flexbox: some
            browsers mishandle flex in print and can drop the bottom
-           band. Proportions stay the photo split: panel 1.70in,
-           gap 0.07in, ingredients take the rest; the codes live in
+           band. Proportions stay the photo split: panel 43.2mm,
+           gap 1.8mm, ingredients take the rest; the codes live in
            the ingredients column (bottom-aligned on screen). */
         #erpPrintView .cols { display: block !important; overflow: hidden !important; }
         #erpPrintView .panelcol { float: left !important; }
-        #erpPrintView .ingcol { margin-left: 1.77in !important; }
+        #erpPrintView .ingcol { margin-left: 45mm !important; }
         #erpPrintView .bot { display: block !important; overflow: hidden !important; }
-        #erpPrintView .botleft { float: left !important; width: calc(100% - 2.05in) !important; }
+        #erpPrintView .botleft { float: left !important; width: calc(100% - 52.1mm) !important; }
         #erpPrintView .botright { float: right !important; }
       }
       /* mobile register — Apple Store-style roaming checkout: big
@@ -10765,7 +10765,7 @@ function erpLabelSettingsBox(r, res) {
   box.appendChild(h);
   var note = document.createElement("p");
   note.style.color = "var(--muted)";
-  note.textContent = "The name prints on the 4\u00d76 label and decides the barcode and QR code. " +
+  note.textContent = "The name prints on the A6 label and decides the barcode and QR code. " +
     "Serving size, serving weight, and servings per bag print on the Nutrition Facts panel and set the Net Wt. " +
     "Leave a serving field blank to use the automatic value.";
   box.appendChild(note);
@@ -10853,12 +10853,12 @@ function erpBarcodePictureBox(r, res) {
     img.style.display = "block";
     img.style.marginBottom = "8px";
     box.appendChild(img);
-    note.textContent = "This picture prints in the barcode spot on the 4×6 label, in place of the generated barcode.";
+    note.textContent = "This picture prints in the barcode spot on the A6 label, in place of the generated barcode.";
   } else {
     var code = erpMatchFlavorCode(r.name);
     note.textContent = code ?
       "No picture added — the label prints the " + code.name + " barcode automatically. Add a picture here to use it instead." :
-      "No barcode picture yet — add one here and it will print in the barcode spot on the 4×6 label.";
+      "No barcode picture yet — add one here and it will print in the barcode spot on the A6 label.";
   }
   box.appendChild(note);
   if (erpCan("recipes.write")) {
@@ -11252,10 +11252,10 @@ function renderErpRecipeDetail(body) {
         var flavorCode = erpMatchFlavorCode(r.name);
         var hasPic = !!(r.barcode_image);
         qrNote.textContent = hasPic ?
-          "Prints at 4×6 with your uploaded barcode picture" +
+          "Prints at A6 with your uploaded barcode picture" +
           (flavorCode ? " and the " + flavorCode.name + " QR code." : ".") :
           flavorCode ?
-          "Prints at 4×6 with the " + flavorCode.name + " barcode (" +
+          "Prints at A6 with the " + flavorCode.name + " barcode (" +
           flavorCode.upc + ") and QR code, carried over automatically." :
           "Standard FDA Nutrition Facts panel. Ingredients, manufacturer block, and net weight appear on the printed label below the panel. The QR code and barcode are added once this product is assigned a GTIN.";
         nutView.appendChild(qrNote);
@@ -11579,17 +11579,17 @@ function erpRecipeLabelParts(r, nut, serving) {
   var barHTML = "";
   if (pic) {
     barHTML = "<img src=\"" + esc(pic) + "\" alt=\"Barcode\" " +
-      "style=\"width:1.25in;max-height:0.9in;object-fit:contain;flex:none;\"/>";
+      "style=\"width:31.8mm;max-height:22.9mm;object-fit:contain;flex:none;\"/>";
   } else if (code) {
-    barHTML = "<div style=\"width:1.25in;flex:none;\">" +
+    barHTML = "<div style=\"width:31.8mm;flex:none;\">" +
       erpUpcBarcodeSVG(code.upc) + "</div>";
   }
   var codesHTML = "";
   if (code || pic) {
     codesHTML = "<div style=\"display:flex;justify-content:flex-end;" +
-      "align-items:center;gap:0.06in;margin-top:4px;\">" +
+      "align-items:center;gap:1.5mm;margin-top:4px;\">" +
       (code ? "<img src=\"" + code.qr + "\" alt=\"QR code\" " +
-      "style=\"width:0.65in;height:0.65in;flex:none;\"/>" : "") +
+      "style=\"width:16.5mm;height:16.5mm;flex:none;\"/>" : "") +
       barHTML + "</div>";
   } else {
     codesHTML = "<p style=\"color:#666;font-size:11px;margin-top:6px;\">" +
@@ -11601,27 +11601,27 @@ function erpRecipeLabelParts(r, nut, serving) {
     style:
     "#erpPrintView *{box-sizing:content-box;}" +
     "#erpPrintView .label{box-sizing:border-box;}" +
-    "@page{size:4in 6in;margin:0;}" +
+    "@page{size:105mm 148mm;margin:0;}" +
     "html,body{margin:0;padding:0;}" +
     "body{font-family:Arial,Helvetica,sans-serif;color:#000;background:#fff;}" +
     ".noprint{margin:12px;}@media print{.noprint{display:none;}" +
     "body{background:#fff;}.label{box-shadow:none;}}" +
-    ".label{width:4in;height:6in;padding:0.05in 0.06in;box-sizing:border-box;" +
+    ".label{width:105mm;height:148mm;padding:1.3mm 1.5mm;box-sizing:border-box;" +
     "background:#fff;margin:0 auto;overflow:hidden;" +
     "print-color-adjust:exact;-webkit-print-color-adjust:exact;}" +
     ".label h1{font-size:19px;text-align:center;margin:0 0 2px;}" +
-    ".cols{display:flex;gap:0.07in;}" +
-    ".panelcol{width:1.70in;flex:none;}" +
+    ".cols{display:flex;gap:1.8mm;}" +
+    ".panelcol{width:43.2mm;flex:none;}" +
     ".panelwarn{font-size:8pt;line-height:1.35;margin:4px 0 0;font-weight:700;}" +
     ".panelmfg{font-size:8pt;line-height:1.25;margin:4px 0 0;font-weight:700;}" +
     ".panelmfg p{margin:0 0 8px;}" +
     ".ingcol{flex:1;min-width:0;font-size:7.5pt;line-height:1.2;display:flex;flex-direction:column;}" +
     ".ingcol p:not(:first-child){font-size:8pt;}" +
     ".ingcol p{margin:0 0 8px;}" +
-    ".bot{display:flex;gap:0.05in;margin-top:2px;justify-content:flex-end;}" +
+    ".bot{display:flex;gap:1.3mm;margin-top:2px;justify-content:flex-end;}" +
     ".botleft{flex:1;min-width:0;font-size:8pt;line-height:1.35;}" +
     ".botleft p{margin:0 0 8px;}" +
-    ".botright{width:2.0in;flex:none;margin-top:auto;margin-left:auto;}" +
+    ".botright{width:50.8mm;flex:none;margin-top:auto;margin-left:auto;}" +
     "",
     label:
     "<div class=\"label\"><div class=\"labelfit\"><h1>" + esc(r.name) + "</h1>" +
@@ -11638,7 +11638,7 @@ function erpRecipeLabelParts(r, nut, serving) {
     (nut.allergens_text ? "<p><b>Contains: " + esc(nut.allergens_text) + "</b></p>" : "") +
     "<p><b>This product is made in a facility that also processes: " +
     "peanuts and tree nuts.</b></p>" +
-    "<div class=\"botright\"><div style=\"width:1.25in;margin-left:auto;\">" +
+    "<div class=\"botright\"><div style=\"width:31.8mm;margin-left:auto;\">" +
     erpSocialIconsHTML() + "</div>" + codesHTML +
     "</div></div></div></div></div>"
   };
@@ -11651,14 +11651,19 @@ function erpRecipeLabelDoc(r, nut, serving) {
   return "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" +
     p.title + "</title><style>" + p.style + "</style></head><body>" +
     "<div class=\"noprint\"><button onclick=\"window.print()\">Print</button> " +
-    "Label prints at 4&times;6 inches.</div>" + p.label + "</body></html>";
+    "Label prints at A6 (105 &times; 148 mm).</div>" + p.label +
+    "<script>window.addEventListener(\"load\",function(){var l=" +
+    "document.querySelector(\".label\"),f=document.querySelector(\".labelfit\");" +
+    "if(l&&f&&f.scrollHeight>l.clientHeight){f.style.transform=\"scale(\"+(" +
+    "l.clientHeight/f.scrollHeight)+\")\";f.style.transformOrigin=\"top center\";}});" +
+    "</script></body></html>";
 }
 /* Print the label from this page: hide the app, show only the label, and
    let the browser print the real document. On screen the label is
    enlarged to fill the window via a screen-only zoom rule; print
-   uses a plain 4x6 block layout. The Print/Back bar floats
+   uses a plain A6 block layout. The Print/Back bar floats
    above it and is hidden in print. Safari ignores @page size, so the bar
-   notes iPhone/iPad users must pick 4x6 paper. */
+   notes iPhone/iPad users must pick A6 paper. */
 function erpShowPrintLabel(r, nut, serving) {
   var p = erpRecipeLabelParts(r, nut, serving);
   var view = document.getElementById("erpPrintView");
@@ -11670,17 +11675,17 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v11 &mdash; On screen the label is " +
-    "enlarged for readability; it always prints at true 4&times;6. On " +
-    "iPhone/iPad: Share, then Print, then pick your 4&times;6 label paper.</p></div>" + p.label;
+    "<p class=\"erp-print-help\">Label v12 &mdash; On screen the label is " +
+    "enlarged for readability; it always prints at true A6 (105 &times; 148 mm). On " +
+    "iPhone/iPad: Share, then Print, then pick A6 paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
   window.scrollTo(0, 0);
-  /* Fit the whole label in the 4x6 box: a long ingredient list
+  /* Fit the whole label in the A6 box: a long ingredient list
      (e.g. Birthday Cake) otherwise pushes the bottom band — address,
      Net Wt, QR code, barcode — past the box, where
      overflow:hidden clips it away. Scale the inner wrapper with
      transform (painting only, layout untouched) so the rendered
-     content fits the fixed 6in box. Shrink only when it overflows. */
+     content fits the fixed A6 box. Shrink only when it overflows. */
   var labelEl = view.querySelector(".label");
   var fitEl = view.querySelector(".labelfit");
   if (labelEl && fitEl && fitEl.scrollHeight > labelEl.clientHeight) {
@@ -11688,10 +11693,10 @@ function erpShowPrintLabel(r, nut, serving) {
     fitEl.style.transformOrigin = "top center";
   }
   /* Screen only: enlarge the label to fill the window, so on a wide
-     desktop screen it does not sit as a tiny 4in column in a sea of
+     desktop screen it does not sit as a tiny A6 column in a sea of
      white. The zoom lives in a screen-media rule only, so it cannot
      leak into print the way an inline zoom could if a browser
-     ignored a print reset. Print uses the plain 4x6 layout below. */
+     ignored a print reset. Print uses the plain A6 layout below. */
   erpPrintScreenZoom();
   window.addEventListener("resize", erpPrintScreenZoom);
   document.getElementById("erpPrintGo").addEventListener("click", function () {
