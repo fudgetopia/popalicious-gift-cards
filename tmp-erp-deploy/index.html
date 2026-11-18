@@ -13633,23 +13633,151 @@ function erpNewWholesaleOrderForm() {
       lines.push(line);
     }
     submit.disabled = true;
-    status.textContent = "Creating order…";
-    erpPost("/api/erp/wholesale-orders", {
+    status.textContent = "";
+    // Order verification (Nov 17, 2026): the order is NOT created yet.
+    // The verify pop-up shows the whole order first; only a confirm
+    // there posts it, with verified: true. Going back leaves the form
+    // untouched so the order can be corrected and verified again.
+    var acct = erpAccountById(acctSel.value);
+    erpShowWholesaleVerifyModal({
       account_id: Number(acctSel.value),
       order_date: orderDate.value || undefined,
       due_date: dueDate.value || undefined,
       po_number: form.po_number.value.trim(),
       notes: form.notes.value.trim(),
       lines: lines
-    }).then(function (res) {
+    }, acct, submit, status, function () {
       erpState.showNewWholesaleOrder = false;
-      erpGoToOrder("wholesale", res.order.id);
-    }).catch(function (error) {
-      submit.disabled = false;
-      status.textContent = error.message;
+      renderErpOrdersDetail();
     });
   });
   return form;
+}
+
+function erpShowWholesaleVerifyModal(payload, acct, submitBtn, statusEl, onCreated) {
+  var overlay = document.createElement("div");
+  overlay.className = "erp-modal-overlay";
+  var modal = document.createElement("div");
+  modal.className = "erp-modal";
+  var h3 = document.createElement("h3");
+  h3.textContent = "Verify this order";
+  modal.appendChild(h3);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Check every line. If anything is wrong, go back and fix the form — the order is not created until you verify it. Once verified, the order is accepted for fulfillment and the invoice goes to the billing person.";
+  modal.appendChild(note);
+  function metaRow(label, value) {
+    var row = document.createElement("div");
+    row.className = "ws-review-line";
+    var left = document.createElement("span");
+    left.textContent = label + ": " + value;
+    row.appendChild(left);
+    modal.appendChild(row);
+  }
+  metaRow("Account", acct ? acct.name : "—");
+  metaRow("Deliver to", acct ? (acct.address || "—") : "—");
+  metaRow("Billing", acct ? ((acct.billing_name || "—") + " <" + (acct.billing_email || acct.email || "—") + ">") : "—");
+  var poDisplay = payload.po_number || (acct && acct.default_po) || "(auto-generated)";
+  metaRow("PO", poDisplay);
+  if (payload.order_date) metaRow("Order date", payload.order_date);
+  if (payload.due_date) metaRow("Due date", payload.due_date);
+  if (payload.notes) metaRow("Notes", payload.notes);
+  var acctPriceCents = acct ? Number(acct.price_per_bag_cents || 0) : 0;
+  var totalCents = 0;
+  payload.lines.forEach(function (l) {
+    var row = document.createElement("div");
+    row.className = "ws-review-line";
+    var left = document.createElement("span");
+    var unit = l.unit_price_cents || acctPriceCents;
+    var lineTotal = Math.round(Number(l.qty_bags) * unit);
+    totalCents += lineTotal;
+    left.textContent = l.qty_bags + " × " + l.flavor_name + " @ " +
+      (l.unit_price_cents ? erpMoney(l.unit_price_cents) : erpMoney(acctPriceCents) + " (account price)") + "/bag";
+    var right = document.createElement("span");
+    right.textContent = erpMoney(lineTotal);
+    row.appendChild(left);
+    row.appendChild(right);
+    modal.appendChild(row);
+  });
+  var tot = document.createElement("div");
+  tot.className = "ws-review-total";
+  var tleft = document.createElement("span");
+  tleft.textContent = "Total";
+  var tright = document.createElement("span");
+  tright.textContent = erpMoney(totalCents);
+  tot.appendChild(tleft);
+  tot.appendChild(tright);
+  modal.appendChild(tot);
+  var priceNote = document.createElement("p");
+  priceNote.className = "admin-orders-empty";
+  priceNote.textContent = "Prices shown use the account price where a line price was left blank. The system prices each flavor by category (savory / sweet) when the order is created — the created order shows the final totals.";
+  modal.appendChild(priceNote);
+  var err = document.createElement("p");
+  err.className = "ws-error";
+  err.hidden = true;
+  modal.appendChild(err);
+  var row = document.createElement("div");
+  row.style.display = "flex";
+  row.style.gap = "10px";
+  var back = document.createElement("button");
+  back.type = "button";
+  back.textContent = "Go back and edit";
+  back.style.padding = "12px 20px";
+  back.addEventListener("click", function () {
+    overlay.parentNode.removeChild(overlay);
+    submitBtn.disabled = false;
+  });
+  var verify = document.createElement("button");
+  verify.type = "button";
+  verify.textContent = "Verify & create order";
+  verify.style.padding = "12px 20px";
+  var createdOrderId = null;
+  verify.addEventListener("click", function () {
+    if (createdOrderId) {
+      overlay.parentNode.removeChild(overlay);
+      onCreated();
+      erpGoToOrder("wholesale", createdOrderId);
+      return;
+    }
+    verify.disabled = true;
+    err.hidden = true;
+    statusEl.textContent = "Creating order…";
+    var body = {
+      account_id: payload.account_id,
+      order_date: payload.order_date,
+      due_date: payload.due_date,
+      po_number: payload.po_number,
+      notes: payload.notes,
+      lines: payload.lines,
+      verified: true
+    };
+    erpPost("/api/erp/wholesale-orders", body).then(function (res) {
+      if (res.order && res.order.invoice_error) {
+        // The order is created and accepted, but the invoice did not
+        // post (usually a locked period). Say so plainly and let the
+        // employee read it before going to the order -- it posts at
+        // delivery.
+        createdOrderId = res.order.id;
+        err.textContent = "Order " + res.order.order_number + " created and accepted, but the invoice could not be posted: " + res.order.invoice_error + " — it will post automatically at delivery.";
+        err.hidden = false;
+        verify.textContent = "Go to the order";
+        verify.disabled = false;
+        return;
+      }
+      overlay.parentNode.removeChild(overlay);
+      onCreated();
+      erpGoToOrder("wholesale", res.order.id);
+    }).catch(function (e) {
+      verify.disabled = false;
+      err.textContent = e.message;
+      err.hidden = false;
+    });
+  });
+  row.appendChild(back);
+  row.appendChild(verify);
+  modal.appendChild(row);
+  overlay.appendChild(modal);
+  document.body.appendChild(overlay);
 }
 
 /* ---------- accounts sub-view ---------- */
