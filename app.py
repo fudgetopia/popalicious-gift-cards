@@ -6846,9 +6846,7 @@ _CSRF_EXEMPT_EXACT = {
     "/api/auth/login", "/api/admin/login", "/api/loyalty/staff/login",
     "/api/wholesale/login",
     "/api/auth/forgot-password", "/api/loyalty/staff/forgot-password",
-    "/api/wholesale/forgot-password",
     "/api/auth/reset-password", "/api/loyalty/staff/reset-password",
-    "/api/wholesale/set-password",
     "/api/auth/erp-handoff",
     "/api/auth/logout", "/api/loyalty/staff/logout",
     "/api/subscriptions/request",
@@ -44365,83 +44363,6 @@ def wholesale_login():
     conn.close()
     return jsonify(out)
 
-
-@app.post("/api/wholesale/set-password")
-def wholesale_set_password():
-    data = request.get_json(force=True) or {}
-    token = (data.get("token") or "").strip()
-    password = data.get("password") or ""
-    if not token:
-        conn = None
-        return jsonify(error="invite token is required"), 400
-    if len(password) < 8:
-        return jsonify(error="password must be at least 8 characters"), 400
-    conn = db()
-    user = conn.execute("SELECT * FROM erp_wholesale_users WHERE invite_token = ?",
-                        (token,)).fetchone()
-    if not user:
-        conn.close()
-        return jsonify(error="invalid invite token"), 400
-    if not user["invite_expires_at"] or user["invite_expires_at"] < datetime.now(timezone.utc).isoformat():
-        conn.close()
-        return jsonify(error="invite token has expired — ask for a new invitation"), 410
-    now = datetime.now(timezone.utc).isoformat()
-    conn.execute("UPDATE erp_wholesale_users SET password_hash = ?, invite_token = '',"
-                 " invite_expires_at = '', active = 1, token_version = token_version + 1 WHERE id = ?",
-                 (generate_password_hash(password), user["id"]))
-    conn.execute("UPDATE erp_wholesale_accounts SET account_status = 'active'"
-                 " WHERE id = ? AND account_status = 'invited'", (user["account_id"],))
-    conn.commit()
-    out_token = _issue_wholesale_token(user["id"])
-    acct = conn.execute("SELECT name FROM erp_wholesale_accounts WHERE id = ?",
-                        (user["account_id"],)).fetchone()
-    conn.close()
-    return jsonify(token=out_token, email=user["email"],
-                   account_id=user["account_id"],
-                   account_name=acct["name"] if acct else "")
-
-
-def _send_wholesale_reset_email(to_email, business_name, link):
-    return send_email(
-        to_email,
-        "Reset your Pop-A-Licious wholesale password",
-        "<p>Hi%s,</p>"
-        "<p>We got a request to reset the password for your wholesale ordering account%s.</p>"
-        "<p><a href=\"%s\">Click here to set a new password</a>. "
-        "This link expires in 1 hour. If you didn't ask for this, just ignore this email.</p>"
-        "<p>— Pop-A-Licious</p>"
-        % (", " + business_name if business_name else "",
-           (" (" + business_name + ")") if business_name else "",
-           link))
-
-
-@app.post("/api/wholesale/forgot-password")
-def wholesale_forgot_password():
-    data = request.get_json(force=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    if _auth_throttle_check("forgot-wholesale", email) \
-            or _auth_throttle_check("forgot-wholesale-ip", _client_ip(), max_fails=20):
-        return jsonify(ok=True)
-    _auth_throttle_fail("forgot-wholesale", email)
-    _auth_throttle_fail("forgot-wholesale-ip", _client_ip())
-    # Always return ok — never reveal whether an email is registered.
-    if email and EMAIL_RE.match(email):
-        conn = db()
-        user = conn.execute("SELECT * FROM erp_wholesale_users WHERE email = ? AND active = 1",
-                            (email,)).fetchone()
-        if user:
-            token = secrets.token_urlsafe(32)
-            expires = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-            conn.execute("UPDATE erp_wholesale_users SET invite_token = ?,"
-                         " invite_expires_at = ? WHERE id = ?",
-                         (token, expires, user["id"]))
-            conn.commit()
-            acct = conn.execute("SELECT name FROM erp_wholesale_accounts WHERE id = ?",
-                                (user["account_id"],)).fetchone()
-            link = _wholesale_portal_url(data) + "/#/wholesale-setup?token=" + token
-            _send_wholesale_reset_email(email, acct["name"] if acct else "", link)
-        conn.close()
-    return jsonify(ok=True)
 
 
 def _wholesale_me_dict(conn, user):
