@@ -57,6 +57,10 @@ button { font-family: inherit; }
   border-radius: 999px; background: var(--teal); color: #fff; margin-left: 6px; vertical-align: middle; }
       .erp-toolbar { display: flex; gap: 10px; flex-wrap: wrap; margin: 14px 0; align-items: center; }
       .erp-toolbar input[type="search"] { min-width: 240px; }
+      /* Accounting sub-tabs (Chart of accounts, Journal, Invoices, ...) run
+         a little bigger than other toolbar buttons so they read and tap
+         easily: 16px text, roomier padding. Nov 17, 2026. */
+      .erp-acct-tabs button { font-size: 16px; font-weight: 800; padding: 12px 20px; min-height: 48px; }
       .erp-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin: 12px 0 20px; padding: 14px; border: 2px solid var(--ink); background: var(--surface); }
       .erp-form label { display: inline-flex; gap: 6px; align-items: center; font-weight: 700; font-size: 14px; }
       .erp-form input, .erp-form select { padding: 8px 10px; border: 2px solid var(--ink); font-size: 14px; }
@@ -4496,7 +4500,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           els.body.replaceChildren();
           els.body.appendChild(erpSectionTitle("Accounting"));
           var tabs = document.createElement("div");
-          tabs.className = "erp-toolbar";
+          tabs.className = "erp-toolbar erp-acct-tabs";
           var acctTabs = [["accounts", "Chart of accounts"], ["journal", "Journal"], ["trial", "Trial balance"], ["invoices", "Invoices"], ["bills", "Bills"], ["aging", "Aging"], ["banking", "Banking"]];
           if (erpAcctCanRead()) acctTabs.push(["reports", "Reports"]);
           if (erpAcctCanRead()) acctTabs.push(["audit", "Audit log"]);
@@ -11656,7 +11660,10 @@ function erpRecipeLabelDoc(r, nut, serving) {
     "document.querySelector(\".label\"),f=document.querySelector(\".labelfit\");" +
     "if(l&&f&&f.scrollHeight>l.clientHeight){f.style.transform=\"scale(\"+(" +
     "l.clientHeight/f.scrollHeight)+\")\";f.style.transformOrigin=\"top center\";}});" +
-    "</script></body></html>";
+    /* NOTE: the closing tag is written with an escaped slash — a literal
+       closing script tag inside this string would close the page's own
+       script element early and the app would never boot (broke live Nov 17, 2026). */
+    "<\/script></body></html>";
 }
 /* Print the label from this page: hide the app, show only the label, and
    let the browser print the real document. On screen the label is
