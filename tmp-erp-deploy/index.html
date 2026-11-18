@@ -61,6 +61,36 @@ button { font-family: inherit; }
          a little bigger than other toolbar buttons so they read and tap
          easily: 16px text, roomier padding. Nov 17, 2026. */
       .erp-acct-tabs button { font-size: 16px; font-weight: 800; padding: 12px 20px; min-height: 48px; }
+      /* Poppy — ERP chat bot (Nov 17, 2026). Floating button + panel copied
+         from the website's Poppy widget. The ERP defines no --shadow and
+         loads no Fredoka, so the shadow is written out and the head uses
+         the ERP font stack. */
+      .chat-fab { position: fixed; right: 18px; bottom: calc(18px + env(safe-area-inset-bottom)); z-index: 90; width: 58px; height: 58px; border: 0; border-radius: 50%; background: var(--red); color: #fff; display: grid; place-items: center; cursor: pointer; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
+      .chat-fab:hover { background: var(--red-dark); }
+      .chat-fab[hidden] { display: none; }
+      .chat-panel { position: fixed; right: 18px; bottom: calc(86px + env(safe-area-inset-bottom)); z-index: 90; width: min(360px, calc(100vw - 24px)); max-height: min(560px, calc(100dvh - 120px)); display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 10px 30px rgba(0,0,0,.18); overflow: hidden; }
+      .chat-panel[hidden] { display: none; }
+      .chat-head { background: var(--red); color: #fff; padding: 14px 16px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+      .chat-head strong { font-size: 17px; font-weight: 800; display: block; }
+      .chat-head span { font-size: 12px; opacity: .9; }
+      .chat-close { border: 0; background: transparent; color: #fff; width: 34px; height: 34px; border-radius: 50%; cursor: pointer; font-size: 19px; line-height: 1; }
+      .chat-messages { flex: 1; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 9px; }
+      .chat-msg { max-width: 88%; padding: 10px 13px; border-radius: 12px; font-size: 14px; line-height: 1.45; }
+      .chat-msg.bot { background: var(--paper); border: 1px solid var(--line); align-self: flex-start; border-bottom-left-radius: 4px; }
+      .chat-msg.user { background: var(--red); color: #fff; align-self: flex-end; border-bottom-right-radius: 4px; }
+      .chat-quick { display: flex; flex-wrap: wrap; gap: 7px; padding: 0 14px 12px; }
+      .chat-quick button { border: 1px solid var(--red); color: var(--red-dark); background: transparent; border-radius: 999px; padding: 7px 12px; font-size: 13px; font-weight: 700; cursor: pointer; }
+      .chat-quick button:hover { background: var(--red); color: #fff; }
+      .chat-input-row { display: flex; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
+      .chat-input-row input { flex: 1; min-width: 0; min-height: 42px; border: 1px solid var(--line); border-radius: 8px; padding: 0 12px; background: var(--paper); color: var(--ink); }
+      .chat-input-row button { min-height: 42px; padding: 0 16px; border: 0; border-radius: 8px; background: var(--red); color: #fff; font-weight: 800; cursor: pointer; }
+      .chat-result-group { font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 6px 0 2px; }
+      .chat-result { display: block; width: 100%; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 4px 0; cursor: pointer; font-size: 14px; color: var(--ink); }
+      .chat-result:hover { border-color: var(--red); }
+      .chat-result strong { display: block; font-weight: 800; }
+      .chat-result span { display: block; font-size: 12px; color: var(--muted); }
+      /* Row Poppy lands on, after a find. */
+      .erp-row-highlight { background: #fff3cd !important; outline: 2px solid var(--yellow); }
       .erp-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin: 12px 0 20px; padding: 14px; border: 2px solid var(--ink); background: var(--surface); }
       .erp-form label { display: inline-flex; gap: 6px; align-items: center; font-weight: 700; font-size: 14px; }
       .erp-form input, .erp-form select { padding: 8px 10px; border: 2px solid var(--ink); font-size: 14px; }
@@ -390,6 +420,28 @@ button { font-family: inherit; }
     <p id="appStatus" class="app-status"></p>
     <div id="appBody"></div>
   </main>
+  <button class="chat-fab" id="chatFab" type="button" aria-label="Chat with Poppy, our virtual assistant" aria-expanded="false" aria-controls="chatPanel">
+    <svg width="27" height="27" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 12a8 8 0 0 1-8 8c-1.2 0-2.4-.3-3.4-.7L4 20l.8-4.1A8 8 0 1 1 21 12Z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><circle cx="9" cy="12" r="1.15" fill="currentColor"/><circle cx="12.8" cy="12" r="1.15" fill="currentColor"/><circle cx="16.6" cy="12" r="1.15" fill="currentColor"/></svg>
+  </button>
+  <div class="chat-panel" id="chatPanel" hidden role="dialog" aria-label="Pop-A-Licious virtual assistant chat">
+    <div class="chat-head">
+      <div><strong>Poppy</strong><span>Pop-A-Licious virtual assistant · here 24/7</span></div>
+      <button class="chat-close" id="chatClose" type="button" aria-label="Close chat">×</button>
+    </div>
+    <div class="chat-messages" id="chatMessages" aria-live="polite"></div>
+    <div class="chat-quick" id="chatQuick">
+      <button type="button" data-chat-quick="Find an order">Find an order</button>
+      <button type="button" data-chat-quick="Find an invoice">Find an invoice</button>
+      <button type="button" data-chat-quick="Find a vendor">Find a vendor</button>
+      <button type="button" data-chat-quick="Find a recipe">Find a recipe</button>
+      <button type="button" data-chat-quick="How do I…?">How do I…?</button>
+    </div>
+    <form class="chat-input-row" id="chatForm">
+      <label class="sr-only" for="chatInput">Type your question</label>
+      <input id="chatInput" type="text" placeholder="Ask Poppy to find something…" autocomplete="off" />
+      <button type="submit">Send</button>
+    </form>
+  </div>
 </div>
 <script>
 "use strict";
@@ -1276,6 +1328,25 @@ function currentRoute() {
   if (h.indexOf("#/stores") === 0) return "stores";
   return "home";
 }
+/* ---------- Poppy row highlight (Nov 17, 2026) ---------- */
+// Scrolls a table row into view and flashes it. The target view loads
+// async (list fetch, then render), so poll briefly for the row instead of
+// assuming it is in the DOM already.
+function erpHighlightRow(id) {
+  var tries = 0;
+  function attempt() {
+    var el = document.getElementById(id);
+    if (el) {
+      if (el.scrollIntoView) el.scrollIntoView({ block: "center" });
+      el.classList.add("erp-row-highlight");
+      window.setTimeout(function () { el.classList.remove("erp-row-highlight"); }, 4000);
+      return;
+    }
+    tries++;
+    if (tries < 25) window.setTimeout(attempt, 100);
+  }
+  attempt();
+}
 function renderRoute() {
   if (!isLoggedIn()) { showLogin(); return; }
   // "Accept order" button from the new-order admin email: #/login?accept_order=W-1002
@@ -1284,12 +1355,14 @@ function renderRoute() {
     if (acceptNum) { erpHandleAcceptOrderIntent(acceptNum); return; }
   }
   // Wholesale customers never see ERP internals: dedicated customer shell.
-  if (erpSession().role === "wholesale") { renderWholesaleRoute(); return; }
+  // They never see Poppy either — the chat button stays hidden for them.
+  if (erpSession().role === "wholesale") { poppySetVisible(false); renderWholesaleRoute(); return; }
   var openModals = document.querySelectorAll(".erp-modal-overlay");
   openModals.forEach(function (m) { m.parentNode.removeChild(m); });
   hideBoot();
   document.getElementById("loginView").hidden = true;
   document.getElementById("appView").hidden = false;
+  poppySetVisible(true);
   var r = currentRoute();
   var links = document.querySelectorAll(".app-nav a");
   links.forEach(function (a) {
@@ -1319,11 +1392,19 @@ function renderRoute() {
     if (!erpCan("inventory.read")) { location.hash = "#/"; return; }
     erpState.selectedItemId = null;
     erpState.selectedItem = null;
+    if (erpState.itemPostMap) {
+      erpState.selectedItemId = erpState.itemPostMap;
+      erpState.itemPostMap = null;
+    }
     loadErpInventoryDetail();
   } else if (r === "purchasing") {
     document.title = "Purchasing \u00b7 Pop-A-Licious ERP";
     if (!erpCan("purchasing.read")) { location.hash = "#/"; return; }
     erpState.selectedPOId = null;
+    if (erpState.poPostMap) {
+      erpState.selectedPOId = erpState.poPostMap;
+      erpState.poPostMap = null;
+    }
     loadErpPurchasingDetail();
   } else if (r === "production") {
     document.title = "Production \u00b7 Pop-A-Licious ERP";
@@ -1333,6 +1414,10 @@ function renderRoute() {
     if (erpState.productionPostBatch) {
       erpState.selectedBatchId = erpState.productionPostBatch;
       erpState.productionPostBatch = null;
+    }
+    if (erpState.recipePostMap) {
+      erpState.selectedRecipeId = erpState.recipePostMap;
+      erpState.recipePostMap = null;
     }
     loadErpProductionDetail();
   } else if (r === "orders") {
@@ -1345,6 +1430,10 @@ function renderRoute() {
       erpState.selectedOrderSource = erpState.ordersPostMap.source;
       erpState.selectedOrderId = erpState.ordersPostMap.id;
       erpState.ordersPostMap = null;
+    }
+    if (erpState.accountsPostMap) {
+      erpState.selectedAccountId = erpState.accountsPostMap;
+      erpState.accountsPostMap = null;
     }
     loadErpOrdersDetail();
   } else if (r === "loyalty") {
@@ -7381,6 +7470,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           }
           erpState.acctInvoices.forEach(function (inv) {
             var tr = document.createElement("tr");
+            tr.id = "invoice-" + inv.id;
             tr.appendChild(erpCell("Customer", inv.customer_name));
             tr.appendChild(erpCell("Date", inv.date));
             tr.appendChild(erpCell("Due", inv.due_date));
@@ -7892,6 +7982,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           }
           erpState.acctBills.forEach(function (bill) {
             var tr = document.createElement("tr");
+            tr.id = "bill-" + bill.id;
             tr.appendChild(erpCell("Vendor", bill.vendor_name));
             tr.appendChild(erpCell("Date", bill.date));
             tr.appendChild(erpCell("Due", bill.due_date));
@@ -8667,6 +8758,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           var body = document.createElement("tbody");
           erpState.vendors.forEach(function (v) {
             var tr = document.createElement("tr");
+            tr.id = "vendor-" + v.id;
             tr.appendChild(erpCell("Vendor", v.name));
             tr.appendChild(erpCell("Contact", v.contact_name));
             tr.appendChild(erpCell("Email", v.email));
@@ -21722,6 +21814,16 @@ function renderErpQualityDetail(data) {
     });
   }
   renderSopList(sopAll);
+  // Poppy deep-open (Nov 17, 2026): a SOP search result sets
+  // erpState.sopPostMap before navigating to #/quality; open that SOP
+  // once the list is rendered, then clear the map.
+  if (erpState.sopPostMap) {
+    var poppySopId = erpState.sopPostMap;
+    erpState.sopPostMap = null;
+    for (var si = 0; si < sopAll.length; si++) {
+      if (String(sopAll[si].id) === String(poppySopId)) { openSop(sopAll[si]); break; }
+    }
+  }
   els.body.appendChild(sopCard);
 }
 function renderErpQualityChecklistsSection(wrap, templates, checklists, tempLog, stores, reload) {
@@ -27209,6 +27311,155 @@ function renderErpSettingsDetail() {
   danger.appendChild(wipeBtn);
   els.body.appendChild(danger);
 }
+
+/* ================= Poppy — ERP chat bot (Nov 17, 2026) ================= */
+// Find-only chat bot, modeled on the website's Poppy widget (floating
+// button + panel). It finds records via GET /api/erp/search and opens
+// them; it never changes data and never invents a record. Results are
+// filtered server-side by the caller's own permissions.
+var poppyPanel = document.getElementById("chatPanel");
+var poppyFab = document.getElementById("chatFab");
+var poppyMessages = document.getElementById("chatMessages");
+var poppyGreeted = false;
+function poppySetVisible(visible) {
+  if (poppyFab) poppyFab.hidden = !visible;
+  if (!visible && poppyPanel) poppyPanel.hidden = true;
+}
+function poppyEscape(value) {
+  return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function poppyAddMessage(html, who) {
+  var bubble = document.createElement("div");
+  bubble.className = "chat-msg " + who;
+  bubble.innerHTML = html;
+  poppyMessages.appendChild(bubble);
+  poppyMessages.scrollTop = poppyMessages.scrollHeight;
+}
+function poppyOpen() {
+  poppyPanel.hidden = false;
+  poppyFab.setAttribute("aria-expanded", "true");
+  if (!poppyGreeted) {
+    poppyGreeted = true;
+    poppyAddMessage("Hi there, I'm <strong>Poppy</strong>, your Pop-A-Licious virtual assistant — ask me to find an order, invoice, vendor, recipe, or SOP. What are you looking for?", "bot");
+  }
+  document.getElementById("chatInput").focus();
+}
+function poppyClosePanel() {
+  poppyPanel.hidden = true;
+  poppyFab.setAttribute("aria-expanded", "false");
+  poppyFab.focus();
+}
+function poppyClosePanelSilent() {
+  poppyPanel.hidden = true;
+  poppyFab.setAttribute("aria-expanded", "false");
+}
+// Quick replies are prompts, not searches: the bot asks what to find.
+var POPPY_PROMPTS = {
+  "Find an order": "Which order? Give me an order number like W-1001 or #1001, or a customer name.",
+  "Find an invoice": "Which invoice? An invoice number or the customer name works.",
+  "Find a vendor": "Which vendor? A name, email, or phone number works.",
+  "Find a recipe": "Which recipe? A flavor name works — try \u201CBacon\u201D.",
+  "How do I…?": "I find things in the ERP: orders, invoices, bills, vendors, purchase orders, items, recipes, wholesale accounts, and SOPs. Try an order number like W-1001, an invoice number, or a name — I only show records you already have permission to open."
+};
+var POPPY_TYPE_LABELS = {
+  order: "Orders", invoice: "Invoices", bill: "Bills", vendor: "Vendors",
+  "purchase-order": "Purchase orders", item: "Items", recipe: "Recipes",
+  account: "Wholesale accounts", sop: "SOPs"
+};
+function poppyAddResults(results) {
+  var bubble = document.createElement("div");
+  bubble.className = "chat-msg bot";
+  var groups = {};
+  var order = [];
+  results.forEach(function (r) {
+    if (!groups[r.type]) { groups[r.type] = []; order.push(r.type); }
+    groups[r.type].push(r);
+  });
+  var intro = document.createElement("div");
+  intro.textContent = "Here's what I found — tap one to open it:";
+  bubble.appendChild(intro);
+  order.forEach(function (type) {
+    var heading = document.createElement("div");
+    heading.className = "chat-result-group";
+    heading.textContent = POPPY_TYPE_LABELS[type] || type;
+    bubble.appendChild(heading);
+    groups[type].forEach(function (r) {
+      var btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "chat-result";
+      var title = document.createElement("strong");
+      title.textContent = r.title || "";
+      var sub = document.createElement("span");
+      sub.textContent = r.subtitle || "";
+      btn.appendChild(title);
+      btn.appendChild(sub);
+      btn.addEventListener("click", function () { poppyOpenResult(r); });
+      bubble.appendChild(btn);
+    });
+  });
+  poppyMessages.appendChild(bubble);
+  poppyMessages.scrollTop = poppyMessages.scrollHeight;
+}
+function poppyOpenResult(r) {
+  var open = r.open || {};
+  if (open.ordersPostMap) erpState.ordersPostMap = open.ordersPostMap;
+  if (open.accountsPostMap) erpState.accountsPostMap = open.accountsPostMap;
+  if (open.sopPostMap) erpState.sopPostMap = open.sopPostMap;
+  if (open.itemPostMap) erpState.itemPostMap = open.itemPostMap;
+  if (open.poPostMap) erpState.poPostMap = open.poPostMap;
+  if (open.recipePostMap) erpState.recipePostMap = open.recipePostMap;
+  if (open.acctView) erpState.acctView = open.acctView;
+  poppyClosePanelSilent();
+  // Same-tab tap: the hash does not change, so no hashchange fires —
+  // render the route directly instead of waiting for one.
+  if (location.hash === r.route) renderRoute();
+  else location.hash = r.route;
+  if (open.highlight) erpHighlightRow(open.highlight);
+}
+async function poppyHandle(text) {
+  var trimmed = String(text || "").trim();
+  if (!trimmed) return;
+  poppyAddMessage(poppyEscape(trimmed), "user");
+  if (POPPY_PROMPTS[trimmed]) {
+    window.setTimeout(function () { poppyAddMessage(POPPY_PROMPTS[trimmed], "bot"); }, 200);
+    return;
+  }
+  poppyAddMessage("Looking…", "bot");
+  try {
+    var data = await erpGet("/api/erp/search?q=" + encodeURIComponent(trimmed));
+    var results = (data && data.results) || [];
+    // Drop the "Looking…" bubble before answering.
+    var bubbles = poppyMessages.children;
+    if (bubbles.length) poppyMessages.removeChild(bubbles[bubbles.length - 1]);
+    if (!results.length) {
+      poppyAddMessage("I couldn't find that — try an order number like W-1001, an invoice number, or a name.", "bot");
+      return;
+    }
+    poppyAddResults(results);
+  } catch (error) {
+    var bubbles2 = poppyMessages.children;
+    if (bubbles2.length) poppyMessages.removeChild(bubbles2[bubbles.length - 1]);
+    poppyAddMessage("Sorry, I couldn't search right now — please try again.", "bot");
+  }
+}
+poppyFab.addEventListener("click", function () {
+  if (poppyPanel.hidden) poppyOpen();
+  else poppyClosePanel();
+});
+document.getElementById("chatClose").addEventListener("click", poppyClosePanel);
+document.getElementById("chatForm").addEventListener("submit", function (event) {
+  event.preventDefault();
+  var input = document.getElementById("chatInput");
+  poppyHandle(input.value);
+  input.value = "";
+});
+document.getElementById("chatQuick").addEventListener("click", function (event) {
+  var button = event.target.closest("[data-chat-quick]");
+  if (button) poppyHandle(button.getAttribute("data-chat-quick"));
+});
+document.addEventListener("keydown", function (event) {
+  if (event.key === "Escape" && poppyPanel && !poppyPanel.hidden) poppyClosePanel();
+});
 
 /* ---------- boot (MUST stay last) ---------- */
 // This line used to sit mid-script, before the ERP state (erpState) was
