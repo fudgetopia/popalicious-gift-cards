@@ -21827,7 +21827,7 @@ function renderErpQualityHaccpEditForm(card, rec, status, reload) {
 
 /* ---------------- Legal & Compliance (Dept 14 Wave B) ---------------- */
 // Admin-only. Trademark/IP register, contracts + insurance register,
-// and compliance calendar. The IP register starts seeded with the
+// licenses & permits register, and compliance calendar. The IP register starts seeded with the
 // Pop-A-Licious wordmark (unfiled) and the compliance calendar with
 // the two known FDA obligations; agreements start empty. Overdue and
 // expiring-soon flags are computed from dates -- they are never stored.
@@ -21836,10 +21836,11 @@ async function loadErpLegalDetail() {
   try {
     var ip = await erpGet("/api/erp/legal/ip").catch(function () { return { ip: [] }; });
     var agreements = await erpGet("/api/erp/legal/agreements").catch(function () { return { agreements: [] }; });
+    var licenses = await erpGet("/api/erp/legal/licenses").catch(function () { return { licenses: [] }; });
     var compliance = await erpGet("/api/erp/legal/compliance").catch(function () { return { items: [] }; });
     var leases = await erpGet("/api/erp/legal/leases").catch(function () { return { leases: [] }; });
-    renderErpLegalDetail({ ip: ip.ip || [], agreements: agreements.agreements || [], items: compliance.items || [], leases: leases.leases || [] });
-    setAdminDetailStatus((ip.ip || []).length + " IP record" + ((ip.ip || []).length === 1 ? "" : "s") + " · " + (agreements.agreements || []).length + " agreement" + ((agreements.agreements || []).length === 1 ? "" : "s") + " · " + (compliance.items || []).length + " compliance obligation" + ((compliance.items || []).length === 1 ? "" : "s") + ".");
+    renderErpLegalDetail({ ip: ip.ip || [], agreements: agreements.agreements || [], licenses: licenses.licenses || [], items: compliance.items || [], leases: leases.leases || [] });
+    setAdminDetailStatus((ip.ip || []).length + " IP record" + ((ip.ip || []).length === 1 ? "" : "s") + " · " + (agreements.agreements || []).length + " agreement" + ((agreements.agreements || []).length === 1 ? "" : "s") + " · " + (licenses.licenses || []).length + " license" + ((licenses.licenses || []).length === 1 ? "" : "s") + " · " + (compliance.items || []).length + " compliance obligation" + ((compliance.items || []).length === 1 ? "" : "s") + ".");
   } catch (error) {
     setAdminDetailStatus(error instanceof TypeError ?
       "We couldn't connect to load Legal & Compliance." : error.message, true);
@@ -21853,7 +21854,7 @@ function renderErpLegalDetail(data) {
   els.body.appendChild(h2);
   var note = document.createElement("p");
   note.className = "admin-orders-empty";
-  note.textContent = "Admin-only. The trademark register and the compliance calendar start seeded with the known facts — the Pop-A-Licious wordmark (unfiled) and the two FDA obligations; agreements start empty. Overdue and expiring-soon flags are computed from the dates — they are never stored.";
+  note.textContent = "Admin-only. The trademark register and the compliance calendar start seeded with the known facts — the Pop-A-Licious wordmark (unfiled) and the two FDA obligations; agreements and licenses start empty. Overdue and expiring-soon flags are computed from the dates — they are never stored.";
   els.body.appendChild(note);
   function lInput(placeholder, type) {
     var input = document.createElement("input");
@@ -22073,6 +22074,87 @@ function renderErpLegalDetail(data) {
     agCard.appendChild(rowCard);
   });
   els.body.appendChild(agCard);
+  // --- Licenses & permits register (Nov 17, 2026). ---
+  var licCard = lCard("Licenses & permits");
+  licCard.appendChild(lNote("Licenses and permits the business needs to operate — health department, city, county, state, federal. Insurance policies stay in the contracts register above, not here. Licenses expiring within their renewal-notice window are flagged below — the notice window is per license, in days before the expiry date."));
+  var licName = lInput("License name, e.g. Health permit — food establishment");
+  licCard.appendChild(erpField("Name", licName));
+  var licAuthority = lInput("Issuing authority, e.g. Southern Nevada Health District");
+  licCard.appendChild(erpField("Issuing authority", licAuthority));
+  var licNumber = lInput("License / permit number (if it has one)");
+  licCard.appendChild(erpField("License number", licNumber));
+  var licType = lSelect([["health", "Health department"], ["city", "City"], ["county", "County"], ["state", "State"], ["federal", "Federal"], ["other", "Other"]], "other");
+  licCard.appendChild(erpField("Type", licType));
+  var licIssue = lInput("YYYY-MM-DD");
+  licCard.appendChild(erpField("Issue date", licIssue));
+  var licExpiry = lInput("YYYY-MM-DD");
+  licCard.appendChild(erpField("Expiry date", licExpiry));
+  var licNotice = lInput("Days before expiry to flag renewal, e.g. 30", "number");
+  licNotice.value = "30";
+  licCard.appendChild(erpField("Renewal notice (days)", licNotice));
+  var licNotes = lArea("Notes (optional)", 2);
+  licCard.appendChild(lAreaField("Notes", licNotes));
+  var licAddStatus = lStatus();
+  licCard.appendChild(licAddStatus);
+  var licBtn = lButton("Add license");
+  licBtn.addEventListener("click", function () {
+    if (!licName.value.trim()) { licAddStatus.textContent = "Enter a license name first."; return; }
+    licBtn.disabled = true;
+    licAddStatus.textContent = "Adding…";
+    erpPost("/api/erp/legal/licenses", {
+      name: licName.value, authority: licAuthority.value,
+      license_number: licNumber.value, type: licType.value,
+      issue_date: licIssue.value, expiry_date: licExpiry.value,
+      renewal_notice_days: licNotice.value === "" ? 30 : Number(licNotice.value),
+      notes: licNotes.value
+    }).then(function () {
+      loadErpLegalDetail();
+    }).catch(function (error) {
+      licAddStatus.textContent = error.message;
+      licBtn.disabled = false;
+    });
+  });
+  licCard.appendChild(licBtn);
+  var licenses = data.licenses || [];
+  var licExpired = licenses.filter(function (l) { return l.is_expired; });
+  var licExpiring = licenses.filter(function (l) { return l.expiring_soon; });
+  licCard.appendChild(lRow("Expiry / renewal alerts:"));
+  if (!licExpired.length && !licExpiring.length) {
+    licCard.appendChild(lNote("No licenses expiring within their notice window."));
+  }
+  licExpired.forEach(function (l) {
+    licCard.appendChild(lRow("EXPIRED: " + l.name + " — " + (l.authority || "no authority") + " · expired " + l.expiry_date + " (" + (-l.days_until_expiry) + " days ago)"));
+  });
+  licExpiring.forEach(function (l) {
+    licCard.appendChild(lRow("Expiring soon: " + l.name + " — " + (l.authority || "no authority") + " · expires " + l.expiry_date + " (in " + l.days_until_expiry + " days) · renewal notice " + l.renewal_notice_days + " days"));
+  });
+  if (!licenses.length) {
+    licCard.appendChild(lNote("No licenses recorded yet."));
+  }
+  licenses.forEach(function (rec) {
+    var rowCard = document.createElement("div");
+    rowCard.className = "erp-form";
+    rowCard.style.flex = "1 1 100%";
+    rowCard.appendChild(lRow(rec.name + " — " + (rec.authority || "no authority") + " · " + rec.type + (rec.license_number ? (" · #" + rec.license_number) : "") + (rec.issue_date ? (" · issued " + rec.issue_date) : "") + (rec.expiry_date ? (" · expires " + rec.expiry_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no expiry date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "")));
+    var editBtn = lButton("Edit");
+    editBtn.addEventListener("click", function () {
+      renderErpLegalLicenseEditForm(rowCard, rec, licAddStatus, loadErpLegalDetail);
+    });
+    rowCard.appendChild(editBtn);
+    var delBtn = lButton("Delete");
+    delBtn.addEventListener("click", function () {
+      delBtn.disabled = true;
+      erpPost("/api/erp/legal/licenses/" + rec.id + "/delete", {}).then(function () {
+        loadErpLegalDetail();
+      }).catch(function (error) {
+        licAddStatus.textContent = error.message;
+        delBtn.disabled = false;
+      });
+    });
+    rowCard.appendChild(delBtn);
+    licCard.appendChild(rowCard);
+  });
+  els.body.appendChild(licCard);
   // --- Compliance calendar. ---
   var compCard = lCard("Compliance calendar");
   compCard.appendChild(lNote("Obligations with a due date — the FDA facility registration renewal and the UFI/DUNS reconciliation are seeded. Overdue is computed from the due date — it is never stored. Mark an obligation done when it is complete."));
@@ -22412,6 +22494,71 @@ function renderErpLegalAgreementEditForm(card, rec, status, reload) {
       counterparty: counterpartyInput.value, type: typeSelect.value,
       title: titleInput.value, start_date: startInput.value,
       end_date: endInput.value,
+      renewal_notice_days: noticeInput.value === "" ? 30 : Number(noticeInput.value),
+      notes: notesInput.value
+    }).then(function () {
+      reload();
+    }).catch(function (error) {
+      status.textContent = error.message;
+      saveBtn.disabled = false;
+    });
+  });
+  card.appendChild(saveBtn);
+  var cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", function () { reload(); });
+  card.appendChild(cancelBtn);
+}
+function renderErpLegalLicenseEditForm(card, rec, status, reload) {
+  card.replaceChildren();
+  var title = document.createElement("h3");
+  title.textContent = "Edit license";
+  card.appendChild(title);
+  function eInput(value, placeholder, type) {
+    var input = document.createElement("input");
+    input.type = type || "text";
+    input.placeholder = placeholder || "";
+    input.value = (value === null || value === undefined) ? "" : String(value);
+    return input;
+  }
+  function eSelect(pairs, selected) {
+    var sel = document.createElement("select");
+    pairs.forEach(function (p) {
+      var opt = document.createElement("option");
+      opt.value = p[0];
+      opt.textContent = p[1];
+      if (p[0] === selected) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.value = selected || (pairs.length ? pairs[0][0] : "");
+    return sel;
+  }
+  var nameInput = eInput(rec.name, "License name");
+  card.appendChild(erpField("Name", nameInput));
+  var authorityInput = eInput(rec.authority, "Issuing authority");
+  card.appendChild(erpField("Issuing authority", authorityInput));
+  var numberInput = eInput(rec.license_number, "License / permit number");
+  card.appendChild(erpField("License number", numberInput));
+  var typeSelect = eSelect([["health", "Health department"], ["city", "City"], ["county", "County"], ["state", "State"], ["federal", "Federal"], ["other", "Other"]], rec.type);
+  card.appendChild(erpField("Type", typeSelect));
+  var issueInput = eInput(rec.issue_date, "Issue date (YYYY-MM-DD)");
+  card.appendChild(erpField("Issue date", issueInput));
+  var expiryInput = eInput(rec.expiry_date, "Expiry date (YYYY-MM-DD)");
+  card.appendChild(erpField("Expiry date", expiryInput));
+  var noticeInput = eInput(rec.renewal_notice_days, "Renewal notice (days)", "number");
+  card.appendChild(erpField("Renewal notice (days)", noticeInput));
+  var notesInput = eInput(rec.notes, "Notes");
+  card.appendChild(erpField("Notes", notesInput));
+  var saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.textContent = "Save changes";
+  saveBtn.addEventListener("click", function () {
+    saveBtn.disabled = true;
+    erpPost("/api/erp/legal/licenses/" + rec.id + "/update", {
+      name: nameInput.value, authority: authorityInput.value,
+      license_number: numberInput.value, type: typeSelect.value,
+      issue_date: issueInput.value, expiry_date: expiryInput.value,
       renewal_notice_days: noticeInput.value === "" ? 30 : Number(noticeInput.value),
       notes: notesInput.value
     }).then(function () {
