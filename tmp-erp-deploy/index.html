@@ -352,7 +352,6 @@ button { font-family: inherit; }
     <div class="login-tabs">
       <button type="button" id="tabAdmin" class="login-tab active">Admin</button>
       <button type="button" id="tabStaff" class="login-tab">Staff</button>
-      <button type="button" id="tabWholesale" class="login-tab">Wholesale</button>
     </div>
     <form id="loginForm">
       <label>Email<input type="email" id="loginEmail" required autocomplete="username"></label>
@@ -361,18 +360,6 @@ button { font-family: inherit; }
       <p id="loginError" class="login-error" hidden></p>
       <button type="submit" id="loginSubmit">Log in</button>
       <p class="forgot-wrap" id="forgotWrap"><button type="button" id="forgotBtn" class="link-btn">Forgot password?</button></p>
-    </form>
-  </div>
-</div>
-<div id="setupView" class="login-wrap" hidden>
-  <div class="login-card">
-    <h1>Set your password</h1>
-    <p class="login-sub">Wholesale ordering account</p>
-    <form id="setupForm">
-      <label>New password (8+ characters)<span class="pw-wrap"><input type="password" id="setupPass" required autocomplete="new-password" minlength="8"><button type="button" class="pw-eye" data-pw="setupPass" aria-label="Show password">👁</button></span></label>
-      <label>Confirm password<span class="pw-wrap"><input type="password" id="setupPass2" required autocomplete="new-password" minlength="8"><button type="button" class="pw-eye" data-pw="setupPass2" aria-label="Show password">👁</button></span></label>
-      <p id="setupError" class="login-error" hidden></p>
-      <button type="submit" id="setupSubmit">Set password &amp; log in</button>
     </form>
   </div>
 </div>
@@ -490,7 +477,6 @@ function setLoginMode(mode) {
   loginMode = mode;
   document.getElementById("tabAdmin").classList.toggle("active", mode === "admin");
   document.getElementById("tabStaff").classList.toggle("active", mode === "staff");
-  document.getElementById("tabWholesale").classList.toggle("active", mode === "wholesale");
   document.getElementById("forgotWrap").hidden = false;
   document.getElementById("loginError").hidden = true;
   loginNote("");
@@ -523,15 +509,6 @@ async function doLogin(event) {
       var chkData = await chk.json().catch(function () { return {}; });
       if (!chkData.is_admin) throw new Error("This ERP requires an admin account.");
       saveSession(data.token, data.name || email, data.email || email, "admin");
-    } else if (loginMode === "wholesale") {
-      var wresp = await fetch(API_BASE + "/api/wholesale/login", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: email, password: password })
-      });
-      var wdata = await wresp.json().catch(function () { return {}; });
-      if (!wresp.ok || !wdata.token) throw new Error(authMessage(wdata, "Wholesale login failed."));
-      saveSession(wdata.token, wdata.account_name || email, wdata.email || email, "wholesale");
     } else {
       var sresp = await fetch(API_BASE + "/api/loyalty/staff/login", {
         method: "POST",
@@ -590,15 +567,8 @@ function doLogout(message) {
 function showLogin() {
   hideBoot();
   document.getElementById("loginView").hidden = false;
-  document.getElementById("setupView").hidden = true;
   document.getElementById("appView").hidden = true;
   document.title = "Log in \u00b7 Pop-A-Licious ERP";
-}
-/* ---------- wholesale set-password (invite link: #/wholesale-setup?token=…) ---------- */
-function wholesaleSetupToken() {
-  var h = location.hash || "";
-  var m = h.match(/^#\/wholesale-setup\?token=([A-Za-z0-9\-_]+)/);
-  return m ? m[1] : "";
 }
 /* Accept-order email button: #/login?accept_order=W-1002 — handled after login. */
 function hashQueryParam(name) {
@@ -637,50 +607,10 @@ function erpHandleAcceptOrderIntent(orderNumber) {
     else renderRoute();
   });
 }
-function showWholesaleSetup() {
-  hideBoot();
-  document.getElementById("loginView").hidden = true;
-  document.getElementById("appView").hidden = true;
-  document.getElementById("setupView").hidden = false;
-  document.title = "Set password \u00b7 Pop-A-Licious Wholesale";
-}
-function setupError(msg) {
-  var el = document.getElementById("setupError");
-  el.textContent = msg;
-  el.hidden = false;
-}
-async function doWholesaleSetup(event) {
-  event.preventDefault();
-  var p1 = document.getElementById("setupPass").value;
-  var p2 = document.getElementById("setupPass2").value;
-  var btn = document.getElementById("setupSubmit");
-  document.getElementById("setupError").hidden = true;
-  if (p1 !== p2) { setupError("Passwords do not match."); return; }
-  btn.disabled = true;
-  try {
-    var resp = await fetch(API_BASE + "/api/wholesale/set-password", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ token: wholesaleSetupToken(), password: p1 })
-    });
-    var data = await resp.json().catch(function () { return {}; });
-    if (!resp.ok || !data.token) throw new Error(authMessage(data, "Could not set password."));
-    saveSession(data.token, data.account_name || data.email, data.email, "wholesale");
-    document.getElementById("setupPass").value = "";
-    document.getElementById("setupPass2").value = "";
-    history.replaceState(null, "", "#/");
-    enterApp();
-  } catch (error) {
-    setupError(error instanceof TypeError ? "We couldn't reach the server." : error.message);
-  } finally {
-    btn.disabled = false;
-  }
-}
 function enterApp() {
   hideBoot();
   var s = erpSession();
   document.getElementById("loginView").hidden = true;
-  document.getElementById("setupView").hidden = true;
   document.getElementById("appView").hidden = false;
   var label = document.getElementById("userLabel");
   label.textContent = s.name || s.email;
@@ -746,7 +676,6 @@ function renderWholesaleRoute() {
   hideBoot();
   var h = location.hash || "#/";
   document.getElementById("loginView").hidden = true;
-  document.getElementById("setupView").hidden = true;
   document.getElementById("appView").hidden = false;
   var nav = document.querySelector(".app-nav");
   if (nav) nav.style.display = "none";
@@ -1348,8 +1277,6 @@ function currentRoute() {
   return "home";
 }
 function renderRoute() {
-  // Invite links land here even with no session: #/wholesale-setup?token=…
-  if (wholesaleSetupToken()) { showWholesaleSetup(); return; }
   if (!isLoggedIn()) { showLogin(); return; }
   // "Accept order" button from the new-order admin email: #/login?accept_order=W-1002
   if (erpSession().role === "admin") {
@@ -1738,9 +1665,7 @@ window.addEventListener("hashchange", renderRoute);
 /* ---------- init ---------- */
 document.getElementById("tabAdmin").addEventListener("click", function () { setLoginMode("admin"); });
 document.getElementById("tabStaff").addEventListener("click", function () { setLoginMode("staff"); });
-document.getElementById("tabWholesale").addEventListener("click", function () { setLoginMode("wholesale"); });
 document.getElementById("loginForm").addEventListener("submit", doLogin);
-document.getElementById("setupForm").addEventListener("submit", doWholesaleSetup);
 /* password visibility toggles */
 document.querySelectorAll(".pw-eye").forEach(function (btn) {
   btn.addEventListener("click", function () {
@@ -1771,12 +1696,9 @@ document.getElementById("forgotBtn").addEventListener("click", async function ()
     if (loginMode === "admin") {
       fUrl = API_BASE + "/api/auth/forgot-password";
       fBody = { email: email };
-    } else if (loginMode === "staff") {
+    } else {
       fUrl = API_BASE + "/api/loyalty/staff/forgot-password";
       fBody = { email: email };
-    } else {
-      fUrl = API_BASE + "/api/wholesale/forgot-password";
-      fBody = { email: email, portal_url: location.origin + location.pathname };
     }
     await fetch(fUrl, {
       method: "POST",
@@ -27313,8 +27235,7 @@ async function erpRestoreSession() {
     return true;
   } catch (e) { return false; }
 }
-if (wholesaleSetupToken()) { showWholesaleSetup(); }
-else if (isLoggedIn()) { enterApp(); }
+if (isLoggedIn()) { enterApp(); }
 else { erpRestoreSession().then(function (restored) { if (!restored) showLogin(); }); }
 </script>
 </body>
