@@ -43295,12 +43295,16 @@ def erp_create_wholesale_account():
     pricing_mode = (data.get("pricing_mode") or "bag").strip().lower()
     if pricing_mode not in ("bag", "case"):
         return jsonify(error="pricing_mode must be 'bag' or 'case'"), 400
+    # Nov 18, 2026: there is no generic bag price anymore — savory and
+    # sweet are the only prices that drive orders. An old client or import
+    # may still send price_per_bag_cents; accept it if usable, otherwise
+    # fall back to the 400 default. It is never a reason to refuse.
     try:
         price = int(data.get("price_per_bag_cents", 400) or 400)
     except (TypeError, ValueError):
-        return jsonify(error="price_per_bag_cents must be a number"), 400
+        price = 400
     if price <= 0:
-        return jsonify(error="price_per_bag_cents must be greater than zero"), 400
+        price = 400
     try:
         savory = int(data.get("savory_price_cents", 400) or 400)
         sweet = int(data.get("sweet_price_cents", 400) or 400)
@@ -43411,16 +43415,16 @@ def erp_update_wholesale_account(account_id):
                 "billing_name", "billing_email"):
         if key in data:
             fields[key] = (data.get(key) or "").strip()
+    # Nov 18, 2026: no generic bag price anymore — an invalid value sent
+    # by an old client is ignored (the stored value is left alone) instead
+    # of refusing the update.
     if "price_per_bag_cents" in data:
         try:
             price = int(data.get("price_per_bag_cents") or 0)
         except (TypeError, ValueError):
-            conn.close()
-            return jsonify(error="price_per_bag_cents must be a number"), 400
-        if price <= 0:
-            conn.close()
-            return jsonify(error="price_per_bag_cents must be greater than zero"), 400
-        fields["price_per_bag_cents"] = price
+            price = 0
+        if price > 0:
+            fields["price_per_bag_cents"] = price
     for key in ("savory_price_cents", "sweet_price_cents"):
         if key in data:
             try:
@@ -43571,8 +43575,10 @@ def erp_delete_wholesale_tier(account_id, tier_id):
 @app.post("/api/erp/wholesale-accounts/import")
 def erp_import_wholesale_accounts():
     """CSV import. Columns: name, contact_name, email, phone, address,
-    price_per_bag_cents, payment_terms, notes. Fail-fast with row numbers,
-    same pattern as the recipe import."""
+    savory_price_cents, sweet_price_cents, payment_terms, notes.
+    price_per_bag_cents is still accepted (old files) but no longer
+    listed — savory/sweet are the prices that drive orders. Fail-fast
+    with row numbers, same pattern as the recipe import."""
     import csv
     import io
     actor, err = _erp_check_perm("accounts.write")
@@ -43599,9 +43605,19 @@ def erp_import_wholesale_accounts():
         if price <= 0:
             conn.close()
             return jsonify(error="row %d: price_per_bag_cents must be > 0" % n), 400
+        try:
+            savory = int(row.get("savory_price_cents") or 400)
+            sweet = int(row.get("sweet_price_cents") or 400)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="row %d: savory_price_cents and sweet_price_cents must be numbers" % n), 400
+        if savory <= 0 or sweet <= 0:
+            conn.close()
+            return jsonify(error="row %d: savory_price_cents and sweet_price_cents must be > 0" % n), 400
         rows.append({"name": name, "contact_name": row.get("contact_name") or "",
                      "email": row.get("email") or "", "phone": row.get("phone") or "",
                      "address": row.get("address") or "", "price_per_bag_cents": price,
+                     "savory_price_cents": savory, "sweet_price_cents": sweet,
                      "payment_terms": row.get("payment_terms") or "",
                      "notes": row.get("notes") or ""})
     if not rows:
@@ -43611,11 +43627,13 @@ def erp_import_wholesale_accounts():
     for r in rows:
         conn.execute(
             "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
-            " price_per_bag_cents, payment_terms, notes, active, staff_managed,"
+            " price_per_bag_cents, savory_price_cents, sweet_price_cents,"
+            " payment_terms, notes, active, staff_managed,"
             " created_by, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)",
             (r["name"], r["contact_name"], r["email"], r["phone"], r["address"],
-             r["price_per_bag_cents"], r["payment_terms"], r["notes"], actor, now))
+             r["price_per_bag_cents"], r["savory_price_cents"], r["sweet_price_cents"],
+             r["payment_terms"], r["notes"], actor, now))
     _erp_settings_audit(conn, actor, "import.wholesale_accounts",
                         "wholesale_accounts", 0,
                         "Imported %d wholesale account(s) from CSV" % len(rows))
@@ -43940,9 +43958,11 @@ def _erp_import_seed_csv(conn, actor, text):
 def _erp_import_wholesale_csv(conn, actor, text):
     """Bulk wholesale-account import, same columns as
     POST /api/erp/wholesale-accounts/import (name, contact_name, email,
-    phone, address, price_per_bag_cents, payment_terms, notes). Validates
-    the whole file first; idempotent on re-import (same name -> skipped,
-    never duplicated) and never resurrects a deleted account."""
+    phone, address, savory_price_cents, sweet_price_cents, payment_terms,
+    notes). price_per_bag_cents is still accepted (old files) but no
+    longer listed. Validates the whole file first; idempotent on
+    re-import (same name -> skipped, never duplicated) and never
+    resurrects a deleted account."""
     import csv
     import io
     if not (text or "").strip():
@@ -43961,12 +43981,21 @@ def _erp_import_wholesale_csv(conn, actor, text):
             raise _ErpImportError("row %d: price_per_bag_cents must be a number" % n)
         if price <= 0:
             raise _ErpImportError("row %d: price_per_bag_cents must be > 0" % n)
+        try:
+            savory = int(row.get("savory_price_cents") or 400)
+            sweet = int(row.get("sweet_price_cents") or 400)
+        except (TypeError, ValueError):
+            raise _ErpImportError("row %d: savory_price_cents and sweet_price_cents must be numbers" % n)
+        if savory <= 0 or sweet <= 0:
+            raise _ErpImportError("row %d: savory_price_cents and sweet_price_cents must be > 0" % n)
         rows.append({"name": name,
                      "contact_name": row.get("contact_name") or "",
                      "email": row.get("email") or "",
                      "phone": row.get("phone") or "",
                      "address": row.get("address") or "",
                      "price_per_bag_cents": price,
+                     "savory_price_cents": savory,
+                     "sweet_price_cents": sweet,
                      "payment_terms": row.get("payment_terms") or "",
                      "notes": row.get("notes") or ""})
     if not rows:
@@ -43987,11 +44016,13 @@ def _erp_import_wholesale_csv(conn, actor, text):
             continue
         conn.execute(
             "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
-            " price_per_bag_cents, payment_terms, notes, active, staff_managed,"
+            " price_per_bag_cents, savory_price_cents, sweet_price_cents,"
+            " payment_terms, notes, active, staff_managed,"
             " created_by, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)",
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)",
             (r["name"], r["contact_name"], r["email"], r["phone"], r["address"],
-             r["price_per_bag_cents"], r["payment_terms"], r["notes"], actor, now))
+             r["price_per_bag_cents"], r["savory_price_cents"], r["sweet_price_cents"],
+             r["payment_terms"], r["notes"], actor, now))
         imported += 1
     return ({"format": "wholesale_csv", "imported": imported,
              "skipped_existing": skipped_existing,
@@ -45105,7 +45136,12 @@ def erp_add_wholesale_order_line(order_id):
     if qty <= 0:
         conn.close()
         return jsonify(error="qty_bags must be greater than zero"), 400
-    default_unit = int(acct["price_per_bag_cents"]) if acct and acct["price_per_bag_cents"] else 0
+    # Nov 18, 2026: no generic bag price anymore — a line with no explicit
+    # price resolves from the account's savory/sweet price for the flavor's
+    # category (unknown flavor defaults to sweet, same as order create).
+    default_unit = 0
+    if acct:
+        default_unit, _cat = _wholesale_flavor_price(conn, acct, name)
     try:
         unit = int(data.get("unit_price_cents") or default_unit)
     except (TypeError, ValueError):
@@ -45561,7 +45597,12 @@ def erp_update_wholesale_address(addr_id):
 
 @app.get("/api/erp/flavor-categories")
 def erp_list_flavor_categories():
-    actor, err = _require_erp_admin()
+    # Nov 18, 2026: readable by anyone who can read orders, not just
+    # admins — the staff wholesale-order form needs the savory/sweet
+    # category per flavor to price each line. Flavor names and their
+    # category are not sensitive (the 25 flavors are public on the
+    # website). Updating categories stays admin-only (PUT below).
+    actor, err = _erp_check_perm("orders.read")
     if err:
         return err
     conn = db()
@@ -46380,7 +46421,11 @@ def _edi_map_850_to_order(conn, doc, parsed, partner, actor):
         qty = float(ln.get("qty") or 0)
         if qty <= 0:
             return None, "PO1 line %d: quantity must be > 0" % i
-        unit = int(ln.get("unit_price_cents") or acct["price_per_bag_cents"] or 400)
+        # Nov 18, 2026: no generic bag price anymore — a PO1 line with no
+        # price resolves from the account's savory/sweet price for the
+        # flavor's category (unknown flavor defaults to sweet).
+        unit = int(ln.get("unit_price_cents") or
+                   _wholesale_flavor_price(conn, acct, flavor)[0])
         if unit <= 0:
             return None, "PO1 line %d: unit price must be > 0" % i
         lines.append({"flavor_name": flavor, "qty_bags": qty,
