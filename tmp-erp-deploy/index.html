@@ -143,6 +143,16 @@ button { font-family: inherit; }
       .chat-result:hover { border-color: var(--red); }
       .chat-result strong { display: block; font-weight: 800; }
       .chat-result span { display: block; font-size: 12px; color: var(--muted); }
+      /* SOP shown inside the chat (Nov 18, 2026): the body scrolls
+         inside the bubble so a long SOP never pushes the panel off
+         screen; the bubble goes full width so it stays readable on
+         phones. */
+      .chat-msg.chat-sop { max-width: 100%; }
+      .chat-sop-body { max-height: 240px; overflow-y: auto; margin: 8px 0; padding-right: 4px; word-wrap: break-word; overflow-wrap: anywhere; }
+      .chat-sop-body h1, .chat-sop-body h2, .chat-sop-body h3 { font-size: 14px; margin: 10px 0 4px; }
+      .chat-sop-body p { margin: 4px 0; }
+      .chat-sop-link { display: block; width: 100%; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-top: 6px; cursor: pointer; font-size: 14px; font-weight: 800; color: var(--red-dark); }
+      .chat-sop-link:hover { border-color: var(--red); }
       /* Row Poppy lands on, after a find. */
       .erp-row-highlight { background: #fff3cd !important; outline: 2px solid var(--yellow); }
       .erp-form { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin: 12px 0 20px; padding: 14px; border: 2px solid var(--ink); background: var(--surface); }
@@ -11969,12 +11979,53 @@ function erpRecipeLabelDoc(r, nut, serving) {
     "Label prints at A6 (105 &times; 148 mm).</div>" + p.label +
     "<script>window.addEventListener(\"load\",function(){var l=" +
     "document.querySelector(\".label\"),f=document.querySelector(\".labelfit\");" +
-    "if(l&&f&&f.scrollHeight>l.clientHeight){f.style.transform=\"scale(\"+(" +
-    "l.clientHeight/f.scrollHeight)+\")\";f.style.transformOrigin=\"top center\";}});" +
+    /* Scale to the CONTENT-box height (clientHeight minus the 1.3mm
+       top/bottom padding): scaling to clientHeight leaves the bottom
+       padding's worth of content past the box, where overflow:hidden
+       clips the bottom edge of the barcode digits (v14). */
+    "if(l&&f){var cs=getComputedStyle(l),av=l.clientHeight-" +
+    "(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);" +
+    "if(f.scrollHeight>av){f.style.transform=\"scale(\"+(av/f.scrollHeight)+" +
+    ")\";f.style.transformOrigin=\"top center\";}}});" +
     /* NOTE: the closing tag is written with an escaped slash — a literal
        closing script tag inside this string would close the page's own
        script element early and the app would never boot (broke live Nov 17, 2026). */
     "<\/script></body></html>";
+}
+/* Fit the label content in the fixed A6 box (shared by the live print
+   view and the standalone label document). The scale targets the
+   label's CONTENT-box height, not clientHeight: clientHeight includes
+   the 1.3mm top/bottom padding, and scaling to it leaves the bottom
+   padding's worth of content hanging past the box, where
+   overflow:hidden clips it — in practice the bottom edge of the
+   barcode digits, which sit within ~1px of the clip edge, so any
+   browser laying the text out a hair taller (different font metrics)
+   cuts them visibly (v14). Clearing any previous scale before
+   measuring lets a refit after an image loads shrink further instead
+   of stacking on the old scale. */
+function erpFitLabelToBox(labelEl, fitEl) {
+  if (!labelEl || !fitEl) return;
+  /* Measure with the screen zoom switched off: while the label is
+     zoomed, scrollHeight reads ~5px short (the top padding's worth),
+     so a refit after the zoom is applied would under-measure and
+     restore the v13 razor-thin margin. The zoom style is restored
+     before this returns; no paint happens in between. */
+  var zoomSt = (typeof document !== "undefined" && document.getElementById) ?
+    document.getElementById("erpPrintZoomStyle") : null;
+  var zoomCss = zoomSt ? zoomSt.textContent : null;
+  if (zoomSt) zoomSt.textContent = "";
+  fitEl.style.transform = "";
+  var pad = 0;
+  if (typeof getComputedStyle === "function") {
+    var cs = getComputedStyle(labelEl);
+    pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+  }
+  var avail = labelEl.clientHeight - pad;
+  if (avail > 0 && fitEl.scrollHeight > avail) {
+    fitEl.style.transform = "scale(" + (avail / fitEl.scrollHeight) + ")";
+    fitEl.style.transformOrigin = "top center";
+  }
+  if (zoomSt) zoomSt.textContent = zoomCss || "";
 }
 /* Print the label from this page: hide the app, show only the label, and
    let the browser print the real document. On screen the label is
@@ -11993,7 +12044,7 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v13 &mdash; On screen the label is " +
+    "<p class=\"erp-print-help\">Label v14 &mdash; On screen the label is " +
     "enlarged for readability; it always prints at true A6 (105 &times; 148 mm). On " +
     "iPhone/iPad: Share, then Print, then pick A6 paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
@@ -12006,9 +12057,29 @@ function erpShowPrintLabel(r, nut, serving) {
      content fits the fixed A6 box. Shrink only when it overflows. */
   var labelEl = view.querySelector(".label");
   var fitEl = view.querySelector(".labelfit");
-  if (labelEl && fitEl && fitEl.scrollHeight > labelEl.clientHeight) {
-    fitEl.style.transform = "scale(" + (labelEl.clientHeight / fitEl.scrollHeight) + ")";
-    fitEl.style.transformOrigin = "top center";
+  erpFitLabelToBox(labelEl, fitEl);
+  /* An uploaded barcode picture has no intrinsic size until it loads,
+     so the fit above measures the label without it; when it lands the
+     content grows and the bottom can clip. Refit on every label image
+     load so the scale always matches the final content. Images that
+     already finished (QR code, cached pictures) were measured with
+     their size and need no refit. */
+  if (labelEl && fitEl) {
+    Array.prototype.forEach.call(view.querySelectorAll(".label img"), function (img) {
+      if (img.complete) return;
+      img.addEventListener("load", function () { erpFitLabelToBox(labelEl, fitEl); });
+      img.addEventListener("error", function () { erpFitLabelToBox(labelEl, fitEl); });
+    });
+    /* The first layout can measure a few px short (the first build
+       reads ~5px less than a settled one), and a font swap can grow
+       the text after the fit. Refit once layout has settled and once
+       fonts arrive, so the scale always matches the final content. */
+    if (typeof requestAnimationFrame === "function") {
+      requestAnimationFrame(function () { erpFitLabelToBox(labelEl, fitEl); });
+    }
+    if (typeof document !== "undefined" && document.fonts && document.fonts.ready) {
+      document.fonts.ready.then(function () { erpFitLabelToBox(labelEl, fitEl); });
+    }
   }
   /* Screen only: enlarge the label to fill the window, so on a wide
      desktop screen it does not sit as a tiny A6 column in a sea of
@@ -12045,6 +12116,40 @@ function erpHidePrintLabel() {
   var view = document.getElementById("erpPrintView");
   if (view) view.innerHTML = "";
   document.body.classList.remove("erp-printing");
+}
+/* Cmd/Ctrl+P (and Share > Print on iPhone/iPad) while the nutrition
+   panel is showing used to print the whole recipe page — sidebar,
+   lines table, settings forms — across two pages, with only the
+   Nutrition Facts panel on page 2 and no ingredients, codes, Net Wt
+   or address: the preview never showed the whole label (v13 proof
+   only covered the Print button's path). Route that print into the
+   same A6 label view the Print button opens, then put the recipe page
+   back when the print sheet closes. The Print button's own
+   window.print() already has the view open, so the handler leaves it
+   alone; the packing-slip print view likewise. The recipe page's
+   "Print label" button is the only button with that text, and it only
+   exists while the panel is showing, so the route is naturally scoped
+   to the panel view. */
+var erpPrintOpenedByBeforePrint = false;
+function erpRoutePanelPrintToLabel() {
+  if (document.body.classList.contains("erp-printing")) return;
+  var btns = document.querySelectorAll("#appBody button");
+  for (var i = 0; i < btns.length; i++) {
+    if (btns[i].textContent.trim() === "Print label" && btns[i].offsetParent !== null) {
+      erpPrintOpenedByBeforePrint = true;
+      btns[i].click();
+      return;
+    }
+  }
+}
+function erpRestoreAfterPanelPrint() {
+  if (!erpPrintOpenedByBeforePrint) return;
+  erpPrintOpenedByBeforePrint = false;
+  erpHidePrintLabel();
+}
+if (typeof window !== "undefined" && window.addEventListener) {
+  window.addEventListener("beforeprint", erpRoutePanelPrintToLabel);
+  window.addEventListener("afterprint", erpRestoreAfterPanelPrint);
 }
 /* ---------- new recipe form (also used for new versions) ---------- */
 function erpNewRecipeForm(existing) {
@@ -13035,7 +13140,9 @@ function renderErpOrderDetail(body) {
           (o.account.email ? " · " + o.account.email : "") +
           (o.account.phone ? " · " + o.account.phone : "") +
           (o.account.payment_terms ? " · terms: " + o.account.payment_terms : "") +
-          (o.account.price_per_bag_cents ? " · " + erpMoney(o.account.price_per_bag_cents) + "/bag" : "");
+          // Nov 18, 2026: no generic bag price — show the savory/sweet
+          // prices that actually price this account's lines.
+          (erpAccountPriceLabel(o.account) !== "—" ? " · " + erpAccountPriceLabel(o.account) : "");
         atr.appendChild(atd);
         ctbody.appendChild(atr);
       }
@@ -13139,8 +13246,12 @@ function renderErpOrderDetail(body) {
       apPriceInput.type = "number";
       apPriceInput.min = "0.01";
       apPriceInput.step = "0.01";
-      apPriceInput.placeholder = o.account && o.account.price_per_bag_cents ?
-        (o.account.price_per_bag_cents / 100).toFixed(2) + " (account default)" : "4.00";
+      // Nov 18, 2026: no generic bag price — the hint is the account's
+      // savory/sweet pair, since an off-catalog product has no flavor
+      // category to price from. Leave the field blank and the backend
+      // prices it from the sweet price.
+      var apLabel = o.account ? erpAccountPriceLabel(o.account) : "—";
+      apPriceInput.placeholder = apLabel !== "—" ? apLabel + " (account prices)" : "4.00";
       apPriceLabel.appendChild(apPriceInput);
       addProdForm.appendChild(apPriceLabel);
       var apSubmit = document.createElement("button");
@@ -14037,14 +14148,82 @@ function renderErpWholesaleOrders(body) {
   wrap.appendChild(table);
 }
 
-function erpWholesaleLineRow(flavor, qty, priceDollars) {
+/* ---------- flavor categories + picker (Nov 18, 2026) ---------- */
+// The staff wholesale-order form prices each line from the account's
+// savory/sweet price for the flavor's category. Categories come from
+// GET /api/erp/flavor-categories (orders.read — staff can read it);
+// the picker lists every flavor name from ERP_FLAVOR_CODES plus any
+// category-listed name the GS1 map does not have yet (Nashville Hot
+// has no UPC/QR in the map, so it only appears via categories).
+var erpFlavorCategoryMap = null; // null = not loaded yet
+var erpFlavorCategoryPromise = null;
+function erpLoadFlavorCategories() {
+  if (erpFlavorCategoryMap) return Promise.resolve(erpFlavorCategoryMap);
+  if (!erpFlavorCategoryPromise) {
+    erpFlavorCategoryPromise = erpGet("/api/erp/flavor-categories").then(function (res) {
+      var map = {};
+      (res.categories || []).forEach(function (c) { map[c.flavor_name] = c.category; });
+      erpFlavorCategoryMap = map;
+      return map;
+    }).catch(function () { erpFlavorCategoryPromise = null; return {}; });
+  }
+  return erpFlavorCategoryPromise;
+}
+function erpFlavorCategory(name) {
+  if (!erpFlavorCategoryMap || !name) return null;
+  return erpFlavorCategoryMap[name] || null;
+}
+function erpAccountCategoryPriceCents(acct, category) {
+  // Mirrors the backend's _wholesale_account_prices: a missing or zero
+  // category price falls back to 400, so the preview always shows the
+  // price the order will actually get.
+  if (!acct) return 0;
+  var c = category === "savory" ? Number(acct.savory_price_cents) : Number(acct.sweet_price_cents);
+  return c || 400;
+}
+function erpAccountCategoryPriceDollars(acct, category) {
+  var c = erpAccountCategoryPriceCents(acct, category);
+  return c ? (c / 100).toFixed(2) : "";
+}
+function erpFlavorNames() {
+  var names = {};
+  if (typeof ERP_FLAVOR_CODES !== "undefined") {
+    Object.keys(ERP_FLAVOR_CODES).forEach(function (k) {
+      var e = ERP_FLAVOR_CODES[k];
+      if (e && e.name) names[e.name] = true;
+    });
+  }
+  if (erpFlavorCategoryMap) {
+    Object.keys(erpFlavorCategoryMap).forEach(function (n) { names[n] = true; });
+  }
+  return Object.keys(names).sort();
+}
+function erpFillFlavorSelect(sel, selected) {
+  var keep = selected !== undefined ? selected : sel.value;
+  sel.replaceChildren();
+  var blank = document.createElement("option");
+  blank.value = "";
+  blank.textContent = "Pick a flavor…";
+  sel.appendChild(blank);
+  erpFlavorNames().forEach(function (n) {
+    var o = document.createElement("option");
+    o.value = n;
+    o.textContent = n;
+    sel.appendChild(o);
+  });
+  if (keep) sel.value = keep;
+}
+
+function erpWholesaleLineRow(flavor, qty, priceDollars, priceForFlavor) {
   var row = document.createElement("div");
   row.className = "erp-po-line";
-  var f = document.createElement("input");
+  // Nov 18, 2026: a scrolling list of all popcorn flavors, not a
+  // free-text box — the picker supplies the canonical display name, so
+  // the backend's category lookup matches exactly.
+  var f = document.createElement("select");
   f.name = "flavor_name";
-  f.placeholder = "Flavor name";
   f.style.minWidth = "200px";
-  if (flavor) f.value = flavor;
+  erpFillFlavorSelect(f, flavor || "");
   row.appendChild(f);
   var q = document.createElement("input");
   q.name = "qty_bags";
@@ -14061,6 +14240,15 @@ function erpWholesaleLineRow(flavor, qty, priceDollars) {
   p.style.width = "90px";
   if (priceDollars) p.value = priceDollars;
   row.appendChild(p);
+  f.addEventListener("change", function () {
+    // Picking a flavor fills a blank line price from the account's
+    // price for that flavor's category; a typed price is never
+    // overwritten.
+    if (priceForFlavor && !p.value.trim() && f.value) {
+      var d = priceForFlavor(f.value);
+      if (d) p.value = d;
+    }
+  });
   var rm = document.createElement("button");
   rm.type = "button";
   rm.textContent = "✕";
@@ -14082,22 +14270,34 @@ function erpNewWholesaleOrderForm() {
   erpState.wholesaleAccounts.forEach(function (a) {
     var o = document.createElement("option");
     o.value = a.id;
-    o.textContent = a.name + " (" + erpMoney(a.price_per_bag_cents) + "/bag)";
+    // Nov 18, 2026: no generic bag price — the account's savory/sweet
+    // prices are what price its lines.
+    var aLabel = erpAccountPriceLabel(a);
+    o.textContent = aLabel !== "—" ? a.name + " (" + aLabel + ")" : a.name;
     acctSel.appendChild(o);
   });
   form.appendChild(erpField("Account", acctSel));
 
-  function accountPriceDollars() {
+  // Price for one flavor from the account's savory/sweet price for that
+  // flavor's category. Unknown flavor (categories not loaded yet) leaves
+  // the line blank — the backend resolves it at create (unknown
+  // defaults to sweet).
+  function priceForFlavor(flavorName) {
     var a = erpAccountById(acctSel.value);
-    if (a && a.price_per_bag_cents) return (Number(a.price_per_bag_cents) / 100).toFixed(2);
-    return "";
+    if (!a) return "";
+    var cat = erpFlavorCategory(flavorName);
+    if (!cat) return "";
+    return erpAccountCategoryPriceDollars(a, cat);
   }
   acctSel.addEventListener("change", function () {
-    var d = accountPriceDollars();
     var rows = linesWrap.querySelectorAll(".erp-po-line");
     for (var i = 0; i < rows.length; i++) {
       var p = rows[i].querySelector('input[name="unit_price"]');
-      if (p && !p.value.trim() && d) p.value = d;
+      var f = rows[i].querySelector('select[name="flavor_name"]');
+      if (p && !p.value.trim() && f && f.value) {
+        var d = priceForFlavor(f.value);
+        if (d) p.value = d;
+      }
     }
   });
 
@@ -14117,10 +14317,20 @@ function erpNewWholesaleOrderForm() {
   addRowBtn.type = "button";
   addRowBtn.textContent = "+ Add line";
   addRowBtn.addEventListener("click", function () {
-    linesWrap.appendChild(erpWholesaleLineRow("", null, accountPriceDollars()));
+    linesWrap.appendChild(erpWholesaleLineRow("", null, "", priceForFlavor));
   });
   form.appendChild(addRowBtn);
-  linesWrap.appendChild(erpWholesaleLineRow("", null, accountPriceDollars()));
+  linesWrap.appendChild(erpWholesaleLineRow("", null, "", priceForFlavor));
+  // Load the categories as soon as the form renders, then add any
+  // category-only flavor (Nashville Hot has no UPC/QR in the GS1 map)
+  // to the pickers already on screen, keeping each row's picked flavor.
+  erpLoadFlavorCategories().then(function () {
+    var rows = linesWrap.querySelectorAll(".erp-po-line");
+    for (var i = 0; i < rows.length; i++) {
+      var f = rows[i].querySelector('select[name="flavor_name"]');
+      if (f) erpFillFlavorSelect(f);
+    }
+  });
 
   var submit = document.createElement("button");
   submit.type = "submit";
@@ -14137,7 +14347,7 @@ function erpNewWholesaleOrderForm() {
     }
     var lines = [];
     for (var i = 0; i < rows.length; i++) {
-      var f = rows[i].querySelector('input[name="flavor_name"]').value.trim();
+      var f = rows[i].querySelector('select[name="flavor_name"]').value.trim();
       var qv = Number(rows[i].querySelector('input[name="qty_bags"]').value);
       var priceRaw = rows[i].querySelector('input[name="unit_price"]').value.trim();
       if (!f || !isFinite(qv) || qv <= 0) {
@@ -14205,17 +14415,20 @@ function erpShowWholesaleVerifyModal(payload, acct, submitBtn, statusEl, onCreat
   if (payload.order_date) metaRow("Order date", payload.order_date);
   if (payload.due_date) metaRow("Due date", payload.due_date);
   if (payload.notes) metaRow("Notes", payload.notes);
-  var acctPriceCents = acct ? Number(acct.price_per_bag_cents || 0) : 0;
   var totalCents = 0;
   payload.lines.forEach(function (l) {
     var row = document.createElement("div");
     row.className = "ws-review-line";
     var left = document.createElement("span");
-    var unit = l.unit_price_cents || acctPriceCents;
+    // Nov 18, 2026: no generic bag price — a blank line shows the
+    // account's price for that flavor's category (unknown flavor falls
+    // back to sweet, exactly as the backend prices it at create).
+    var cat = erpFlavorCategory(l.flavor_name);
+    var unit = l.unit_price_cents || erpAccountCategoryPriceCents(acct, cat || "sweet");
     var lineTotal = Math.round(Number(l.qty_bags) * unit);
     totalCents += lineTotal;
     left.textContent = l.qty_bags + " × " + l.flavor_name + " @ " +
-      (l.unit_price_cents ? erpMoney(l.unit_price_cents) : erpMoney(acctPriceCents) + " (account price)") + "/bag";
+      (l.unit_price_cents ? erpMoney(l.unit_price_cents) : erpMoney(unit) + " (account price" + (cat ? " · " + cat : "") + ")") + "/bag";
     var right = document.createElement("span");
     right.textContent = erpMoney(lineTotal);
     row.appendChild(left);
@@ -14431,7 +14644,8 @@ function erpNewAccountForm() {
     billingEmailInput.value = emailInput.value.trim();
   });
   form.appendChild(sameAsBtn);
-  form.appendChild(erpField("Price/bag ($)", erpTextInput("price_per_bag", "4.00")));
+  // Nov 18, 2026: the generic "Price/bag ($)" field is gone — savory and
+  // sweet are the only prices that drive orders, and they follow below.
   var savoryPriceInput = erpTextInput("savory_price", "4.00");
   var sweetPriceInput = erpTextInput("sweet_price", "4.00");
   form.appendChild(erpField("Savory price/bag ($)", savoryPriceInput));
@@ -14533,8 +14747,8 @@ function erpNewAccountForm() {
       location_email: form.location_email.value.trim(),
       location_phone: form.location_phone.value.trim()
     };
-    var priceFields = [["price_per_bag", "price_per_bag_cents"],
-      ["savory_price", "savory_price_cents"], ["sweet_price", "sweet_price_cents"],
+    var priceFields = [["savory_price", "savory_price_cents"],
+      ["sweet_price", "sweet_price_cents"],
       ["savory_case_price", "savory_case_price_cents"], ["sweet_case_price", "sweet_case_price_cents"]];
     for (var pi = 0; pi < priceFields.length; pi++) {
       var raw = form[priceFields[pi][0]].value.trim();
@@ -14572,12 +14786,13 @@ function erpImportAccountsForm() {
   var form = document.createElement("form");
   form.className = "erp-form";
   var help = document.createElement("p");
-  help.textContent = "CSV columns: name, contact_name, email, phone, address, price_per_bag_cents, payment_terms, notes. " +
+  help.textContent = "CSV columns: name, contact_name, email, phone, address, savory_price_cents, sweet_price_cents, payment_terms, notes. " +
+    "Prices are in cents (400 = $4.00) and default to 400 when blank. " +
     "First row is the header. Stops on the first bad row.";
   form.appendChild(help);
   var area = document.createElement("textarea");
   area.rows = 8;
-  area.placeholder = "name,contact_name,email,phone,address,price_per_bag_cents,payment_terms,notes\nAcme Markets,Jane Doe,jane@acme.com,555-0100,123 Main St,400,Net 30,";
+  area.placeholder = "name,contact_name,email,phone,address,savory_price_cents,sweet_price_cents,payment_terms,notes\nAcme Markets,Jane Doe,jane@acme.com,555-0100,123 Main St,400,400,Net 30,";
   area.required = true;
   area.style.width = "100%";
   form.appendChild(area);
@@ -14630,7 +14845,8 @@ function renderErpAccountDetail(body) {
      "Phone: " + (a.phone || "—"),
      "Address: " + (a.address || "—"),
      "Billing: " + ((a.billing_name || "—") + " <" + (a.billing_email || "—") + ">"),
-     "Price/bag: " + (a.price_per_bag_cents ? erpMoney(a.price_per_bag_cents) : "—"),
+     // Nov 18, 2026: no generic bag price line — Savory/Sweet below are
+     // the only prices that drive orders.
      "Pricing: " + (((a.pricing_mode || "bag") === "case") ? "Per case (12 bags)" : "Per bag"),
      "Savory: " + (a.savory_price_cents ? erpMoney(a.savory_price_cents) : "—") +
        " · Sweet: " + (a.sweet_price_cents ? erpMoney(a.sweet_price_cents) : "—") +
@@ -27323,7 +27539,7 @@ function erpSettingsDataCard() {
   card.appendChild(ih);
   var hint = document.createElement("p");
   hint.style.color = "var(--muted)";
-  hint.textContent = "Seed CSV columns: sku, location_code, qty, lot_code, expiry_date, unit_cost_cents (same as the seed template). Wholesale CSV columns: name, contact_name, email, phone, address, price_per_bag_cents, payment_terms, notes. A full export is the JSON file an export produces. Nothing is written until the whole file validates; deleted items stay deleted, accounting data is never touched, and purchase orders take popcorn only.";
+  hint.textContent = "Seed CSV columns: sku, location_code, qty, lot_code, expiry_date, unit_cost_cents (same as the seed template). Wholesale CSV columns: name, contact_name, email, phone, address, savory_price_cents, sweet_price_cents, payment_terms, notes. A full export is the JSON file an export produces. Nothing is written until the whole file validates; deleted items stay deleted, accounting data is never touched, and purchase orders take popcorn only.";
   card.appendChild(hint);
   var fmt = document.createElement("select");
   [["seed_csv", "Opening balances (seed CSV)"],
@@ -27728,6 +27944,10 @@ function poppyAddResults(results) {
 }
 function poppyOpenResult(r) {
   var open = r.open || {};
+  // SOPs open INSIDE the chat (Nov 18, 2026) — the SOP is posted as a
+  // bot message with a link to the library; every other type navigates
+  // away to its tab as before.
+  if (r.type === "sop") { poppyOpenSop(r); return; }
   if (open.ordersPostMap) erpState.ordersPostMap = open.ordersPostMap;
   if (open.accountsPostMap) erpState.accountsPostMap = open.accountsPostMap;
   if (open.sopPostMap) erpState.sopPostMap = open.sopPostMap;
@@ -27741,6 +27961,65 @@ function poppyOpenResult(r) {
   if (location.hash === r.route) renderRoute();
   else location.hash = r.route;
   if (open.highlight) erpHighlightRow(open.highlight);
+}
+function poppySopLibraryButton(r) {
+  var btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "chat-sop-link";
+  btn.textContent = "Open in SOP Library →";
+  btn.addEventListener("click", function () { poppyOpenSopLibrary(r); });
+  return btn;
+}
+function poppyOpenSopLibrary(r) {
+  // The original navigation: set the deep-open map, then go to the
+  // SOP Library, where the library opens this SOP.
+  var open = r.open || {};
+  if (open.sopPostMap) erpState.sopPostMap = open.sopPostMap;
+  poppyClosePanelSilent();
+  // Same-tab tap: the hash does not change, so no hashchange fires —
+  // render the route directly instead of waiting for one.
+  if (location.hash === r.route) renderRoute();
+  else location.hash = r.route;
+  if (open.highlight) erpHighlightRow(open.highlight);
+}
+function poppyOpenSop(r) {
+  // Tapping an SOP result stays in the chat: fetch the full SOP from
+  // the existing detail endpoint (the search result and the library
+  // list carry no body) and post it as a bot message — title, full
+  // body in a scrollable box, and a link to the SOP Library.
+  poppyAddMessage("Loading…", "bot");
+  erpGet("/api/erp/quality/sops/" + encodeURIComponent(String(r.id))).then(function (res) {
+    var bubbles = poppyMessages.children;
+    if (bubbles.length) poppyMessages.removeChild(bubbles[bubbles.length - 1]);
+    var sop = res.sop || {};
+    var bubble = document.createElement("div");
+    bubble.className = "chat-msg bot chat-sop";
+    var title = document.createElement("strong");
+    title.textContent = sop.title || r.title || "SOP";
+    bubble.appendChild(title);
+    var meta = document.createElement("div");
+    meta.className = "chat-result-group";
+    meta.textContent = "Dept " + (sop.dept || "") +
+      (sop.dept_name ? " · " + sop.dept_name : "") +
+      (sop.status ? " · " + sop.status : "");
+    bubble.appendChild(meta);
+    var bodyEl = document.createElement("div");
+    bodyEl.className = "chat-sop-body";
+    bodyEl.innerHTML = erpSopMarkdown(sop.body || "");
+    bubble.appendChild(bodyEl);
+    bubble.appendChild(poppySopLibraryButton(r));
+    poppyMessages.appendChild(bubble);
+    poppyMessages.scrollTop = poppyMessages.scrollHeight;
+  }).catch(function () {
+    var bubbles = poppyMessages.children;
+    if (bubbles.length) poppyMessages.removeChild(bubbles[bubbles.length - 1]);
+    poppyAddMessage("I couldn't open that SOP here — try it in the library:", "bot");
+    var bubble = document.createElement("div");
+    bubble.className = "chat-msg bot";
+    bubble.appendChild(poppySopLibraryButton(r));
+    poppyMessages.appendChild(bubble);
+    poppyMessages.scrollTop = poppyMessages.scrollHeight;
+  });
 }
 async function poppyHandle(text) {
   var trimmed = String(text || "").trim();
