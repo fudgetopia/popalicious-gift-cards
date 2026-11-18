@@ -42916,6 +42916,270 @@ def erp_order_detail(source, order_id):
     return jsonify(order=order)
 
 
+def _erp_search_match(haystacks, words):
+    """AND-match: every word must appear somewhere in the record's text."""
+    hay = " ".join(h for h in haystacks if h).lower()
+    return all(w in hay for w in words)
+
+
+def _erp_search_rank(primary, number, words):
+    """0 = a word exactly equals the record's number/SKU, 1 = the primary
+    field starts with a word, 2 = plain substring match."""
+    num = (number or "").lower().lstrip("#")
+    for w in words:
+        if w.lstrip("#") and w.lstrip("#") == num:
+            return 0
+    prim = (primary or "").lower()
+    for w in words:
+        if prim.startswith(w):
+            return 1
+    return 2
+
+
+def _erp_search_money(cents):
+    return "$%.2f" % ((cents or 0) / 100.0)
+
+
+@app.get("/api/erp/search")
+def erp_search():
+    """Find-anything search for Poppy, the ERP chat bot (Nov 17, 2026).
+
+    FIND-ONLY: keyword matching over the caller's own ERP data, no data
+    changes, no computed answers, no external service. Each record type is
+    queried only when the caller holds that type's read perm (checked with
+    the same _erp_check_perm the list endpoint uses); a type the caller
+    cannot read is silently omitted. SOPs are admin-only, like their list
+    endpoint. Empty q (or under 2 chars) returns {results: []}.
+    """
+    _, err = _require_erp()
+    if err:
+        return err
+    q_raw = (request.args.get("q") or "").strip()
+    if len(q_raw) < 2:
+        return jsonify(q=q_raw, results=[])
+    try:
+        limit = int(request.args.get("limit") or 5)
+    except (TypeError, ValueError):
+        limit = 5
+    limit = max(1, min(limit, 10))
+    words = q_raw.lower().split()
+    results = []
+    conn = db()
+
+    def _add(rows):
+        rows.sort(key=lambda r: (r[0], r[1]))
+        for _, _, item in rows[:limit]:
+            results.append(item)
+
+    # --- orders: wholesale + website (stripe + captured paypal only) ---
+    _, oerr = _erp_check_perm("orders.read")
+    if oerr is None:
+        fulf = {(f["order_source"], f["order_id"]): f["status"]
+                for f in conn.execute("SELECT order_source, order_id, status"
+                                      " FROM erp_order_fulfillment").fetchall()}
+        found = []
+        ws_lines = {}
+        for l in conn.execute("SELECT order_id, flavor_name FROM erp_wholesale_order_lines").fetchall():
+            ws_lines.setdefault(l["order_id"], []).append(l["flavor_name"])
+        for w in conn.execute("SELECT * FROM erp_wholesale_orders ORDER BY id DESC").fetchall():
+            brief = _erp_wholesale_order_brief(conn, w)
+            brief["status"] = fulf.get(("wholesale", w["id"]), brief["status"])
+            hay = [w["order_number"], brief["account_name"], brief["status"],
+                   w["po_number"] if "po_number" in w.keys() else "",
+                   " ".join(ws_lines.get(w["id"], []))]
+            if not _erp_search_match(hay, words):
+                continue
+            found.append((_erp_search_rank(brief["account_name"], w["order_number"], words),
+                          -w["id"],
+                          {"type": "order", "id": w["id"],
+                           "title": "%s — %s" % (w["order_number"], brief["account_name"] or "—"),
+                           "subtitle": "Wholesale · %g bags · %s · %s" % (
+                               brief["total_qty"], _erp_search_money(brief["total_cents"]),
+                               brief["status"]),
+                           "route": "#/orders",
+                           "open": {"ordersPostMap": {"source": "wholesale", "id": w["id"]}}}))
+        for source, table in (("stripe", "orders"), ("paypal", "paypal_orders")):
+            if source == "stripe":
+                rows = conn.execute(
+                    "SELECT * FROM orders WHERE stripe_session_id NOT LIKE 'paypal:%'"
+                    " ORDER BY id DESC").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM paypal_orders WHERE status = 'captured'"
+                    " ORDER BY id DESC").fetchall()
+            for r in rows:
+                o = _erp_online_order(conn, source, r["id"])
+                if not o:
+                    continue
+                o["status"] = fulf.get((source, r["id"]), "new")
+                hay = [o["number"], o["customer_name"], o["email"], o["items_summary"]]
+                if not _erp_search_match(hay, words):
+                    continue
+                who = o["customer_name"] or o["email"] or "—"
+                found.append((_erp_search_rank(who, o["number"], words),
+                              -r["id"],
+                              {"type": "order", "id": r["id"],
+                               "title": "%s — %s" % (o["number"], who),
+                               "subtitle": "Website · %s · %s" % (
+                                   _erp_search_money(o["total_cents"]), o["status"]),
+                               "route": "#/orders",
+                               "open": {"ordersPostMap": {"source": source, "id": r["id"]}}}))
+        _add(found)
+
+    # --- invoices ---
+    _, aerr = _erp_check_perm("accounting.read")
+    if aerr is None:
+        found = []
+        for r in conn.execute("SELECT * FROM erp_acct_invoices"
+                              " ORDER BY date DESC, id DESC").fetchall():
+            hay = ["#%d" % r["id"], str(r["id"]), r["customer_name"], r["status"]]
+            if not _erp_search_match(hay, words):
+                continue
+            sub = "%s · %s" % (_erp_search_money(r["total_cents"]), r["status"])
+            if r["due_date"]:
+                sub += " · due %s" % r["due_date"]
+            found.append((_erp_search_rank(r["customer_name"], "#%d" % r["id"], words),
+                          -r["id"],
+                          {"type": "invoice", "id": r["id"],
+                           "title": "Invoice #%d — %s" % (r["id"], r["customer_name"]),
+                           "subtitle": sub, "route": "#/accounting",
+                           "open": {"acctView": "invoices", "highlight": "invoice-%d" % r["id"]}}))
+        _add(found)
+        # --- bills ---
+        found = []
+        for r in conn.execute("SELECT * FROM erp_acct_bills"
+                              " ORDER BY date DESC, id DESC").fetchall():
+            hay = ["#%d" % r["id"], str(r["id"]), r["vendor_name"], r["status"]]
+            if not _erp_search_match(hay, words):
+                continue
+            sub = "%s · %s" % (_erp_search_money(r["total_cents"]), r["status"])
+            if r["due_date"]:
+                sub += " · due %s" % r["due_date"]
+            found.append((_erp_search_rank(r["vendor_name"], "#%d" % r["id"], words),
+                          -r["id"],
+                          {"type": "bill", "id": r["id"],
+                           "title": "Bill #%d — %s" % (r["id"], r["vendor_name"] or "—"),
+                           "subtitle": sub, "route": "#/accounting",
+                           "open": {"acctView": "bills", "highlight": "bill-%d" % r["id"]}}))
+        _add(found)
+
+    # --- vendors ---
+    _, perr = _erp_check_perm("purchasing.read")
+    if perr is None:
+        found = []
+        for r in conn.execute("SELECT * FROM erp_vendors WHERE active = 1"
+                              " ORDER BY name").fetchall():
+            hay = [r["name"], r["contact_name"], r["email"], r["phone"],
+                   r["notes"], r["payment_terms"]]
+            if not _erp_search_match(hay, words):
+                continue
+            sub = "Vendor"
+            if r["payment_terms"]:
+                sub += " · %s" % r["payment_terms"]
+            if r["email"]:
+                sub += " · %s" % r["email"]
+            found.append((_erp_search_rank(r["name"], "", words), r["name"].lower(),
+                          {"type": "vendor", "id": r["id"], "title": r["name"],
+                           "subtitle": sub, "route": "#/purchasing",
+                           "open": {"highlight": "vendor-%d" % r["id"]}}))
+        _add(found)
+        # --- purchase orders ---
+        vendors = {v["id"]: v["name"] for v in conn.execute(
+            "SELECT id, name FROM erp_vendors").fetchall()}
+        po_totals = {t["po_id"]: t["total"] for t in conn.execute(
+            "SELECT po_id, COALESCE(SUM(qty_ordered * unit_cost_cents), 0) AS total"
+            " FROM erp_po_lines GROUP BY po_id").fetchall()}
+        found = []
+        for r in conn.execute("SELECT * FROM erp_purchase_orders"
+                              " ORDER BY id DESC").fetchall():
+            vname = vendors.get(r["vendor_id"], "")
+            hay = [r["po_number"], vname, r["status"]]
+            if not _erp_search_match(hay, words):
+                continue
+            found.append((_erp_search_rank(vname, r["po_number"], words),
+                          -r["id"],
+                          {"type": "purchase-order", "id": r["id"],
+                           "title": "%s — %s" % (r["po_number"], vname or "—"),
+                           "subtitle": "Purchase order · %s · %s" % (
+                               r["status"], _erp_search_money(po_totals.get(r["id"], 0))),
+                           "route": "#/purchasing",
+                           "open": {"poPostMap": r["id"]}}))
+        _add(found)
+
+    # --- inventory items ---
+    _, ierr = _erp_check_perm("inventory.read")
+    if ierr is None:
+        found = []
+        for r in conn.execute("SELECT * FROM erp_items WHERE active = 1"
+                              " ORDER BY type, name").fetchall():
+            hay = [r["name"], r["sku"], r["type"]]
+            if not _erp_search_match(hay, words):
+                continue
+            found.append((_erp_search_rank(r["name"], r["sku"], words), r["name"].lower(),
+                          {"type": "item", "id": r["id"], "title": r["name"],
+                           "subtitle": "Item · %s · %s" % (r["sku"], r["type"]),
+                           "route": "#/inventory",
+                           "open": {"itemPostMap": r["id"]}}))
+        _add(found)
+
+    # --- recipes ---
+    _, rerr = _erp_check_perm("recipes.read")
+    if rerr is None:
+        found = []
+        for r in conn.execute("SELECT * FROM erp_recipes WHERE active = 1"
+                              " ORDER BY name").fetchall():
+            if not _erp_search_match([r["name"]], words):
+                continue
+            found.append((_erp_search_rank(r["name"], "", words), r["name"].lower(),
+                          {"type": "recipe", "id": r["id"], "title": r["name"],
+                           "subtitle": "Recipe · %s bags per batch" % _erp_fmt_qty(r["batch_size_bags"]),
+                           "route": "#/production",
+                           "open": {"recipePostMap": r["id"]}}))
+        _add(found)
+
+    # --- wholesale accounts ---
+    _, cerr = _erp_check_perm("accounts.read")
+    if cerr is None:
+        found = []
+        for r in conn.execute("SELECT * FROM erp_wholesale_accounts"
+                              " ORDER BY name").fetchall():
+            hay = [r["name"], r["contact_name"], r["email"],
+                   r["billing_name"] if "billing_name" in r.keys() else "",
+                   r["billing_email"] if "billing_email" in r.keys() else ""]
+            if not _erp_search_match(hay, words):
+                continue
+            sub = "Wholesale account"
+            if r["contact_name"]:
+                sub += " · %s" % r["contact_name"]
+            if r["email"]:
+                sub += " · %s" % r["email"]
+            found.append((_erp_search_rank(r["name"], "", words), r["name"].lower(),
+                          {"type": "account", "id": r["id"], "title": r["name"],
+                           "subtitle": sub, "route": "#/orders",
+                           "open": {"accountsPostMap": r["id"]}}))
+        _add(found)
+
+    # --- SOPs: admin only, like the SOP list endpoint ---
+    _, serr = _require_erp_admin()
+    if serr is None:
+        found = []
+        for r in conn.execute("SELECT * FROM erp_quality_sops"
+                              " ORDER BY dept, position, id").fetchall():
+            if not _erp_search_match([r["title"], r["body"]], words):
+                continue
+            d = _quality_sop_dict(r)
+            found.append((_erp_search_rank(r["title"], "", words),
+                          (r["dept"], r["position"], r["id"]),
+                          {"type": "sop", "id": r["id"], "title": r["title"],
+                           "subtitle": "Dept %d · %s" % (r["dept"], d["dept_name"]),
+                           "route": "#/quality",
+                           "open": {"sopPostMap": r["id"]}}))
+        _add(found)
+
+    conn.close()
+    return jsonify(q=q_raw, results=results)
+
+
 @app.post("/api/erp/orders/<source>/<int:order_id>/status")
 def erp_order_set_status(source, order_id):
     actor, err = _erp_check_perm("orders.write")
