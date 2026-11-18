@@ -3022,11 +3022,18 @@ def init_db():
                      ("savory_price_cents", "INTEGER NOT NULL DEFAULT 400"),
                      ("sweet_price_cents", "INTEGER NOT NULL DEFAULT 400"),
                      ("default_po", "TEXT NOT NULL DEFAULT ''"),
+                     ("billing_name", "TEXT NOT NULL DEFAULT ''"),
+                     ("billing_email", "TEXT NOT NULL DEFAULT ''"),
                      ("pricing_mode", "TEXT NOT NULL DEFAULT 'bag'"),
                      ("account_status", "TEXT NOT NULL DEFAULT 'active'"),
                      ("staff_managed", "INTEGER NOT NULL DEFAULT 0")):
         if col not in wacols:
             conn.execute("ALTER TABLE erp_wholesale_accounts ADD COLUMN %s %s" % (col, ddl))
+    # Nov 17, 2026: customers no longer get portal accounts — employees create
+    # every order. Every wholesale account is staff-managed now, including ones
+    # created before this change (Faire imports, QB migration, CSV).
+    conn.execute("UPDATE erp_wholesale_accounts SET staff_managed = 1"
+                 " WHERE staff_managed = 0")
     wocols = [r["name"] for r in conn.execute("PRAGMA table_info(erp_wholesale_orders)").fetchall()]
     for col, ddl in (("po_number", "TEXT NOT NULL DEFAULT ''"),
                      ("address_id", "INTEGER NOT NULL DEFAULT 0"),
@@ -37971,7 +37978,7 @@ def _acct_migrate_import_run(conn, actor, lists, as_of, snapshot_id=""):
                 (name, (rec.get("contact_name") or "").strip(),
                  (rec.get("email") or "").strip(),
                  (rec.get("phone") or "").strip(), "", 400, "", "", actor, now,
-                 "", 400, 400, "", "bag", 0))
+                 "", 400, 400, "", "bag", 1))
             erp_id = cur.lastrowid
             ws_by_norm[_acct_migrate_norm_name(name)] = {
                 "id": erp_id, "name": name}
@@ -42138,6 +42145,7 @@ def _erp_wholesale_order_brief(conn, w):
             "email": "", "items_summary": "",
             "total_cents": total, "total_qty": qty,
             "status": w["status"], "created_at": w["created_at"],
+            "po_number": w["po_number"],
             "due_date": w["due_date"], "via_edi": bool(w["via_edi"])}
 
 
@@ -42435,17 +42443,23 @@ def erp_create_wholesale_account():
         "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
         " price_per_bag_cents, payment_terms, notes, active, created_by, created_at,"
         " contact_person, savory_price_cents, sweet_price_cents, default_po,"
+        " billing_name, billing_email,"
         " pricing_mode, staff_managed, account_status, credit_limit_cents,"
         " credit_hold, savory_case_price_cents, sweet_case_price_cents)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)",
         (name, (data.get("contact_name") or "").strip(),
          (data.get("email") or "").strip(), (data.get("phone") or "").strip(),
          (data.get("address") or "").strip(), price,
          (data.get("payment_terms") or "").strip(),
          (data.get("notes") or "").strip(), actor, now,
          (data.get("contact_person") or "").strip(), savory, sweet,
-         (data.get("default_po") or "").strip(), pricing_mode,
-         1 if data.get("staff_managed") else 0, credit_limit,
+         (data.get("default_po") or "").strip(),
+         (data.get("billing_name") or "").strip(),
+         (data.get("billing_email") or "").strip(), pricing_mode,
+         # Nov 17, 2026: every customer is staff-managed — employees create
+         # their orders, so no portal account is ever needed. The flag is no
+         # longer offered on the form; the create always stores 1.
+         1, credit_limit,
          1 if data.get("credit_hold") else 0,
          case_prices.get("savory_case_price_cents"),
          case_prices.get("sweet_case_price_cents")))
@@ -42504,7 +42518,8 @@ def erp_update_wholesale_account(account_id):
         return jsonify(error="account not found"), 404
     fields = {}
     for key in ("name", "contact_name", "email", "phone", "address",
-                "payment_terms", "notes", "contact_person", "default_po"):
+                "payment_terms", "notes", "contact_person", "default_po",
+                "billing_name", "billing_email"):
         if key in data:
             fields[key] = (data.get(key) or "").strip()
     if "price_per_bag_cents" in data:
@@ -42542,8 +42557,10 @@ def erp_update_wholesale_account(account_id):
         fields["pricing_mode"] = pm
     if "active" in data:
         fields["active"] = 1 if data.get("active") else 0
-    if "staff_managed" in data:
-        fields["staff_managed"] = 1 if data.get("staff_managed") else 0
+    # Nov 17, 2026: every customer is staff-managed — the flag is no longer
+    # offered on the form and can never be switched off, so a stale client
+    # sending staff_managed=0 must not reopen portal invites.
+    fields["staff_managed"] = 1
     if "credit_limit_cents" in data:
         if data.get("credit_limit_cents") is None:
             fields["credit_limit_cents"] = None
@@ -42705,8 +42722,9 @@ def erp_import_wholesale_accounts():
     for r in rows:
         conn.execute(
             "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
-            " price_per_bag_cents, payment_terms, notes, active, created_by, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            " price_per_bag_cents, payment_terms, notes, active, staff_managed,"
+            " created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)",
             (r["name"], r["contact_name"], r["email"], r["phone"], r["address"],
              r["price_per_bag_cents"], r["payment_terms"], r["notes"], actor, now))
     _erp_settings_audit(conn, actor, "import.wholesale_accounts",
@@ -43080,8 +43098,9 @@ def _erp_import_wholesale_csv(conn, actor, text):
             continue
         conn.execute(
             "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
-            " price_per_bag_cents, payment_terms, notes, active, created_by, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+            " price_per_bag_cents, payment_terms, notes, active, staff_managed,"
+            " created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?)",
             (r["name"], r["contact_name"], r["email"], r["phone"], r["address"],
              r["price_per_bag_cents"], r["payment_terms"], r["notes"], actor, now))
         imported += 1
@@ -43316,8 +43335,13 @@ def erp_reset():
     return jsonify(reset=True, deleted=deleted)
 
 def _erp_next_wholesale_number(conn):
-    count = conn.execute("SELECT COUNT(*) AS c FROM erp_wholesale_orders").fetchone()["c"]
-    return "W-%d" % (1001 + int(count))
+    # MAX-based, not COUNT-based: deleting an order must never make the next
+    # number collide with a surviving order (Nov 17, 2026 — a deleted middle
+    # order made the next create 500 on the UNIQUE order_number constraint).
+    row = conn.execute(
+        "SELECT MAX(CAST(SUBSTR(order_number, 3) AS INTEGER)) AS m"
+        " FROM erp_wholesale_orders").fetchone()
+    return "W-%d" % ((int(row["m"]) if row and row["m"] else 1000) + 1)
 
 
 @app.get("/api/erp/wholesale-orders")
@@ -43383,14 +43407,20 @@ def erp_create_wholesale_order():
         return jsonify(error=refusal), 400
     now = datetime.now(timezone.utc).isoformat()
     order_number = _erp_next_wholesale_number(conn)
+    # PO number: what the employee typed, else the account's default PO, else
+    # the system generates one from the order number — an order never goes out
+    # without a PO reference.
+    po_number = ((data.get("po_number") or "").strip()
+                 or (acct["default_po"] or "")
+                 or ("PO-" + order_number))
     cur = conn.execute(
         "INSERT INTO erp_wholesale_orders (order_number, account_id, status, order_date,"
-        " due_date, notes, via_edi, edi_document_id, created_by, created_at)"
-        " VALUES (?, ?, 'new', ?, ?, ?, ?, ?, ?, ?)",
+        " due_date, notes, via_edi, edi_document_id, created_by, created_at, po_number)"
+        " VALUES (?, ?, 'new', ?, ?, ?, ?, ?, ?, ?, ?)",
         (order_number, acct["id"], (data.get("order_date") or "").strip(),
          (data.get("due_date") or "").strip(), (data.get("notes") or "").strip(),
          1 if data.get("via_edi") else 0, int(data.get("edi_document_id") or 0),
-         actor, now))
+         actor, now, po_number))
     order_id = cur.lastrowid
     for li in lines:
         conn.execute(
@@ -43539,19 +43569,6 @@ def _wholesale_flavor_price(conn, acct, flavor_name, qty_bags=None):
                        (flavor_name,)).fetchone()
     category = (cat["category"] if cat else "sweet")
     return _erp_wholesale_resolved_bag_price(conn, acct, category, qty_bags), category
-
-
-def _send_wholesale_invite_email(to_email, business_name, link):
-    return send_email(
-        to_email,
-        "You're invited to order Pop-A-Licious wholesale",
-        "<p>Hi%s,</p>"
-        "<p><strong>%s</strong> has set up a wholesale ordering account for you.</p>"
-        "<p><a href=\"%s\">Click here to set your password</a> and start ordering. "
-        "This link expires in 7 days.</p>"
-        "<p>— Pop-A-Licious</p>"
-        % (", " + business_name if business_name else "", business_name or "Pop-A-Licious",
-           link))
 
 
 def _send_new_wholesale_order_emails(order_number, acct, lines, total_cents, po_number,
@@ -43864,9 +43881,13 @@ def wholesale_create_order():
     if refusal:
         conn.close()
         return jsonify(error=refusal), 400
-    po_number = (data.get("po_number") or "").strip() or (acct["default_po"] or "")
     now = datetime.now(timezone.utc).isoformat()
     order_number = _erp_next_wholesale_number(conn)
+    # Same PO rule as staff-created orders: typed, else the account default,
+    # else the system generates one from the order number.
+    po_number = ((data.get("po_number") or "").strip()
+                 or (acct["default_po"] or "")
+                 or ("PO-" + order_number))
     cur = conn.execute(
         "INSERT INTO erp_wholesale_orders (order_number, account_id, status, order_date,"
         " notes, created_by, created_at, po_number, address_id, pricing_mode,"
@@ -43999,42 +44020,12 @@ def erp_invite_wholesale_customer(account_id):
     if acct["account_status"] == "deactivated" or not acct["active"]:
         conn.close()
         return jsonify(error="account is deactivated"), 400
-    if "staff_managed" in acct.keys() and acct["staff_managed"]:
-        conn.close()
-        return jsonify(error="this account is staff-managed — we create their orders, so no portal invite is needed"), 400
-    email = (acct["email"] or "").strip().lower()
-    if not email or not EMAIL_RE.match(email):
-        conn.close()
-        return jsonify(error="account needs a valid email before inviting"), 400
-    token = secrets.token_urlsafe(32)
-    expires = (datetime.now(timezone.utc) + timedelta(days=7)).isoformat()
-    now = datetime.now(timezone.utc).isoformat()
-    existing = conn.execute("SELECT * FROM erp_wholesale_users WHERE email = ?",
-                            (email,)).fetchone()
-    if existing:
-        if existing["account_id"] != account_id:
-            conn.close()
-            return jsonify(error="that email is already a portal login for another account"), 400
-        conn.execute("UPDATE erp_wholesale_users SET invite_token = ?,"
-                     " invite_expires_at = ?, active = 1 WHERE id = ?",
-                     (token, expires, existing["id"]))
-    else:
-        conn.execute("INSERT INTO erp_wholesale_users (account_id, email, password_hash,"
-                     " invite_token, invite_expires_at, active, created_at)"
-                     " VALUES (?, ?, '', ?, ?, 1, ?)",
-                     (account_id, email, token, expires, now))
-        # First invite for this account: mark it invited (re-invites of active
-        # customers leave the status alone).
-        conn.execute("UPDATE erp_wholesale_accounts SET account_status = 'invited'"
-                     " WHERE id = ? AND account_status = 'active'", (account_id,))
-    conn.commit()
-    link = _wholesale_portal_url(data) + "/#/wholesale-setup?token=" + token
+    # Nov 17, 2026: portal invites are off for every account. Customers never
+    # need a portal account — employees create all their orders — so this
+    # endpoint no longer sends an account-creation email to anyone. The route
+    # stays so old clients fail cleanly instead of 404ing.
     conn.close()
-    _send_wholesale_invite_email(email, acct["name"], link)
-    out = {"ok": True, "email": email}
-    if str(request.args.get("reveal") or "") == "1":
-        out["invite_link"] = link
-    return jsonify(out)
+    return jsonify(error="portal invites are off — employees create customer orders, so customers never need a portal account"), 400
 
 
 @app.post("/api/erp/wholesale-accounts/<int:account_id>/deactivate")
@@ -47882,7 +47873,7 @@ def _faire_match_or_create_account(conn, retailer, customer, payment_terms, acto
         "INSERT INTO erp_wholesale_accounts (name, contact_name, email, phone, address,"
         " price_per_bag_cents, savory_price_cents, sweet_price_cents, payment_terms,"
         " notes, active, staff_managed, created_by, created_at)"
-        " VALUES (?, ?, '', '', ?, 400, 400, 400, ?, ?, 1, 0, ?, ?)",
+        " VALUES (?, ?, '', '', ?, 400, 400, 400, ?, ?, 1, 1, ?, ?)",
         (name, contact, _faire_format_address((retailer or {}).get("address") or {}),
          _faire_payment_terms(payment_terms),
          "Created by Faire auto-import", actor, now))
