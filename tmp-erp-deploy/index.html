@@ -336,17 +336,13 @@ button { font-family: inherit; }
         body.erp-printing #erpPrintView { padding-top: 0; }
         #erpPrintView .erp-print-bar { display: none !important; }
         #erpPrintView .label { zoom: 1 !important; }
-        /* Print uses a plain block/float layout, not flexbox: some
-           browsers mishandle flex in print and can drop the bottom
-           band. Proportions stay the photo split: panel 43.2mm,
-           gap 1.8mm, ingredients take the rest; the codes live in
-           the ingredients column (bottom-aligned on screen). */
-        #erpPrintView .cols { display: block !important; overflow: hidden !important; }
-        #erpPrintView .panelcol { float: left !important; }
-        #erpPrintView .ingcol { margin-left: 45mm !important; }
-        #erpPrintView .bot { display: block !important; overflow: hidden !important; }
-        #erpPrintView .botleft { float: left !important; width: calc(100% - 52.1mm) !important; }
-        #erpPrintView .botright { float: right !important; }
+        /* Print uses the SAME flex layout as the screen view (v13):
+           the earlier block/float print layout moved the QR/barcode
+           block up under the ingredients text instead of bottom-
+           aligning it with Net Wt, so the print preview did not
+           match the on-screen label. The zoom reset above is the
+           only print-only layout change; everything else prints
+           exactly as shown on screen. */
       }
       /* mobile register — Apple Store-style roaming checkout: big
          touch targets, ticket + total pinned at the bottom. */
@@ -11696,7 +11692,7 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v12 &mdash; On screen the label is " +
+    "<p class=\"erp-print-help\">Label v13 &mdash; On screen the label is " +
     "enlarged for readability; it always prints at true A6 (105 &times; 148 mm). On " +
     "iPhone/iPad: Share, then Print, then pick A6 paper.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
