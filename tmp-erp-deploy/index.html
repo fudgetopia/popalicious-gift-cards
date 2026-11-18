@@ -22141,6 +22141,10 @@ function renderErpLegalDetail(data) {
   agCard.appendChild(erpField("Renewal notice (days)", agNotice));
   var agNotes = lArea("Notes (optional)", 2);
   agCard.appendChild(lAreaField("Notes", agNotes));
+  var agPhoto = document.createElement("input");
+  agPhoto.type = "file";
+  agPhoto.accept = "image/png,image/jpeg,image/gif,image/webp";
+  agCard.appendChild(erpField("Photo of the document (optional)", agPhoto));
   var agAddStatus = lStatus();
   agCard.appendChild(agAddStatus);
   var agBtn = lButton("Add agreement");
@@ -22154,8 +22158,30 @@ function renderErpLegalDetail(data) {
       end_date: agEnd.value,
       renewal_notice_days: agNotice.value === "" ? 30 : Number(agNotice.value),
       notes: agNotes.value
-    }).then(function () {
-      loadErpLegalDetail();
+    }).then(function (created) {
+      var file = agPhoto.files && agPhoto.files[0];
+      if (!file) { loadErpLegalDetail(); return; }
+      if (file.size > 5 * 1024 * 1024) {
+        agAddStatus.textContent = "Agreement saved, but the photo is over 5MB — add a smaller one from Edit.";
+        agBtn.disabled = false;
+        return;
+      }
+      agAddStatus.textContent = "Uploading photo…";
+      var reader = new FileReader();
+      reader.onload = function () {
+        erpPost("/api/erp/legal/agreements/" + created.record.id + "/image",
+          { image: reader.result }).then(function () {
+          loadErpLegalDetail();
+        }).catch(function (error) {
+          agAddStatus.textContent = "Agreement saved, but the photo did not upload: " + error.message;
+          agBtn.disabled = false;
+        });
+      };
+      reader.onerror = function () {
+        agAddStatus.textContent = "Agreement saved, but the photo could not be read — add it from Edit.";
+        agBtn.disabled = false;
+      };
+      reader.readAsDataURL(file);
     }).catch(function (error) {
       agAddStatus.textContent = error.message;
       agBtn.disabled = false;
@@ -22182,12 +22208,15 @@ function renderErpLegalDetail(data) {
     var rowCard = document.createElement("div");
     rowCard.className = "erp-form";
     rowCard.style.flex = "1 1 100%";
-    rowCard.appendChild(lRow(rec.title + " — " + rec.counterparty + " · " + rec.type + (rec.start_date ? (" · from " + rec.start_date) : "") + (rec.end_date ? (" · ends " + rec.end_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no end date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "")));
+    rowCard.appendChild(lRow(rec.title + " — " + rec.counterparty + " · " + rec.type + (rec.start_date ? (" · from " + rec.start_date) : "") + (rec.end_date ? (" · ends " + rec.end_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no end date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "") + (rec.has_image ? " · 📷 Photo" : "")));
     var editBtn = lButton("Edit");
     editBtn.addEventListener("click", function () {
       renderErpLegalAgreementEditForm(rowCard, rec, agAddStatus, loadErpLegalDetail);
     });
     rowCard.appendChild(editBtn);
+    if (rec.has_image) {
+      rowCard.appendChild(erpLegalPhotoViewButton("agreements", rec, rowCard, agAddStatus));
+    }
     var delBtn = lButton("Delete");
     delBtn.addEventListener("click", function () {
       delBtn.disabled = true;
@@ -22222,6 +22251,10 @@ function renderErpLegalDetail(data) {
   licCard.appendChild(erpField("Renewal notice (days)", licNotice));
   var licNotes = lArea("Notes (optional)", 2);
   licCard.appendChild(lAreaField("Notes", licNotes));
+  var licPhoto = document.createElement("input");
+  licPhoto.type = "file";
+  licPhoto.accept = "image/png,image/jpeg,image/gif,image/webp";
+  licCard.appendChild(erpField("Photo of the document (optional)", licPhoto));
   var licAddStatus = lStatus();
   licCard.appendChild(licAddStatus);
   var licBtn = lButton("Add license");
@@ -22235,8 +22268,30 @@ function renderErpLegalDetail(data) {
       issue_date: licIssue.value, expiry_date: licExpiry.value,
       renewal_notice_days: licNotice.value === "" ? 30 : Number(licNotice.value),
       notes: licNotes.value
-    }).then(function () {
-      loadErpLegalDetail();
+    }).then(function (created) {
+      var file = licPhoto.files && licPhoto.files[0];
+      if (!file) { loadErpLegalDetail(); return; }
+      if (file.size > 5 * 1024 * 1024) {
+        licAddStatus.textContent = "License saved, but the photo is over 5MB — add a smaller one from Edit.";
+        licBtn.disabled = false;
+        return;
+      }
+      licAddStatus.textContent = "Uploading photo…";
+      var reader = new FileReader();
+      reader.onload = function () {
+        erpPost("/api/erp/legal/licenses/" + created.record.id + "/image",
+          { image: reader.result }).then(function () {
+          loadErpLegalDetail();
+        }).catch(function (error) {
+          licAddStatus.textContent = "License saved, but the photo did not upload: " + error.message;
+          licBtn.disabled = false;
+        });
+      };
+      reader.onerror = function () {
+        licAddStatus.textContent = "License saved, but the photo could not be read — add it from Edit.";
+        licBtn.disabled = false;
+      };
+      reader.readAsDataURL(file);
     }).catch(function (error) {
       licAddStatus.textContent = error.message;
       licBtn.disabled = false;
@@ -22263,12 +22318,15 @@ function renderErpLegalDetail(data) {
     var rowCard = document.createElement("div");
     rowCard.className = "erp-form";
     rowCard.style.flex = "1 1 100%";
-    rowCard.appendChild(lRow(rec.name + " — " + (rec.authority || "no authority") + " · " + rec.type + (rec.license_number ? (" · #" + rec.license_number) : "") + (rec.issue_date ? (" · issued " + rec.issue_date) : "") + (rec.expiry_date ? (" · expires " + rec.expiry_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no expiry date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "")));
+    rowCard.appendChild(lRow(rec.name + " — " + (rec.authority || "no authority") + " · " + rec.type + (rec.license_number ? (" · #" + rec.license_number) : "") + (rec.issue_date ? (" · issued " + rec.issue_date) : "") + (rec.expiry_date ? (" · expires " + rec.expiry_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no expiry date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "") + (rec.has_image ? " · 📷 Photo" : "")));
     var editBtn = lButton("Edit");
     editBtn.addEventListener("click", function () {
       renderErpLegalLicenseEditForm(rowCard, rec, licAddStatus, loadErpLegalDetail);
     });
     rowCard.appendChild(editBtn);
+    if (rec.has_image) {
+      rowCard.appendChild(erpLegalPhotoViewButton("licenses", rec, rowCard, licAddStatus));
+    }
     var delBtn = lButton("Delete");
     delBtn.addEventListener("click", function () {
       delBtn.disabled = true;
@@ -22575,6 +22633,153 @@ function renderErpLegalIpEditForm(card, rec, status, reload) {
   cancelBtn.addEventListener("click", function () { reload(); });
   card.appendChild(cancelBtn);
 }
+// One photo/scan per legal record (Nov 17, 2026). The list never carries
+// the blob -- this box fetches it through the per-record image endpoint
+// only when the record has one. kind is "licenses" or "agreements".
+function renderErpLegalPhotoBox(kind, rec, status, reload) {
+  var box = document.createElement("div");
+  box.className = "erp-form";
+  box.style.flex = "1 1 100%";
+  var h = document.createElement("h3");
+  h.textContent = "Photo of the document";
+  box.appendChild(h);
+  var note = document.createElement("p");
+  note.style.color = "var(--muted)";
+  box.appendChild(note);
+  var imgWrap = document.createElement("div");
+  box.appendChild(imgWrap);
+  function showPhoto(src) {
+    imgWrap.replaceChildren();
+    if (!src) {
+      note.textContent = "No photo yet — add a picture of the signed document here (PNG, JPEG, GIF, or WebP, up to 5MB).";
+      return;
+    }
+    var img = document.createElement("img");
+    img.src = src;
+    img.alt = "Photo of the document";
+    img.style.maxWidth = "100%";
+    img.style.display = "block";
+    img.style.marginBottom = "8px";
+    imgWrap.appendChild(img);
+    note.textContent = "This is the photo on file for this record.";
+  }
+  if (rec.has_image) {
+    note.textContent = "Loading photo…";
+    erpGet("/api/erp/legal/" + kind + "/" + rec.id + "/image").then(function (data) {
+      showPhoto(data.image || "");
+    }).catch(function (error) {
+      note.textContent = error.message;
+    });
+  } else {
+    showPhoto("");
+  }
+  var imgStatus = document.createElement("p");
+  imgStatus.style.color = "var(--muted)";
+  box.appendChild(imgStatus);
+  var input = document.createElement("input");
+  input.type = "file";
+  input.accept = "image/png,image/jpeg,image/gif,image/webp";
+  input.style.display = "block";
+  input.style.marginBottom = "8px";
+  box.appendChild(input);
+  var upBtn = document.createElement("button");
+  upBtn.type = "button";
+  upBtn.textContent = rec.has_image ? "Replace photo" : "Upload photo";
+  upBtn.addEventListener("click", function () {
+    var file = input.files && input.files[0];
+    if (!file) { imgStatus.textContent = "Choose a picture first."; return; }
+    if (file.size > 5 * 1024 * 1024) { imgStatus.textContent = "That picture is over 5MB — pick a smaller one."; return; }
+    upBtn.disabled = true;
+    imgStatus.textContent = "Uploading…";
+    var reader = new FileReader();
+    reader.onload = function () {
+      erpPost("/api/erp/legal/" + kind + "/" + rec.id + "/image",
+        { image: reader.result }).then(function () {
+        reload();
+      }).catch(function (error) {
+        imgStatus.textContent = error.message;
+        upBtn.disabled = false;
+      });
+    };
+    reader.onerror = function () {
+      imgStatus.textContent = "Could not read that file.";
+      upBtn.disabled = false;
+    };
+    reader.readAsDataURL(file);
+  });
+  box.appendChild(upBtn);
+  if (rec.has_image) {
+    var delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.textContent = "Remove photo";
+    delBtn.style.marginLeft = "8px";
+    var delArmed = false;
+    var delTimer = null;
+    delBtn.addEventListener("click", function () {
+      if (!delArmed) {
+        delArmed = true;
+        delBtn.textContent = "Tap again to remove";
+        delBtn.classList.add("erp-danger-armed");
+        delTimer = setTimeout(function () {
+          delArmed = false;
+          delBtn.textContent = "Remove photo";
+          delBtn.classList.remove("erp-danger-armed");
+        }, 4000);
+        return;
+      }
+      clearTimeout(delTimer);
+      delBtn.disabled = true;
+      erpDelete("/api/erp/legal/" + kind + "/" + rec.id + "/image").then(function () {
+        reload();
+      }).catch(function (error) {
+        imgStatus.textContent = error.message;
+        delBtn.disabled = false;
+        delArmed = false;
+        delBtn.textContent = "Remove photo";
+        delBtn.classList.remove("erp-danger-armed");
+      });
+    });
+    box.appendChild(delBtn);
+  }
+  return box;
+}
+
+// View-photo toggle for a legal row: fetches the blob once, shows it
+// inline in the row card, hides it on a second tap.
+function erpLegalPhotoViewButton(kind, rec, rowCard, status) {
+  var btn = document.createElement("button");
+  btn.type = "button";
+  btn.textContent = "View photo";
+  var shown = null;
+  btn.addEventListener("click", function () {
+    if (shown) {
+      rowCard.removeChild(shown);
+      shown = null;
+      btn.textContent = "View photo";
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "Loading photo…";
+    erpGet("/api/erp/legal/" + kind + "/" + rec.id + "/image").then(function (data) {
+      var img = document.createElement("img");
+      img.src = data.image;
+      img.alt = "Photo of the document";
+      img.style.maxWidth = "100%";
+      img.style.display = "block";
+      img.style.marginTop = "8px";
+      rowCard.appendChild(img);
+      shown = img;
+      btn.textContent = "Hide photo";
+      btn.disabled = false;
+    }).catch(function (error) {
+      status.textContent = error.message;
+      btn.textContent = "View photo";
+      btn.disabled = false;
+    });
+  });
+  return btn;
+}
+
 function renderErpLegalAgreementEditForm(card, rec, status, reload) {
   card.replaceChildren();
   var title = document.createElement("h3");
@@ -22613,6 +22818,7 @@ function renderErpLegalAgreementEditForm(card, rec, status, reload) {
   card.appendChild(erpField("Renewal notice (days)", noticeInput));
   var notesInput = eInput(rec.notes, "Notes");
   card.appendChild(erpField("Notes", notesInput));
+  card.appendChild(renderErpLegalPhotoBox("agreements", rec, status, reload));
   var saveBtn = document.createElement("button");
   saveBtn.type = "button";
   saveBtn.textContent = "Save changes";
@@ -22678,6 +22884,7 @@ function renderErpLegalLicenseEditForm(card, rec, status, reload) {
   card.appendChild(erpField("Renewal notice (days)", noticeInput));
   var notesInput = eInput(rec.notes, "Notes");
   card.appendChild(erpField("Notes", notesInput));
+  card.appendChild(renderErpLegalPhotoBox("licenses", rec, status, reload));
   var saveBtn = document.createElement("button");
   saveBtn.type = "button";
   saveBtn.textContent = "Save changes";
