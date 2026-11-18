@@ -1797,7 +1797,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           selectedItemId: null, selectedPOId: null,
           overduePOs: [], perfVendorId: null, perfData: null,
           priceVendorId: null, priceData: null, editPOId: null,
-          stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: "", acctAudit: [], acctAuditFilters: {action: "", actor: "", from: "", to: ""}, acctAuditOffset: 0, acctAuditLoaded: false, acctBackup: null, acctBackupLoaded: false, acctSales: null, acctSalesLoaded: false, acctSalesMsg: "", acctSnapshot: null, acctSnapshotLoaded: false, acctStmtCustomers: [], acctStmtCustomersLoaded: false, acctStatement: null, acctStatementLoaded: false, acctStmtKey: "", acctStmtStart: "", acctStmtEnd: "", acctStmtError: "",
+          stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, editInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: "", acctAudit: [], acctAuditFilters: {action: "", actor: "", from: "", to: ""}, acctAuditOffset: 0, acctAuditLoaded: false, acctBackup: null, acctBackupLoaded: false, acctSales: null, acctSalesLoaded: false, acctSalesMsg: "", acctSnapshot: null, acctSnapshotLoaded: false, acctStmtCustomers: [], acctStmtCustomersLoaded: false, acctStatement: null, acctStatementLoaded: false, acctStmtKey: "", acctStmtStart: "", acctStmtEnd: "", acctStmtError: "",
           acctMatch: null, acctMatchLoaded: false, creditNoteInvoiceId: null,
           acctBillMatch: null, acctBillMatchId: null,
           acctQbDiff: null, acctQbDiffLoaded: false,
@@ -4398,12 +4398,12 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           if (erpCan("purchasing.write")) vToolbar.appendChild(addVendorBtn);
           els.body.appendChild(vToolbar);
           if (erpState.showAddVendor && erpCan("purchasing.write")) els.body.appendChild(erpAddVendorForm());
-          els.body.appendChild(erpVendorTable());
           if (erpState.editVendorId && erpCan("purchasing.write")) {
             var ev = null;
             erpState.vendors.forEach(function (vv) { if (vv.id === erpState.editVendorId) ev = vv; });
             if (ev) els.body.appendChild(erpEditVendorForm(ev));
           }
+          els.body.appendChild(erpVendorTable());
           if ((erpState.overduePOs || []).length) els.body.appendChild(erpOverduePanel());
           if (erpState.perfVendorId && erpState.perfData) els.body.appendChild(erpVendorPerformancePanel(erpState.perfData));
           if (erpState.priceVendorId && erpState.priceData) els.body.appendChild(erpVendorPricePanel(erpState.priceData));
@@ -4549,6 +4549,10 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             if (erpAcctCanWrite()) iToolbar.appendChild(newInvBtn);
             els.body.appendChild(iToolbar);
             if (erpState.showNewInvoice && erpAcctCanWrite()) els.body.appendChild(erpAcctNewInvoiceForm());
+            if (erpState.editInvoiceId) {
+              var _einv = erpAcctInvoiceById(erpState.editInvoiceId);
+              if (_einv) els.body.appendChild(erpAcctEditInvoiceForm(_einv));
+            }
             if (erpState.payInvoiceId) {
               var _pinv = erpAcctInvoiceById(erpState.payInvoiceId);
               if (_pinv) els.body.appendChild(erpAcctPayInvoiceForm(_pinv));
@@ -7456,18 +7460,18 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             tr.appendChild(erpCell("Due", inv.due_date));
             tr.appendChild(erpCell("Total", erpMoney(inv.total_cents)));
             tr.appendChild(erpCell("Balance", erpMoney(inv.balance_cents)));
-            tr.appendChild(erpCell("Status", inv.status));
+            tr.appendChild(erpCell("Status", inv.status + (inv.sent_at ? " · sent " + String(inv.sent_at).slice(0, 10) : "")));
             var actionCell = document.createElement("td");
             actionCell.setAttribute("data-label", "Action");
             if (inv.status === "open") {
-              var pay = document.createElement("button");
-              pay.type = "button";
-              pay.textContent = "Pay";
-              pay.addEventListener("click", function () {
-                erpState.payInvoiceId = inv.id;
+              var edit = document.createElement("button");
+              edit.type = "button";
+              edit.textContent = "Edit";
+              edit.addEventListener("click", function () {
+                erpState.editInvoiceId = inv.id;
                 renderErpAccountingDetail();
               });
-              if (erpAcctCanWrite()) actionCell.appendChild(pay);
+              if (erpAcctCanWrite()) actionCell.appendChild(edit);
               var creditBtn = document.createElement("button");
               creditBtn.type = "button";
               creditBtn.textContent = "Credit note";
@@ -7476,6 +7480,26 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
                 renderErpAccountingDetail();
               });
               if (erpAcctCanWrite()) actionCell.appendChild(creditBtn);
+              if (inv.customer_type === "wholesale") {
+                var sendBtn = document.createElement("button");
+                sendBtn.type = "button";
+                sendBtn.textContent = "Send invoice";
+                sendBtn.addEventListener("click", function () {
+                  if (sendBtn.textContent === "Send invoice") {
+                    sendBtn.textContent = "Confirm send";
+                    return;
+                  }
+                  sendBtn.disabled = true;
+                  erpPost("/api/erp/accounting/invoices/" + encodeURIComponent(String(inv.id)) + "/send", {}).then(function () {
+                    return loadErpAccountingDetail();
+                  }).catch(function (error) {
+                    sendBtn.disabled = false;
+                    sendBtn.textContent = "Send invoice";
+                    setAdminDetailStatus(error.message, true);
+                  });
+                });
+                if (erpAcctCanWrite()) actionCell.appendChild(sendBtn);
+              }
               var voidBtn = document.createElement("button");
               voidBtn.type = "button";
               voidBtn.textContent = "Void";
@@ -7653,6 +7677,181 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             status.textContent = "Saving\u2026";
             erpPost("/api/erp/accounting/invoices", body).then(function () {
               erpState.showNewInvoice = false;
+              return loadErpAccountingDetail();
+            }).catch(function (error) {
+              submit.disabled = false;
+              status.textContent = error.message;
+            });
+          });
+          return form;
+        }
+        function erpAcctEditInvoiceForm(inv) {
+          var form = document.createElement("form");
+          form.className = "erp-form";
+          var title = document.createElement("p");
+          title.textContent = "Edit invoice #" + inv.id + " — " + inv.customer_name
+            + " — total " + erpMoney(inv.total_cents) + " · balance " + erpMoney(inv.balance_cents)
+            + (inv.sent_at ? " · sent " + String(inv.sent_at).slice(0, 10) : "");
+          form.appendChild(title);
+          var locked = inv.balance_cents !== inv.total_cents;
+          if (locked) {
+            var lockNote = document.createElement("p");
+            lockNote.className = "admin-orders-empty";
+            lockNote.textContent = "A payment has been applied, so the amounts can't change — use a credit note for corrections. Due date and customer name can still change.";
+            form.appendChild(lockNote);
+          }
+          var nameLabel = document.createElement("label");
+          nameLabel.textContent = "Customer name ";
+          var nameInput = document.createElement("input");
+          nameInput.name = "customer_name";
+          nameInput.value = inv.customer_name || "";
+          nameLabel.appendChild(nameInput);
+          form.appendChild(nameLabel);
+          var dateNote = document.createElement("p");
+          dateNote.className = "admin-orders-empty";
+          dateNote.textContent = "Date " + inv.date + " (not editable — the ledger entry is dated to it).";
+          form.appendChild(dateNote);
+          var dueLabel = document.createElement("label");
+          dueLabel.textContent = "Due ";
+          var dueInput = document.createElement("input");
+          dueInput.type = "date";
+          dueInput.name = "due_date";
+          dueInput.required = true;
+          dueInput.value = inv.due_date || "";
+          dueLabel.appendChild(dueInput);
+          form.appendChild(dueLabel);
+          var taxLabel = document.createElement("label");
+          taxLabel.textContent = "Tax $ ";
+          var taxInput = document.createElement("input");
+          taxInput.type = "number";
+          taxInput.min = "0";
+          taxInput.step = "0.01";
+          taxInput.name = "tax";
+          taxInput.value = ((inv.tax_cents || 0) / 100).toFixed(2);
+          taxInput.disabled = locked;
+          taxLabel.appendChild(taxInput);
+          form.appendChild(taxLabel);
+          var linesWrap = document.createElement("div");
+          form.appendChild(linesWrap);
+          var lineRows = [];
+          var addLineBtn = document.createElement("button");
+          addLineBtn.type = "button";
+          addLineBtn.textContent = "Add line";
+          addLineBtn.disabled = locked;
+          addLineBtn.addEventListener("click", function () { addLineRow(); updateTotals(); });
+          form.appendChild(addLineBtn);
+          var totals = document.createElement("p");
+          totals.className = "erp-form-status";
+          form.appendChild(totals);
+          var submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Save changes";
+          form.appendChild(submit);
+          var cancel = document.createElement("button");
+          cancel.type = "button";
+          cancel.textContent = "Cancel";
+          cancel.addEventListener("click", function () {
+            erpState.editInvoiceId = null;
+            renderErpAccountingDetail();
+          });
+          form.appendChild(cancel);
+          var payBtn = document.createElement("button");
+          payBtn.type = "button";
+          payBtn.textContent = "Record a payment";
+          payBtn.addEventListener("click", function () {
+            erpState.payInvoiceId = inv.id;
+            renderErpAccountingDetail();
+          });
+          form.appendChild(payBtn);
+          var status = document.createElement("p");
+          status.className = "erp-form-status";
+          form.appendChild(status);
+          function updateTotals() {
+            var sub = 0, bad = false, effective = 0;
+            lineRows.forEach(function (lr) {
+              var hasDesc = lr.desc.value.trim() !== "";
+              var hasQty = lr.qty.value !== "";
+              var hasRate = lr.rate.value !== "";
+              if (!hasDesc && !hasQty && !hasRate) return;
+              var qty = Number(lr.qty.value);
+              var rate = erpDollarsToCents(lr.rate.value || "0");
+              if (!hasDesc || !isFinite(qty) || qty < 1 || Math.floor(qty) !== qty || rate === null) { bad = true; return; }
+              effective++;
+              sub += qty * rate;
+            });
+            var tax = erpDollarsToCents(taxInput.value || "0");
+            if (tax === null) bad = true;
+            var total = sub + (tax || 0);
+            totals.textContent = "Subtotal " + erpMoney(sub) + " · Tax " + erpMoney(tax || 0) + " · Total " + erpMoney(total);
+            submit.disabled = bad || effective < 1 || total <= 0 || nameInput.value.trim() === "";
+          }
+          function addLineRow(prefill) {
+            var row = document.createElement("div");
+            row.className = "erp-acct-line";
+            var desc = document.createElement("input");
+            desc.placeholder = "Description";
+            if (prefill) desc.value = prefill.description || "";
+            desc.disabled = locked;
+            var qty = document.createElement("input");
+            qty.type = "number"; qty.min = "1"; qty.step = "1";
+            qty.placeholder = "Qty";
+            if (prefill) qty.value = String(prefill.qty || "");
+            qty.disabled = locked;
+            var rate = document.createElement("input");
+            rate.type = "number"; rate.min = "0"; rate.step = "0.01";
+            rate.placeholder = "Rate $";
+            if (prefill) rate.value = ((prefill.rate_cents || 0) / 100).toFixed(2);
+            rate.disabled = locked;
+            var remove = document.createElement("button");
+            remove.type = "button";
+            remove.textContent = "Remove";
+            remove.disabled = locked;
+            var lr = { desc: desc, qty: qty, rate: rate, row: row };
+            remove.addEventListener("click", function () {
+              var idx = lineRows.indexOf(lr);
+              if (idx >= 0) lineRows.splice(idx, 1);
+              if (row.parentNode) row.parentNode.removeChild(row);
+              updateTotals();
+            });
+            desc.addEventListener("input", updateTotals);
+            qty.addEventListener("input", updateTotals);
+            rate.addEventListener("input", updateTotals);
+            row.appendChild(desc); row.appendChild(qty); row.appendChild(rate);
+            row.appendChild(remove);
+            linesWrap.appendChild(row);
+            lineRows.push(lr);
+            return lr;
+          }
+          nameInput.addEventListener("input", updateTotals);
+          taxInput.addEventListener("input", updateTotals);
+          (inv.lines || []).forEach(function (l) { addLineRow(l); });
+          if (!lineRows.length) addLineRow();
+          updateTotals();
+          form.addEventListener("submit", function (event) {
+            event.preventDefault();
+            var body = { customer_name: nameInput.value.trim(), due_date: dueInput.value };
+            if (!locked) {
+              var lines = [];
+              var bad = false;
+              lineRows.forEach(function (lr) {
+                var hasDesc = lr.desc.value.trim() !== "";
+                var hasQty = lr.qty.value !== "";
+                var hasRate = lr.rate.value !== "";
+                if (!hasDesc && !hasQty && !hasRate) return;
+                var qty = Number(lr.qty.value);
+                var rate = erpDollarsToCents(lr.rate.value || "0");
+                if (!hasDesc || !isFinite(qty) || qty < 1 || Math.floor(qty) !== qty || rate === null) { bad = true; return; }
+                lines.push({ description: lr.desc.value.trim(), qty: qty, rate_cents: rate });
+              });
+              var tax = erpDollarsToCents(taxInput.value || "0");
+              if (bad || lines.length < 1 || tax === null) { status.textContent = "Each line needs a description, a quantity of at least 1, and a rate."; return; }
+              body.lines = lines;
+              body.tax_cents = tax;
+            }
+            submit.disabled = true;
+            status.textContent = "Saving…";
+            erpPost("/api/erp/accounting/invoices/" + encodeURIComponent(String(inv.id)) + "/update", body).then(function () {
+              erpState.editInvoiceId = null;
               return loadErpAccountingDetail();
             }).catch(function (error) {
               submit.disabled = false;
@@ -8497,7 +8696,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             label.textContent = f[1] + " ";
             var input = document.createElement("input");
             input.name = f[0];
-            input.value = f[3] || "";
+            input.value = f[3] ? String(f[3]) : "";
             if (f[2]) input.required = true;
             label.appendChild(input);
             form.appendChild(label);
@@ -13664,7 +13863,7 @@ function erpShowWholesaleVerifyModal(payload, acct, submitBtn, statusEl, onCreat
   modal.appendChild(h3);
   var note = document.createElement("p");
   note.className = "admin-orders-empty";
-  note.textContent = "Check every line. If anything is wrong, go back and fix the form — the order is not created until you verify it. Once verified, the order is accepted for fulfillment and the invoice goes to the billing person.";
+  note.textContent = "Check every line. If anything is wrong, go back and fix the form — the order is not created until you verify it. Once verified, the order is accepted for fulfillment and the invoice is created in Accounting — you send it to the billing person yourself from Accounting → Invoices.";
   modal.appendChild(note);
   function metaRow(label, value) {
     var row = document.createElement("div");
