@@ -34,22 +34,71 @@ button { font-family: inherit; }
   background: var(--yellow); font-weight: 800; font-size: 16px; cursor: pointer; }
 .login-error { color: var(--red-dark); font-weight: 700; font-size: 14px; }
 
-/* app shell */
-.app-header { background: var(--ink); color: var(--paper); padding: 0 20px;
-  display: flex; align-items: center; gap: 24px; flex-wrap: wrap; }
-.app-brand { font-weight: 900; font-size: 19px; padding: 14px 0; letter-spacing: -.01em; }
-.app-nav { display: flex; gap: 4px; }
-.app-nav a { color: var(--paper); text-decoration: none; font-weight: 700; font-size: 14px;
-  padding: 16px 14px; opacity: .75; }
-.app-nav a.active { opacity: 1; border-bottom: 4px solid var(--yellow); }
-.app-user { margin-left: auto; display: flex; align-items: center; gap: 12px; font-size: 14px; }
-.app-user button { border: 2px solid var(--paper); background: transparent; color: var(--paper);
-  padding: 6px 12px; font-weight: 700; cursor: pointer; font-size: 13px; }
-#viewStorefrontLink, #viewStorefrontLink:visited { color: var(--paper); }
+/* app shell — QuickBooks-style left sidebar (Nov 17, 2026). The 16 main
+   links are the same static <a data-route> anchors the top header used;
+   only their home moved, from the top bar into this sidebar. The tab's
+   sub-tab row (when one exists) is hidden by [data-erp-subtabs] below and
+   shown again as sub-items under the active link; the sidebar item
+   delegates to the row's own button, so the handler runs exactly as before. */
+.erp-shell { display: flex; align-items: stretch; min-height: 100vh; background: #f4f5f8; }
+.erp-sidebar { width: 250px; flex: 0 0 250px; background: #393a3d; color: #fff;
+  position: sticky; top: 0; height: 100vh; height: 100dvh;
+  display: flex; flex-direction: column; z-index: 60; }
+.erp-brand { padding: 18px 18px 14px; border-bottom: 1px solid rgba(255,255,255,.12);
+  font-weight: 900; font-size: 17px; letter-spacing: -.01em; flex: 0 0 auto; }
+.app-nav { flex: 1 1 auto; overflow-y: auto; padding: 8px 0 12px;
+  scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.25) transparent; display: block; }
+.app-nav::-webkit-scrollbar { width: 8px; }
+.app-nav::-webkit-scrollbar-thumb { background: rgba(255,255,255,.22); border-radius: 4px; }
+.app-nav a { display: flex; align-items: center; gap: 11px; width: 100%; min-height: 42px;
+  padding: 9px 14px 9px 15px; background: none; border: 0; border-left: 3px solid transparent;
+  color: #e9eaeb; text-decoration: none; font-weight: 700; font-size: 14.5px; text-align: left; }
+.app-nav a:hover { background: rgba(255,255,255,.08); }
+.app-nav a.active { background: #2ca01c; color: #fff; font-weight: 600; }
+.app-nav a .erp-nav-ic { flex: 0 0 20px; display: inline-flex; opacity: .92; }
+.app-nav a .erp-nav-ic svg { width: 20px; height: 20px; }
+.app-nav a .erp-nav-lbl { flex: 1 1 auto; min-width: 0; }
+.app-nav a .erp-nav-chev { flex: 0 0 auto; display: none; opacity: .75; transition: transform .18s ease; }
+.app-nav a .erp-nav-chev svg { width: 14px; height: 14px; }
+.app-nav a.has-subs .erp-nav-chev { display: inline-flex; }
+.app-nav a.active .erp-nav-chev { transform: rotate(90deg); }
+.erp-sublist { background: #2e2f31; padding: 4px 0 6px; }
+.erp-sub-item { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px;
+  padding: 7px 14px 7px 49px; background: none; border: 0; border-left: 3px solid transparent;
+  color: #c9cbcd; font-size: 13.5px; text-align: left; cursor: pointer; }
+.erp-sub-item:hover { background: rgba(255,255,255,.07); color: #fff; }
+.erp-sub-item.active { color: #fff; font-weight: 600; background: rgba(44,160,28,.28); border-left-color: #2ca01c; }
+.erp-side-foot { flex: 0 0 auto; border-top: 1px solid rgba(255,255,255,.12); padding: 12px 14px 14px; }
+.app-user { display: flex; flex-direction: column; align-items: stretch; gap: 10px; font-size: 14px; }
+.app-user button { width: 100%; min-height: 38px; background: rgba(255,255,255,.08); color: #fff;
+  border: 1px solid rgba(255,255,255,.18); border-radius: 6px; padding: 6px 12px;
+  font-weight: 700; cursor: pointer; font-size: 13px; }
+.app-user button:hover { background: rgba(255,255,255,.16); }
+#viewStorefrontLink, #viewStorefrontLink:visited { color: #e9eaeb; font-size: 13px; }
 #viewStorefrontLink:hover { text-decoration: underline; }
+/* Mobile top bar + backdrop: only shown at phone/tablet widths (see the
+   900px media query below). The sidebar becomes a fixed overlay there. */
+.erp-topbar { display: none; position: sticky; top: 0; z-index: 50;
+  background: #393a3d; color: #fff; padding: 8px 12px; align-items: center; gap: 10px; }
+.erp-menu-btn { width: 42px; height: 42px; flex: 0 0 42px; background: rgba(255,255,255,.1);
+  border: 1px solid rgba(255,255,255,.2); border-radius: 6px; color: #fff;
+  display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+.erp-menu-btn svg { width: 22px; height: 22px; }
+.erp-topbar-name { font-size: 15.5px; font-weight: 700; flex: 1 1 auto; }
+.erp-backdrop { position: fixed; inset: 0; z-index: 55; background: rgba(20,20,22,.5); border: 0; padding: 0; cursor: pointer; }
+/* A tab's sub-tab row lives in the sidebar now, not in the page body.
+   The row stays in the DOM (hidden) so the sidebar items can delegate
+   to its buttons — the exact same handlers run. This rule must NOT match
+   the dashboard's chart toggles or any action toolbar: only rows marked
+   with data-erp-subtabs are sub-tab rows. */
+[data-erp-subtabs] { display: none !important; }
+      /* Staff permissions: per-department Grant all / Clear buttons sit
+         beside the department heading and only tick the boxes on the
+         card; saving still goes through Save permissions below. */
+      .erp-form button.erp-perm-grant { padding: 4px 10px; font-size: 13px; margin: 0 6px 6px 0; min-height: 0; }
 .mkt-thumbs { display: flex; flex-wrap: wrap; gap: 8px; margin: 4px 0 8px; }
 .mkt-thumb { width: 160px; height: 160px; object-fit: cover; border: 2px solid var(--ink); background: var(--surface); }
-.app-main { max-width: 1120px; margin: 0 auto; padding: 20px 20px 60px; }
+.app-main { flex: 1 1 auto; min-width: 0; max-width: 1120px; margin: 0 auto; padding: 20px 20px 60px; }
 .app-main h2 { margin: 6px 0 4px; font-size: 26px; }
 .app-status { min-height: 22px; margin: 0 0 14px; color: var(--muted); }
 .app-status[data-state="error"] { color: var(--red-dark); font-weight: 700; }
@@ -65,6 +114,11 @@ button { font-family: inherit; }
          from the website's Poppy widget. The ERP defines no --shadow and
          loads no Fredoka, so the shadow is written out and the head uses
          the ERP font stack. */
+      /* .sr-only was left behind when the Poppy widget was copied from the
+         website (Nov 17): its "Type your question" label rendered as
+         visible text and squeezed the chat input, worst on phones.
+         Same rule as the site — the label stays screen-reader-only. */
+      .sr-only { position: absolute !important; width: 1px !important; height: 1px !important; padding: 0 !important; margin: -1px !important; overflow: hidden !important; clip: rect(0,0,0,0) !important; white-space: nowrap !important; border: 0 !important; }
       .chat-fab { position: fixed; right: 18px; bottom: calc(18px + env(safe-area-inset-bottom)); z-index: 90; width: 58px; height: 58px; border: 0; border-radius: 50%; background: var(--red); color: #fff; display: grid; place-items: center; cursor: pointer; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
       .chat-fab:hover { background: var(--red-dark); }
       .chat-fab[hidden] { display: none; }
@@ -277,9 +331,17 @@ button { font-family: inherit; }
       /* All data tables live in .admin-orders-wrap: swipe horizontally instead of squeezing. */
       .admin-orders-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
       @media (max-width: 900px) {
-        .app-header { gap: 12px; padding: 0 12px; }
-        .app-nav { overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; }
-        .app-nav a { white-space: nowrap; flex-shrink: 0; padding: 14px 10px; }
+        /* Left sidebar becomes a fixed overlay opened by the top bar's menu button. */
+        .erp-topbar { display: flex; }
+        .erp-sidebar { display: none; position: fixed; left: 0; top: 0; bottom: 0;
+          box-shadow: 0 0 40px rgba(0,0,0,.35); height: 100vh; height: 100dvh; }
+        .erp-sidebar.open { display: flex; }
+        .app-nav a { white-space: nowrap; }
+        /* 44px touch targets on phones/tablets: nav links, sub-items and
+           the menu button grow from 42/36px. Desktop keeps 42/36px. */
+        .app-nav a { min-height: 44px; }
+        .erp-sub-item { min-height: 44px; }
+        .erp-menu-btn { width: 44px; height: 44px; flex: 0 0 44px; }
         .app-user button { min-height: 44px; padding: 10px 16px; }
         .app-main { padding: 12px 12px 48px; }
         .app-main h2 { font-size: 22px; }
@@ -390,32 +452,43 @@ button { font-family: inherit; }
   </div>
 </div>
 <div id="appView" hidden>
-  <header class="app-header">
-    <div class="app-brand">Pop-A-Licious ERP</div>
-    <nav class="app-nav">
-      <a href="#/" data-route="home">Dashboard</a>
-      <a href="#/inventory" data-route="inventory">Inventory</a>
-      <a href="#/purchasing" data-route="purchasing">Purchasing</a>
-      <a href="#/production" data-route="production">Production</a>
-      <a href="#/orders" data-route="orders">Order hub</a>
-      <a href="#/loyalty" data-route="loyalty">Loyalty</a>
-      <a href="#/edi" data-route="edi">EDI</a>
-      <a href="#/reports" data-route="reports">Reports</a>
-      <a href="#/marketing" data-route="marketing">Marketing &amp; Service</a>
-      <a href="#/accounting" data-route="accounting">Accounting</a>
-      <a href="#/settings" data-route="settings">Settings</a>
-      <a href="#/staff-perms" data-route="staff-perms">Staff &amp; permissions</a>
-      <a href="#/hr" data-route="hr">HR</a>
-      <a href="#/quality" data-route="quality">Quality &amp; Food Safety</a>
-      <a href="#/legal" data-route="legal">Legal &amp; Compliance</a>
-      <a href="#/stores" data-route="stores">Stores</a>
+  <div class="erp-topbar" id="erpTopbar">
+    <button class="erp-menu-btn" id="erpMenuBtn" type="button" aria-label="Open navigation menu" aria-expanded="false">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+    </button>
+    <span class="erp-topbar-name">Pop-A-Licious ERP</span>
+  </div>
+  <div class="erp-shell">
+  <aside class="erp-sidebar" id="erpSidebar" aria-label="ERP navigation">
+    <div class="app-brand erp-brand">Pop-A-Licious ERP</div>
+    <nav class="app-nav" id="erpSidenav">
+      <a href="#/" data-route="home"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg></span><span class="erp-nav-lbl">Dashboard</span></a>
+      <a href="#/inventory" data-route="inventory" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M4 7.5l8 4.5 8-4.5"/><path d="M12 12v9"/></svg></span><span class="erp-nav-lbl">Inventory</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/purchasing" data-route="purchasing" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9.5" cy="20" r="1.5"/><circle cx="17" cy="20" r="1.5"/><path d="M3 3.5h2.2l2.3 11h10l2-8H6"/></svg></span><span class="erp-nav-lbl">Purchasing</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/production" data-route="production" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 21v-9.5L9 15V9l5.5 3.5V21"/><path d="M3.5 21h17"/><path d="M17.5 21v-5"/></svg></span><span class="erp-nav-lbl">Production</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/orders" data-route="orders" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3.5h12V21l-2-1.4L14 21l-2-1.4L10 21l-2-1.4L6 21z"/><path d="M9 8h6M9 12h6"/></svg></span><span class="erp-nav-lbl">Order hub</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/loyalty" data-route="loyalty" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.8l2.5 5.2 5.7.7-4.2 3.9 1.1 5.6L12 16.5l-5.1 2.7L8 13.6 3.8 9.7l5.7-.7z"/></svg></span><span class="erp-nav-lbl">Loyalty</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/edi" data-route="edi" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 8h13M13.5 4.5L17 8l-3.5 3.5"/><path d="M20 16H7M10.5 12.5L7 16l3.5 3.5"/></svg></span><span class="erp-nav-lbl">EDI</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/reports" data-route="reports" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 4v16.5h16.5"/><path d="M8.5 16.5v-4.5M12.5 16.5V8M16.5 16.5v-6.5"/></svg></span><span class="erp-nav-lbl">Reports</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/marketing" data-route="marketing" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 10.3v3.4l3 .7V9.6L4 10.3z"/><path d="M7 9.6l11-4.6v13.5L7 14.4"/><path d="M9.6 14.7v3.1a2.1 2.1 0 0 0 4.2.4"/></svg></span><span class="erp-nav-lbl">Marketing &amp; Service</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/accounting" data-route="accounting" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="5.5" y="3.5" width="13" height="17" rx="2"/><path d="M8.7 7.2h6.6"/><path d="M8.8 12h.01M12 12h.01M15.2 12h.01M8.8 15.4h.01M12 15.4h.01M15.2 15.4h.01"/></svg></span><span class="erp-nav-lbl">Accounting</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/settings" data-route="settings" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.1"/><path d="M12 3.5v3M12 17.5v3M3.5 12h3M17.5 12h3M6 6l2.1 2.1M15.9 15.9L18 18M18 6l-2.1 2.1M8.1 15.9L6 18"/></svg></span><span class="erp-nav-lbl">Settings</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/staff-perms" data-route="staff-perms" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9" cy="8.5" r="3.2"/><path d="M3.8 19.5c.6-3 2.6-4.5 5.2-4.5s4.6 1.5 5.2 4.5"/><path d="M15.4 5.7a3.2 3.2 0 0 1 .1 5.9M17.7 15.3c1.4.7 2.3 2 2.6 4.2"/></svg></span><span class="erp-nav-lbl">Staff &amp; permissions</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/hr" data-route="hr" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="5" width="17" height="14" rx="2"/><circle cx="8.8" cy="11" r="2"/><path d="M5.8 16.6c.5-1.7 1.6-2.6 3-2.6s2.5.9 3 2.6"/><path d="M14.5 9.5H18M14.5 13H18"/></svg></span><span class="erp-nav-lbl">HR</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/quality" data-route="quality" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3.5l7 2.5v6c0 4.5-3 7.2-7 8.5-4-1.3-7-4-7-8.5v-6z"/><path d="M9 11.8l2.2 2.2 3.8-4"/></svg></span><span class="erp-nav-lbl">Quality &amp; Food Safety</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/legal" data-route="legal" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v13"/><path d="M12 4H6.5M12 4h5.5"/><path d="M6.5 4.5L3.9 10a2.9 2.9 0 0 0 5.2 0z"/><path d="M17.5 4.5L14.9 10a2.9 2.9 0 0 0 5.2 0z"/><path d="M8.5 20.5h7M12 17v3.5"/></svg></span><span class="erp-nav-lbl">Legal &amp; Compliance</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
+      <a href="#/stores" data-route="stores" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 10.5L6.3 4.5h11.4L19 10.5"/><path d="M5 10.5a2.35 2.35 0 0 0 4.7 0 2.35 2.35 0 0 0 4.65 0 2.35 2.35 0 0 0 4.65 0"/><path d="M6.5 13.2V20.5h11V13.2"/><path d="M10 20.5v-4.2h4v4.2"/></svg></span><span class="erp-nav-lbl">Stores</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
     </nav>
-    <div class="app-user"><span id="userLabel"></span><a href="https://pop-a-licious.com/" id="viewStorefrontLink" target="_blank" rel="noopener">View storefront</a><button type="button" id="logoutBtn">Log out</button></div>
-  </header>
+    <div class="erp-side-foot">
+      <div class="app-user"><span id="userLabel"></span><a href="https://pop-a-licious.com/" id="viewStorefrontLink" target="_blank" rel="noopener">View storefront</a><button type="button" id="logoutBtn">Log out</button></div>
+    </div>
+  </aside>
   <main class="app-main">
     <p id="appStatus" class="app-status"></p>
     <div id="appBody"></div>
   </main>
+  </div>
+  <button class="erp-backdrop" id="erpBackdrop" type="button" aria-label="Close navigation menu" hidden></button>
   <button class="chat-fab" id="chatFab" type="button" aria-label="Chat with Poppy, our virtual assistant" aria-expanded="false" aria-controls="chatPanel">
     <svg width="27" height="27" viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M21 12a8 8 0 0 1-8 8c-1.2 0-2.4-.3-3.4-.7L4 20l.8-4.1A8 8 0 1 1 21 12Z" stroke="currentColor" stroke-width="1.9" stroke-linejoin="round"/><circle cx="9" cy="12" r="1.15" fill="currentColor"/><circle cx="12.8" cy="12" r="1.15" fill="currentColor"/><circle cx="16.6" cy="12" r="1.15" fill="currentColor"/></svg>
   </button>
@@ -604,7 +677,7 @@ function doLogout(message) {
     sessionStorage.removeItem("erpUserRole");
     sessionStorage.removeItem("erpUserPerms");
   } catch (e) {}
-  var nav = document.querySelector(".app-nav");
+  var nav = document.getElementById("erpSidebar");
   if (nav) nav.style.display = "";
   var brand = document.querySelector(".app-brand");
   if (brand) brand.textContent = "Pop-A-Licious ERP";
@@ -667,7 +740,7 @@ function enterApp() {
   badge.textContent = s.role === "admin" ? "ADMIN" : (s.role === "wholesale" ? "WHOLESALE" : "STAFF");
   label.appendChild(badge);
   // Wholesale customers get a customer-only shell: no ERP nav at all.
-  var nav = document.querySelector(".app-nav");
+  var nav = document.getElementById("erpSidebar");
   if (nav) nav.style.display = s.role === "wholesale" ? "none" : "";
   var brand = document.querySelector(".app-brand");
   if (brand) brand.textContent = s.role === "wholesale" ? "Pop-A-Licious Wholesale" : "Pop-A-Licious ERP";
@@ -725,7 +798,7 @@ function renderWholesaleRoute() {
   var h = location.hash || "#/";
   document.getElementById("loginView").hidden = true;
   document.getElementById("appView").hidden = false;
-  var nav = document.querySelector(".app-nav");
+  var nav = document.getElementById("erpSidebar");
   if (nav) nav.style.display = "none";
   var m = h.match(/^#\/wholesale-orders\/(\d+)/);
   if (m) { wsState.view = "detail"; wsState.orderId = parseInt(m[1], 10); }
@@ -1383,6 +1456,11 @@ function renderRoute() {
       a.style.display = erpCan(routeReadPerm) ? "" : "none";
     }
   });
+  // The sub-list under the active link belongs to the old tab's content
+  // until the new tab renders; clear it now so the load shows no stale
+  // sub-items. The observer below re-adds the right ones once the tab
+  // has rendered.
+  erpSidebarClearSubs();
   if (r === "inventory") {
     document.title = "Inventory \u00b7 Pop-A-Licious ERP";
     if (!erpCan("inventory.read")) { location.hash = "#/"; return; }
@@ -1495,6 +1573,228 @@ function renderRoute() {
   erpLoyaltyArmInactivity();
   window.scrollTo(0, 0);
 }
+
+/* ---------- Left sidebar navigation (Nov 17, 2026) ---------- */
+// QuickBooks-style left sidebar. The 16 main links are the same static
+// <a data-route> anchors the top header used; only their home moved.
+// Sub-items under the active link come from the tab's own sub-tab row when
+// one is rendered (that row is hidden by CSS; the sidebar item delegates
+// to the row's button, so the exact same handler runs), or from the tab's
+// real sections (scroll-to-section) when the tab has no sub-tab row.
+// Tabs with no sub-tab row show their real sections, as in the approved
+// preview: Dashboard has none; the rest list their sections below.
+var ERP_SIDEBAR_SECTIONS = {
+  inventory: ["Items", "Lots & expiry", "Shrinkage", "Replenishment"],
+  purchasing: ["Vendors", "Purchase orders"],
+  production: ["Recipes", "Batches"],
+  "staff-perms": ["Staff", "Add staff member"],
+  hr: ["Employee records", "Overtime alerts", "Add employee"],
+  quality: ["Recall plan", "Trace a lot", "Recall drills", "Supplier COAs", "HACCP plan", "Complaint trending", "SOP Library"],
+  legal: ["Trademark + IP register", "Contracts + insurance", "Licenses & permits", "Compliance calendar"],
+  stores: ["All stores", "Add store", "Transfers"]
+};
+// Tabs with a real sub-tab row. The subs lists below are the same lists
+// the rows build (same keys, same labels, same order) and are only used
+// as a fallback when the row is not in the DOM — in a detail view, where
+// the row is not rendered. The fallback resets the detail state, sets
+// the view, and re-renders: the same end state as tapping the row's
+// button from the list view. The reset lists copy the row buttons'
+// own handlers (Marketing clears its nine detail fields, and so on).
+var ERP_SIDEBAR_SUBTABS = {
+  accounting: { view: "acctView", render: function () { renderErpAccountingDetail(); }, reset: function () {},
+    subs: [["accounts", "Chart of accounts"], ["journal", "Journal"], ["trial", "Trial balance"], ["invoices", "Invoices"], ["bills", "Bills"], ["aging", "Aging"], ["banking", "Banking"], ["reports", "Reports"], ["audit", "Audit log"], ["sales", "Sales posting"], ["snapshot", "Dashboard"], ["statements", "Statements"], ["matching", "Matching"], ["diff", "QB diff"], ["draws", "Owner draws"], ["tax", "Sales Tax"], ["payroll", "Payroll"]] },
+  orders: { view: "ordersView", render: function () { renderErpOrdersDetail(); },
+    reset: function () { erpState.selectedOrderSource = null; erpState.selectedOrderId = null; erpState.selectedAccountId = null; },
+    subs: [["queue", "Queue"], ["wholesale", "Wholesale orders"], ["accounts", "Accounts"]] },
+  edi: { view: "ediView", render: function () { renderErpEdiDetail(); },
+    reset: function () { erpState.selectedEdiDocId = null; erpState.selectedEdiPartnerId = null; },
+    subs: [["documents", "Documents"], ["partners", "Partners"]] },
+  reports: { view: "reportsView", render: function () { renderErpReportsDetail(); },
+    reset: function () { erpState.reportData = null; },
+    subs: [["sales", "Sales"], ["valuation", "Inventory valuation"], ["margin", "Production margin"], ["wholesale", "Wholesale performance"], ["spend", "Spend by vendor"], ["customers", "Customers"], ["profitability", "Channel profitability"], ["programs", "Programs"], ["forecast", "Forecast"], ["summaries", "Sales summaries"]] },
+  marketing: { view: "mktView", render: function () { renderErpMarketingDetail(); },
+    reset: function () { erpState.mktSelectedTicketId = null; erpState.mktTicketDetail = null; erpState.mktCustomerDetail = null; erpState.mktCalDetail = null; erpState.mktPromos = null; erpState.mktInbox = null; erpState.mktAutomation = null; erpState.mktWinback = null; erpState.mktReviews = null; },
+    subs: [["instagram", "Instagram"], ["newsletter", "Newsletter"], ["support", "Support inbox"], ["customers", "Customers"], ["calendar", "Content calendar"], ["promos", "Promo calendar"], ["inbox", "Social inbox"], ["automation", "Automation"], ["reviews", "Reviews"]] },
+  loyalty: { view: "loyaltyView", render: function () { renderErpLoyaltyDetail(); },
+    reset: function () { erpState.loyaltyConfirm = null; erpState.loyaltySelfConfirm = null; },
+    subs: [["find", "Find member"], ["signup", "Sign up new member"], ["profile", "My profile"]] },
+  settings: { view: "settingsView", render: function () { renderErpSettingsDetail(); },
+    reset: function () { erpState.showCompanyEdit = false; },
+    subs: [["company", "Company profile"], ["integrations", "Integrations"], ["quickbooks", "QuickBooks"], ["notifications", "Notifications"], ["audit", "Audit log"], ["data", "Data export & import"]] }
+};
+var erpSidebarSublistEl = null;
+var erpSidebarLastSig = "";
+var erpSidebarLastRoute = "";
+var erpSidebarSection = null; // last clicked section label, for active styling
+function erpSidebarClearSubs() {
+  if (erpSidebarSublistEl && erpSidebarSublistEl.parentNode) erpSidebarSublistEl.parentNode.removeChild(erpSidebarSublistEl);
+  erpSidebarSublistEl = null;
+  erpSidebarLastSig = "";
+}
+function erpSidebarSubRow() {
+  var body = document.getElementById("appBody");
+  if (!body || typeof body.querySelector !== "function") return null;
+  return body.querySelector("[data-erp-subtabs]");
+}
+function erpSidebarModel() {
+  var r = currentRoute();
+  if (r !== erpSidebarLastRoute) { erpSidebarLastRoute = r; erpSidebarSection = null; }
+  var subs = [];
+  var row = erpSidebarSubRow();
+  if (row) {
+    // The row's own buttons, in order: the sidebar mirrors them exactly
+    // (perm-gating included) and delegates clicks back to them.
+    var btns = row.children || [];
+    Array.prototype.forEach.call(btns, function (b) {
+      if (!b || b.tagName !== "BUTTON") return;
+      subs.push({ route: r, label: (b.textContent || "").trim(),
+        active: !!(b.disabled || (b.classList && b.classList.contains("active"))),
+        button: b, key: null, section: false });
+    });
+  } else if (ERP_SIDEBAR_SUBTABS[r]) {
+    var def = ERP_SIDEBAR_SUBTABS[r];
+    def.subs.forEach(function (s) {
+      subs.push({ route: r, label: s[1], active: erpState[def.view] === s[0],
+        button: null, key: s[0], section: false });
+    });
+  } else if (ERP_SIDEBAR_SECTIONS[r]) {
+    ERP_SIDEBAR_SECTIONS[r].forEach(function (label) {
+      subs.push({ route: r, label: label, active: erpSidebarSection === label,
+        button: null, key: null, section: true });
+    });
+  }
+  return { route: r, subs: subs };
+}
+function erpSidebarScrollEl(el) {
+  if (!el) return false;
+  // A matching button is a control, not a heading: run it (e.g. the
+  // Inventory "Shrinkage" toggle opens its panel) and then scroll to it.
+  if (el.tagName === "BUTTON" && typeof el.click === "function") el.click();
+  if (el.scrollIntoView) el.scrollIntoView({ block: "start" });
+  return true;
+}
+function erpSidebarScrollTo(label) {
+  var body = document.getElementById("appBody");
+  if (!body || typeof body.querySelectorAll !== "function") return false;
+  var want = String(label).toLowerCase();
+  var els = body.querySelectorAll("h2, h3, h4, button");
+  function norm(s) { return String(s || "").trim().toLowerCase(); }
+  var i, el, text;
+  for (i = 0; i < els.length; i++) { el = els[i]; if (norm(el.textContent) === want) return erpSidebarScrollEl(el); }
+  for (i = 0; i < els.length; i++) { el = els[i]; text = norm(el.textContent); if (text && text.indexOf(want) === 0) return erpSidebarScrollEl(el); }
+  for (i = 0; i < els.length; i++) { el = els[i]; text = norm(el.textContent); if (text && (text.indexOf(want) >= 0 || want.indexOf(text) >= 0)) return erpSidebarScrollEl(el); }
+  // The Inventory items table has no heading: scroll to its wrapper.
+  if (label === "Items") {
+    var wrap = body.querySelector(".admin-orders-wrap");
+    if (wrap) return erpSidebarScrollEl(wrap);
+  }
+  // No section matched (e.g. Production "Batches", which has no heading):
+  // land at the top of the page, where that section lives.
+  var h2 = body.querySelector("h2");
+  if (h2) return erpSidebarScrollEl(h2);
+  return false;
+}
+function erpSidebarSubClick(sub) {
+  erpMobileNavClose();
+  if (sub.button) {
+    // The row is rendered: delegate to its button so the exact same
+    // handler runs. The active one is already showing; leave it alone.
+    if (!sub.active && !sub.button.disabled && typeof sub.button.click === "function") sub.button.click();
+    return;
+  }
+  if (sub.key && ERP_SIDEBAR_SUBTABS[sub.route]) {
+    var def = ERP_SIDEBAR_SUBTABS[sub.route];
+    def.reset();
+    erpState[def.view] = sub.key;
+    def.render();
+    return;
+  }
+  if (sub.section) {
+    erpSidebarSection = sub.label;
+    erpSidebarScrollTo(sub.label);
+    // Re-mark the clicked section active without touching the content.
+    erpSidebarLastSig = "";
+    erpSyncSidebar();
+  }
+}
+function erpSyncSidebar() {
+  var sidenav = document.getElementById("erpSidenav");
+  var appView = document.getElementById("appView");
+  if (!sidenav || !appView || appView.hidden) return;
+  if (typeof erpSession === "function") {
+    var sess = erpSession();
+    if (sess && sess.role === "wholesale") return;
+  }
+  var model = erpSidebarModel();
+  var sig = model.route + "|" + model.subs.map(function (s) { return s.label + "=" + (s.active ? "1" : "0"); }).join(",");
+  if (sig === erpSidebarLastSig) return;
+  erpSidebarClearSubs();
+  erpSidebarLastSig = sig;
+  if (!model.subs.length) return;
+  var activeLink = null;
+  var links = sidenav.children || [];
+  for (var i = 0; i < links.length; i++) {
+    var a = links[i];
+    if (a && a.tagName === "A" && a.getAttribute && a.getAttribute("data-route") === model.route) { activeLink = a; break; }
+  }
+  if (!activeLink) return;
+  var list = document.createElement("div");
+  list.className = "erp-sublist";
+  list.setAttribute("role", "group");
+  list.setAttribute("aria-label", "Sub-pages");
+  model.subs.forEach(function (sub) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.className = "erp-sub-item" + (sub.active ? " active" : "");
+    b.textContent = sub.label;
+    if (sub.active) b.setAttribute("aria-current", "page");
+    b.addEventListener("click", function () { erpSidebarSubClick(sub); });
+    list.appendChild(b);
+  });
+  if (typeof sidenav.insertBefore === "function" && activeLink.nextSibling) sidenav.insertBefore(list, activeLink.nextSibling);
+  else if (typeof sidenav.insertBefore === "function") sidenav.insertBefore(list, null);
+  else sidenav.appendChild(list);
+  erpSidebarSublistEl = list;
+}
+/* ---------- Mobile navigation (left sidebar as overlay) ---------- */
+function erpMobileNavOpen() {
+  var s = document.getElementById("erpSidebar");
+  if (s) s.classList.add("open");
+  var b = document.getElementById("erpBackdrop");
+  if (b) b.hidden = false;
+  var m = document.getElementById("erpMenuBtn");
+  if (m) m.setAttribute("aria-expanded", "true");
+}
+function erpMobileNavClose() {
+  var s = document.getElementById("erpSidebar");
+  if (s) s.classList.remove("open");
+  var b = document.getElementById("erpBackdrop");
+  if (b) b.hidden = true;
+  var m = document.getElementById("erpMenuBtn");
+  if (m) m.setAttribute("aria-expanded", "false");
+}
+function erpMobileNavToggle() {
+  var s = document.getElementById("erpSidebar");
+  if (s && s.classList.contains("open")) erpMobileNavClose(); else erpMobileNavOpen();
+}
+(function erpSidebarBind() {
+  var menuBtn = document.getElementById("erpMenuBtn");
+  if (menuBtn) menuBtn.addEventListener("click", erpMobileNavToggle);
+  var backdrop = document.getElementById("erpBackdrop");
+  if (backdrop) backdrop.addEventListener("click", erpMobileNavClose);
+  var sidenav = document.getElementById("erpSidenav");
+  if (sidenav) sidenav.addEventListener("click", function () { erpMobileNavClose(); });
+  document.addEventListener("keydown", function (e) {
+    if (e && e.key === "Escape") erpMobileNavClose();
+  });
+  // Rebuild the sub-list whenever the tab content changes (every render
+  // replaces #appBody's children). The signature check inside
+  // erpSyncSidebar makes the frequent callbacks cheap no-ops.
+  if (typeof MutationObserver !== "undefined") {
+    var body = document.getElementById("appBody");
+    if (body) new MutationObserver(function () { erpSyncSidebar(); }).observe(body, { childList: true, subtree: true });
+  }
+})();
 async function renderHome() {
   var body = document.getElementById("appBody");
   body.replaceChildren();
@@ -4508,6 +4808,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           els.body.appendChild(erpSectionTitle("Accounting"));
           var tabs = document.createElement("div");
           tabs.className = "erp-toolbar erp-acct-tabs";
+          tabs.setAttribute("data-erp-subtabs", "accounting");
           var acctTabs = [["accounts", "Chart of accounts"], ["journal", "Journal"], ["trial", "Trial balance"], ["invoices", "Invoices"], ["bills", "Bills"], ["aging", "Aging"], ["banking", "Banking"]];
           if (erpAcctCanRead()) acctTabs.push(["reports", "Reports"]);
           if (erpAcctCanRead()) acctTabs.push(["audit", "Audit log"]);
@@ -12502,6 +12803,7 @@ function renderErpOrdersDetail() {
   els.body.appendChild(h2);
   var tabs = document.createElement("div");
   tabs.className = "erp-subtabs";
+  tabs.setAttribute("data-erp-subtabs", "orders");
   [["queue", "Queue"], ["wholesale", "Wholesale orders"], ["accounts", "Accounts"]].forEach(function (t) {
     if (t[0] === "accounts" && !erpCan("accounts.read")) return;
     var b = document.createElement("button");
@@ -14912,6 +15214,7 @@ function renderErpEdiDetail() {
   if (erpState.lastWebhookKey) els.body.appendChild(erpWebhookKeyNotice());
   var tabs = document.createElement("div");
   tabs.className = "erp-subtabs";
+  tabs.setAttribute("data-erp-subtabs", "edi");
   [["documents", "Documents"], ["partners", "Partners"]].forEach(function (t) {
     var b = document.createElement("button");
     b.type = "button";
@@ -15814,6 +16117,7 @@ function renderErpReportsDetail() {
   els.body.appendChild(h2);
   var tabs = document.createElement("div");
   tabs.className = "erp-subtabs";
+  tabs.setAttribute("data-erp-subtabs", "reports");
   [["sales", "Sales"], ["valuation", "Inventory valuation"],
    ["margin", "Production margin"], ["wholesale", "Wholesale performance"],
    ["spend", "Spend by vendor"], ["customers", "Customers"],
@@ -16461,6 +16765,7 @@ function renderErpMarketingDetail() {
   }
   var tabs = document.createElement("div");
   tabs.className = "erp-toolbar";
+  tabs.setAttribute("data-erp-subtabs", "marketing");
   sections.forEach(function (s) {
     var b = document.createElement("button");
     b.type = "button";
@@ -17737,6 +18042,7 @@ function renderErpLoyaltyDetail() {
   els.body.appendChild(erpSectionTitle("Loyalty"));
   var tabs = document.createElement("div");
   tabs.className = "erp-toolbar";
+  tabs.setAttribute("data-erp-subtabs", "loyalty");
   [["find", "Find member"], ["signup", "Sign up new member"], ["profile", "My profile"]].forEach(function (s) {
     var b = document.createElement("button");
     b.type = "button";
@@ -18278,13 +18584,36 @@ function renderErpStaffPermsDetail(data) {
       gdiv.style.flex = "1 1 100%";
       var gh = document.createElement("h4");
       gh.textContent = g[0];
+      gh.style.display = "inline-block";
+      gh.style.margin = "0 10px 6px 0";
       gdiv.appendChild(gh);
+      // Per-department buttons (Nov 17, 2026): Grant all / Clear only
+      // tick this department's boxes on the card. Nothing is saved
+      // until the card's Save permissions button is tapped.
+      var groupBoxes = [];
+      var grantBtn = document.createElement("button");
+      grantBtn.type = "button";
+      grantBtn.className = "erp-perm-grant";
+      grantBtn.textContent = "Grant all";
+      grantBtn.addEventListener("click", function () {
+        groupBoxes.forEach(function (cb) { cb.checked = true; });
+      });
+      gdiv.appendChild(grantBtn);
+      var clearBtn = document.createElement("button");
+      clearBtn.type = "button";
+      clearBtn.className = "erp-perm-grant";
+      clearBtn.textContent = "Clear";
+      clearBtn.addEventListener("click", function () {
+        groupBoxes.forEach(function (cb) { cb.checked = false; });
+      });
+      gdiv.appendChild(clearBtn);
       g[1].forEach(function (p) {
         var lab = document.createElement("label");
         var cb = document.createElement("input");
         cb.type = "checkbox";
         cb.checked = (s.perms || []).indexOf(p[0]) !== -1;
         boxes[p[0]] = cb;
+        groupBoxes.push(cb);
         lab.appendChild(cb);
         lab.appendChild(document.createTextNode(" " + p[1]));
         gdiv.appendChild(lab);
@@ -27074,6 +27403,7 @@ function renderErpSettingsDetail() {
   if (!erpState.settingsView) erpState.settingsView = "company";
   var tabs = document.createElement("div");
   tabs.className = "erp-toolbar";
+  tabs.setAttribute("data-erp-subtabs", "settings");
   [["company", "Company profile"], ["integrations", "Integrations"], ["quickbooks", "QuickBooks"], ["notifications", "Notifications"], ["audit", "Audit log"], ["data", "Data export & import"]].forEach(function (t) {
     var b = document.createElement("button");
     b.type = "button";
