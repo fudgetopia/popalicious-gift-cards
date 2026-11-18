@@ -32237,13 +32237,18 @@ def _acct_find_wholesale_invoice(conn, account_id, total_cents, date):
         (account_id, total_cents, date)).fetchone()
 
 
-def _acct_post_wholesale_sale(conn, actor, order_id):
+def _acct_post_wholesale_sale(conn, actor, order_id, at_verify=False):
     """Post a shipped/picked-up wholesale order by creating its Phase 1
     AR invoice (Dr AR / Cr wholesale income, tax 0, resale-exempt).
-    Returns (invoice_id, status, None) or (None, None, error), where
-    status is posted / already_posted / skipped_invoiced / skipped_qb.
-    The caller commits. On failure nothing is written, so a later
-    backfill retries."""
+    With at_verify=True (order verification, Nov 17, 2026) the invoice
+    posts when the order is verified/accepted instead -- the employee
+    verifies the order, the invoice goes to the billing person, and the
+    order moves to fulfillment. Either way the sale_post row is recorded,
+    so the delivery-time post later sees already_posted and never posts
+    a second invoice. Returns (invoice_id, status, None) or
+    (None, None, error), where status is posted / already_posted /
+    skipped_invoiced / skipped_qb. The caller commits. On failure
+    nothing is written, so a later delivery post retries."""
     _acct_ensure_sale_posts_table(conn)
     source_key = "wholesale:%d" % order_id
     existing = _acct_sale_posted(conn, source_key)
@@ -32253,7 +32258,11 @@ def _acct_post_wholesale_sale(conn, actor, order_id):
                      (order_id,)).fetchone()
     if not w:
         return None, None, "wholesale order not found"
-    if w["status"] not in ("shipped", "picked_up"):
+    if at_verify:
+        if w["status"] != "accepted":
+            return None, None, ("wholesale order is not accepted (status: %s)"
+                                % w["status"])
+    elif w["status"] not in ("shipped", "picked_up"):
         return None, None, ("wholesale order is not shipped (status: %s)"
                             % w["status"])
     acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
@@ -43573,6 +43582,12 @@ def erp_create_wholesale_order():
     if err:
         return err
     data = request.get_json(force=True) or {}
+    # Order verification (Nov 17, 2026): a staff order is only created
+    # after the employee has seen the verify pop-up and confirmed the
+    # order is correct. The pop-up is the verification -- the API refuses
+    # an unverified create so nothing can bypass it.
+    if data.get("verified") is not True:
+        return jsonify(error="verify the order before creating it"), 400
     conn = db()
     acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
                         (data.get("account_id"),)).fetchone()
@@ -43640,6 +43655,37 @@ def erp_create_wholesale_order():
             (order_id, li["flavor_name"], li["qty_bags"],
              li["unit_price_cents"], li["line_total_cents"]))
     _erp_set_fulfillment(conn, "wholesale", order_id, "new", actor, "order created")
+    # Verification passed: the order is accepted straight away (the
+    # verify step IS the acceptance for staff orders) so it can be
+    # fulfilled, and its AR invoice posts now -- not at delivery -- so
+    # it can be emailed to the billing person. A posting failure must
+    # never roll back the order, so it runs inside a savepoint; the
+    # failure is audited and the invoice posts at delivery instead.
+    _erp_set_fulfillment(conn, "wholesale", order_id, "accepted", actor,
+                         "verified by " + actor)
+    invoice_id = None
+    invoice_error = None
+    try:
+        conn.execute("SAVEPOINT acct_verify_invoice")
+        _inv_id, _st, _err = _acct_post_wholesale_sale(
+            conn, actor, order_id, at_verify=True)
+        if _err:
+            raise RuntimeError(_err)
+        invoice_id = _inv_id
+        conn.execute("RELEASE SAVEPOINT acct_verify_invoice")
+    except Exception as _e:
+        try:
+            conn.execute("ROLLBACK TO SAVEPOINT acct_verify_invoice")
+            conn.execute("RELEASE SAVEPOINT acct_verify_invoice")
+        except Exception:
+            pass
+        invoice_error = str(_e)
+        try:
+            _acct_audit(conn, actor, "sale.post_failed", "sale_post", 0,
+                        "wholesale:%d verify invoice failed: %s"
+                        % (order_id, _e))
+        except Exception:
+            pass
     conn.commit()
     w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
                      (order_id,)).fetchone()
@@ -43648,6 +43694,35 @@ def erp_create_wholesale_order():
         "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ? ORDER BY id",
         (order_id,)).fetchall()]
     conn.close()
+    # Emails go out after the commit, and a failed send never blocks the
+    # order: the invoice is in Accounting either way. The contact hears
+    # the order was accepted; the billing person gets the invoice.
+    accepted_email_sent = False
+    if acct["email"]:
+        try:
+            _send_order_accepted_email(acct["email"], order_number,
+                                       acct["name"])
+            accepted_email_sent = True
+        except Exception:
+            pass
+    invoice_email_sent = False
+    if invoice_id:
+        billing_email = (acct["billing_email"] or "").strip() \
+            or (acct["email"] or "").strip()
+        if billing_email:
+            try:
+                _send_wholesale_invoice_email(
+                    (acct["billing_name"] or "").strip(), billing_email,
+                    order_number, invoice_id, lines,
+                    sum(li["line_total_cents"] for li in lines),
+                    po_number, w["due_date"])
+                invoice_email_sent = True
+            except Exception:
+                pass
+    out["invoice_id"] = invoice_id
+    out["invoice_error"] = invoice_error
+    out["invoice_email_sent"] = invoice_email_sent
+    out["accepted_email_sent"] = accepted_email_sent
     return jsonify(order=out), 201
 
 
@@ -43825,6 +43900,34 @@ def _send_order_accepted_email(to_email, order_number, business_name):
         " and is going into production.</p>"
         "<p>We'll let you know when it ships.<br>— Pop-A-Licious</p>"
         % (", " + business_name if business_name else "", order_number))
+
+
+def _send_wholesale_invoice_email(billing_name, billing_email, order_number,
+                                  invoice_id, lines, total_cents, po_number,
+                                  due_date):
+    """Invoice for a verified wholesale order, to the billing person.
+    Plain HTML summary -- the ERP invoice itself lives in Accounting
+    (Dr AR / Cr wholesale income, Net 30). Raises on a mail failure;
+    callers catch it so a failed send never blocks the order."""
+    dollars = lambda c: "$%s" % "{:,.2f}".format(c / 100)
+    line_rows = "".join(
+        "<li>%s &times; %s — %s</li>"
+        % (l["qty_bags"], l["flavor_name"],
+           dollars(l["line_total_cents"]))
+        for l in lines)
+    send_email(
+        billing_email,
+        "Invoice #%d — Pop-A-Licious order %s" % (invoice_id, order_number),
+        "<p>Hi%s,</p>"
+        "<p>Your Pop-A-Licious wholesale order <strong>%s</strong> has been"
+        " verified and is going into production. Your invoice is"
+        " <strong>#%d</strong>.</p>"
+        "<ul>%s</ul>"
+        "<p>Total: <strong>%s</strong><br>PO: %s<br>Due: %s</p>"
+        "<p>Questions? Reply to this email or call us.<br>— Pop-A-Licious</p>"
+        % (", " + billing_name if billing_name else "", order_number,
+           invoice_id, line_rows, dollars(total_cents),
+           po_number or "—", due_date or "Net 30"))
 
 
 def _send_order_declined_email(to_email, order_number, business_name, note):
