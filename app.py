@@ -2058,6 +2058,9 @@ def init_db():
         -- erp_legal_agreements: contracts and insurance policies, one
         -- row per agreement. renewal_notice_days is how many days
         -- before the end/expiry date the renewal alert fires.
+        -- image_data holds one photo/scan of the document as a data
+        -- URI (Nov 17, 2026); list views never return it, only the
+        -- per-record image endpoint does.
         CREATE TABLE IF NOT EXISTS erp_legal_agreements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             counterparty TEXT NOT NULL DEFAULT '',
@@ -2067,6 +2070,7 @@ def init_db():
             end_date TEXT NOT NULL DEFAULT '',
             renewal_notice_days INTEGER NOT NULL DEFAULT 30,
             notes TEXT NOT NULL DEFAULT '',
+            image_data TEXT NOT NULL DEFAULT '',
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_by TEXT NOT NULL DEFAULT '',
@@ -2082,6 +2086,9 @@ def init_db():
         -- fires. Insurance policies stay in the agreements register
         -- (type 'insurance'), not here. Like the other legal tables,
         -- NOT in _ERP_RESET_TABLES -- a wipe must never erase them.
+        -- image_data holds one photo/scan of the document as a data
+        -- URI (Nov 17, 2026); list views never return it, only the
+        -- per-record image endpoint does.
         CREATE TABLE IF NOT EXISTS erp_legal_licenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL DEFAULT '',
@@ -2092,6 +2099,7 @@ def init_db():
             expiry_date TEXT NOT NULL DEFAULT '',
             renewal_notice_days INTEGER NOT NULL DEFAULT 30,
             notes TEXT NOT NULL DEFAULT '',
+            image_data TEXT NOT NULL DEFAULT '',
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_by TEXT NOT NULL DEFAULT '',
@@ -3868,6 +3876,15 @@ def init_db():
     if "tax_jurisdiction" not in _inv_cols:
         conn.execute("ALTER TABLE erp_acct_invoices ADD COLUMN"
                      " tax_jurisdiction TEXT NOT NULL DEFAULT 'Clark County'")
+    # Migration: one photo/scan per legal record (Nov 17, 2026). Lives
+    # here at the END of init_db, after the legal tables exist: an
+    # earlier ALTER would crash on the missing table and abort init_db.
+    for _lt in ("erp_legal_licenses", "erp_legal_agreements"):
+        _lcols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(%s)" % _lt).fetchall()]
+        if "image_data" not in _lcols:
+            conn.execute(
+                "ALTER TABLE %s ADD COLUMN image_data TEXT NOT NULL DEFAULT ''" % _lt)
     # Security (Nov 13 2026): per-user token version (bumped on every
     # password change, invalidating all outstanding tokens) and a denylist
     # for tokens invalidated by logout. Lives at the END of init_db on
@@ -17818,8 +17835,40 @@ def _legal_ip_dict(row):
     return d
 
 
+_LEGAL_IMAGE_MAX_BYTES = 5242880  # 5 MB decoded, matching HR documents
+_LEGAL_IMAGE_MIMES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+
+
+def _legal_validate_image(data):
+    """Validate one photo/scan data URI for a legal record. Returns the
+    data URI string, or (error_response, status) on a bad value."""
+    image = data.get("image") or ""
+    if not isinstance(image, str) or not image.startswith("data:image/"):
+        return jsonify(error="image must be an image data URI"), 400
+    try:
+        header, b64 = image.split(",", 1)
+    except ValueError:
+        return jsonify(error="image must be an image data URI"), 400
+    mime = header[len("data:"):].split(";", 1)[0]
+    if mime not in _LEGAL_IMAGE_MIMES:
+        return jsonify(
+            error="photo must be PNG, JPEG, GIF, or WebP"), 400
+    try:
+        raw = base64.b64decode(b64, validate=True)
+    except Exception:
+        return jsonify(error="image is not valid base64"), 400
+    if len(raw) > _LEGAL_IMAGE_MAX_BYTES:
+        return jsonify(error="photo is too large (max 5MB)"), 400
+    if len(raw) == 0:
+        return jsonify(error="photo is empty"), 400
+    return image
+
+
 def _legal_agreement_dict(row):
     d = dict(row)
+    # The blob never leaves the server in a list/detail dict -- only the
+    # per-record image endpoint returns it. has_image is the flag.
+    d["has_image"] = bool(d.pop("image_data", ""))
     today = datetime.now(timezone.utc).date()
     end = row["end_date"] or ""
     days = None
@@ -17841,8 +17890,11 @@ def _legal_license_dict(row):
     """Licenses register row + computed expiry flags, mirroring
     _legal_agreement_dict: days_until_expiry / is_expired /
     expiring_soon come from expiry_date vs today and the renewal
-    notice window, never stored."""
+    notice window, never stored. The image blob is stripped here --
+    only the per-record image endpoint returns it; has_image is the
+    flag."""
     d = dict(row)
+    d["has_image"] = bool(d.pop("image_data", ""))
     today = datetime.now(timezone.utc).date()
     exp = row["expiry_date"] or ""
     days = None
@@ -18238,6 +18290,113 @@ def legal_agreement_delete(record_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------- Legal record photos (Nov 17, 2026) ----------------
+# One photo/scan per license or agreement, stored as a data URI on the
+# record. List/detail dicts never carry the blob -- only the per-record
+# image GET below returns it. Admin-only, mirroring the registers.
+def _legal_set_image(table, dict_fn, record_id, not_found):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    image = _legal_validate_image(data)
+    if isinstance(image, tuple):
+        return image
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    row = conn.execute("SELECT * FROM %s WHERE id = ?" % table,
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error=not_found), 404
+    conn.execute("UPDATE %s SET image_data = ?, updated_by = ?,"
+                 " updated_at = ? WHERE id = ?"
+                 % table, (image, actor, now, record_id))
+    row = conn.execute("SELECT * FROM %s WHERE id = ?" % table,
+                       (record_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=dict_fn(row))
+
+
+def _legal_get_image(table, record_id, not_found):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT image_data FROM %s WHERE id = ?" % table,
+                       (record_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify(error=not_found), 404
+    if not row["image_data"]:
+        return jsonify(error="No photo on this record"), 404
+    return jsonify(image=row["image_data"])
+
+
+def _legal_delete_image(table, dict_fn, record_id, not_found):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    row = conn.execute("SELECT * FROM %s WHERE id = ?" % table,
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error=not_found), 404
+    conn.execute("UPDATE %s SET image_data = '', updated_by = ?,"
+                 " updated_at = ? WHERE id = ?"
+                 % table, (actor, now, record_id))
+    row = conn.execute("SELECT * FROM %s WHERE id = ?" % table,
+                       (record_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=dict_fn(row))
+
+
+@app.post("/api/erp/legal/licenses/<int:record_id>/image")
+def legal_license_set_image(record_id):
+    """Save (or replace) the photo of a license. Body: {"image": data URI}."""
+    return _legal_set_image("erp_legal_licenses", _legal_license_dict,
+                            record_id, "License not found")
+
+
+@app.get("/api/erp/legal/licenses/<int:record_id>/image")
+def legal_license_get_image(record_id):
+    """Return the photo of a license (the only read that returns the blob)."""
+    return _legal_get_image("erp_legal_licenses", record_id,
+                            "License not found")
+
+
+@app.delete("/api/erp/legal/licenses/<int:record_id>/image")
+def legal_license_delete_image(record_id):
+    """Remove the photo from a license (the license record stays)."""
+    return _legal_delete_image("erp_legal_licenses", _legal_license_dict,
+                               record_id, "License not found")
+
+
+@app.post("/api/erp/legal/agreements/<int:record_id>/image")
+def legal_agreement_set_image(record_id):
+    """Save (or replace) the photo of a contract or policy. Body: {"image": data URI}."""
+    return _legal_set_image("erp_legal_agreements", _legal_agreement_dict,
+                            record_id, "Agreement not found")
+
+
+@app.get("/api/erp/legal/agreements/<int:record_id>/image")
+def legal_agreement_get_image(record_id):
+    """Return the photo of a contract or policy (the only read that returns the blob)."""
+    return _legal_get_image("erp_legal_agreements", record_id,
+                            "Agreement not found")
+
+
+@app.delete("/api/erp/legal/agreements/<int:record_id>/image")
+def legal_agreement_delete_image(record_id):
+    """Remove the photo from a contract or policy (the record stays)."""
+    return _legal_delete_image("erp_legal_agreements", _legal_agreement_dict,
+                               record_id, "Agreement not found")
 
 
 # ---------------- Licenses & permits register (Nov 17, 2026) ----------------
@@ -42425,11 +42584,22 @@ def erp_order_queue():
         return jsonify(error="unknown status"), 400
     conn = db()
     orders = []
+    # A captured PayPal order also has an orders copy (stripe_session_id
+    # 'paypal:<id>'); the PayPal branch below is its one queue entry, so
+    # the stripe branch skips those copies instead of listing it twice.
     if not source or source == "stripe":
-        for r in conn.execute("SELECT * FROM orders ORDER BY id DESC").fetchall():
+        for r in conn.execute(
+                "SELECT * FROM orders"
+                " WHERE stripe_session_id NOT LIKE 'paypal:%'"
+                " ORDER BY id DESC").fetchall():
             orders.append(_erp_order_brief(conn, "stripe", r["id"]))
+    # Only completed website orders reach the hub: a PayPal checkout is
+    # a paypal_orders row with status 'created' until the customer pays.
+    # Uncaptured checkouts are not orders and never appear here.
     if not source or source == "paypal":
-        for r in conn.execute("SELECT * FROM paypal_orders ORDER BY id DESC").fetchall():
+        for r in conn.execute(
+                "SELECT * FROM paypal_orders WHERE status = 'captured'"
+                " ORDER BY id DESC").fetchall():
             orders.append(_erp_order_brief(conn, "paypal", r["id"]))
     if not source or source == "wholesale":
         for w in conn.execute(
