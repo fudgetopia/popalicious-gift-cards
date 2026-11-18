@@ -3252,6 +3252,7 @@ def init_db():
             status TEXT NOT NULL DEFAULT 'open',
             journal_entry_id INTEGER,
             qb_id TEXT,
+            sent_at TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS erp_acct_bills (
@@ -3885,6 +3886,13 @@ def init_db():
         if "image_data" not in _lcols:
             conn.execute(
                 "ALTER TABLE %s ADD COLUMN image_data TEXT NOT NULL DEFAULT ''" % _lt)
+    # Migration: invoice sent_at (Nov 17, 2026) -- the employee sends
+    # the invoice by hand, so the send time is recorded on the row.
+    _invcols = [r["name"] for r in conn.execute(
+        "PRAGMA table_info(erp_acct_invoices)").fetchall()]
+    if "sent_at" not in _invcols:
+        conn.execute("ALTER TABLE erp_acct_invoices ADD COLUMN"
+                     " sent_at TEXT NOT NULL DEFAULT ''")
     # Security (Nov 13 2026): per-user token version (bumped on every
     # password change, invalidating all outstanding tokens) and a denylist
     # for tokens invalidated by logout. Lives at the END of init_db on
@@ -31903,6 +31911,234 @@ def erp_acct_void_invoice(invoice_id):
     return jsonify(invoice=_acct_invoice_dict(row))
 
 
+@app.post("/api/erp/accounting/invoices/<int:invoice_id>/update")
+def erp_acct_update_invoice(invoice_id):
+    """Edit an open invoice (Nov 17, 2026): due date and customer name
+    any time; lines and tax only while no payment has been applied
+    (balance == total), because a payment would no longer reconcile.
+    An amounts change reverses the original journal entry and posts a
+    corrected one -- the posted entry is never edited in place (Phase 1:
+    posted entries are permanent, corrections go through reversals).
+    A wholesale invoice's sale_post amount follows the new total. The
+    invoice date is not editable (the entry is dated to it). A failed
+    re-post leaves the invoice untouched: the reversal and the new
+    entry post in one transaction, so a locked period refuses the
+    whole edit. Returns the updated invoice."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    inv = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    if not inv:
+        conn.close()
+        return jsonify(error="invoice not found"), 404
+    if inv["status"] != "open":
+        conn.close()
+        return jsonify(error="only an open invoice can be edited"), 400
+    data = request.get_json(force=True) or {}
+    new_name = inv["customer_name"]
+    if "customer_name" in data and data.get("customer_name") is not None:
+        new_name = (data.get("customer_name") or "").strip()
+        if not new_name:
+            conn.close()
+            return jsonify(error="customer_name must not be empty"), 400
+    new_due = inv["due_date"]
+    if "due_date" in data and data.get("due_date") is not None:
+        new_due = (data.get("due_date") or "").strip()
+        if not _acct_valid_date(new_due):
+            conn.close()
+            return jsonify(error="due_date must be YYYY-MM-DD"), 400
+    amounts_change = False
+    new_lines = None
+    new_subtotal = inv["subtotal_cents"]
+    new_tax = inv["tax_cents"]
+    new_total = inv["total_cents"]
+    if "lines" in data and data.get("lines") is not None:
+        lines, subtotal, error = _acct_validate_invoice_lines(
+            data.get("lines"), default_taxable=(inv["customer_type"] == "retail"))
+        if error:
+            conn.close()
+            return jsonify(error=error), 400
+        if subtotal <= 0:
+            conn.close()
+            return jsonify(error="invoice lines must total more than zero"), 400
+        tax = data.get("tax_cents")
+        if tax is not None:
+            tax = _acct_int_cents(tax)
+            if tax is None or tax < 0:
+                conn.close()
+                return jsonify(error="tax_cents must be whole cents"), 400
+        else:
+            if inv["customer_type"] == "wholesale":
+                tax = 0
+            else:
+                taxable_base = sum(l["amount_cents"] for l in lines
+                                   if l["taxable"])
+                if taxable_base > 0:
+                    rate_bps = _acct_tax_rate_bps(
+                        conn, inv["tax_jurisdiction"], inv["date"])
+                    if rate_bps is None:
+                        conn.close()
+                        return jsonify(
+                            error="no tax rate in effect for %s on %s"
+                            % (inv["tax_jurisdiction"], inv["date"])), 400
+                    tax = _acct_compute_tax_cents(taxable_base, rate_bps)
+                else:
+                    tax = 0
+        new_lines = lines
+        new_subtotal = subtotal
+        new_tax = tax
+        new_total = subtotal + tax
+        if (new_lines != json.loads(inv["lines"] or "[]")
+                or new_tax != inv["tax_cents"]):
+            amounts_change = True
+    if amounts_change and inv["balance_cents"] != inv["total_cents"]:
+        conn.close()
+        return jsonify(
+            error="invoice has payments applied; amounts cannot be changed"
+                  " -- use a credit note"), 400
+    old_total = inv["total_cents"]
+    old_entry_id = inv["journal_entry_id"]
+    new_entry_id = old_entry_id
+    if amounts_change:
+        entry = conn.execute("SELECT * FROM erp_acct_journal WHERE id = ?",
+                             (old_entry_id,)).fetchone()
+        if not entry:
+            conn.close()
+            return jsonify(error="invoice has no journal entry to correct"), 500
+        if entry["reversed_by"]:
+            conn.close()
+            return jsonify(error="invoice entry was already reversed"), 400
+        rev_id, rev_error = _acct_reverse_entry(
+            conn, actor, entry, "Correction of invoice #%d" % invoice_id,
+            "invoice", invoice_id)
+        if rev_error:
+            conn.close()
+            return jsonify(error=rev_error), 400
+        ar_id = _acct_account_id_by_code(conn, ERP_ACCT_AR_CODE)
+        income_code = (ERP_ACCT_WHOLESALE_INCOME_CODE
+                       if inv["customer_type"] == "wholesale"
+                       else ERP_ACCT_RETAIL_INCOME_CODE)
+        income_id = _acct_account_id_by_code(conn, income_code)
+        tax_id = _acct_account_id_by_code(
+            conn, ERP_ACCT_TAX_PAYABLE_CODE) if new_tax else None
+        if not ar_id or not income_id or (new_tax and not tax_id):
+            conn.close()
+            return jsonify(error="chart of accounts is missing a required account"), 500
+        raw = [{"account_id": ar_id, "debit_cents": new_total,
+                "credit_cents": 0, "memo": "Invoice #%d" % invoice_id},
+               {"account_id": income_id, "debit_cents": 0,
+                "credit_cents": new_subtotal,
+                "memo": "Invoice #%d" % invoice_id}]
+        if new_tax:
+            raw.append({"account_id": tax_id, "debit_cents": 0,
+                        "credit_cents": new_tax,
+                        "memo": "Sales tax on invoice #%d" % invoice_id})
+        new_entry_id, post_error = _acct_post_entry(
+            conn, actor, inv["date"], "Invoice #%d — %s (corrected)"
+            % (invoice_id, new_name), "invoice", invoice_id, raw)
+        if post_error:
+            conn.close()
+            return jsonify(error=post_error), 400
+        conn.execute(
+            "UPDATE erp_acct_sale_posts SET amount_cents = ?"
+            " WHERE invoice_id = ? AND kind = 'wholesale'",
+            (new_total, invoice_id))
+    conn.execute(
+        "UPDATE erp_acct_invoices SET customer_name = ?, due_date = ?,"
+        " lines = ?, subtotal_cents = ?, tax_cents = ?, total_cents = ?,"
+        " balance_cents = ?, journal_entry_id = ? WHERE id = ?",
+        (new_name, new_due,
+         json.dumps(new_lines) if new_lines is not None else inv["lines"],
+         new_subtotal, new_tax, new_total,
+         new_total if amounts_change else inv["balance_cents"],
+         new_entry_id, invoice_id))
+    _acct_audit(conn, actor, "invoice.edit", "invoice", invoice_id,
+                "#%d %s total %d -> %d (entry #%s -> #%s)"
+                % (invoice_id, new_name, old_total, new_total,
+                   old_entry_id, new_entry_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    conn.close()
+    return jsonify(invoice=_acct_invoice_dict(row))
+
+
+@app.post("/api/erp/accounting/invoices/<int:invoice_id>/send")
+def erp_acct_send_invoice(invoice_id):
+    """Send a wholesale order invoice to the billing person, by hand
+    (Nov 17, 2026). The verify step creates the invoice but never
+    emails it; the employee sends it from Accounting -> Invoices when
+    they are ready. Only an open invoice linked to a wholesale order
+    can be sent: the billing email comes from the account (billing
+    email, else the account email), the lines from the order. A failed
+    mail send returns 502 and records nothing -- the employee retries.
+    A re-send is allowed and overwrites sent_at."""
+    actor, err = _erp_check_perm("accounting.write")
+    if err:
+        return err
+    conn = db()
+    inv = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    if not inv:
+        conn.close()
+        return jsonify(error="invoice not found"), 404
+    if inv["status"] != "open":
+        conn.close()
+        return jsonify(error="only an open invoice can be sent"), 400
+    post = conn.execute(
+        "SELECT source_key, ref_id FROM erp_acct_sale_posts"
+        " WHERE invoice_id = ? AND kind = 'wholesale'",
+        (invoice_id,)).fetchone()
+    if not post:
+        conn.close()
+        return jsonify(
+            error="only a wholesale order invoice can be sent from here"), 400
+    order = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
+                         (post["ref_id"],)).fetchone()
+    if not order:
+        conn.close()
+        return jsonify(error="wholesale order not found"), 404
+    acct = conn.execute("SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+                        (order["account_id"],)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="wholesale account not found"), 404
+    billing_email = (acct["billing_email"] or "").strip() \
+        or (acct["email"] or "").strip()
+    if not billing_email:
+        conn.close()
+        return jsonify(
+            error="account has no billing email to send to"), 400
+    lines = conn.execute(
+        "SELECT * FROM erp_wholesale_order_lines WHERE order_id = ?"
+        " ORDER BY id", (order["id"],)).fetchall()
+    if not lines:
+        conn.close()
+        return jsonify(error="wholesale order has no lines"), 400
+    total = sum(li["line_total_cents"] for li in lines)
+    try:
+        _send_wholesale_invoice_email(
+            (acct["billing_name"] or "").strip(), billing_email,
+            order["order_number"], invoice_id, lines, total,
+            order["po_number"], inv["due_date"])
+    except Exception as e:
+        conn.close()
+        return jsonify(error="invoice email failed: %s" % e), 502
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_acct_invoices SET sent_at = ? WHERE id = ?",
+                 (now, invoice_id))
+    _acct_audit(conn, actor, "invoice.send", "invoice", invoice_id,
+                "#%d sent to %s (order %s)"
+                % (invoice_id, billing_email, order["order_number"]))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_acct_invoices WHERE id = ?",
+                       (invoice_id,)).fetchone()
+    conn.close()
+    return jsonify(invoice=_acct_invoice_dict(row))
+
+
 
 # ---- Dept 9, item 1: sales auto-posting to the ledger (Nov 10, 2026) ----
 # PER-ORDER posting (not daily summary): one journal entry per completed
@@ -32401,8 +32637,9 @@ def _acct_post_wholesale_sale(conn, actor, order_id, at_verify=False):
     AR invoice (Dr AR / Cr wholesale income, tax 0, resale-exempt).
     With at_verify=True (order verification, Nov 17, 2026) the invoice
     posts when the order is verified/accepted instead -- the employee
-    verifies the order, the invoice goes to the billing person, and the
-    order moves to fulfillment. Either way the sale_post row is recorded,
+    verifies the order, the invoice is created in Accounting, and the
+    employee sends it to the billing person by hand (Accounting ->
+    Invoices -> Send); nothing is emailed automatically at verify.
     so the delivery-time post later sees already_posted and never posts
     a second invoice. Returns (invoice_id, status, None) or
     (None, None, error), where status is posted / already_posted /
@@ -43865,8 +44102,10 @@ def erp_create_wholesale_order():
         (order_id,)).fetchall()]
     conn.close()
     # Emails go out after the commit, and a failed send never blocks the
-    # order: the invoice is in Accounting either way. The contact hears
-    # the order was accepted; the billing person gets the invoice.
+    # order. The contact hears the order was accepted. The invoice is
+    # NOT emailed here (Nov 17, 2026): the employee sends it by hand
+    # from Accounting -> Invoices, so the billing person only ever
+    # hears from a person, never from the verify step.
     accepted_email_sent = False
     if acct["email"]:
         try:
@@ -43875,23 +44114,8 @@ def erp_create_wholesale_order():
             accepted_email_sent = True
         except Exception:
             pass
-    invoice_email_sent = False
-    if invoice_id:
-        billing_email = (acct["billing_email"] or "").strip() \
-            or (acct["email"] or "").strip()
-        if billing_email:
-            try:
-                _send_wholesale_invoice_email(
-                    (acct["billing_name"] or "").strip(), billing_email,
-                    order_number, invoice_id, lines,
-                    sum(li["line_total_cents"] for li in lines),
-                    po_number, w["due_date"])
-                invoice_email_sent = True
-            except Exception:
-                pass
     out["invoice_id"] = invoice_id
     out["invoice_error"] = invoice_error
-    out["invoice_email_sent"] = invoice_email_sent
     out["accepted_email_sent"] = accepted_email_sent
     return jsonify(order=out), 201
 
