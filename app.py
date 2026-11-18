@@ -2074,6 +2074,31 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_erp_legal_agreements_end
             ON erp_legal_agreements (end_date);
+        -- erp_legal_licenses (Nov 17, 2026): licenses and permits, one
+        -- row per license. authority is the issuing body (health
+        -- department, city, county, state, federal); license_number is
+        -- the number on the document, if it has one. renewal_notice_days
+        -- is how many days before the expiry date the renewal alert
+        -- fires. Insurance policies stay in the agreements register
+        -- (type 'insurance'), not here. Like the other legal tables,
+        -- NOT in _ERP_RESET_TABLES -- a wipe must never erase them.
+        CREATE TABLE IF NOT EXISTS erp_legal_licenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL DEFAULT '',
+            authority TEXT NOT NULL DEFAULT '',
+            license_number TEXT NOT NULL DEFAULT '',
+            type TEXT NOT NULL DEFAULT 'other',
+            issue_date TEXT NOT NULL DEFAULT '',
+            expiry_date TEXT NOT NULL DEFAULT '',
+            renewal_notice_days INTEGER NOT NULL DEFAULT 30,
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_legal_licenses_expiry
+            ON erp_legal_licenses (expiry_date);
         -- Additions Wave C (Item 6): lease accounting (ASC 842).
         -- erp_legal_lease_schedules is one row per lease, linked to the
         -- contracts register (leases live there as agreements -- a lease
@@ -17769,6 +17794,8 @@ def quality_sop_delete(sop_id):
 _LEGAL_IP_TYPES = ("trademark", "logo", "domain", "other")
 _LEGAL_IP_STATUSES = ("unfiled", "filed", "pending", "registered")
 _LEGAL_AGREEMENT_TYPES = ("contract", "insurance", "other")
+_LEGAL_LICENSE_TYPES = ("health", "city", "county", "state", "federal",
+                        "other")
 
 
 def _legal_valid_date(value):
@@ -17799,6 +17826,29 @@ def _legal_agreement_dict(row):
     if end:
         try:
             days = (datetime.strptime(end, "%Y-%m-%d").date() - today).days
+        except ValueError:
+            days = None
+    d["days_until_expiry"] = days
+    notice = row["renewal_notice_days"]
+    if notice is None:
+        notice = 30
+    d["is_expired"] = days is not None and days < 0
+    d["expiring_soon"] = days is not None and 0 <= days <= notice
+    return d
+
+
+def _legal_license_dict(row):
+    """Licenses register row + computed expiry flags, mirroring
+    _legal_agreement_dict: days_until_expiry / is_expired /
+    expiring_soon come from expiry_date vs today and the renewal
+    notice window, never stored."""
+    d = dict(row)
+    today = datetime.now(timezone.utc).date()
+    exp = row["expiry_date"] or ""
+    days = None
+    if exp:
+        try:
+            days = (datetime.strptime(exp, "%Y-%m-%d").date() - today).days
         except ValueError:
             days = None
     d["days_until_expiry"] = days
@@ -17900,6 +17950,52 @@ def _legal_agreement_fields(data):
         return jsonify(error="notes must be 5000 characters or fewer"), 400
     return {"counterparty": counterparty, "type": ag_type, "title": title,
             "start_date": start, "end_date": end,
+            "renewal_notice_days": notice, "notes": notes}
+
+
+def _legal_license_fields(data):
+    """Validate license fields. Returns the cleaned fields dict,
+    or (error_response, status) on a bad value."""
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    if len(name) > 500:
+        return jsonify(error="name must be 500 characters or fewer"), 400
+    authority = (data.get("authority") or "").strip()
+    if len(authority) > 200:
+        return jsonify(error="authority must be 200 characters"
+                       " or fewer"), 400
+    number = (data.get("license_number") or "").strip()
+    if len(number) > 200:
+        return jsonify(error="license_number must be 200 characters"
+                       " or fewer"), 400
+    lic_type = (data.get("type") or "other").strip()
+    if lic_type not in _LEGAL_LICENSE_TYPES:
+        return jsonify(error="type must be health, city, county, state,"
+                       " federal or other"), 400
+    issue = (data.get("issue_date") or "").strip()
+    if not _legal_valid_date(issue):
+        return jsonify(error="issue_date must be YYYY-MM-DD"), 400
+    expiry = (data.get("expiry_date") or "").strip()
+    if not _legal_valid_date(expiry):
+        return jsonify(error="expiry_date must be YYYY-MM-DD"), 400
+    notice = data.get("renewal_notice_days", 30)
+    if isinstance(notice, bool):
+        return jsonify(error="renewal_notice_days must be a whole number"
+                       " of days"), 400
+    try:
+        notice = int(notice)
+    except (TypeError, ValueError):
+        return jsonify(error="renewal_notice_days must be a whole number"
+                       " of days"), 400
+    if notice < 0 or notice > 3650:
+        return jsonify(error="renewal_notice_days must be between 0 and"
+                       " 3650"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    return {"name": name, "authority": authority, "license_number": number,
+            "type": lic_type, "issue_date": issue, "expiry_date": expiry,
             "renewal_notice_days": notice, "notes": notes}
 
 
@@ -18138,6 +18234,121 @@ def legal_agreement_delete(record_id):
         conn.close()
         return jsonify(error="Agreement not found"), 404
     conn.execute("DELETE FROM erp_legal_agreements WHERE id = ?",
+                 (record_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---------------- Licenses & permits register (Nov 17, 2026) ----------------
+# Admin-only via _require_erp_admin(), mirroring the agreements
+# register. Expiry flags are computed from expiry_date vs today and
+# the renewal notice window, never stored.
+@app.get("/api/erp/legal/licenses")
+def legal_licenses_list():
+    """Licenses + permits register, soonest expiry first (rows with
+    no expiry date last). expiring_soon / is_expired are computed
+    from expiry_date vs today and the renewal notice window."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_legal_licenses"
+        " ORDER BY CASE WHEN expiry_date = '' THEN 1 ELSE 0 END,"
+        " expiry_date, id").fetchall()
+    out = [_legal_license_dict(r) for r in rows]
+    conn.close()
+    return jsonify(licenses=out)
+
+
+@app.post("/api/erp/legal/licenses")
+def legal_license_create():
+    """Add a license or permit. name is required;
+    renewal_notice_days defaults to 30."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields = _legal_license_fields(data)
+    if isinstance(fields, tuple):
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_legal_licenses (name, authority, license_number,"
+        " type, issue_date, expiry_date, renewal_notice_days, notes,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["name"], fields["authority"], fields["license_number"],
+         fields["type"], fields["issue_date"], fields["expiry_date"],
+         fields["renewal_notice_days"], fields["notes"], actor, now,
+         actor, now))
+    row = conn.execute("SELECT * FROM erp_legal_licenses WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=_legal_license_dict(row)), 201
+
+
+@app.post("/api/erp/legal/licenses/<int:record_id>/update")
+def legal_license_update(record_id):
+    """Edit a license (omitted fields keep their value)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_licenses WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="License not found"), 404
+    merged = {"name": data.get("name", row["name"]),
+              "authority": data.get("authority", row["authority"]),
+              "license_number": data.get("license_number",
+                                         row["license_number"]),
+              "type": data.get("type", row["type"]),
+              "issue_date": data.get("issue_date", row["issue_date"]),
+              "expiry_date": data.get("expiry_date", row["expiry_date"]),
+              "renewal_notice_days": data.get("renewal_notice_days",
+                                              row["renewal_notice_days"]),
+              "notes": data.get("notes", row["notes"])}
+    fields = _legal_license_fields(merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_legal_licenses SET name = ?, authority = ?,"
+        " license_number = ?, type = ?, issue_date = ?, expiry_date = ?,"
+        " renewal_notice_days = ?, notes = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (fields["name"], fields["authority"], fields["license_number"],
+         fields["type"], fields["issue_date"], fields["expiry_date"],
+         fields["renewal_notice_days"], fields["notes"], actor, now,
+         record_id))
+    row = conn.execute("SELECT * FROM erp_legal_licenses WHERE id = ?",
+                       (record_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(record=_legal_license_dict(row))
+
+
+@app.post("/api/erp/legal/licenses/<int:record_id>/delete")
+def legal_license_delete(record_id):
+    """Delete a license record (correction only -- the license itself
+    is untouched outside the ERP)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_licenses WHERE id = ?",
+                       (record_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="License not found"), 404
+    conn.execute("DELETE FROM erp_legal_licenses WHERE id = ?",
                  (record_id,))
     conn.commit()
     conn.close()
