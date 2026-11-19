@@ -4846,6 +4846,28 @@ PRINTFUL_MERCH = {
         "file_id": "1086696410", "file_type": "default",
         "variants": {"WHITE": 23470},
     },
+    "MERCH-XMAS-TEE": {  # Ugly Sweater Holiday Tee (Christmas 2026; Printful "Ugly-Sweater Popcorn Tee", Bella+Canvas 3001 Red, draft 110250844)
+        "name": "Ugly Sweater Holiday Tee", "price_cents": 2800,
+        "file_id": "1110155362", "file_type": "default",
+        "variants": {"XS": 9552, "S": 4141, "M": 4142, "L": 4143, "XL": 4144,
+                     "2XL": 4145, "3XL": 5304, "4XL": 5319, "5XL": 12877},
+    },
+    "MERCH-XMAS-HOODIE": {  # Merry Popmas Hoodie (Christmas 2026; Printful "Neon Merry Popmas Hoodie", Cotton Heritage M2580 Black, draft 110251269)
+        "name": "Merry Popmas Hoodie", "price_cents": 5500,
+        "file_id": "1110050707", "file_type": "default",
+        "variants": {"XS": 53488, "S": 10779, "M": 10780, "L": 10781,
+                     "XL": 10782, "2XL": 10783, "3XL": 13416, "4XL": 53493},
+    },
+    "MERCH-XMAS-MUG": {  # Pop! Pop! Hooray! Mug (Christmas 2026; Printful White Glossy Mug 11oz, draft 110251614)
+        "name": "Pop! Pop! Hooray! Mug", "price_cents": 1800,
+        "file_id": "1110049128", "file_type": "default",
+        "variants": {"11OZ": 1320},
+    },
+    "MERCH-XMAS-SOCKS": {  # Popcorn Garland Crew Socks (Christmas 2026; Printful Sublimation Socks, draft 110251788)
+        "name": "Popcorn Garland Crew Socks", "price_cents": 1600,
+        "file_id": "1110050005", "file_type": "socks",
+        "variants": {"S": 22786, "M": 22787, "L": 22788},
+    },
 }
 
 
