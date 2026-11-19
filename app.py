@@ -96,11 +96,6 @@ BACKEND_URL = os.environ.get(
 # $20 = $4 off per set of 3 at the $8 bag price); discount is a flat
 # amount computed in _compute_order, never a percent.
 PROMOS = {
-    "RELAUNCH15": {
-        "type": "percent", "percent_off": 15,
-        "label": "Grand Re-Launch",
-        "description": "15% off your order",
-    },
     "WELCOME10": {
         "type": "percent", "percent_off": 10,
         "label": "Newsletter Signup",
@@ -139,7 +134,7 @@ PROMOS = {
     # with 404 — fixed Nov 10). One 15%-off code per national day, single-day
     # window = the next occurrence of that month/day on or after 2026-11-10
     # (Nov 14/26 + Dec 4/30 use 2026, the rest 2027). Same percent mechanics
-    # as RELAUNCH15/MERRYPOP15 — 15% off the order, one use per email via
+    # as MERRYPOP15 — 15% off the order, one use per email via
     # promo_redemptions. JUNK21 + DESSERT14 ("Any 3 bags for $20") are the
     # bundle entries below (type "bundle", built Nov 10); PIZZAMONTH
     # (October month code, window passed) and the floating first-Saturday
