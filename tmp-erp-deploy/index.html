@@ -1720,6 +1720,16 @@ function erpSidebarSubClick(sub) {
     return;
   }
   if (sub.section) {
+    // Production detail open: a section tap must leave the detail and
+    // show the list first. The detail view has no "Recipes" heading
+    // (its heading is the recipe name) and no "Batches" heading, so
+    // scrolling alone changes nothing visible. Clear the detail state
+    // and re-render the list, then scroll to the section in it.
+    if (sub.route === "production" && (erpState.selectedRecipeId || erpState.selectedBatchId)) {
+      erpState.selectedRecipeId = null;
+      erpState.selectedBatchId = null;
+      renderErpProductionDetail();
+    }
     erpSidebarSection = sub.label;
     erpSidebarScrollTo(sub.label);
     // Re-mark the clicked section active without touching the content.
@@ -1794,6 +1804,22 @@ function erpMobileNavToggle() {
   if (backdrop) backdrop.addEventListener("click", erpMobileNavClose);
   var sidenav = document.getElementById("erpSidenav");
   if (sidenav) sidenav.addEventListener("click", function () { erpMobileNavClose(); });
+  // Same-route tap on a main link: the hash does not change, so no
+  // hashchange fires and the tab never re-renders — a recipe (or item,
+  // PO, order) detail stays open forever. Render the route directly
+  // instead (Poppy does the same for same-tab taps). renderRoute()
+  // clears the tab's selection state first, so the tap returns to the
+  // tab's list view.
+  if (sidenav) sidenav.addEventListener("click", function (e) {
+    var el = e && e.target ? e.target : null;
+    while (el) {
+      if (el.tagName === "A" && el.getAttribute && el.getAttribute("data-route")) {
+        if (currentRoute() === el.getAttribute("data-route")) renderRoute();
+        return;
+      }
+      el = el.parentNode;
+    }
+  });
   document.addEventListener("keydown", function (e) {
     if (e && e.key === "Escape") erpMobileNavClose();
   });
