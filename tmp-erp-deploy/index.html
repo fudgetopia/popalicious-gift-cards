@@ -2674,6 +2674,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           var packaging = erpIsPackagingType(type);
           if (parts.nutWrap) parts.nutWrap.style.display = packaging ? "none" : "";
           if (parts.cupLabel) parts.cupLabel.style.display = packaging ? "none" : "";
+          if (parts.gramsLabel) parts.gramsLabel.style.display = packaging ? "none" : "";
           if (parts.costLabel) parts.costLabel.style.display = packaging ? "none" : "";
           if (parts.sizeLabel) erpSetLabelText(parts.sizeLabel, packaging ?
             "Count — how many in the package " :
@@ -2777,6 +2778,15 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           cupInput3.placeholder = "optional";
           cupLabel3.appendChild(cupInput3);
           form.appendChild(cupLabel3);
+          var gramsLabel3 = document.createElement("label");
+          gramsLabel3.textContent = "Grams per piece (g) — for recipes counted in pieces ";
+          var gramsInput3 = document.createElement("input");
+          gramsInput3.type = "number";
+          gramsInput3.min = "0";
+          gramsInput3.step = "any";
+          gramsInput3.placeholder = "optional, e.g. weigh 1 piece";
+          gramsLabel3.appendChild(gramsInput3);
+          form.appendChild(gramsLabel3);
           var pkg3 = erpPkgInputs(null);
           form.appendChild(pkg3.wrap);
           var nut3 = erpNutritionInputs(null, {nameInput: inputs.name, skuInput: inputs.sku, pkg: pkg3});
@@ -2786,7 +2796,8 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           pkg3.wrap.appendChild(piecePreview3);
           function applyAddTypeState() {
             erpApplyPackagingState(typeSel.value, {
-              nutWrap: nut3.wrap, cupLabel: cupLabel3, costLabel: costLabel3,
+              nutWrap: nut3.wrap, cupLabel: cupLabel3, gramsLabel: gramsLabel3,
+              costLabel: costLabel3,
               sizeLabel: pkg3.sizeLabel, preview: piecePreview3, pkg: pkg3
             });
           }
@@ -2835,6 +2846,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               cost_cents: costInput3.value.trim() === "" ? null :
                 Math.round(Number(costInput3.value) * 100),
               oz_per_cup: cupInput3.value.trim() === "" ? null : Number(cupInput3.value),
+              grams_each: gramsInput3.value.trim() === "" ? null : Number(gramsInput3.value),
               pkg_price_cents: erpPkgPayload(pkg3).pkg_price_cents,
               pkg_size: erpPkgPayload(pkg3).pkg_size,
               pkg_unit: erpPkgPayload(pkg3).pkg_unit
@@ -4149,6 +4161,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
                 ? " · cost " + erpMoney(item.cost_cents) + " (entered)"
                 : " · avg cost " + erpMoney(item.avg_cost_cents))) +
             (item.oz_per_cup ? " · 1 cup = " + erpQty(item.oz_per_cup) + " oz" : "") +
+            (item.grams_each ? " · 1 piece = " + erpQty(item.grams_each) + " g" : "") +
             " · total on hand " + erpQty(item.on_hand_total) + " " + (item.unit || "");
           head.appendChild(meta);
           body.appendChild(head);
@@ -4234,6 +4247,18 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             }
             eCupL.appendChild(eCup);
             eform.appendChild(eCupL);
+            var eGramsL = document.createElement("label");
+            eGramsL.textContent = "Grams per piece (g) — optional; lets piece-counted recipe lines cost ";
+            var eGrams = document.createElement("input");
+            eGrams.type = "number";
+            eGrams.min = "0";
+            eGrams.step = "any";
+            eGrams.placeholder = "optional, e.g. 3.625";
+            if (item.grams_each !== null && item.grams_each !== undefined) {
+              eGrams.value = item.grams_each;
+            }
+            eGramsL.appendChild(eGrams);
+            eform.appendChild(eGramsL);
             var ePkg = erpPkgInputs(item);
             eform.appendChild(ePkg.wrap);
             var eNut = erpNutritionInputs(item, {nameInput: eName, skuInput: eSku, pkg: ePkg});
@@ -4243,7 +4268,8 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             ePkg.wrap.appendChild(ePiecePreview);
             function applyEditTypeState() {
               erpApplyPackagingState(eType.value, {
-                nutWrap: eNut.wrap, cupLabel: eCupL, costLabel: eCostL,
+                nutWrap: eNut.wrap, cupLabel: eCupL, gramsLabel: eGramsL,
+                costLabel: eCostL,
                 sizeLabel: ePkg.sizeLabel, preview: ePiecePreview, pkg: ePkg
               });
             }
@@ -4289,6 +4315,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
                 cost_cents: eCost.value.trim() === "" ? null :
                   Math.round(Number(eCost.value) * 100),
                 oz_per_cup: eCup.value.trim() === "" ? null : Number(eCup.value),
+                grams_each: eGrams.value.trim() === "" ? null : Number(eGrams.value),
                 pkg_price_cents: erpPkgPayload(ePkg).pkg_price_cents,
                 pkg_size: erpPkgPayload(ePkg).pkg_size,
                 pkg_unit: erpPkgPayload(ePkg).pkg_unit
@@ -11404,6 +11431,8 @@ function renderErpRecipeDetail(body) {
       "size on the item in Inventory. Items without package pricing use their per-unit " +
       "or average purchase cost. Cup and spoon amounts are weighed automatically using " +
       "standard kitchen cup weights (or the item's own '1 cup weighs' if you set one). " +
+      "Piece counts ('each') are weighed from the item's 'grams per piece' — without it " +
+      "the line can't be costed. " +
       "Ingredients only — no labor.";
     body.appendChild(costNote);
     // Packaging cost: per finished bag for bags + labels, from the same
