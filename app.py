@@ -40589,13 +40589,43 @@ def _erp_recipe_nutrition(conn, recipe_id):
             d["servings_used"] = None
             detail.append(d)
             continue
+        try:
+            for k in _ERP_NUTRIENT_KEYS:
+                if ln[k] is not None:
+                    float(ln[k])
+        except (TypeError, ValueError):
+            missing.append({"item": ln["item_name"],
+                            "reason": "a nutrition value cannot be read"})
+            d["servings_used"] = None
+            detail.append(d)
+            continue
         if unit in ("each", "bag", "bags"):
-            servings = qty
-            if unit == "each" and ln.get("grams_each"):
+            if unit == "each":
+                # One piece is not one nutrition serving: servings are
+                # pieces x grams per piece / serving grams. Without a
+                # per-piece weight or serving grams the line cannot be
+                # weighed, so it is listed missing instead of counted
+                # as one serving per piece.
                 try:
-                    batch_grams += qty * float(ln["grams_each"])
+                    ge = float(d.get("grams_each")) \
+                        if d.get("grams_each") is not None else 0
+                    sg = float(ln["nut_serving_grams"]) \
+                        if ln["nut_serving_grams"] is not None else 0
                 except (TypeError, ValueError):
-                    pass
+                    ge = 0
+                    sg = 0
+                if ge <= 0 or sg <= 0:
+                    missing.append({"item": ln["item_name"],
+                                    "reason": "grams per piece or serving"
+                                              " grams missing — cannot"
+                                              " weigh pieces"})
+                    d["servings_used"] = None
+                    detail.append(d)
+                    continue
+                batch_grams += qty * ge
+                servings = qty * ge / sg
+            else:
+                servings = qty
         else:
             cup_oz, _src = _erp_cup_weight_oz(d)
             grams = _erp_convert_qty(qty, unit, "g", cup_oz)
