@@ -1277,6 +1277,7 @@ def init_db():
             avg_cost_cents INTEGER NOT NULL DEFAULT 0,
             cost_cents INTEGER,
             oz_per_cup REAL,
+            grams_each REAL,
             pkg_price_cents INTEGER,
             pkg_size REAL,
             pkg_unit TEXT,
@@ -2961,6 +2962,10 @@ def init_db():
         conn.execute("ALTER TABLE erp_items ADD COLUMN cost_cents INTEGER")
     if "oz_per_cup" not in icols:
         conn.execute("ALTER TABLE erp_items ADD COLUMN oz_per_cup REAL")
+    # Grams per piece, so recipe lines counted in pieces ("each") can be
+    # costed and weighed for items stocked by weight (candy, pretzels).
+    if "grams_each" not in icols:
+        conn.execute("ALTER TABLE erp_items ADD COLUMN grams_each REAL")
     # Package pricing (Budget Bytes method): what the whole package cost
     # and how much it contains; recipe costing divides price by size.
     if "pkg_price_cents" not in icols:
@@ -21439,7 +21444,8 @@ def stores_delivery_create(store_id):
                       % (i + 1)), 400
         unit = (ln.get("unit") or item["unit"] or "each").strip()
         cup_oz, _src = _erp_cup_weight_oz(dict(item))
-        stock_qty = _erp_convert_qty(qty, unit, item["unit"], cup_oz)
+        stock_qty = _erp_convert_qty(qty, unit, item["unit"], cup_oz,
+                                     dict(item).get("grams_each"))
         if stock_qty is None:
             conn.close()
             return jsonify(
@@ -28720,7 +28726,10 @@ def _erp_item_cost_fields(data, partial=False):
     Returns (fields, error) where fields maps column -> value for the keys
     present (or all keys when partial=False). cost_cents is the admin-entered
     cost per 1 item unit; oz_per_cup is the weight of one cup of the item,
-    used to cost recipe lines measured in cups/spoons. None clears a field.
+    used to cost recipe lines measured in cups/spoons; grams_each is the
+    weight of one piece of the item, used to cost and weigh recipe lines
+    counted in pieces ("each") for items stocked by weight. None clears
+    a field.
     """
     fields = {}
     if not partial or "cost_cents" in data:
@@ -28747,6 +28756,18 @@ def _erp_item_cost_fields(data, partial=False):
             if o <= 0:
                 return None, "cup weight must be greater than zero"
             fields["oz_per_cup"] = o
+    if not partial or "grams_each" in data:
+        raw = data.get("grams_each")
+        if raw is None or raw == "":
+            fields["grams_each"] = None
+        else:
+            try:
+                g = float(raw)
+            except (TypeError, ValueError):
+                return None, "grams per piece must be a number of grams"
+            if g <= 0:
+                return None, "grams per piece must be greater than zero"
+            fields["grams_each"] = g
     # Package pricing (Budget Bytes method): the price paid for the whole
     # package and the amount it contains. Recipe costing = price / size.
     if not partial or "pkg_price_cents" in data:
@@ -29315,12 +29336,13 @@ def erp_create_item():
     nut_cols = list(_ERP_NUTRITION_TEXT_FIELDS) + list(_ERP_NUTRITION_NUM_FIELDS)
     cur = conn.execute(
         "INSERT INTO erp_items (sku, name, type, unit, track_lots, avg_cost_cents,"
-        " cost_cents, oz_per_cup, pkg_price_cents, pkg_size, pkg_unit,"
+        " cost_cents, oz_per_cup, grams_each, pkg_price_cents, pkg_size, pkg_unit,"
         " active, created_at, " + ", ".join(nut_cols) + ")"
-        " VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, 1, ?"
+        " VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, 1, ?"
         + ", ?" * len(nut_cols) + ")",
         (sku, name, itype, unit, track_lots, cost_fields["cost_cents"],
-         cost_fields["oz_per_cup"], cost_fields["pkg_price_cents"],
+         cost_fields["oz_per_cup"], cost_fields["grams_each"],
+         cost_fields["pkg_price_cents"],
          cost_fields["pkg_size"], cost_fields["pkg_unit"],
          datetime.now(timezone.utc).isoformat(),
          *[nut_fields[c] for c in nut_cols]),
@@ -40232,7 +40254,7 @@ def _erp_recipe_lines(conn, recipe_id, version):
     return conn.execute(
         "SELECT rl.*, i.sku, i.name AS item_name, i.type AS item_type,"
         " i.unit AS item_unit, i.avg_cost_cents, i.cost_cents, i.oz_per_cup,"
-        " i.pkg_price_cents, i.pkg_size, i.pkg_unit"
+        " i.grams_each, i.pkg_price_cents, i.pkg_size, i.pkg_unit"
         " FROM erp_recipe_lines rl"
         " JOIN erp_items i ON i.id = rl.item_id"
         " WHERE rl.recipe_id = ? AND rl.recipe_version = ? ORDER BY rl.id",
@@ -40282,11 +40304,13 @@ def _erp_cup_weight_oz(item):
     return _ERP_CUP_WEIGHT_DEFAULT_OZ, "standard"
 
 
-def _erp_convert_qty(qty, from_unit, to_unit, oz_per_cup=None):
+def _erp_convert_qty(qty, from_unit, to_unit, oz_per_cup=None, grams_each=None):
     """Convert a quantity between units of the same dimension (weight or
     volume). Volume <-> weight works when oz_per_cup is given (the weight
-    of one cup of the item). Returns the converted float, or None when the
-    units cannot be converted."""
+    of one cup of the item). A piece count ("each") converts to/from
+    weight when grams_each is given (the weight of one piece of the
+    item). Returns the converted float, or None when the units cannot
+    be converted."""
     f = (from_unit or "").strip().lower()
     t = (to_unit or "").strip().lower()
     if f == t:
@@ -40295,6 +40319,16 @@ def _erp_convert_qty(qty, from_unit, to_unit, oz_per_cup=None):
         return float(qty) * _ERP_WEIGHT_TO_G[f] / _ERP_WEIGHT_TO_G[t]
     if f in _ERP_VOL_TO_ML and t in _ERP_VOL_TO_ML:
         return float(qty) * _ERP_VOL_TO_ML[f] / _ERP_VOL_TO_ML[t]
+    if grams_each:
+        try:
+            ge = float(grams_each)
+        except (TypeError, ValueError):
+            ge = 0
+        if ge > 0:
+            if f == "each" and t in _ERP_WEIGHT_TO_G:
+                return float(qty) * ge / _ERP_WEIGHT_TO_G[t]
+            if f in _ERP_WEIGHT_TO_G and t == "each":
+                return float(qty) * _ERP_WEIGHT_TO_G[f] / ge
     if oz_per_cup:
         oz_g = _ERP_WEIGHT_TO_G["oz"]
         cup_ml = _ERP_VOL_TO_ML["cup"]
@@ -40324,7 +40358,8 @@ def _erp_unit_cost_from_package(item):
         return None
     per_pkg_unit = float(price) / float(size)
     cup_oz, _src = _erp_cup_weight_oz(item)
-    conv = _erp_convert_qty(1, item.get("unit"), pu, cup_oz)
+    conv = _erp_convert_qty(1, item.get("unit"), pu, cup_oz,
+                            item.get("grams_each"))
     if conv is not None:
         return per_pkg_unit * conv
     if (item.get("unit") or "").strip().lower() in ("each", "bag", "bags"):
@@ -40350,19 +40385,22 @@ def _erp_recipe_cost(lines, batch_size_bags):
         cup_oz, cup_src = _erp_cup_weight_oz(ln)
         ln["cup_weight_oz"] = cup_oz
         ln["cup_weight_source"] = cup_src
+        grams_each = ln.get("grams_each")
         qty = ln.get("qty_per_batch") or 0
         line_cost = None
         pkg_price = ln.get("pkg_price_cents")
         pkg_size = ln.get("pkg_size")
         pkg_unit = (ln.get("pkg_unit") or "").strip()
         if pkg_price is not None and pkg_size and float(pkg_size) > 0 and pkg_unit:
-            qty_pkg = _erp_convert_qty(qty, ln.get("unit"), pkg_unit, cup_oz)
+            qty_pkg = _erp_convert_qty(qty, ln.get("unit"), pkg_unit, cup_oz,
+                                       grams_each)
             if qty_pkg is not None:
                 line_cost = int(round(float(pkg_price) * qty_pkg / float(pkg_size)))
                 ln["cost_source"] = "package"
         if line_cost is None:
             qty_item_units = _erp_convert_qty(qty, ln.get("unit"),
-                                              ln.get("item_unit"), cup_oz)
+                                              ln.get("item_unit"), cup_oz,
+                                              grams_each)
             if ln.get("cost_cents") is not None:
                 unit_price = ln["cost_cents"]
                 ln["cost_source"] = "entered"
@@ -40523,7 +40561,7 @@ def _erp_recipe_nutrition(conn, recipe_id):
     lines = conn.execute(
         "SELECT rl.*, i.name AS item_name, i.sku AS item_sku,"
         " i.type AS item_type,"
-        " i.unit AS item_unit, i.oz_per_cup,"
+        " i.unit AS item_unit, i.oz_per_cup, i.grams_each,"
         " i.nut_serving_grams, i.nut_calories, i.nut_fat_g,"
         " i.nut_sat_fat_g, i.nut_trans_fat_g, i.nut_chol_mg,"
         " i.nut_sodium_mg, i.nut_carb_g, i.nut_fiber_g, i.nut_sugars_g,"
@@ -40553,6 +40591,11 @@ def _erp_recipe_nutrition(conn, recipe_id):
             continue
         if unit in ("each", "bag", "bags"):
             servings = qty
+            if unit == "each" and ln.get("grams_each"):
+                try:
+                    batch_grams += qty * float(ln["grams_each"])
+                except (TypeError, ValueError):
+                    pass
         else:
             cup_oz, _src = _erp_cup_weight_oz(d)
             grams = _erp_convert_qty(qty, unit, "g", cup_oz)
@@ -40623,7 +40666,8 @@ def _erp_auto_serving_grams(conn, recipe_id):
     servings per bag. Servings per bag defaults to 5 (the house
     standard on every live recipe) when the recipe has none saved.
     Weight comes from each ingredient line's own conversion (cup
-    weight or standard kitchen weight), never from nutrition facts --
+    weight, standard kitchen weight, or grams per piece), never from
+    nutrition facts --
     a line with no nutrition facts still weighs something. Packaging
     lines carry no finished-product weight and are skipped. Returns
     (grams_int, servings_used), or (None, servings_used) when it
@@ -40645,7 +40689,8 @@ def _erp_auto_serving_grams(conn, recipe_id):
             continue
         cup_oz, _src = _erp_cup_weight_oz(d)
         grams = _erp_convert_qty(float(d["qty_per_batch"] or 0),
-                                 d["unit"], "g", cup_oz)
+                                 d["unit"], "g", cup_oz,
+                                 d.get("grams_each"))
         if grams is None:
             return None, None
         batch_grams += grams
