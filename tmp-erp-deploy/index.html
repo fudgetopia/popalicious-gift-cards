@@ -12035,30 +12035,38 @@ function erpRecipeLabelDoc(r, nut, serving) {
     "Label prints at A6 (105 &times; 148 mm).</div>" + p.label +
     "<script>window.addEventListener(\"load\",function(){var l=" +
     "document.querySelector(\".label\"),f=document.querySelector(\".labelfit\");" +
-    /* Scale to the CONTENT-box height (clientHeight minus the 1.3mm
-       top/bottom padding): scaling to clientHeight leaves the bottom
-       padding's worth of content past the box, where overflow:hidden
-       clips the bottom edge of the barcode digits (v14). */
-    "if(l&&f){var cs=getComputedStyle(l),av=l.clientHeight-" +
-    "(parseFloat(cs.paddingTop)||0)-(parseFloat(cs.paddingBottom)||0);" +
-    "if(f.scrollHeight>av){f.style.transform=\"scale(\"+(av/f.scrollHeight)+" +
-    ")\";f.style.transformOrigin=\"top center\";}}});" +
+    /* v15 safe area: keep all content >=5mm from every sheet edge.
+       The v14 fit scaled to the full content box, so the name sat
+       1.3mm from the top and Net Wt / the barcode digits ~0.5-3.5mm
+       from the bottom — inside real printers' unprintable margins,
+       so they were cut off on paper while Chromium's zero-margin
+       print-to-PDF looked perfect. */
+    "if(l&&f){var cs=getComputedStyle(l),pl=parseFloat(cs.paddingLeft)||0," +
+    "pt=parseFloat(cs.paddingTop)||0,safe=5*(l.clientWidth/105)," +
+    "k=Math.min(1,(l.clientWidth-2*safe)/f.scrollWidth," +
+    "(l.clientHeight-2*safe)/f.scrollHeight)," +
+    "tx=(safe-pl)+Math.max(0,((l.clientWidth-2*safe)-k*f.scrollWidth)/2)," +
+    "ty=safe-pt;f.style.transformOrigin=\"0 0\";" +
+    "f.style.transform=\"translate(\"+tx+\"px,\"+ty+\"px) scale(\"+k+\")\";}});" +
     /* NOTE: the closing tag is written with an escaped slash — a literal
        closing script tag inside this string would close the page's own
        script element early and the app would never boot (broke live Nov 17, 2026). */
     "<\/script></body></html>";
 }
 /* Fit the label content in the fixed A6 box (shared by the live print
-   view and the standalone label document). The scale targets the
-   label's CONTENT-box height, not clientHeight: clientHeight includes
-   the 1.3mm top/bottom padding, and scaling to it leaves the bottom
-   padding's worth of content hanging past the box, where
-   overflow:hidden clips it — in practice the bottom edge of the
-   barcode digits, which sit within ~1px of the clip edge, so any
-   browser laying the text out a hair taller (different font metrics)
-   cuts them visibly (v14). Clearing any previous scale before
-   measuring lets a refit after an image loads shrink further instead
-   of stacking on the old scale. */
+   view and the standalone label document). v15: the content is kept
+   inside a 5mm safe area on all four sides of the sheet. The v14 fit
+   scaled content to the full content box, so the name sat 1.3mm from
+   the top edge and Net Wt / the barcode digits ~0.5-3.5mm from the
+   bottom edge — inside the unprintable margin of any real printer
+   (typically 3-5mm) and of Safari, which ignores @page margins, so
+   on the user's printer the name and the Net Wt were cut off while
+   Chromium's zero-margin print-to-PDF looked perfect. The label box
+   stays true A6 (105x148mm); only the content is a little smaller
+   and top-aligned inside the safe area, so it survives real print
+   margins. Clearing any previous scale before measuring lets a refit
+   after an image loads shrink further instead of stacking on the
+   old scale. */
 function erpFitLabelToBox(labelEl, fitEl) {
   if (!labelEl || !fitEl) return;
   /* Measure with the screen zoom switched off: while the label is
@@ -12071,16 +12079,25 @@ function erpFitLabelToBox(labelEl, fitEl) {
   var zoomCss = zoomSt ? zoomSt.textContent : null;
   if (zoomSt) zoomSt.textContent = "";
   fitEl.style.transform = "";
-  var pad = 0;
+  var padL = 0, padT = 0;
   if (typeof getComputedStyle === "function") {
     var cs = getComputedStyle(labelEl);
-    pad = (parseFloat(cs.paddingTop) || 0) + (parseFloat(cs.paddingBottom) || 0);
+    padL = parseFloat(cs.paddingLeft) || 0;
+    padT = parseFloat(cs.paddingTop) || 0;
   }
-  var avail = labelEl.clientHeight - pad;
-  if (avail > 0 && fitEl.scrollHeight > avail) {
-    fitEl.style.transform = "scale(" + (avail / fitEl.scrollHeight) + ")";
-    fitEl.style.transformOrigin = "top center";
-  }
+  /* 5mm safe area, in px, from the label's own width (105mm). */
+  var safe = 5 * (labelEl.clientWidth / 105);
+  var sw = fitEl.scrollWidth, sh = fitEl.scrollHeight;
+  var k = 1;
+  if (sw > 0) k = Math.min(k, (labelEl.clientWidth - 2 * safe) / sw);
+  if (sh > 0) k = Math.min(k, (labelEl.clientHeight - 2 * safe) / sh);
+  /* Top-align inside the safe area; center horizontally. tx/ty are in
+     .labelfit coordinates (its top-left sits at the content-box
+     top-left, i.e. padL/padT inside the label). */
+  var tx = (safe - padL) + Math.max(0, ((labelEl.clientWidth - 2 * safe) - k * sw) / 2);
+  var ty = safe - padT;
+  fitEl.style.transformOrigin = "0 0";
+  fitEl.style.transform = "translate(" + tx + "px," + ty + "px) scale(" + k + ")";
   if (zoomSt) zoomSt.textContent = zoomCss || "";
 }
 /* Print the label from this page: hide the app, show only the label, and
@@ -12100,9 +12117,12 @@ function erpShowPrintLabel(r, nut, serving) {
   view.innerHTML = "<style>" + p.style + "</style>" +
     "<div class=\"erp-print-bar\"><button type=\"button\" id=\"erpPrintGo\">Print</button>" +
     "<button type=\"button\" id=\"erpPrintBack\">Back to recipe</button>" +
-    "<p class=\"erp-print-help\">Label v14 &mdash; On screen the label is " +
-    "enlarged for readability; it always prints at true A6 (105 &times; 148 mm). On " +
-    "iPhone/iPad: Share, then Print, then pick A6 paper.</p></div>" + p.label;
+    "<p class=\"erp-print-help\">Label v15 &mdash; On screen the label is " +
+    "enlarged for readability; it always prints at true A6 (105 &times; 148 mm), " +
+    "with the name and Net Wt kept clear of the sheet edges. On " +
+    "iPhone/iPad: Share, then Print, then pick A6 paper. If an edge is " +
+    "still cut off, set the print margins to Minimum (or None) in the " +
+    "print dialog.</p></div>" + p.label;
   document.body.classList.add("erp-printing");
   window.scrollTo(0, 0);
   /* Fit the whole label in the A6 box: a long ingredient list
