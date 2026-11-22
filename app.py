@@ -348,6 +348,13 @@ PROMOS = {
         "flavors": ["Dill Pickle"],
         "windows": [["2026-11-14", "2026-11-14"]],
     },
+    'CAKE25': {
+        "type": "percent", "percent_off": 15,
+        "label": 'Cake Day',
+        "description": '15% off Birthday Cake',
+        "flavors": ["Birthday Cake"],
+        "windows": [["2026-11-25", "2026-11-25"]],
+    },
     'CAKE26': {
         "type": "percent", "percent_off": 15,
         "label": 'National Cake Day',
