@@ -935,6 +935,36 @@ def init_db():
             conn.execute("ALTER TABLE erp_recipes ADD COLUMN serving_grams REAL")
         if "servings_per_bag" not in rcols:
             conn.execute("ALTER TABLE erp_recipes ADD COLUMN servings_per_bag INTEGER")
+        # Migration: health-department approval of the nutritional label
+        # (Nov 23, 2026) — a flavor cannot be added to the website until
+        # the health department has approved THIS version of the label.
+        # label_approved_version is the recipe version that was approved;
+        # a new version (recipe edit) starts unapproved, and changing the
+        # label settings also clears approval because the printed label
+        # changed. Never invented: existing recipes stay unapproved (0).
+        if "label_approved" not in rcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN label_approved INTEGER NOT NULL DEFAULT 0")
+        if "label_approved_version" not in rcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN label_approved_version INTEGER")
+        if "label_approved_at" not in rcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN label_approved_at TEXT")
+        if "label_approved_by" not in rcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN label_approved_by TEXT")
+    # Migration: approval stamp on website-flavor requests (Nov 23, 2026)
+    # — the label-approval version the request was staged under, so the
+    # workspace stage script can re-check it before finishing the flavor.
+    _wf_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_website_flavor_requests'"
+    ).fetchone()
+    if _wf_exists:
+        _wf_cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(erp_website_flavor_requests)").fetchall()]
+        if "label_approved_version" not in _wf_cols:
+            conn.execute("ALTER TABLE erp_website_flavor_requests"
+                         " ADD COLUMN label_approved_version INTEGER")
+        if "recipe_version" not in _wf_cols:
+            conn.execute("ALTER TABLE erp_website_flavor_requests"
+                         " ADD COLUMN recipe_version INTEGER")
     # Migration: hourly_rate_cents on HR employee records (HR Wave B,
     # Nov 2026) -- the default cash rate for event time records, NULL
     # until the admin sets one. Never invented: blank means no rate.
@@ -1422,7 +1452,11 @@ def init_db():
             barcode_image TEXT NOT NULL DEFAULT '',
             serving_size TEXT,
             serving_grams REAL,
-            servings_per_bag INTEGER
+            servings_per_bag INTEGER,
+            label_approved INTEGER NOT NULL DEFAULT 0,
+            label_approved_version INTEGER,
+            label_approved_at TEXT,
+            label_approved_by TEXT
         );
         CREATE TABLE IF NOT EXISTS erp_recipe_lines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2904,6 +2938,38 @@ def init_db():
             flavor_name TEXT PRIMARY KEY,
             category TEXT NOT NULL DEFAULT 'sweet'
         );
+        -- Website-flavor staging (Nov 20, 2026): a new recipe the user
+        -- confirms for the website. The ERP only RECORDS the request -- the
+        -- Railway backend cannot write gs1-qr-data.csv, flavors.json, or the
+        -- ERP map, so the workspace generator (hidden_files/stage_new_flavor.py)
+        -- finishes QR/CSV/map from the exported JSON. status: pending (recorded,
+        -- awaiting the generator step), staged (generator done, awaiting user
+        -- preview approval), live, rejected. The partial unique index keeps
+        -- one live staging per UPC while allowing a re-stage after rejection.
+        CREATE TABLE IF NOT EXISTS erp_website_flavor_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipe_id INTEGER,
+            flavor_name TEXT NOT NULL,
+            slug TEXT NOT NULL,
+            category TEXT NOT NULL,
+            description TEXT NOT NULL,
+            photo_data TEXT NOT NULL,
+            photo_filename TEXT NOT NULL DEFAULT '',
+            upc_a TEXT NOT NULL,
+            upc_source TEXT NOT NULL,
+            gtin_14 TEXT NOT NULL,
+            digital_link TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            label_approved_version INTEGER,
+            recipe_version INTEGER
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_erp_website_flavors_upc
+            ON erp_website_flavor_requests (upc_a)
+            WHERE status IN ('pending', 'staged');
+        CREATE INDEX IF NOT EXISTS idx_erp_website_flavors_status
+            ON erp_website_flavor_requests (status);
         CREATE TABLE IF NOT EXISTS erp_order_production_lines (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             order_id INTEGER NOT NULL,
@@ -41138,7 +41204,12 @@ def erp_get_recipe(recipe_id):
 
 @app.put("/api/erp/recipes/<int:recipe_id>")
 def erp_update_recipe(recipe_id):
-    """Edit a recipe by creating a new version. Old batches keep the old version."""
+    """Edit a recipe by creating a new version. Old batches keep the old version.
+
+    The new version starts with the nutritional label unapproved — the
+    health department must approve the new label before the flavor can
+    be added to the website.
+    """
     actor, err = _erp_check_perm("recipes.write")
     if err:
         return err
@@ -41171,7 +41242,8 @@ def erp_update_recipe(recipe_id):
     notes = recipe["notes"] if notes is None else (notes or "").strip()
     conn.execute(
         "UPDATE erp_recipes SET name = ?, batch_size_bags = ?, version = ?,"
-        " notes = ? WHERE id = ?",
+        " notes = ?, label_approved = 0, label_approved_version = NULL,"
+        " label_approved_at = NULL, label_approved_by = NULL WHERE id = ?",
         (name, batch_size, new_version, notes, recipe_id))
     for ln in clean:
         conn.execute(
@@ -41188,6 +41260,24 @@ def erp_update_recipe(recipe_id):
     return jsonify(recipe=dict(row), lines=[dict(l) for l in lines])
 
 
+def _erp_recipe_label_approved(recipe):
+    """True only when the health department approved THIS recipe version.
+
+    Approval is version-tied: label_approved_version must equal the
+    recipe's current version. A recipe edit (new version) or a label
+    settings change clears the approval, so the check fails until the
+    label is approved again. Existing recipes are unapproved (0/NULL).
+    """
+    if not recipe:
+        return False
+    try:
+        return (int(recipe["label_approved"] or 0) == 1
+                and recipe["label_approved_version"] is not None
+                and int(recipe["label_approved_version"]) == int(recipe["version"]))
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
 @app.put("/api/erp/recipes/<int:recipe_id>/label-settings")
 def erp_update_recipe_label_settings(recipe_id):
     """Rename a recipe and/or save its label serving settings, in place.
@@ -41199,6 +41289,9 @@ def erp_update_recipe_label_settings(recipe_id):
     back to automatic (1 cup / 17g / computed from batch weight).
     No new version: the recipe content and cost are untouched, so batches
     already made are unaffected.
+    Changing anything printed on the label clears the health-department
+    approval for this version — the label must be approved again before
+    the flavor can be added to the website.
     """
     actor, err = _erp_check_perm("recipes.write")
     if err:
@@ -41251,10 +41344,68 @@ def erp_update_recipe_label_settings(recipe_id):
             if servings_per_bag < 1:
                 conn.close()
                 return jsonify(error="servings_per_bag must be at least 1"), 400
-    conn.execute(
-        "UPDATE erp_recipes SET name = ?, serving_size = ?, serving_grams = ?,"
-        " servings_per_bag = ? WHERE id = ?",
-        (name, serving_size, serving_grams, servings_per_bag, recipe_id))
+    # The printed label changed if any label field changed value: the
+    # health-department approval no longer covers this label, so clear
+    # it. A no-op save (same values) keeps the approval.
+    label_changed = (
+        name != recipe["name"]
+        or serving_size != recipe["serving_size"]
+        or serving_grams != recipe["serving_grams"]
+        or servings_per_bag != recipe["servings_per_bag"])
+    if label_changed:
+        conn.execute(
+            "UPDATE erp_recipes SET name = ?, serving_size = ?, serving_grams = ?,"
+            " servings_per_bag = ?, label_approved = 0,"
+            " label_approved_version = NULL, label_approved_at = NULL,"
+            " label_approved_by = NULL WHERE id = ?",
+            (name, serving_size, serving_grams, servings_per_bag, recipe_id))
+    else:
+        conn.execute(
+            "UPDATE erp_recipes SET name = ?, serving_size = ?, serving_grams = ?,"
+            " servings_per_bag = ? WHERE id = ?",
+            (name, serving_size, serving_grams, servings_per_bag, recipe_id))
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
+                       (recipe_id,)).fetchone()
+    conn.close()
+    return jsonify(recipe={k: row[k] for k in row.keys() if k != "barcode_image"})
+
+
+@app.post("/api/erp/recipes/<int:recipe_id>/label-approval")
+def erp_set_recipe_label_approval(recipe_id):
+    """Mark the recipe's nutritional label health-department approved
+    (or clear the approval). Admin only (DJ/Matt).
+
+    Approval belongs to the recipe's CURRENT version: approving records
+    the version, the approver, and the timestamp. A later recipe edit
+    (new version) or label-settings change clears it, so the label must
+    be approved again before the flavor can be added to the website.
+    """
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    approved = data.get("approved")
+    if not isinstance(approved, bool):
+        return jsonify(error="approved must be true or false"), 400
+    conn = db()
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    if approved:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE erp_recipes SET label_approved = 1,"
+            " label_approved_version = ?, label_approved_at = ?,"
+            " label_approved_by = ? WHERE id = ?",
+            (int(recipe["version"]), now, actor, recipe_id))
+    else:
+        conn.execute(
+            "UPDATE erp_recipes SET label_approved = 0,"
+            " label_approved_version = NULL, label_approved_at = NULL,"
+            " label_approved_by = NULL WHERE id = ?",
+            (recipe_id,))
     conn.commit()
     row = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
                        (recipe_id,)).fetchone()
@@ -41420,6 +41571,153 @@ def erp_import_recipes():
         _erp_apply_auto_serving_grams(conn, rid)
     conn.close()
     return jsonify(ok=True, imported=created)
+
+
+# ---- Website-flavor staging (Nov 20, 2026) ----
+# A new recipe confirmed for the website ("Add this flavor to the website?"
+# YES). The ERP records the pending request only — Railway cannot write
+# gs1-qr-data.csv, flavors.json, or the ERP map, so the workspace generator
+# finishes QR/CSV/map from the exported JSON. UPC rules (user-confirmed
+# Nov 20): auto-assign LOWEST FREE HOUSE code (602581 only) at YES, never
+# at recipe creation alone, never for a draft/test recipe; never auto-assign
+# from other prefixes; an already-recorded code is kept, never re-assigned;
+# the code is shown to the user before anything is final, with a manual
+# override. The backend re-validates format + check digit + duplicates
+# within its own table; the generator re-checks all four sources
+# (CSV, flavors.json/build_gs1.py, ERP map, Faire map) before writing.
+def _erp_upc_check_digit(upc11):
+    """UPC-A check digit for the first 11 digits (same as build_gs1.py)."""
+    d = [int(c) for c in upc11]
+    s = sum(d[i] for i in range(0, 11, 2)) * 3 + sum(d[i] for i in range(1, 11, 2))
+    return (10 - s % 10) % 10
+
+
+def _erp_website_flavor_slug(name):
+    ascii_s = unicodedata.normalize("NFKD", str(name or "")).encode(
+        "ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_s.lower()).strip("-")
+    return slug or "flavor"
+
+
+def _erp_website_flavor_row(row, with_photo=False):
+    d = dict(row)
+    if not with_photo:
+        d["photo_bytes"] = len(d.pop("photo_data") or "")
+        d.pop("photo_data", None)
+    return d
+
+
+@app.post("/api/erp/website-flavors")
+def erp_create_website_flavor():
+    actor, err = _erp_check_perm("recipes.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    flavor_name = (data.get("flavor_name") or "").strip()
+    if not flavor_name:
+        return jsonify(error="flavor_name is required"), 400
+    category = (data.get("category") or "").strip()
+    if category not in ("sweet", "savory", "cheesy"):
+        return jsonify(error="category must be sweet, savory, or cheesy"), 400
+    description = (data.get("description") or "").strip()
+    if not description:
+        return jsonify(error="description is required (never invent copy)"), 400
+    photo_data = data.get("photo_data") or ""
+    if not isinstance(photo_data, str) or not photo_data.startswith("data:image/"):
+        return jsonify(error="bag photo is required (image upload)"), 400
+    if len(photo_data) > 8000000:
+        return jsonify(error="bag photo is too large (8 MB limit)"), 400
+    upc = (data.get("upc_a") or "").strip()
+    if len(upc) != 12 or not upc.isdigit():
+        return jsonify(error="upc_a must be 12 digits"), 400
+    if _erp_upc_check_digit(upc[:11]) != int(upc[-1]):
+        return jsonify(error="upc_a check digit is invalid"), 400
+    upc_source = (data.get("upc_source") or "").strip()
+    if upc_source not in ("auto-assigned", "manual override", "existing code kept"):
+        return jsonify(error="upc_source must be auto-assigned, manual override, "
+                       "or existing code kept"), 400
+    if upc_source == "auto-assigned" and not upc.startswith("602581"):
+        return jsonify(error="auto-assigned UPCs must be house (602581) codes"), 400
+    if (data.get("gtin_14") or "") != "00" + upc:
+        return jsonify(error="gtin_14 must be 00 + upc_a"), 400
+    if (data.get("digital_link") or "") != "https://pop-a-licious.com/01/" + "00" + upc:
+        return jsonify(error="digital_link must be the GS1 Digital Link for the UPC"), 400
+    # Health-department label gate (Nov 23, 2026): the flavor's current
+    # recipe version must have its nutritional label approved before it
+    # can be added to the website. The approval is recorded in the
+    # recipe's Label settings by an admin (DJ/Matt).
+    recipe_id = data.get("recipe_id")
+    if not recipe_id:
+        return jsonify(error="recipe_id is required — label approval cannot be verified without the recipe"), 400
+    conn = db()
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    if not _erp_recipe_label_approved(recipe):
+        conn.close()
+        return jsonify(error="nutritional label must be approved by the health department before this flavor can be added to the website (approve it in the recipe's Label settings)"), 400
+    slug = _erp_website_flavor_slug(flavor_name)
+    dup = conn.execute(
+        "SELECT id FROM erp_website_flavor_requests WHERE flavor_name = ?"
+        " AND status IN ('pending', 'staged')", (flavor_name,)).fetchone()
+    if dup:
+        conn.close()
+        return jsonify(error="this flavor already has a staged website request"), 400
+    dup_upc = conn.execute(
+        "SELECT id FROM erp_website_flavor_requests WHERE upc_a = ?"
+        " AND status IN ('pending', 'staged')", (upc,)).fetchone()
+    if dup_upc:
+        conn.close()
+        return jsonify(error="this UPC is already staged for another flavor"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        cur = conn.execute(
+            "INSERT INTO erp_website_flavor_requests (recipe_id, flavor_name, slug,"
+            " category, description, photo_data, photo_filename, upc_a, upc_source,"
+            " gtin_14, digital_link, status, created_by, created_at,"
+            " label_approved_version, recipe_version)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
+            (data.get("recipe_id"), flavor_name, slug, category, description,
+             photo_data, (data.get("photo_filename") or "").strip(), upc,
+             upc_source, "00" + upc,
+             "https://pop-a-licious.com/01/" + "00" + upc, actor, now,
+             int(recipe["version"]), int(recipe["version"])))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        conn.close()
+        return jsonify(error="this UPC is already staged for another flavor"), 400
+    row = conn.execute("SELECT * FROM erp_website_flavor_requests WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(request=_erp_website_flavor_row(row)), 201
+
+
+@app.get("/api/erp/website-flavors")
+def erp_list_website_flavors():
+    actor, err = _erp_check_perm("recipes.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_website_flavor_requests ORDER BY id DESC").fetchall()
+    conn.close()
+    return jsonify(requests=[_erp_website_flavor_row(r) for r in rows])
+
+
+@app.get("/api/erp/website-flavors/<int:request_id>")
+def erp_get_website_flavor(request_id):
+    actor, err = _erp_check_perm("recipes.read")
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_website_flavor_requests WHERE id = ?",
+                       (request_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify(error="website flavor request not found"), 404
+    return jsonify(request=_erp_website_flavor_row(row, with_photo=True))
 
 
 # ---- Production Wave 1: labor + overhead in batch cost ----
@@ -48759,6 +49057,8 @@ _FAIRE_UPC_FLAVORS = {
     "00602581038207": "Lemonade",
     "794969412485": "Muddy Buddy",
     "00794969412485": "Muddy Buddy",
+    "602581038016": "Nashville Hot",
+    "00602581038016": "Nashville Hot",
     "669423097037": "Pizza",
     "00669423097037": "Pizza",
     "602581038009": "Salt and Vinegar",
