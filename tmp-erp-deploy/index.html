@@ -21772,6 +21772,91 @@ function renderErpHrTimeSummarySection(timeTotals) {
 // section never changes the existing deactivate behaviour.
 var HR_ADD7_NEXT_STAGE = { applied: "screening", screening: "interview", interview: "offer" };
 var HR_ADD7_STAGES = ["applied", "screening", "interview", "offer", "hired", "rejected"];
+/* HR roles: one row per defined job role. Edit opens an inline
+   title/description form; Deactivate/Activate flips the active flag
+   (inactive roles leave the applicant picker on the next reload);
+   Delete is refused by the backend with a 409 while applicants are
+   attached, and that message is shown in the section status line. */
+function renderErpHrRoleRow(role, status, reload) {
+  var card = document.createElement("div");
+  card.className = "erp-form";
+  var h4 = document.createElement("h4");
+  var head = role.title + " (" + (role.active ? "Active" : "Inactive") + ")";
+  if (role.applicant_count > 0) head += " · " + role.applicant_count + " applicant" + (role.applicant_count === 1 ? "" : "s");
+  h4.textContent = head;
+  card.appendChild(h4);
+  if (role.description) {
+    var desc = document.createElement("p");
+    desc.textContent = role.description;
+    card.appendChild(desc);
+  }
+  var editBtn = document.createElement("button");
+  editBtn.type = "button";
+  editBtn.textContent = "Edit";
+  card.appendChild(editBtn);
+  var toggleBtn = document.createElement("button");
+  toggleBtn.type = "button";
+  toggleBtn.textContent = role.active ? "Deactivate" : "Activate";
+  toggleBtn.addEventListener("click", function () {
+    toggleBtn.disabled = true;
+    status.textContent = role.active ? "Deactivating role…" : "Activating role…";
+    erpPost("/api/erp/hr/roles/" + encodeURIComponent(String(role.id)) + "/update", { active: !role.active }).then(function () {
+      if (typeof reload === "function") reload();
+    }).catch(function (error) {
+      status.textContent = error.message;
+      toggleBtn.disabled = false;
+    });
+  });
+  card.appendChild(toggleBtn);
+  var delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.textContent = "Delete";
+  delBtn.addEventListener("click", function () {
+    delBtn.disabled = true;
+    status.textContent = "Deleting role…";
+    erpDelete("/api/erp/hr/roles/" + encodeURIComponent(String(role.id))).then(function () {
+      if (typeof reload === "function") reload();
+    }).catch(function (error) {
+      status.textContent = error.message;
+      delBtn.disabled = false;
+    });
+  });
+  card.appendChild(delBtn);
+  var editForm = null;
+  editBtn.addEventListener("click", function () {
+    if (editForm) { editForm.remove(); editForm = null; return; }
+    editForm = document.createElement("div");
+    editForm.className = "erp-form";
+    var titleInput = document.createElement("input");
+    titleInput.type = "text";
+    titleInput.value = role.title;
+    editForm.appendChild(erpField("Title", titleInput));
+    var descInput = document.createElement("textarea");
+    descInput.value = role.description || "";
+    editForm.appendChild(erpField("Description", descInput));
+    var saveBtn = document.createElement("button");
+    saveBtn.type = "button";
+    saveBtn.textContent = "Save role";
+    saveBtn.addEventListener("click", function () {
+      saveBtn.disabled = true;
+      status.textContent = "Saving role…";
+      erpPost("/api/erp/hr/roles/" + encodeURIComponent(String(role.id)) + "/update", { title: titleInput.value, description: descInput.value }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        saveBtn.disabled = false;
+      });
+    });
+    editForm.appendChild(saveBtn);
+    var cancelBtn = document.createElement("button");
+    cancelBtn.type = "button";
+    cancelBtn.textContent = "Cancel";
+    cancelBtn.addEventListener("click", function () { editForm.remove(); editForm = null; });
+    editForm.appendChild(cancelBtn);
+    card.appendChild(editForm);
+  });
+  return card;
+}
 function renderErpHrHiringSection(reload) {
   var wrap = document.createElement("div");
   var title = document.createElement("h2");
@@ -21781,6 +21866,69 @@ function renderErpHrHiringSection(reload) {
   note.className = "admin-orders-empty";
   note.textContent = "Applicants start empty — add them by hand; nothing is pre-filled. Stages move forward only: applied → screening → interview → offer → hired. Rejected can be set from any stage. Hired is only reached through the Hire action, which creates the employee record and seeds their onboarding checklist. A hired applicant's record is sealed (notes can still be appended).";
   wrap.appendChild(note);
+  /* Job roles: the defined roles applicants apply for. The Add
+     applicant picker below only offers active roles, so the list
+     and the picker are reloaded together after any role change. */
+  var rolesWrap = document.createElement("div");
+  var rolesTitle = document.createElement("h3");
+  rolesTitle.textContent = "Job roles";
+  rolesWrap.appendChild(rolesTitle);
+  var rolesStatus = document.createElement("p");
+  rolesStatus.style.color = "var(--muted)";
+  rolesStatus.style.flex = "1 1 100%";
+  rolesWrap.appendChild(rolesStatus);
+  var rolesList = document.createElement("div");
+  rolesWrap.appendChild(rolesList);
+  var roleForm = document.createElement("div");
+  roleForm.className = "erp-form";
+  var roleFormTitle = document.createElement("h4");
+  roleFormTitle.textContent = "Add role";
+  roleForm.appendChild(roleFormTitle);
+  var roleTitleInput = document.createElement("input");
+  roleTitleInput.type = "text";
+  roleTitleInput.placeholder = "Title";
+  roleForm.appendChild(erpField("Title", roleTitleInput));
+  var roleDescInput = document.createElement("textarea");
+  roleDescInput.placeholder = "Description";
+  roleForm.appendChild(erpField("Description", roleDescInput));
+  var addRoleBtn = document.createElement("button");
+  addRoleBtn.type = "button";
+  addRoleBtn.textContent = "Add role";
+  addRoleBtn.addEventListener("click", function () {
+    addRoleBtn.disabled = true;
+    rolesStatus.textContent = "Adding role…";
+    erpPost("/api/erp/hr/roles", { title: roleTitleInput.value, description: roleDescInput.value }).then(function () {
+      if (typeof reload === "function") reload();
+    }).catch(function (error) {
+      rolesStatus.textContent = error.message;
+      addRoleBtn.disabled = false;
+    });
+  });
+  roleForm.appendChild(addRoleBtn);
+  rolesWrap.appendChild(roleForm);
+  wrap.appendChild(rolesWrap);
+  function loadRoles() {
+    erpGet("/api/erp/hr/roles").then(function (data) {
+      rolesList.replaceChildren();
+      var roles = data.roles || [];
+      if (!roles.length) {
+        var none = document.createElement("p");
+        none.className = "admin-orders-empty";
+        none.textContent = "No job roles yet. Add the first one above.";
+        rolesList.appendChild(none);
+        return;
+      }
+      roles.forEach(function (role) {
+        rolesList.appendChild(renderErpHrRoleRow(role, rolesStatus, reload));
+      });
+    }).catch(function (error) {
+      rolesList.replaceChildren();
+      var err = document.createElement("p");
+      err.className = "admin-orders-empty";
+      err.textContent = "Job roles could not be loaded: " + error.message;
+      rolesList.appendChild(err);
+    });
+  }
   var form = document.createElement("div");
   form.className = "erp-form";
   var formTitle = document.createElement("h3");
@@ -21794,8 +21942,12 @@ function renderErpHrHiringSection(reload) {
   }
   var nameInput = hrAdd7Input("Name");
   form.appendChild(erpField("Name", nameInput));
-  var roleInput = hrAdd7Input("Role applied for");
-  form.appendChild(erpField("Role applied for", roleInput));
+  var roleSelect = document.createElement("select");
+  var rolePlaceholder = document.createElement("option");
+  rolePlaceholder.value = "";
+  rolePlaceholder.textContent = "— Select a role —";
+  roleSelect.appendChild(rolePlaceholder);
+  form.appendChild(erpField("Role applied for", roleSelect));
   var emailInput = hrAdd7Input("Email", "email");
   form.appendChild(erpField("Email", emailInput));
   var phoneInput = hrAdd7Input("Phone", "tel");
@@ -21810,6 +21962,9 @@ function renderErpHrHiringSection(reload) {
   contactNote.className = "admin-orders-empty";
   contactNote.textContent = "At least one contact is required: an email or a phone number.";
   form.appendChild(contactNote);
+  var noRolesNote = document.createElement("p");
+  noRolesNote.className = "admin-orders-empty";
+  form.appendChild(noRolesNote);
   var addStatus = document.createElement("p");
   addStatus.style.color = "var(--muted)";
   addStatus.style.flex = "1 1 100%";
@@ -21818,10 +21973,14 @@ function renderErpHrHiringSection(reload) {
   addBtn.type = "button";
   addBtn.textContent = "Add applicant";
   addBtn.addEventListener("click", function () {
+    if (!roleSelect.value) {
+      addStatus.textContent = "Select a role first.";
+      return;
+    }
     addBtn.disabled = true;
     addStatus.textContent = "Adding…";
     erpPost("/api/erp/hr/applicants", {
-      name: nameInput.value, role: roleInput.value, email: emailInput.value,
+      name: nameInput.value, role_id: parseInt(roleSelect.value, 10), email: emailInput.value,
       phone: phoneInput.value, source: sourceInput.value,
       applied_date: dateInput.value, notes: notesInput.value
     }).then(function () {
@@ -21833,6 +21992,34 @@ function renderErpHrHiringSection(reload) {
   });
   form.appendChild(addBtn);
   wrap.appendChild(form);
+  /* Active roles for the picker. With no active roles the Add
+     applicant button stays disabled until a role is defined. */
+  function loadActiveRoles() {
+    erpGet("/api/erp/hr/roles?active=1").then(function (data) {
+      var roles = data.roles || [];
+      roleSelect.replaceChildren();
+      var ph = document.createElement("option");
+      ph.value = "";
+      ph.textContent = "— Select a role —";
+      roleSelect.appendChild(ph);
+      roles.forEach(function (r) {
+        var opt = document.createElement("option");
+        opt.value = String(r.id);
+        opt.textContent = r.title;
+        roleSelect.appendChild(opt);
+      });
+      if (!roles.length) {
+        addBtn.disabled = true;
+        noRolesNote.textContent = "Add a job role first — applicants need a defined role.";
+      } else {
+        addBtn.disabled = false;
+        noRolesNote.textContent = "";
+      }
+    }).catch(function (error) {
+      addBtn.disabled = true;
+      noRolesNote.textContent = "Roles could not be loaded: " + error.message;
+    });
+  }
   var filterLabel = document.createElement("p");
   filterLabel.className = "admin-orders-empty";
   filterLabel.textContent = "Filter by stage:";
@@ -21874,6 +22061,11 @@ function renderErpHrHiringSection(reload) {
         var h3 = document.createElement("h3");
         h3.textContent = a.name + " — " + a.role + " (" + a.stage + ")";
         card.appendChild(h3);
+        if (a.role_description) {
+          var roleDesc = document.createElement("p");
+          roleDesc.textContent = "Role: " + a.role + " — " + a.role_description;
+          card.appendChild(roleDesc);
+        }
         var meta = document.createElement("p");
         meta.className = "admin-orders-empty";
         var bits = [];
@@ -21965,6 +22157,8 @@ function renderErpHrHiringSection(reload) {
     });
   }
   filterSel.addEventListener("change", loadApplicants);
+  loadRoles();
+  loadActiveRoles();
   loadApplicants();
   return wrap;
 }
