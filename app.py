@@ -22,11 +22,13 @@ import secrets
 import shutil
 import sqlite3
 import string
+import struct
 import subprocess
 import tempfile
 import threading
 import time
 import zipfile
+import zlib
 import unicodedata
 import collections
 import hmac
@@ -657,6 +659,230 @@ def _sec_deactivate_demo_cards(conn):
         except sqlite3.OperationalError:
             pass
     return count
+
+
+# ---- Barcode pool (Nov 23, 2026) ----
+# Every new recipe automatically gets a barcode at creation: the lowest
+# free purchased house (602581) code. The pool is purchased codes ONLY
+# (Bar Codes Talk) — never generated, never invented. Seed = the Nov 20
+# GS1 audit of free house codes, minus Nashville Hot 602581038016 and
+# Reindeer Munch 602581038023, which were already assigned. Assignment
+# does NOT add the flavor to the website and does NOT imply
+# health-department label approval (the website-flavor gate is separate).
+_ERP_BARCODE_POOL_SEED = (
+    "602581038030", "602581038047", "602581038054", "602581038061",
+    "602581038078", "602581038085", "602581038108", "602581038115",
+    "602581038122", "602581038139", "602581038146", "602581038221",
+    "602581038238",
+)
+_ERP_BARCODE_POOL_EXHAUSTED = ("barcode pool exhausted — buy more"
+                               " from Bar Codes Talk")
+# Test recipes that predate auto-assign, backfilled with these exact codes.
+_ERP_BARCODE_BACKFILL = (
+    ("Ghost Pepper Cheddar", "602581038030"),
+    ("Loaded Baked Potato Popcorn", "602581038047"),
+    ("Memphis BBQ", "602581038061"),
+)
+
+# UPC-A left-hand (L) digit patterns, same tables as the frontend's
+# erpUpcBarcodeSVG. Right-hand digits use the inverted L pattern.
+_ERP_UPC_L_PATTERNS = (
+    "0001101", "0011001", "0010011", "0111101", "0100011",
+    "0110001", "0101111", "0111011", "0110111", "0001011",
+)
+
+# Minimal 5x7 bitmap font (digits 0-9 and space only) for the
+# human-readable line under the bars. Each glyph is 7 rows of 5 bits.
+_ERP_UPC_FONT_5X7 = {
+    "0": ("01110", "10001", "10011", "10101", "11001", "10001", "01110"),
+    "1": ("00100", "01100", "00100", "00100", "00100", "00100", "01110"),
+    "2": ("01110", "10001", "00001", "00010", "00100", "01000", "11111"),
+    "3": ("11111", "00010", "00100", "00010", "00001", "10001", "01110"),
+    "4": ("00010", "00110", "01010", "10010", "11111", "00010", "00010"),
+    "5": ("11111", "10000", "11110", "00001", "00001", "10001", "01110"),
+    "6": ("00110", "01000", "10000", "11110", "10001", "10001", "01110"),
+    "7": ("11111", "00001", "00010", "00100", "01000", "01000", "01000"),
+    "8": ("01110", "10001", "10001", "01110", "10001", "10001", "01110"),
+    "9": ("01110", "10001", "10001", "01111", "00001", "00010", "01100"),
+    " ": ("00000", "00000", "00000", "00000", "00000", "00000", "00000"),
+}
+
+
+def _erp_upc_barcode_bits(upc):
+    """The 95-module UPC-A bit string for a 12-digit code."""
+    bits = "101"
+    for i in range(6):
+        bits += _ERP_UPC_L_PATTERNS[int(upc[i])]
+    bits += "01010"
+    for j in range(6, 12):
+        bits += "".join("0" if b == "1" else "1"
+                        for b in _ERP_UPC_L_PATTERNS[int(upc[j])])
+    bits += "101"
+    return bits
+
+
+def _erp_upc_barcode_png_data_uri(upc):
+    """Render a UPC-A barcode as a PNG data URI (pure stdlib: zlib +
+    struct + base64, no new dependencies). Bars are the 95-module
+    pattern with a 10-module quiet zone on each side; the 12 digits
+    print beneath in a built-in 5x7 bitmap font. Validates the UPC
+    (12 digits, check digit) and raises ValueError on a bad one.
+
+    NOTE: the check digit is computed inline here (same Mod-10 formula
+    as _erp_upc_check_digit) because this generator is defined before
+    init_db and runs from the import-time migration — _erp_upc_check_digit
+    is defined later in this file and does not exist yet at import.
+    """
+    upc = str(upc or "").strip()
+    if len(upc) != 12 or not upc.isdigit():
+        raise ValueError("upc must be 12 digits")
+    digits = [int(c) for c in upc[:11]]
+    check = (10 - (sum(digits[0::2]) * 3 + sum(digits[1::2])) % 10) % 10
+    if check != int(upc[11]):
+        raise ValueError("upc check digit is invalid")
+    bits = _erp_upc_barcode_bits(upc)
+    module = 2            # px per barcode module
+    quiet = 10            # quiet-zone modules on each side
+    bar_h = 60            # bar height in px
+    text_scale = 2        # bitmap font scale
+    text_gap = 4          # px between bars and digits
+    bottom = 6            # px below the digits
+    width = (len(bits) + 2 * quiet) * module
+    text_h = 7 * text_scale
+    height = bar_h + text_gap + text_h + bottom
+    # Grayscale canvas: 255 = white, 0 = black.
+    px = bytearray([255]) * (width * height)
+    for i, b in enumerate(bits):
+        if b == "1":
+            x0 = (quiet + i) * module
+            for y in range(bar_h):
+                base = y * width + x0
+                px[base:base + module] = b"\x00" * module
+    human = "%s %s %s %s" % (upc[0], upc[1:6], upc[6:11], upc[11])
+    cell_w = 5 * text_scale + 2
+    text_w = len(human) * cell_w - 2
+    tx0 = (width - text_w) // 2
+    ty0 = bar_h + text_gap
+    for ci, ch in enumerate(human):
+        glyph = _ERP_UPC_FONT_5X7[ch]
+        cx0 = tx0 + ci * cell_w
+        for gy in range(7):
+            for gx in range(5):
+                if glyph[gy][gx] == "1":
+                    for dy in range(text_scale):
+                        y = ty0 + gy * text_scale + dy
+                        base = y * width + cx0 + gx * text_scale
+                        px[base:base + text_scale] = b"\x00" * text_scale
+    raw = b"".join(b"\x00" + bytes(px[y * width:(y + 1) * width])
+                   for y in range(height))
+
+    def _chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+
+    png = (b"\x89PNG\r\n\x1a\n"
+           + _chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 0,
+                                         0, 0, 0))
+           + _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+           + _chunk(b"IEND", b""))
+    return "data:image/png;base64," + base64.b64encode(png).decode("ascii")
+
+
+def _erp_assign_barcode_for_recipe(conn, recipe_id, now):
+    """Assign the lowest free pool code to a recipe, inside the caller's
+    transaction (call before commit). Claims the pool row with a
+    conditional UPDATE (code + status='free'), so two writers racing
+    for the same code cannot both claim it: the loser sees rowcount 0
+    and retries with the next free code. The recipe's barcode picture
+    is generated only when barcode_image is currently empty, so a
+    hand-uploaded picture is never overwritten. Returns
+    (upc, 'assigned') or (None, 'pool-exhausted'). Creation never
+    fails for lack of a code: with an empty pool the recipe is still
+    created with upc_a NULL and upc_status 'pool-exhausted'; the exact
+    flag text (_ERP_BARCODE_POOL_EXHAUSTED) is surfaced by
+    GET /api/erp/barcode-pool when the pool is empty."""
+    for _attempt in range(50):
+        row = conn.execute(
+            "SELECT code FROM erp_barcode_pool WHERE status = 'free'"
+            " ORDER BY code ASC LIMIT 1").fetchone()
+        if not row:
+            conn.execute(
+                "UPDATE erp_recipes SET upc_a = NULL,"
+                " upc_status = 'pool-exhausted' WHERE id = ?",
+                (recipe_id,))
+            return None, "pool-exhausted"
+        code = row[0]
+        claimed = conn.execute(
+            "UPDATE erp_barcode_pool SET status = 'assigned',"
+            " recipe_id = ?, assigned_at = ? WHERE code = ?"
+            " AND status = 'free'", (recipe_id, now, code))
+        if claimed.rowcount != 1:
+            continue  # lost the race for this code; try the next free one
+        try:
+            conn.execute(
+                "UPDATE erp_recipes SET upc_a = ?, upc_status = 'assigned'"
+                " WHERE id = ?", (code, recipe_id))
+        except sqlite3.IntegrityError:
+            # Backstop unique index fired (a duplicate upc_a): release
+            # the claim and try the next free code instead of failing.
+            conn.execute(
+                "UPDATE erp_barcode_pool SET status = 'free',"
+                " recipe_id = NULL, assigned_at = NULL WHERE code = ?",
+                (code,))
+            continue
+        cur = conn.execute(
+            "SELECT barcode_image FROM erp_recipes WHERE id = ?",
+            (recipe_id,)).fetchone()
+        if cur is not None and not (cur[0] or "").strip():
+            conn.execute(
+                "UPDATE erp_recipes SET barcode_image = ? WHERE id = ?",
+                (_erp_upc_barcode_png_data_uri(code), recipe_id))
+        return code, "assigned"
+    conn.execute(
+        "UPDATE erp_recipes SET upc_a = NULL, upc_status = 'pool-exhausted'"
+        " WHERE id = ?", (recipe_id,))
+    return None, "pool-exhausted"
+
+
+def _erp_migrate_barcode_pool(conn):
+    """Backfill the three pre-auto-assign test recipes with their exact
+    purchased codes. Fully idempotent: a recipe that already has a code,
+    or a pool code that is no longer free, is skipped, so a second run
+    changes nothing. Called from the end of init_db."""
+    now = datetime.now(timezone.utc).isoformat()
+    for name, code in _ERP_BARCODE_BACKFILL:
+        row = conn.execute(
+            "SELECT id, barcode_image FROM erp_recipes WHERE name = ?"
+            " AND upc_a IS NULL ORDER BY id ASC LIMIT 1",
+            (name,)).fetchone()
+        if not row:
+            continue
+        claimed = conn.execute(
+            "UPDATE erp_barcode_pool SET status = 'assigned',"
+            " recipe_id = ?, assigned_at = ? WHERE code = ?"
+            " AND status = 'free'", (row[0], now, code))
+        if claimed.rowcount != 1:
+            continue
+        try:
+            updated = conn.execute(
+                "UPDATE erp_recipes SET upc_a = ?, upc_status = 'assigned'"
+                " WHERE id = ? AND upc_a IS NULL", (code, row[0]))
+        except sqlite3.IntegrityError:
+            conn.execute(
+                "UPDATE erp_barcode_pool SET status = 'free',"
+                " recipe_id = NULL, assigned_at = NULL WHERE code = ?",
+                (code,))
+            continue
+        if updated.rowcount != 1:
+            conn.execute(
+                "UPDATE erp_barcode_pool SET status = 'free',"
+                " recipe_id = NULL, assigned_at = NULL WHERE code = ?",
+                (code,))
+            continue
+        if not (row[1] or "").strip():
+            conn.execute(
+                "UPDATE erp_recipes SET barcode_image = ? WHERE id = ?",
+                (_erp_upc_barcode_png_data_uri(code), row[0]))
 
 
 def init_db():
@@ -3980,6 +4206,37 @@ def init_db():
         "CREATE TABLE IF NOT EXISTS erp_token_denylist ("
         " jti TEXT PRIMARY KEY, kind TEXT NOT NULL, user_id INTEGER NOT NULL,"
         " expires_at TEXT NOT NULL, created_at TEXT NOT NULL)")
+    # Barcode pool (Nov 23, 2026) — lives at the END of init_db on
+    # purpose: it touches erp_recipes, which is created by an earlier
+    # executescript. Every new recipe auto-assigns the lowest free
+    # purchased house (602581) code at creation; the pool table is the
+    # single source of truth for which codes are free vs assigned.
+    _bprexists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_recipes'"
+    ).fetchone()
+    if _bprexists:
+        _bprcols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(erp_recipes)").fetchall()]
+        if "upc_a" not in _bprcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN upc_a TEXT")
+        if "upc_status" not in _bprcols:
+            conn.execute("ALTER TABLE erp_recipes ADD COLUMN upc_status TEXT")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS erp_barcode_pool ("
+        " code TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'free',"
+        " recipe_id INTEGER, assigned_at TEXT)")
+    for _code in _ERP_BARCODE_POOL_SEED:
+        conn.execute(
+            "INSERT OR IGNORE INTO erp_barcode_pool (code) VALUES (?)",
+            (_code,))
+    if _bprexists:
+        # Backstop against duplicate assignment: at most one active
+        # recipe may hold a given code (NULLs are exempt — a recipe
+        # with no code is not a duplicate).
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_erp_recipes_upc_a"
+            " ON erp_recipes(upc_a) WHERE upc_a IS NOT NULL")
+        _erp_migrate_barcode_pool(conn)
     conn.commit()
     conn.close()
 
@@ -41132,6 +41389,117 @@ def erp_list_recipes():
                              if k != "barcode_image"} for r in rows])
 
 
+@app.get("/api/erp/barcode-pool")
+def erp_barcode_pool():
+    """Barcode pool state: free purchased house codes (lowest first)
+    and assigned codes with their recipe. Auth: either the recipes.read
+    permission (session auth) or the X-Cron-Secret header (same
+    _mkt_cron_auth pattern as the marketing cron endpoints). 401/403
+    otherwise. When the pool is empty the response also carries the
+    exact pool-exhausted flag text."""
+    actor, err = _erp_check_perm("recipes.read")
+    if err:
+        if _mkt_cron_auth() is not None:
+            return err
+    conn = db()
+    free = [r[0] for r in conn.execute(
+        "SELECT code FROM erp_barcode_pool WHERE status = 'free'"
+        " ORDER BY code ASC").fetchall()]
+    assigned = [{"code": r["code"], "recipe_id": r["recipe_id"],
+                 "recipe_name": r["recipe_name"]} for r in conn.execute(
+        "SELECT p.code, p.recipe_id, r.name AS recipe_name"
+        " FROM erp_barcode_pool p LEFT JOIN erp_recipes r"
+        " ON r.id = p.recipe_id WHERE p.status = 'assigned'"
+        " ORDER BY p.code ASC").fetchall()]
+    conn.close()
+    out = {"free": free, "assigned": assigned,
+           "exhausted": len(free) == 0}
+    if not free:
+        out["message"] = _ERP_BARCODE_POOL_EXHAUSTED
+    return jsonify(out)
+
+
+@app.post("/api/erp/barcode-pool/intake")
+def erp_barcode_pool_intake():
+    """Add purchased house codes to the live barcode pool (Nov 23, 2026).
+
+    Pool intake: the operator buys more codes from Bar Codes Talk, uploads
+    the sheet, updates the audit, then runs hidden_files/
+    barcode_pool_intake.py, which POSTs the new codes here. Auth: ERP
+    admin (DJ/Matt) or X-Cron-Secret (operator script). Body: {"codes":
+    ["602581038XXX", ...]}. Every code is validated FIRST (12 digits,
+    valid check digit, house 602581 prefix only — other prefixes need a
+    human decision, never auto-intake; not already in the pool, not
+    assigned to any active recipe, not staged for the website); ANY
+    failure rejects the WHOLE batch (400, nothing inserted) so a bad
+    sheet can never half-load. Accepted codes enter as status='free',
+    lowest first from then on. No code is ever generated here — intake
+    only records codes the user bought and uploaded.
+    """
+    actor, err = _require_erp_admin()
+    if err:
+        if _mkt_cron_auth() is not None:
+            return err
+    data = request.get_json(force=True) or {}
+    codes = data.get("codes")
+    if not isinstance(codes, list) or not codes:
+        return jsonify(error="codes must be a non-empty list of 12-digit UPCs"), 400
+    seen = set()
+    rejected = []
+    clean = []
+    for raw in codes:
+        code = str(raw or "").strip()
+        if code in seen:
+            rejected.append({"code": code, "reason": "duplicate in this batch"})
+            continue
+        seen.add(code)
+        if len(code) != 12 or not code.isdigit():
+            rejected.append({"code": code, "reason": "must be 12 digits"})
+            continue
+        if _erp_upc_check_digit(code[:11]) != int(code[-1]):
+            rejected.append({"code": code, "reason": "check digit is invalid"})
+            continue
+        if not code.startswith("602581"):
+            rejected.append({"code": code,
+                             "reason": "intake is house (602581) codes only"})
+            continue
+        clean.append(code)
+    if rejected:
+        return jsonify(error="some codes were rejected; nothing was added",
+                       rejected=rejected), 400
+    conn = db()
+    taken = []
+    for code in clean:
+        if conn.execute("SELECT 1 FROM erp_barcode_pool WHERE code = ?",
+                        (code,)).fetchone():
+            taken.append({"code": code, "reason": "already in the pool"})
+            continue
+        if conn.execute("SELECT id FROM erp_recipes WHERE upc_a = ?"
+                        " AND active = 1", (code,)).fetchone():
+            taken.append({"code": code,
+                          "reason": "already assigned to a recipe"})
+            continue
+        if conn.execute("SELECT id FROM erp_website_flavor_requests"
+                        " WHERE upc_a = ? AND status IN ('pending', 'staged')",
+                        (code,)).fetchone():
+            taken.append({"code": code,
+                          "reason": "already staged for a website flavor"})
+            continue
+    if taken:
+        conn.close()
+        return jsonify(error="some codes are already in use; nothing was added",
+                       rejected=taken), 400
+    for code in clean:
+        conn.execute("INSERT INTO erp_barcode_pool (code, status)"
+                     " VALUES (?, 'free')", (code,))
+    conn.commit()
+    free = [r[0] for r in conn.execute(
+        "SELECT code FROM erp_barcode_pool WHERE status = 'free'"
+        " ORDER BY code ASC").fetchall()]
+    conn.close()
+    return jsonify(ok=True, added=sorted(clean), free=free), 201
+
+
 @app.post("/api/erp/recipes")
 def erp_create_recipe():
     actor, err = _erp_check_perm("recipes.write")
@@ -41164,6 +41532,10 @@ def erp_create_recipe():
             " qty_per_batch, unit, notes) VALUES (?, 1, ?, ?, ?, ?)",
             (recipe_id, ln["item_id"], ln["qty_per_batch"], ln["unit"],
              ln["notes"]))
+    # Nov 23, 2026: every new recipe auto-assigns the lowest free
+    # purchased house barcode at creation (never fails creation when
+    # the pool is empty — see _erp_assign_barcode_for_recipe).
+    _erp_assign_barcode_for_recipe(conn, recipe_id, now)
     conn.commit()
     _erp_apply_auto_serving_grams(conn, recipe_id)
     row = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
@@ -41469,6 +41841,40 @@ def erp_delete_recipe_barcode_image(recipe_id):
     return jsonify(ok=True)
 
 
+@app.post("/api/erp/recipes/<int:recipe_id>/assign-barcode")
+def erp_assign_recipe_barcode(recipe_id):
+    """Assign the lowest free purchased house barcode to a recipe that
+    has none (admin). Nov 23, 2026: the recovery path for a recipe that
+    was created while the pool was empty (upc_status 'pool-exhausted'):
+    buy more codes, run the intake (Dept 13), then call this — the
+    recipe gets the lowest free code and its barcode picture, exactly
+    as it would have at creation. A recipe that already has a code is
+    rejected (409) — codes are never replaced. With an empty pool the
+    call succeeds (200) but assigns nothing and returns the exact
+    pool-exhausted flag. Never generates a code."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    recipe = _erp_get_recipe(conn, recipe_id)
+    if not recipe or not recipe["active"]:
+        conn.close()
+        return jsonify(error="recipe not found"), 404
+    if recipe["upc_a"]:
+        conn.close()
+        return jsonify(error="recipe already has a barcode"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    code, status = _erp_assign_barcode_for_recipe(conn, recipe_id, now)
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_recipes WHERE id = ?",
+                       (recipe_id,)).fetchone()
+    conn.close()
+    body = {"recipe": dict(row)}
+    if status == "pool-exhausted":
+        body["message"] = _ERP_BARCODE_POOL_EXHAUSTED
+    return jsonify(body), 200
+
+
 @app.delete("/api/erp/recipes/<int:recipe_id>")
 def erp_delete_recipe(recipe_id):
     """Delete a recipe (admin). Soft delete: it leaves the recipes list and
@@ -41562,6 +41968,9 @@ def erp_import_recipes():
                 "INSERT INTO erp_recipe_lines (recipe_id, recipe_version, item_id,"
                 " qty_per_batch, unit, notes) VALUES (?, 1, ?, ?, ?, ?)",
                 (rid, ln["item_id"], ln["qty_per_batch"], ln["unit"], ln["notes"]))
+        # Nov 23, 2026: imported recipes auto-assign too, lowest-first
+        # in file order.
+        _erp_assign_barcode_for_recipe(conn, rid, now)
         created += 1
         created_ids.append(rid)
     _erp_settings_audit(conn, actor, "import.recipes", "recipes", 0,
@@ -41573,18 +41982,19 @@ def erp_import_recipes():
     return jsonify(ok=True, imported=created)
 
 
-# ---- Website-flavor staging (Nov 20, 2026) ----
+# ---- Website-flavor staging (Nov 20, 2026; UPC rule revised Nov 23) ----
 # A new recipe confirmed for the website ("Add this flavor to the website?"
 # YES). The ERP records the pending request only — Railway cannot write
 # gs1-qr-data.csv, flavors.json, or the ERP map, so the workspace generator
-# finishes QR/CSV/map from the exported JSON. UPC rules (user-confirmed
-# Nov 20): auto-assign LOWEST FREE HOUSE code (602581 only) at YES, never
-# at recipe creation alone, never for a draft/test recipe; never auto-assign
-# from other prefixes; an already-recorded code is kept, never re-assigned;
-# the code is shown to the user before anything is final, with a manual
-# override. The backend re-validates format + check digit + duplicates
-# within its own table; the generator re-checks all four sources
-# (CSV, flavors.json/build_gs1.py, ERP map, Faire map) before writing.
+# finishes QR/CSV/map from the exported JSON. UPC rules (user-confirmed,
+# revised Nov 23): EVERY new recipe auto-assigns the LOWEST FREE HOUSE
+# code (602581 only) at creation — never auto-assign from other prefixes;
+# an already-recorded code is kept, never re-assigned; assignment does
+# NOT add the flavor to the website and does NOT imply label approval
+# (the health-department gate below still applies). The backend
+# re-validates format + check digit + duplicates within its own table;
+# the generator re-checks all four sources (CSV, flavors.json/build_gs1.py,
+# ERP map, Faire map) before writing.
 def _erp_upc_check_digit(upc11):
     """UPC-A check digit for the first 11 digits (same as build_gs1.py)."""
     d = [int(c) for c in upc11]
@@ -41670,6 +42080,16 @@ def erp_create_website_flavor():
     if dup_upc:
         conn.close()
         return jsonify(error="this UPC is already staged for another flavor"), 400
+    # Nov 23, 2026: a UPC auto-assigned to a recipe at creation belongs
+    # to that recipe — staging it under a DIFFERENT recipe is rejected.
+    # Staging a recipe's OWN code is allowed (id == this request's
+    # recipe). Assignment alone never stages a flavor for the website.
+    other_recipe = conn.execute(
+        "SELECT id FROM erp_recipes WHERE upc_a = ? AND active = 1"
+        " AND id != ?", (upc, recipe["id"])).fetchone()
+    if other_recipe:
+        conn.close()
+        return jsonify(error="this UPC is already assigned to another recipe"), 400
     now = datetime.now(timezone.utc).isoformat()
     try:
         cur = conn.execute(
@@ -44058,6 +44478,7 @@ _ERP_RESET_TABLES = [
     "erp_production_batches",
     "erp_recipe_lines",
     "erp_recipes",
+    "erp_barcode_pool",
     "erp_inventory_count_lines",
     "erp_inventory_counts",
     "erp_po_lines",
@@ -44636,6 +45057,13 @@ def erp_reset():
     for table in _ERP_RESET_TABLES:
         cur = conn.execute("DELETE FROM %s" % table)
         deleted[table] = cur.rowcount
+    # The barcode pool is purchased-code inventory, not recipe data: a
+    # wipe frees every code again, so the next recipe created after a
+    # reset still auto-assigns instead of hitting an empty pool.
+    for _code in _ERP_BARCODE_POOL_SEED:
+        conn.execute(
+            "INSERT OR IGNORE INTO erp_barcode_pool (code) VALUES (?)",
+            (_code,))
     _erp_settings_audit(
         conn, actor, "settings.wipe.completed", "settings", 0,
         "Wipe completed: %d rows deleted across %d tables"
