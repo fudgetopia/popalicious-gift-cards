@@ -20718,6 +20718,10 @@ function loadErpStaffAudit(body, action) {
 // tax, or withholding.
 async function loadErpHrDetail() {
   setAdminDetailStatus("Loading HR…");
+  // Headcount planning: the forecast is cached one request per tab
+  // load (shared by the hiring open counts and the planning section);
+  // a fresh tab load always re-fetches.
+  if (typeof erpHrForecastCache !== "undefined") erpHrForecastCache = {};
   try {
     var data = await erpGet("/api/erp/hr/employees");
     var staffList = await erpGet("/api/erp/admin/staff-permissions").catch(function () { return { staff: [] }; });
@@ -20823,6 +20827,53 @@ function renderErpHrDetail(data, staffList, events, timeTotals, overtimeAlerts, 
   addCard.appendChild(erpField("Email", emailInput));
   var roleInput = hrInput("Role / title");
   addCard.appendChild(erpField("Role / title", roleInput));
+  // Headcount planning: defined-role picker (optional -- free-text
+  // role still allowed for event staff) + scope picker, defaulting
+  // to Event staff. The form's established use is adding event-only
+  // staff by hand, and the safe failure is an uncounted employee,
+  // not a phantom corporate filled seat.
+  var rolePick = document.createElement("select");
+  var rolePickNone = document.createElement("option");
+  rolePickNone.value = "";
+  rolePickNone.textContent = "— No defined role —";
+  rolePick.appendChild(rolePickNone);
+  addCard.appendChild(erpField("Defined role (optional)", rolePick));
+  var scopePick = document.createElement("select");
+  [["corporate", "Corporate"], ["event", "Event staff"]].forEach(function (p) {
+    var opt = document.createElement("option");
+    opt.value = p[0];
+    opt.textContent = p[1];
+    scopePick.appendChild(opt);
+  });
+  scopePick.value = "event";
+  addCard.appendChild(erpField("Scope", scopePick));
+  var scopeNote = document.createElement("p");
+  scopeNote.className = "admin-orders-empty";
+  scopeNote.textContent = "Scope decides headcount: Corporate and store staff fill planned seats; Event staff never do. Picking a defined role fills the role above from that role's title; typing a different title afterwards clears the picker.";
+  addCard.appendChild(scopeNote);
+  erpGet("/api/erp/hr/roles?active=1").then(function (rd) {
+    (rd.roles || []).forEach(function (r) {
+      var opt = document.createElement("option");
+      opt.value = String(r.id);
+      opt.textContent = r.title;
+      rolePick.appendChild(opt);
+    });
+  }).catch(function () { /* roles stay unlisted; free-text role still works */ });
+  erpGet("/api/erp/stores").then(function (sd) {
+    (sd.stores || []).filter(function (s) { return s.status === "open"; }).forEach(function (s) {
+      var opt = document.createElement("option");
+      opt.value = "store:" + s.id;
+      opt.textContent = s.name;
+      scopePick.appendChild(opt);
+    });
+  }).catch(function () { /* no store options; Corporate still works */ });
+  rolePick.addEventListener("change", function () {
+    if (!rolePick.value) return;
+    roleInput.value = rolePick.options[rolePick.selectedIndex].textContent;
+  });
+  roleInput.addEventListener("input", function () {
+    if (rolePick.value && roleInput.value !== rolePick.options[rolePick.selectedIndex].textContent) rolePick.value = "";
+  });
   var deptInput = hrInput("Department");
   addCard.appendChild(erpField("Department", deptInput));
   var phoneInput = hrInput("Phone", "tel");
@@ -20881,7 +20932,10 @@ function renderErpHrDetail(data, staffList, events, timeTotals, overtimeAlerts, 
       emergency_contact: emergInput.value, emergency_phone: emergPhoneInput.value,
       hire_date: hireInput.value, hourly_rate_cents: rateCents,
       staff_id: linkSelect.value ? Number(linkSelect.value) : null,
-      onboarding_template_id: tplSelect.value ? Number(tplSelect.value) : null
+      onboarding_template_id: tplSelect.value ? Number(tplSelect.value) : null,
+      role_id: rolePick.value ? Number(rolePick.value) : null,
+      scope_type: scopePick.value.indexOf("store:") === 0 ? "store" : scopePick.value,
+      scope_store_id: scopePick.value.indexOf("store:") === 0 ? Number(scopePick.value.slice(6)) : null
     }).then(function () {
       loadErpHrDetail();
     }).catch(function (error) {
@@ -20918,6 +20972,7 @@ function renderErpHrDetail(data, staffList, events, timeTotals, overtimeAlerts, 
   els.body.appendChild(renderErpHrRecurringSection(employees, loadErpHrDetail));
   els.body.appendChild(renderErpHrDocumentsExpiringSection());
   els.body.appendChild(renderErpHrHiringSection(loadErpHrDetail));
+  els.body.appendChild(renderErpHrHeadcountSection(loadErpHrDetail));
 }
 function renderErpHrCard(e) {
   var card = document.createElement("div");
@@ -20932,6 +20987,7 @@ function renderErpHrCard(e) {
   if (e.department) bits.push(e.department);
   if (e.phone) bits.push(e.phone);
   if (e.hire_date) bits.push("Hired " + e.hire_date);
+  bits.push(e.scope_label ? ("Scope: " + e.scope_label) : "Scope: No scope set");
   bits.push(e.linked ? ("ERP login: " + (e.staff_email || "linked")) : "No ERP login (event staff)");
   bits.push("Rate: " + hrRateDollars(e.hourly_rate_cents));
   bits.push(e.payroll_eligible ? "Payroll: eligible (opt-in)" : "Payroll: cash only");
@@ -21006,6 +21062,7 @@ function renderErpHrDetailView(card, e, status, reload) {
     if (detail.department) dbits.push(detail.department);
     if (detail.phone) dbits.push(detail.phone);
     if (detail.hire_date) dbits.push("Hired " + detail.hire_date);
+    dbits.push(detail.scope_label ? ("Scope: " + detail.scope_label) : "Scope: No scope set");
     if (detail.emergency_contact) dbits.push("Emergency contact: " + detail.emergency_contact + (detail.emergency_phone ? " (" + detail.emergency_phone + ")" : ""));
     dbits.push(detail.linked ? ("ERP login: " + (detail.staff_email || "linked")) : "No ERP login (event staff)");
     det.textContent = dbits.join(" · ");
@@ -21159,6 +21216,61 @@ function renderErpHrEditForm(card, emp, status, reload) {
   form.appendChild(erpField("Email", emailInput));
   var roleInput = hrEditInput(emp.role, "Role / title");
   form.appendChild(erpField("Role / title", roleInput));
+  // Headcount planning: defined-role + scope pickers. The pickers
+  // only send their values once loaded -- a save before the fetch
+  // lands must never clear a stored role link or scope.
+  var rolePick = document.createElement("select");
+  var rolePickNone = document.createElement("option");
+  rolePickNone.value = "";
+  rolePickNone.textContent = "— No defined role —";
+  rolePick.appendChild(rolePickNone);
+  form.appendChild(erpField("Defined role", rolePick));
+  var scopePick = document.createElement("select");
+  [["", "No scope"], ["corporate", "Corporate"], ["event", "Event staff"]].forEach(function (p) {
+    var opt = document.createElement("option");
+    opt.value = p[0];
+    opt.textContent = p[1];
+    scopePick.appendChild(opt);
+  });
+  form.appendChild(erpField("Scope", scopePick));
+  var scopeNote = document.createElement("p");
+  scopeNote.className = "admin-orders-empty";
+  scopeNote.textContent = "Clearing the scope back to “No scope” takes this person out of every filled count. Picking a defined role sets the role above from that role's title; clearing the role keeps the typed title.";
+  form.appendChild(scopeNote);
+  var pickersLoaded = { roles: false, stores: false };
+  function maybeEnableSave() {
+    if (pickersLoaded.roles && pickersLoaded.stores) saveBtn.disabled = false;
+  }
+  erpGet("/api/erp/hr/roles?active=1").then(function (rd) {
+    (rd.roles || []).forEach(function (r) {
+      var opt = document.createElement("option");
+      opt.value = String(r.id);
+      opt.textContent = r.title;
+      rolePick.appendChild(opt);
+    });
+    if (emp.role_id) rolePick.value = String(emp.role_id);
+    pickersLoaded.roles = true;
+    maybeEnableSave();
+  }).catch(function () { pickersLoaded.roles = true; maybeEnableSave(); });
+  erpGet("/api/erp/stores").then(function (sd) {
+    (sd.stores || []).filter(function (s) { return s.status === "open"; }).forEach(function (s) {
+      var opt = document.createElement("option");
+      opt.value = "store:" + s.id;
+      opt.textContent = s.name;
+      scopePick.appendChild(opt);
+    });
+    if (emp.scope_type === "store" && emp.scope_store_id) scopePick.value = "store:" + emp.scope_store_id;
+    else if (emp.scope_type) scopePick.value = emp.scope_type;
+    pickersLoaded.stores = true;
+    maybeEnableSave();
+  }).catch(function () { pickersLoaded.stores = true; maybeEnableSave(); });
+  rolePick.addEventListener("change", function () {
+    if (!rolePick.value) return;
+    roleInput.value = rolePick.options[rolePick.selectedIndex].textContent;
+  });
+  roleInput.addEventListener("input", function () {
+    if (rolePick.value && roleInput.value !== rolePick.options[rolePick.selectedIndex].textContent) rolePick.value = "";
+  });
   var deptInput = hrEditInput(emp.department, "Department");
   form.appendChild(erpField("Department", deptInput));
   var phoneInput = hrEditInput(emp.phone, "Phone");
@@ -21188,17 +21300,26 @@ function renderErpHrEditForm(card, emp, status, reload) {
   var saveBtn = document.createElement("button");
   saveBtn.type = "button";
   saveBtn.textContent = "Save changes";
+  // Disabled until the role/scope pickers load, so a save can never
+  // clear a stored role link or scope from an unloaded picker.
+  saveBtn.disabled = true;
   saveBtn.addEventListener("click", function () {
     saveBtn.disabled = true;
     status.textContent = "Saving…";
     var rateCents = rateInput.value.trim() ? erpDollarsToCents(rateInput.value) : null;
     if (rateInput.value.trim() && rateCents === null) { status.textContent = "Hourly rate must be a dollar amount, 0 or more."; saveBtn.disabled = false; return; }
-    erpPost("/api/erp/hr/employees/" + encodeURIComponent(String(emp.id)) + "/update", {
+    var body = {
       name: nameInput.value, email: emailInput.value, role: roleInput.value,
       department: deptInput.value, phone: phoneInput.value,
       emergency_contact: emergInput.value, emergency_phone: emergPhoneInput.value,
       hire_date: hireInput.value, hourly_rate_cents: rateCents
-    }).then(function () {
+    };
+    if (pickersLoaded.roles) body.role_id = rolePick.value ? Number(rolePick.value) : null;
+    if (pickersLoaded.stores) {
+      body.scope_type = scopePick.value.indexOf("store:") === 0 ? "store" : (scopePick.value || null);
+      body.scope_store_id = scopePick.value.indexOf("store:") === 0 ? Number(scopePick.value.slice(6)) : null;
+    }
+    erpPost("/api/erp/hr/employees/" + encodeURIComponent(String(emp.id)) + "/update", body).then(function () {
       if (eligBox.checked === !!emp.payroll_eligible) return reload();
       return erpPost("/api/erp/hr/employees/" + encodeURIComponent(String(emp.id)) + "/payroll-eligibility", { payroll_eligible: eligBox.checked }).then(function () { reload(); });
     }).catch(function (error) {
@@ -21772,12 +21893,24 @@ function renderErpHrTimeSummarySection(timeTotals) {
 // section never changes the existing deactivate behaviour.
 var HR_ADD7_NEXT_STAGE = { applied: "screening", screening: "interview", interview: "offer" };
 var HR_ADD7_STAGES = ["applied", "screening", "interview", "offer", "hired", "rejected"];
+/* Headcount planning: one cached forecast request per tab load,
+   shared by the hiring open counts below and the planning section.
+   loadErpHrDetail() clears the cache on every tab load; a mutation
+   reloads the tab, so cached data is never stale across a save. */
+var erpHrForecastCache = {};
+function erpHrHeadcountForecast(periodId) {
+  var key = periodId ? String(periodId) : "default";
+  if (!erpHrForecastCache[key]) {
+    erpHrForecastCache[key] = erpGet("/api/erp/hr/headcount/forecast" + (periodId ? "?period_id=" + encodeURIComponent(String(periodId)) : ""));
+  }
+  return erpHrForecastCache[key];
+}
 /* HR roles: one row per defined job role. Edit opens an inline
    title/description form; Deactivate/Activate flips the active flag
    (inactive roles leave the applicant picker on the next reload);
    Delete is refused by the backend with a 409 while applicants are
    attached, and that message is shown in the section status line. */
-function renderErpHrRoleRow(role, status, reload) {
+function renderErpHrRoleRow(role, status, reload, openInfo) {
   var card = document.createElement("div");
   card.className = "erp-form";
   var h4 = document.createElement("h4");
@@ -21789,6 +21922,17 @@ function renderErpHrRoleRow(role, status, reload) {
     var desc = document.createElement("p");
     desc.textContent = role.description;
     card.appendChild(desc);
+  }
+  // Headcount planning: open seats for the default forecast period,
+  // per scope. Numbers only -- nothing here ever blocks applicants
+  // or hiring at zero open. No line at all when there are no periods
+  // or no targets for this role in the default period.
+  if (openInfo && openInfo.byRole && openInfo.byRole[role.id]) {
+    var openLine = document.createElement("p");
+    openLine.textContent = "Open (" + openInfo.periodLabel + "): " + openInfo.byRole[role.id].map(function (t) {
+      return t.scope_label + (t.over_by > 0 ? " over by " + t.over_by : " " + t.open);
+    }).join(" · ");
+    card.appendChild(openLine);
   }
   var editBtn = document.createElement("button");
   editBtn.type = "button";
@@ -21909,24 +22053,39 @@ function renderErpHrHiringSection(reload) {
   wrap.appendChild(rolesWrap);
   function loadRoles() {
     erpGet("/api/erp/hr/roles").then(function (data) {
-      rolesList.replaceChildren();
       var roles = data.roles || [];
-      if (!roles.length) {
-        var none = document.createElement("p");
-        none.className = "admin-orders-empty";
-        none.textContent = "No job roles yet. Add the first one above.";
-        rolesList.appendChild(none);
-        return;
-      }
-      roles.forEach(function (role) {
-        rolesList.appendChild(renderErpHrRoleRow(role, rolesStatus, reload));
-      });
+      renderRolesList(roles, null);
+      // Open counts for the default forecast period, from the one
+      // cached forecast request shared with the planning section.
+      erpHrHeadcountForecast().then(function (fc) {
+        if (!fc || !fc.period) return;
+        var byRole = {};
+        (fc.scopes || []).forEach(function (sc) {
+          (sc.targets || []).forEach(function (t) {
+            (byRole[t.role_id] = byRole[t.role_id] || []).push(t);
+          });
+        });
+        renderRolesList(roles, { periodLabel: fc.period.label, byRole: byRole });
+      }).catch(function () { /* no periods yet: no open-count line */ });
     }).catch(function (error) {
       rolesList.replaceChildren();
       var err = document.createElement("p");
       err.className = "admin-orders-empty";
       err.textContent = "Job roles could not be loaded: " + error.message;
       rolesList.appendChild(err);
+    });
+  }
+  function renderRolesList(roles, openInfo) {
+    rolesList.replaceChildren();
+    if (!roles.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No job roles yet. Add the first one above.";
+      rolesList.appendChild(none);
+      return;
+    }
+    roles.forEach(function (role) {
+      rolesList.appendChild(renderErpHrRoleRow(role, rolesStatus, reload, openInfo));
     });
   }
   var form = document.createElement("div");
@@ -22102,11 +22261,61 @@ function renderErpHrHiringSection(reload) {
           var hireBtn = document.createElement("button");
           hireBtn.type = "button";
           hireBtn.textContent = "Hire";
+          var hireForm = null;
           hireBtn.addEventListener("click", function () {
+            if (hireForm) { hireForm.remove(); hireForm = null; hireBtn.disabled = false; status.textContent = ""; return; }
             hireBtn.disabled = true;
-            status.textContent = "Hiring…";
-            erpPost("/api/erp/hr/applicants/" + encodeURIComponent(String(a.id)) + "/hire", {}).then(function () {
-              if (typeof reload === "function") reload();
+            status.textContent = "Loading stores…";
+            erpGet("/api/erp/stores").then(function (sd) {
+              status.textContent = "";
+              hireForm = document.createElement("div");
+              hireForm.className = "erp-form";
+              var hireTitle = document.createElement("h4");
+              hireTitle.textContent = "Hire " + a.name;
+              hireForm.appendChild(hireTitle);
+              // Scope picker, defaulting to Corporate. No Event staff
+              // option: a pipeline hire is a real employee, never
+              // event staff.
+              var hireScope = document.createElement("select");
+              var corpOpt = document.createElement("option");
+              corpOpt.value = "corporate";
+              corpOpt.textContent = "Corporate";
+              hireScope.appendChild(corpOpt);
+              (sd.stores || []).filter(function (s) { return s.status === "open"; }).forEach(function (s) {
+                var opt = document.createElement("option");
+                opt.value = "store:" + s.id;
+                opt.textContent = s.name;
+                hireScope.appendChild(opt);
+              });
+              hireForm.appendChild(erpField("Scope", hireScope));
+              var confirmBtn = document.createElement("button");
+              confirmBtn.type = "button";
+              confirmBtn.textContent = "Confirm hire";
+              confirmBtn.addEventListener("click", function () {
+                confirmBtn.disabled = true;
+                status.textContent = "Hiring…";
+                erpPost("/api/erp/hr/applicants/" + encodeURIComponent(String(a.id)) + "/hire", {
+                  scope_type: hireScope.value.indexOf("store:") === 0 ? "store" : "corporate",
+                  scope_store_id: hireScope.value.indexOf("store:") === 0 ? Number(hireScope.value.slice(6)) : null
+                }).then(function () {
+                  if (typeof reload === "function") reload();
+                }).catch(function (error) {
+                  status.textContent = error.message;
+                  confirmBtn.disabled = false;
+                });
+              });
+              hireForm.appendChild(confirmBtn);
+              var hireCancelBtn = document.createElement("button");
+              hireCancelBtn.type = "button";
+              hireCancelBtn.textContent = "Cancel";
+              hireCancelBtn.addEventListener("click", function () {
+                hireForm.remove();
+                hireForm = null;
+                hireBtn.disabled = false;
+                status.textContent = "";
+              });
+              hireForm.appendChild(hireCancelBtn);
+              card.appendChild(hireForm);
             }).catch(function (error) {
               status.textContent = error.message;
               hireBtn.disabled = false;
@@ -22160,6 +22369,518 @@ function renderErpHrHiringSection(reload) {
   loadRoles();
   loadActiveRoles();
   loadApplicants();
+  return wrap;
+}
+function renderErpHrHeadcountSection(reload) {
+  // Headcount planning (Dept 12): quarterly periods, per-role targets
+  // per scope, and the forecast rollup. Self-fetching like the hiring
+  // section. Filled counts are live and point-in-time; event staff
+  // and scope-NULL employees never fill a seat. Budgets are annualized
+  // planned cost per position, admin-entered only -- nothing is ever
+  // derived from pay rates, and there is no actuals column.
+  var wrap = document.createElement("div");
+  var title = document.createElement("h2");
+  title.textContent = "Headcount planning";
+  wrap.appendChild(title);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Plan headcount by quarter: periods, per-role targets per scope, and the forecast of needed vs filled vs open with the annualized budget. Filled is live active headcount right now, not prorated by hire date. Event staff never fill a seat, and employees without a scope are listed below for assignment. Budgets are the annualized planned cost per position, entered by hand — nothing is derived from pay rates, and there is no actuals column here.";
+  wrap.appendChild(note);
+  var status = document.createElement("p");
+  status.style.color = "var(--muted)";
+  status.style.flex = "1 1 100%";
+  wrap.appendChild(status);
+  var periods = [];
+  var roles = [];
+  var openStores = [];
+  var selectedPeriodId = null;
+  var scopeFilter = "all";
+  var currentForecast = null;
+  var periodsWrap = document.createElement("div");
+  wrap.appendChild(periodsWrap);
+  var unassignedWrap = document.createElement("div");
+  wrap.appendChild(unassignedWrap);
+  var forecastWrap = document.createElement("div");
+  wrap.appendChild(forecastWrap);
+  function hcInput(placeholder, type) {
+    var input = document.createElement("input");
+    input.type = type || "text";
+    input.placeholder = placeholder || "";
+    return input;
+  }
+  function hcButton(label) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    return b;
+  }
+  function hcQuarterLabel(dateStr) {
+    var m = /^(\d{4})-(\d{2})-\d{2}$/.exec(dateStr || "");
+    if (!m) return "";
+    return "Q" + (Math.floor((parseInt(m[2], 10) - 1) / 3) + 1) + " " + m[1];
+  }
+  function hcFillScopeSelect(select, includeEvent) {
+    // Values: "corporate" | "store:<id>" | "event".
+    var corp = document.createElement("option");
+    corp.value = "corporate";
+    corp.textContent = "Corporate";
+    select.appendChild(corp);
+    openStores.forEach(function (s) {
+      var opt = document.createElement("option");
+      opt.value = "store:" + s.id;
+      opt.textContent = s.name;
+      select.appendChild(opt);
+    });
+    if (includeEvent) {
+      var ev = document.createElement("option");
+      ev.value = "event";
+      ev.textContent = "Event staff";
+      select.appendChild(ev);
+    }
+  }
+  function hcScopeFromSelect(select) {
+    var v = select.value || "";
+    if (v.indexOf("store:") === 0) return { scope_type: "store", scope_store_id: Number(v.slice(6)) };
+    return { scope_type: v, scope_store_id: null };
+  }
+  function hcMoneyOrDash(cents) {
+    return (cents === null || cents === undefined) ? "—" : erpMoney(cents);
+  }
+  /* Block A — planning periods. */
+  function renderPeriods() {
+    periodsWrap.replaceChildren();
+    var card = document.createElement("div");
+    card.className = "erp-form";
+    card.style.flex = "1 1 100%";
+    var h3 = document.createElement("h3");
+    h3.textContent = "Planning periods";
+    card.appendChild(h3);
+    var hint = document.createElement("p");
+    hint.className = "admin-orders-empty";
+    hint.textContent = "Headcount is planned by quarter. Periods never overlap — a role's needed count would otherwise be counted twice — and a period with targets cannot be deleted until its targets are.";
+    card.appendChild(hint);
+    if (!periods.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No planning periods yet.";
+      card.appendChild(none);
+    }
+    periods.forEach(function (p) {
+      var row = document.createElement("div");
+      row.className = "erp-form";
+      row.style.flex = "1 1 100%";
+      var line = document.createElement("p");
+      line.textContent = p.label + " — " + p.start_date + " to " + p.end_date;
+      row.appendChild(line);
+      var editBtn = hcButton("Edit");
+      var editForm = null;
+      editBtn.addEventListener("click", function () {
+        if (editForm) { editForm.remove(); editForm = null; return; }
+        editForm = document.createElement("div");
+        editForm.className = "erp-form";
+        var labelInput = hcInput("Label, e.g. Q1 2027");
+        labelInput.value = p.label;
+        editForm.appendChild(erpField("Label", labelInput));
+        var startInput = hcInput("YYYY-MM-DD");
+        startInput.value = p.start_date;
+        editForm.appendChild(erpField("Start date", startInput));
+        var endInput = hcInput("YYYY-MM-DD");
+        endInput.value = p.end_date;
+        editForm.appendChild(erpField("End date", endInput));
+        var saveBtn = hcButton("Save period");
+        saveBtn.addEventListener("click", function () {
+          saveBtn.disabled = true;
+          status.textContent = "Saving period…";
+          erpPost("/api/erp/hr/headcount/periods/" + encodeURIComponent(String(p.id)) + "/update", {
+            label: labelInput.value, start_date: startInput.value, end_date: endInput.value
+          }).then(function () {
+            if (typeof reload === "function") reload();
+          }).catch(function (error) {
+            status.textContent = error.message;
+            saveBtn.disabled = false;
+          });
+        });
+        editForm.appendChild(saveBtn);
+        var cancelBtn = hcButton("Cancel");
+        cancelBtn.addEventListener("click", function () { editForm.remove(); editForm = null; });
+        editForm.appendChild(cancelBtn);
+        row.appendChild(editForm);
+      });
+      row.appendChild(editBtn);
+      var delBtn = hcButton("Delete");
+      delBtn.addEventListener("click", function () {
+        delBtn.disabled = true;
+        status.textContent = "Deleting period…";
+        erpDelete("/api/erp/hr/headcount/periods/" + encodeURIComponent(String(p.id))).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          delBtn.disabled = false;
+        });
+      });
+      row.appendChild(delBtn);
+      card.appendChild(row);
+    });
+    var addForm = document.createElement("div");
+    addForm.className = "erp-form";
+    addForm.style.flex = "1 1 100%";
+    var addTitle = document.createElement("h4");
+    addTitle.textContent = "Add period";
+    addForm.appendChild(addTitle);
+    var labelInput = hcInput("Label, e.g. Q1 2027");
+    addForm.appendChild(erpField("Label", labelInput));
+    var startInput = hcInput("YYYY-MM-DD");
+    addForm.appendChild(erpField("Start date", startInput));
+    var endInput = hcInput("YYYY-MM-DD");
+    addForm.appendChild(erpField("End date", endInput));
+    startInput.addEventListener("change", function () {
+      // Suggest the quarter label from the start date; the admin
+      // confirms or renames it before saving.
+      if (!labelInput.value.trim()) labelInput.value = hcQuarterLabel(startInput.value.trim());
+    });
+    var addBtn = hcButton("Add period");
+    addBtn.addEventListener("click", function () {
+      addBtn.disabled = true;
+      status.textContent = "Adding period…";
+      erpPost("/api/erp/hr/headcount/periods", {
+        label: labelInput.value, start_date: startInput.value, end_date: endInput.value
+      }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        addBtn.disabled = false;
+      });
+    });
+    addForm.appendChild(addBtn);
+    card.appendChild(addForm);
+    periodsWrap.appendChild(card);
+  }
+  /* Block C — employees without a scope. Hidden when empty. */
+  function renderUnassigned(employees) {
+    unassignedWrap.replaceChildren();
+    if (!(employees || []).length) return;
+    var card = document.createElement("div");
+    card.className = "erp-form";
+    card.style.flex = "1 1 100%";
+    var h3 = document.createElement("h3");
+    h3.textContent = "Employees without a scope";
+    card.appendChild(h3);
+    var hint = document.createElement("p");
+    hint.className = "admin-orders-empty";
+    hint.textContent = "These employees have no scope, so they fill no planned seat. Assign one below — Corporate, a store, or Event staff.";
+    card.appendChild(hint);
+    employees.forEach(function (e) {
+      var row = document.createElement("div");
+      row.className = "erp-form";
+      row.style.flex = "1 1 100%";
+      var line = document.createElement("p");
+      line.textContent = e.name + (e.role ? " — " + e.role : "") + (e.hire_date ? " (hired " + e.hire_date + ")" : "");
+      row.appendChild(line);
+      var scopeSel = document.createElement("select");
+      hcFillScopeSelect(scopeSel, true);
+      row.appendChild(erpField("Scope", scopeSel));
+      var saveBtn = hcButton("Save");
+      saveBtn.addEventListener("click", function () {
+        saveBtn.disabled = true;
+        status.textContent = "Saving…";
+        var sc = hcScopeFromSelect(scopeSel);
+        erpPost("/api/erp/hr/employees/" + encodeURIComponent(String(e.id)) + "/update", {
+          scope_type: sc.scope_type, scope_store_id: sc.scope_store_id
+        }).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          saveBtn.disabled = false;
+        });
+      });
+      row.appendChild(saveBtn);
+      card.appendChild(row);
+    });
+    unassignedWrap.appendChild(card);
+  }
+  /* Block B — forecast for the selected period. */
+  function renderForecast(fc) {
+    currentForecast = fc;
+    forecastWrap.replaceChildren();
+    var card = document.createElement("div");
+    card.className = "erp-form";
+    card.style.flex = "1 1 100%";
+    var h3 = document.createElement("h3");
+    h3.textContent = "Forecast";
+    card.appendChild(h3);
+    if (!periods.length || !fc || !fc.period) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No planning periods yet. Add the first one above — headcount is planned by quarter (e.g. Q1 2027).";
+      card.appendChild(none);
+      forecastWrap.appendChild(card);
+      return;
+    }
+    var periodSel = document.createElement("select");
+    periods.forEach(function (p) {
+      var opt = document.createElement("option");
+      opt.value = String(p.id);
+      opt.textContent = p.label + " (" + p.start_date + " to " + p.end_date + ")";
+      periodSel.appendChild(opt);
+    });
+    periodSel.value = String(fc.period.id);
+    periodSel.addEventListener("change", function () {
+      selectedPeriodId = Number(periodSel.value);
+      loadForecast();
+    });
+    card.appendChild(erpField("Period", periodSel));
+    var filterSel = document.createElement("select");
+    var allOpt = document.createElement("option");
+    allOpt.value = "all";
+    allOpt.textContent = "All scopes";
+    filterSel.appendChild(allOpt);
+    (fc.scopes || []).forEach(function (sc) {
+      var opt = document.createElement("option");
+      opt.value = sc.scope_type + ":" + (sc.scope_store_id === null || sc.scope_store_id === undefined ? "" : sc.scope_store_id);
+      opt.textContent = sc.scope_label;
+      filterSel.appendChild(opt);
+    });
+    filterSel.value = scopeFilter;
+    filterSel.addEventListener("change", function () {
+      scopeFilter = filterSel.value;
+      renderForecast(currentForecast);
+    });
+    card.appendChild(erpField("Scope", filterSel));
+    // Add-target form.
+    var addForm = document.createElement("div");
+    addForm.className = "erp-form";
+    addForm.style.flex = "1 1 100%";
+    var addTitle = document.createElement("h4");
+    addTitle.textContent = "Add target";
+    addForm.appendChild(addTitle);
+    var roleSel = document.createElement("select");
+    var rolePh = document.createElement("option");
+    rolePh.value = "";
+    rolePh.textContent = "— Select a role —";
+    roleSel.appendChild(rolePh);
+    roles.forEach(function (r) {
+      var opt = document.createElement("option");
+      opt.value = String(r.id);
+      opt.textContent = r.title;
+      roleSel.appendChild(opt);
+    });
+    addForm.appendChild(erpField("Role", roleSel));
+    var scopeSel = document.createElement("select");
+    hcFillScopeSelect(scopeSel, false);
+    addForm.appendChild(erpField("Scope", scopeSel));
+    var neededInput = hcInput("e.g. 2", "text");
+    addForm.appendChild(erpField("Positions needed", neededInput));
+    var costInput = hcInput("e.g. 52000.00 (blank = no budget)", "text");
+    addForm.appendChild(erpField("Cost per position / year ($)", costInput));
+    var noRolesNote = document.createElement("p");
+    noRolesNote.className = "admin-orders-empty";
+    if (!roles.length) noRolesNote.textContent = "Add a job role first — targets need a defined role.";
+    else if (!openStores.length) noRolesNote.textContent = "No stores in the ERP yet — store targets become available when a store is added (Stores tab). Corporate planning works fully with zero stores.";
+    addForm.appendChild(noRolesNote);
+    // Cost prefill: the same role+scope's most recent earlier
+    // period's cost, visible and editable before saving -- never a
+    // backend default. Only fills a blank cost input.
+    function maybePrefillCost() {
+      if (costInput.value.trim() || !roleSel.value) return;
+      erpGet("/api/erp/hr/headcount/targets").then(function (td) {
+        if (costInput.value.trim() || !roleSel.value) return;
+        var sc = hcScopeFromSelect(scopeSel);
+        var mine = (td.targets || []).filter(function (t) {
+          if (String(t.role_id) !== roleSel.value) return false;
+          if (t.scope_type !== sc.scope_type) return false;
+          if ((t.scope_store_id || null) !== (sc.scope_store_id || null)) return false;
+          var per = null;
+          for (var i = 0; i < periods.length; i++) if (periods[i].id === t.period_id) per = periods[i];
+          return per && per.start_date < fc.period.start_date;
+        });
+        mine.sort(function (a, b) {
+          var pa = null, pb = null;
+          periods.forEach(function (p) { if (p.id === a.period_id) pa = p; if (p.id === b.period_id) pb = p; });
+          return (pb ? pb.start_date : "") < (pa ? pa.start_date : "") ? -1 : 1;
+        });
+        var latest = mine[0];
+        if (latest && latest.cost_per_position_cents_annual !== null && latest.cost_per_position_cents_annual !== undefined) {
+          costInput.value = (latest.cost_per_position_cents_annual / 100).toFixed(2);
+        }
+      }).catch(function () { /* blank cost stays blank */ });
+    }
+    roleSel.addEventListener("change", maybePrefillCost);
+    scopeSel.addEventListener("change", maybePrefillCost);
+    var addBtn = hcButton("Add target");
+    if (!roles.length) addBtn.disabled = true;
+    addBtn.addEventListener("click", function () {
+      if (!roleSel.value) { status.textContent = "Select a role first."; return; }
+      var needed = parseInt(neededInput.value.trim(), 10);
+      if (isNaN(needed) || needed < 0 || String(needed) !== neededInput.value.trim()) {
+        status.textContent = "Positions needed must be a whole number, 0 or more.";
+        return;
+      }
+      var costCents = costInput.value.trim() ? erpDollarsToCents(costInput.value) : null;
+      if (costInput.value.trim() && costCents === null) {
+        status.textContent = "Cost must be a dollar amount, 0 or more.";
+        return;
+      }
+      addBtn.disabled = true;
+      status.textContent = "Adding target…";
+      var sc = hcScopeFromSelect(scopeSel);
+      erpPost("/api/erp/hr/headcount/targets", {
+        role_id: Number(roleSel.value), scope_type: sc.scope_type, scope_store_id: sc.scope_store_id,
+        period_id: fc.period.id, needed: needed, cost_per_position_cents_annual: costCents
+      }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        addBtn.disabled = false;
+      });
+    });
+    addForm.appendChild(addBtn);
+    card.appendChild(addForm);
+    var scopes = (fc.scopes || []).filter(function (sc) {
+      if (scopeFilter === "all") return true;
+      return (sc.scope_type + ":" + (sc.scope_store_id === null || sc.scope_store_id === undefined ? "" : sc.scope_store_id)) === scopeFilter;
+    });
+    if (!scopes.length) {
+      var noTargets = document.createElement("p");
+      noTargets.className = "admin-orders-empty";
+      noTargets.textContent = "No targets for " + fc.period.label + " yet. Add the first one above.";
+      card.appendChild(noTargets);
+      var zeroTotals = document.createElement("p");
+      zeroTotals.textContent = "Company totals — Needed 0 · Filled 0 · Open 0 · Budget —";
+      card.appendChild(zeroTotals);
+      forecastWrap.appendChild(card);
+      return;
+    }
+    scopes.forEach(function (sc) {
+      var groupTitle = document.createElement("h4");
+      groupTitle.textContent = sc.scope_label + (sc.store_closed ? " — store closed" : "");
+      card.appendChild(groupTitle);
+      var table = document.createElement("table");
+      var thead = document.createElement("thead");
+      var headRow = document.createElement("tr");
+      ["Role", "Needed", "Filled", "Open", "Cost / position / yr", "Budget / yr (≈ per quarter)", ""].forEach(function (h) {
+        var th = document.createElement("th");
+        th.textContent = h;
+        headRow.appendChild(th);
+      });
+      thead.appendChild(headRow);
+      table.appendChild(thead);
+      var tbody = document.createElement("tbody");
+      sc.targets.forEach(function (t) {
+        var tr = document.createElement("tr");
+        var roleTd = document.createElement("td");
+        roleTd.textContent = t.role_title + (t.role_active ? "" : " (inactive role)");
+        tr.appendChild(roleTd);
+        var neededTd = document.createElement("td");
+        var neededEd = document.createElement("input");
+        neededEd.type = "text";
+        neededEd.value = String(t.needed);
+        neededEd.style.width = "4em";
+        neededTd.appendChild(neededEd);
+        tr.appendChild(neededTd);
+        tr.appendChild(erpCell("Filled", String(t.filled)));
+        tr.appendChild(erpCell("Open", t.over_by > 0 ? ("over by " + t.over_by) : String(t.open)));
+        var costTd = document.createElement("td");
+        var costEd = document.createElement("input");
+        costEd.type = "text";
+        costEd.value = (t.cost_per_position_cents_annual === null || t.cost_per_position_cents_annual === undefined) ? "" : (t.cost_per_position_cents_annual / 100).toFixed(2);
+        costEd.placeholder = "—";
+        costEd.style.width = "7em";
+        costTd.appendChild(costEd);
+        tr.appendChild(costTd);
+        var budgetText = hcMoneyOrDash(t.role_budget_cents_annual);
+        if (t.role_budget_cents_annual !== null && t.role_budget_cents_annual !== undefined) {
+          budgetText += " (≈ " + erpMoney(t.quarter_share_cents) + ")";
+        }
+        tr.appendChild(erpCell("Budget / yr", budgetText));
+        var actTd = document.createElement("td");
+        var saveBtn = hcButton("Save");
+        saveBtn.addEventListener("click", function () {
+          var needed = parseInt(neededEd.value.trim(), 10);
+          if (isNaN(needed) || needed < 0 || String(needed) !== neededEd.value.trim()) {
+            status.textContent = "Positions needed must be a whole number, 0 or more.";
+            return;
+          }
+          var costCents = costEd.value.trim() ? erpDollarsToCents(costEd.value) : null;
+          if (costEd.value.trim() && costCents === null) {
+            status.textContent = "Cost must be a dollar amount, 0 or more.";
+            return;
+          }
+          saveBtn.disabled = true;
+          status.textContent = "Saving target…";
+          erpPost("/api/erp/hr/headcount/targets/" + encodeURIComponent(String(t.id)) + "/update", {
+            needed: needed, cost_per_position_cents_annual: costCents
+          }).then(function () {
+            if (typeof reload === "function") reload();
+          }).catch(function (error) {
+            status.textContent = error.message;
+            saveBtn.disabled = false;
+          });
+        });
+        actTd.appendChild(saveBtn);
+        var delBtn = hcButton("Delete");
+        delBtn.addEventListener("click", function () {
+          delBtn.disabled = true;
+          status.textContent = "Deleting target…";
+          erpDelete("/api/erp/hr/headcount/targets/" + encodeURIComponent(String(t.id))).then(function () {
+            if (typeof reload === "function") reload();
+          }).catch(function (error) {
+            status.textContent = error.message;
+            delBtn.disabled = false;
+          });
+        });
+        actTd.appendChild(delBtn);
+        tr.appendChild(actTd);
+        tbody.appendChild(tr);
+      });
+      var sub = document.createElement("tr");
+      sub.appendChild(erpCell("Role", "Subtotal — " + sc.scope_label));
+      sub.appendChild(erpCell("Needed", String(sc.totals.needed)));
+      sub.appendChild(erpCell("Filled", String(sc.totals.filled)));
+      sub.appendChild(erpCell("Open", sc.totals.over_by > 0 ? (String(sc.totals.open) + " · over by " + sc.totals.over_by) : String(sc.totals.open)));
+      sub.appendChild(erpCell("Cost / position / yr", ""));
+      var subBudget = hcMoneyOrDash(sc.totals.budget_cents_annual);
+      if (sc.totals.partial_budget) subBudget += " — Partial: " + sc.totals.unbudgeted_roles + " role" + (sc.totals.unbudgeted_roles === 1 ? "" : "s") + " without a budget";
+      sub.appendChild(erpCell("Budget / yr", subBudget));
+      sub.appendChild(erpCell("", ""));
+      tbody.appendChild(sub);
+      table.appendChild(tbody);
+      card.appendChild(table);
+    });
+    var totals = document.createElement("p");
+    var totalsText = "Company totals — Needed " + fc.totals.needed + " · Filled " + fc.totals.filled + " · Open " + fc.totals.open;
+    if (fc.totals.over_by > 0) totalsText += " · Over by " + fc.totals.over_by;
+    totalsText += " · Budget " + (fc.totals.partial_budget || fc.totals.budget_cents_annual ? erpMoney(fc.totals.budget_cents_annual) + "/yr" : "—");
+    if (fc.totals.partial_budget) totalsText += " — Partial: " + fc.totals.unbudgeted_roles + " role" + (fc.totals.unbudgeted_roles === 1 ? "" : "s") + " without a budget";
+    totals.textContent = totalsText;
+    card.appendChild(totals);
+    var foot = document.createElement("p");
+    foot.className = "admin-orders-empty";
+    foot.textContent = "Filled is active headcount right now, not prorated by hire date. Budgets are annualized; the quarterly figure is ≈ budget ÷ 4. A target's role, scope and period never change — delete it and create a new one to move it.";
+    card.appendChild(foot);
+    forecastWrap.appendChild(card);
+  }
+  function loadForecast() {
+    status.textContent = "Loading forecast…";
+    erpHrHeadcountForecast(selectedPeriodId).then(function (fc) {
+      status.textContent = "";
+      renderForecast(fc);
+    }).catch(function (error) {
+      status.textContent = error.message;
+    });
+  }
+  Promise.all([
+    erpGet("/api/erp/hr/headcount/periods").catch(function () { return { periods: [] }; }),
+    erpGet("/api/erp/hr/roles?active=1").catch(function () { return { roles: [] }; }),
+    erpGet("/api/erp/stores").catch(function () { return { stores: [] }; }),
+    erpGet("/api/erp/hr/headcount/unassigned").catch(function () { return { employees: [] }; })
+  ]).then(function (results) {
+    periods = results[0].periods || [];
+    roles = results[1].roles || [];
+    openStores = (results[2].stores || []).filter(function (s) { return s.status === "open"; });
+    renderPeriods();
+    renderUnassigned(results[3].employees || []);
+    loadForecast();
+  });
   return wrap;
 }
 function renderErpHrOffboardingSection(wrap, employee, offboarding, status, reload) {
