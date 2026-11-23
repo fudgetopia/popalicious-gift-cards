@@ -2005,6 +2005,45 @@ def init_db():
             updated_by TEXT NOT NULL DEFAULT '',
             updated_at TEXT NOT NULL DEFAULT ''
         );
+        -- Headcount planning (Dept 12, Nov 2026): quarterly planning
+        -- periods + per-role-per-scope targets. Both tables are
+        -- people-adjacent, admin-entered planning records, NOT in
+        -- _ERP_RESET_TABLES -- a wipe must never erase the plan.
+        -- Periods are quarters (label admin-entered, e.g. Q1 2027);
+        -- overlap is forbidden in code, not by an index. Target
+        -- uniqueness (role, scope, period) is enforced in code too:
+        -- scope_store_id NULL never equals NULL in SQL, so a UNIQUE
+        -- index would not stop duplicate corporate rows. Nothing is
+        -- seeded: the plan starts empty.
+        CREATE TABLE IF NOT EXISTS erp_hr_headcount_periods (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_hr_headcount_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role_id INTEGER NOT NULL,
+            scope_type TEXT NOT NULL,
+            scope_store_id INTEGER,
+            period_id INTEGER NOT NULL,
+            needed INTEGER NOT NULL DEFAULT 0,
+            cost_per_position_cents_annual INTEGER,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hc_targets_period
+            ON erp_hr_headcount_targets (period_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hc_targets_role
+            ON erp_hr_headcount_targets (role_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hc_targets_scope
+            ON erp_hr_headcount_targets (scope_type, scope_store_id);
         CREATE TABLE IF NOT EXISTS erp_hr_offboarding (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             employee_id INTEGER NOT NULL,
@@ -3240,6 +3279,29 @@ def init_db():
     if "role_id" not in _arcols:
         conn.execute(
             "ALTER TABLE erp_hr_applicants ADD COLUMN role_id INTEGER")
+    # Headcount planning: scope + role link on employees. Guarded for
+    # databases created before these columns existed (the CREATE TABLE
+    # for erp_hr_employees above does not include them on purpose --
+    # these ALTERs are the only way the columns appear, fresh or old).
+    # scope_type is NULL = never assigned: such rows are excluded from
+    # every filled count and surface under "Employees without a scope".
+    # There is deliberately NO default to corporate -- the table holds
+    # event-only staff too, and a silent corporate default would count
+    # event cash staff as corporate filled headcount. Migration order:
+    # after the employees table it touches.
+    _hecols = [r["name"] for r in conn.execute(
+        "PRAGMA table_info(erp_hr_employees)").fetchall()]
+    for _hc_col, _hc_ddl in (
+            ("scope_type", "TEXT"),
+            ("scope_store_id", "INTEGER"),
+            ("role_id", "INTEGER")):
+        if _hc_col not in _hecols:
+            conn.execute("ALTER TABLE erp_hr_employees ADD COLUMN %s %s"
+                         % (_hc_col, _hc_ddl))
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_erp_hr_employees_scope"
+                 " ON erp_hr_employees (scope_type, scope_store_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_erp_hr_employees_role"
+                 " ON erp_hr_employees (role_id)")
     # Dept 10 Settings Wave A (item 1): seed the company profile once.
     # INSERT OR IGNORE so an admin-edited row is never overwritten.
     # Known values only: legal name FUDGETOPIA LLC; facility address is the
@@ -12677,6 +12739,21 @@ def _hr_employee_payload(conn, row, with_items=False):
         "payroll_employee_id": row["payroll_employee_id"],
         "payroll_eligible": bool(row["payroll_eligible"])
         if "payroll_eligible" in row.keys() else False,
+        # Headcount planning: role_id links to a defined job role
+        # (NULL for legacy / free-text roles); scope_type is NULL =
+        # never assigned, excluded from every filled count. scope_label
+        # is the display value: "Corporate", the store name,
+        # "Event staff", or None when no scope is set.
+        "role_id": row["role_id"] if "role_id" in row.keys() else None,
+        "scope_type": row["scope_type"]
+        if "scope_type" in row.keys() else None,
+        "scope_store_id": row["scope_store_id"]
+        if "scope_store_id" in row.keys() else None,
+        "scope_label": _hc_scope_label(
+            conn,
+            row["scope_type"] if "scope_type" in row.keys() else None,
+            row["scope_store_id"]
+            if "scope_store_id" in row.keys() else None),
         "active": bool(row["active"]),
         "linked": bool(row["staff_id"]),
         "staff_email": staff_email, "staff_active": staff_active,
@@ -12804,6 +12881,24 @@ def hr_create_employee():
     if not _hr_valid_hire_date(hire_date):
         conn.close()
         return jsonify(error="hire date must be YYYY-MM-DD"), 400
+    # Headcount planning: optional role_id (must be an ACTIVE job role;
+    # the stored role string is then set from that role's title) and
+    # scope (corporate / store / event). Absent scope stores NULL =
+    # never assigned: the record is excluded from every filled count
+    # until an admin assigns a scope. Nothing is invented here.
+    _hc_role_row = None
+    if data.get("role_id") not in (None, ""):
+        _hc_role_row, _hc_rerr = _hr_resolve_active_role(
+            conn, data.get("role_id"))
+        if _hc_rerr:
+            conn.close()
+            return jsonify(error=_hc_rerr), 400
+        role = _hc_role_row["title"]
+    _hc_scope, _hc_store_id, _hc_serr = _hc_validate_employee_scope(
+        conn, data.get("scope_type"), data.get("scope_store_id"))
+    if _hc_serr:
+        conn.close()
+        return jsonify(error=_hc_serr), 400
     # Additions Wave C: onboarding template assignment. An explicit
     # onboarding_template_id wins; otherwise a template whose role
     # matches the employee's role (case-insensitive) seeds the
@@ -12841,19 +12936,22 @@ def hr_create_employee():
     cur = conn.execute(
         "INSERT INTO erp_hr_employees (staff_id, name, email, role,"
         " department, phone, emergency_contact, emergency_phone, hire_date,"
-        " hourly_rate_cents,"
+        " hourly_rate_cents, scope_type, scope_store_id, role_id,"
         " active, created_by, created_at, updated_by, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, '', '')",
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, '', '')",
         (staff_id, name, email, role, department, phone, emergency_contact,
-         emergency_phone, hire_date, hourly_rate_cents, actor, now))
+         emergency_phone, hire_date, hourly_rate_cents, _hc_scope,
+         _hc_store_id, _hc_role_row["id"] if _hc_role_row else None,
+         actor, now))
     employee_id = cur.lastrowid
     _hr_seed_onboarding(conn, employee_id, now, _seed_labels or None)
     if staff_row is not None and hire_date and hire_date != (staff_row["hire_date"] or ""):
         conn.execute("UPDATE staff SET hire_date = ? WHERE id = ?",
                      (hire_date, staff_id))
     _erp_staff_audit(conn, actor, "hr.employee_created", "hr_employee",
-                     employee_id, "created HR record for %s%s" % (
-                         name, " (linked to staff #%d)" % staff_id if staff_id else ""))
+                     employee_id, "created HR record for %s%s%s" % (
+                         name, " (linked to staff #%d)" % staff_id if staff_id else "",
+                         " (scope: %s)" % _hc_scope if _hc_scope else ""))
     conn.commit()
     row = conn.execute("SELECT * FROM erp_hr_employees WHERE id = ?",
                        (employee_id,)).fetchone()
@@ -12919,6 +13017,36 @@ def hr_update_employee(employee_id):
     if not row:
         conn.close()
         return jsonify(error="employee not found"), 404
+    # Headcount planning: role_id / scope are editable here. A supplied
+    # role_id must be an ACTIVE job role and sets the role string from
+    # its title; an explicit null clears the role link (the stored role
+    # string stays as typed). scope_type null/"" clears the scope back
+    # to NULL (unassigned). Scope changes are audited via the changes
+    # list below.
+    _hc_role_row = None
+    _hc_role_provided = "role_id" in data
+    if _hc_role_provided and data.get("role_id") not in (None, ""):
+        _hc_role_row, _hc_rerr = _hr_resolve_active_role(
+            conn, data.get("role_id"))
+        if _hc_rerr:
+            conn.close()
+            return jsonify(error=_hc_rerr), 400
+        vals["role"] = _hc_role_row["title"]
+    _hc_scope_provided = "scope_type" in data or "scope_store_id" in data
+    _hc_new_scope = None
+    _hc_new_store = None
+    if _hc_scope_provided:
+        _hc_new_scope = data.get("scope_type") if "scope_type" in data \
+            else (row["scope_type"] if "scope_type" in row.keys() else None)
+        _hc_new_store = data.get("scope_store_id") \
+            if "scope_store_id" in data \
+            else (row["scope_store_id"]
+                  if "scope_store_id" in row.keys() else None)
+        _hc_new_scope, _hc_new_store, _hc_serr = \
+            _hc_validate_employee_scope(conn, _hc_new_scope, _hc_new_store)
+        if _hc_serr:
+            conn.close()
+            return jsonify(error=_hc_serr), 400
     changes = []
     sets = []
     args = []
@@ -12933,6 +13061,29 @@ def hr_update_employee(employee_id):
         if rate_val != (row["hourly_rate_cents"] if "hourly_rate_cents" in row.keys() else None):
             changes.append("hourly_rate_cents: %s -> %s" % (
                 row["hourly_rate_cents"], rate_val))
+    if _hc_role_provided:
+        _hc_new_role_id = _hc_role_row["id"] if _hc_role_row else None
+        _hc_old_role_id = row["role_id"] if "role_id" in row.keys() else None
+        if _hc_new_role_id != _hc_old_role_id:
+            sets.append("role_id = ?")
+            args.append(_hc_new_role_id)
+            changes.append("role_id: %s -> %s"
+                           % (_hc_old_role_id, _hc_new_role_id))
+    if _hc_scope_provided:
+        _hc_old_scope = row["scope_type"] \
+            if "scope_type" in row.keys() else None
+        _hc_old_store = row["scope_store_id"] \
+            if "scope_store_id" in row.keys() else None
+        if _hc_new_scope != _hc_old_scope:
+            sets.append("scope_type = ?")
+            args.append(_hc_new_scope)
+            changes.append("scope_type: %s -> %s"
+                           % (_hc_old_scope or "", _hc_new_scope or ""))
+        if _hc_new_store != _hc_old_store:
+            sets.append("scope_store_id = ?")
+            args.append(_hc_new_store)
+            changes.append("scope_store_id: %s -> %s"
+                           % (_hc_old_store, _hc_new_store))
     if sets:
         now = datetime.now(timezone.utc).isoformat()
         sets.append("updated_by = ?")
@@ -14631,15 +14782,30 @@ def hr_hire_applicant(applicant_id):
                        " (currently %s)" % row["stage"]), 400
     if not hire_date:
         hire_date = datetime.now(timezone.utc).date().isoformat()
+    # Headcount planning: optional scope (corporate / store -- there is
+    # no Event option at hire: a pipeline hire is a real employee,
+    # never event staff). Omitted scope stores NULL (unassigned); the
+    # backend never invents it. role_id is set from the applicant, so
+    # a later role rename keeps matching this employee to the role.
+    _hc_scope, _hc_store_id, _hc_serr = _hc_validate_employee_scope(
+        conn, data.get("scope_type"), data.get("scope_store_id"))
+    if _hc_serr:
+        conn.close()
+        return jsonify(error=_hc_serr), 400
+    if _hc_scope == "event":
+        conn.close()
+        return jsonify(error="event staff cannot be hired through the"
+                       " pipeline"), 400
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO erp_hr_employees (staff_id, name, email, role,"
         " department, phone, emergency_contact, emergency_phone, hire_date,"
-        " hourly_rate_cents, active, created_by, created_at,"
-        " updated_by, updated_at)"
-        " VALUES (NULL, ?, ?, ?, '', ?, '', '', ?, NULL, 1, ?, ?, '', '')",
+        " hourly_rate_cents, scope_type, scope_store_id, role_id,"
+        " active, created_by, created_at, updated_by, updated_at)"
+        " VALUES (NULL, ?, ?, ?, '', ?, '', '', ?, NULL, ?, ?, ?, 1, ?, ?, '', '')",
         (row["name"], row["email"] or "", row["role"] or "",
-         row["phone"] or "", hire_date, actor, now))
+         row["phone"] or "", hire_date, _hc_scope, _hc_store_id,
+         row["role_id"] if "role_id" in row.keys() else None, actor, now))
     employee_id = cur.lastrowid
     _hr_seed_onboarding(conn, employee_id, now,
                         _hr_role_onboarding_labels(conn, row["role"] or ""))
@@ -14648,8 +14814,9 @@ def hr_hire_applicant(applicant_id):
                  " WHERE id = ?",
                  (employee_id, actor, now, applicant_id))
     _erp_staff_audit(conn, actor, "hr.employee_created", "hr_employee",
-                     employee_id, "hired from applicant #%d (%s)"
-                     % (applicant_id, row["name"] or ""))
+                     employee_id, "hired from applicant #%d (%s)%s"
+                     % (applicant_id, row["name"] or "",
+                        " (scope: %s)" % _hc_scope if _hc_scope else ""))
     _erp_staff_audit(conn, actor, "hr.applicant_hired", "hr_applicant",
                      applicant_id, "hired %s as employee #%d"
                      % (row["name"] or "", employee_id))
@@ -14849,8 +15016,9 @@ def hr_update_role(role_id):
 @app.delete("/api/erp/hr/roles/<int:role_id>")
 def hr_delete_role(role_id):
     """Delete a job role. Refused (409) while any applicant has
-    role_id = this role. Otherwise the row is deleted; applicant and
-    employee records are never touched."""
+    role_id = this role, or while any headcount target references it.
+    Otherwise the row is deleted; applicant and employee records are
+    never touched."""
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -14866,12 +15034,784 @@ def hr_delete_role(role_id):
         conn.close()
         return jsonify(error="cannot delete a role with applicants"
                        " (%d applicant(s) attached)" % count), 409
+    tcount = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_headcount_targets WHERE role_id = ?",
+        (role_id,)).fetchone()[0]
+    if tcount:
+        conn.close()
+        return jsonify(error="cannot delete a role with headcount targets"
+                       " (%d target(s) attached)" % tcount), 409
     conn.execute("DELETE FROM erp_hr_roles WHERE id = ?", (role_id,))
     _erp_staff_audit(conn, actor, "hr.role_deleted", "hr_role", role_id,
                      "deleted job role %s" % (row["title"] or ""))
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# Headcount planning (Dept 12, Nov 2026): quarterly planning periods
+# + per-role-per-scope targets + the forecast rollup. Admin-only via
+# _require_erp_admin(), like the rest of HR. Filled counts are always
+# computed (one GROUP BY over active employees), never stored; event
+# staff and scope-NULL rows never fill a seat. Budgets are annualized
+# planned cost per position, admin-entered only -- never derived from
+# hourly_rate_cents or payroll. No actuals column exists on purpose.
+def _hc_money(cents):
+    """Audit-line money: "$52,000.00" for a cents value, "—" for None."""
+    if cents is None:
+        return "—"
+    return "$%s" % ("{:,.2f}".format(cents / 100.0))
+
+
+def _hc_scope_label(conn, scope_type, scope_store_id):
+    """Display label for an employee/target scope: "Corporate", the
+    store name, "Event staff", or None when no scope is set. A store
+    scope whose store row is gone reads "Store #<id> (deleted)"."""
+    if scope_type == "corporate":
+        return "Corporate"
+    if scope_type == "event":
+        return "Event staff"
+    if scope_type == "store":
+        if scope_store_id is None:
+            return "Store (deleted)"
+        s = conn.execute("SELECT name FROM erp_stores WHERE id = ?",
+                         (scope_store_id,)).fetchone()
+        if s:
+            return s["name"] or ("Store #%s" % scope_store_id)
+        return "Store #%s (deleted)" % scope_store_id
+    return None
+
+
+def _hc_validate_employee_scope(conn, scope_type, scope_store_id):
+    """Validate an employee scope pair. Returns (scope_type,
+    scope_store_id, error-or-None). None/blank scope_type is
+    (None, None, None): never assigned, excluded from every filled
+    count. A store scope needs an existing OPEN store; corporate /
+    event must carry no store id."""
+    if scope_type is None or (isinstance(scope_type, str)
+                              and not scope_type.strip()):
+        return None, None, None
+    if isinstance(scope_type, str):
+        scope_type = scope_type.strip()
+    if scope_type not in ("corporate", "store", "event"):
+        return None, None, "scope_type must be corporate, store or event"
+    if scope_type == "store":
+        if scope_store_id in (None, ""):
+            return None, None, "scope_store_id is required for a store scope"
+        try:
+            scope_store_id = int(scope_store_id)
+        except (TypeError, ValueError):
+            return None, None, "store not found"
+        store = conn.execute("SELECT * FROM erp_stores WHERE id = ?",
+                             (scope_store_id,)).fetchone()
+        if not store:
+            return None, None, "store not found"
+        if store["status"] != "open":
+            return None, None, "store is closed"
+        return "store", scope_store_id, None
+    if scope_store_id not in (None, ""):
+        return None, None, "scope_store_id must be blank unless scope" \
+            " is a store"
+    return scope_type, None, None
+
+
+def _hc_period_row(conn, period_id):
+    try:
+        period_id = int(period_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute(
+        "SELECT * FROM erp_hr_headcount_periods WHERE id = ?",
+        (period_id,)).fetchone()
+
+
+def _hc_period_payload(row):
+    return {
+        "id": row["id"], "label": row["label"],
+        "start_date": row["start_date"] or "",
+        "end_date": row["end_date"] or "",
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _hc_period_overlap(conn, start_date, end_date, exclude_id=None):
+    """Label of another period whose [start, end] intersects this one,
+    or None. Overlap is forbidden: a role's needed count would
+    otherwise be counted twice in any cross-period rollup."""
+    rows = conn.execute(
+        "SELECT id, label, start_date, end_date"
+        " FROM erp_hr_headcount_periods").fetchall()
+    for r in rows:
+        if exclude_id is not None and r["id"] == exclude_id:
+            continue
+        if start_date <= (r["end_date"] or "") \
+                and end_date >= (r["start_date"] or ""):
+            return r["label"]
+    return None
+
+
+def _hc_validate_period_fields(conn, label, start_date, end_date,
+                                exclude_id=None):
+    """Validate a period's label/dates. Returns (label, start_date,
+    end_date, error-or-None)."""
+    if not label or len(label) > 100:
+        return None, None, None, "label must be 1-100 characters"
+    if not start_date or not _hr_valid_hire_date(start_date):
+        return None, None, None, "start date must be YYYY-MM-DD"
+    if not end_date or not _hr_valid_hire_date(end_date):
+        return None, None, None, "end date must be YYYY-MM-DD"
+    if start_date > end_date:
+        return None, None, None, "start date must be on or before" \
+            " end date"
+    dup = conn.execute(
+        "SELECT id FROM erp_hr_headcount_periods"
+        " WHERE lower(label) = lower(?)", (label,)).fetchone()
+    if dup and dup["id"] != exclude_id:
+        return None, None, None, "a planning period with this label" \
+            " already exists"
+    over = _hc_period_overlap(conn, start_date, end_date, exclude_id)
+    if over:
+        return None, None, None, "period overlaps %s" % over
+    return label, start_date, end_date, None
+
+
+def _hc_target_row(conn, target_id):
+    try:
+        target_id = int(target_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute(
+        "SELECT * FROM erp_hr_headcount_targets WHERE id = ?",
+        (target_id,)).fetchone()
+
+
+def _hc_filled_groups(conn):
+    """One GROUP BY over active employees in a countable scope
+    (corporate / store only -- event and NULL-scope rows are excluded
+    by the query itself, never by a filter the caller could forget).
+    Returns [(role_id, lower(role), scope_type, scope_store_id, n)]."""
+    rows = conn.execute(
+        "SELECT role_id, lower(role) AS role_lower, scope_type,"
+        " scope_store_id, COUNT(*) AS n FROM erp_hr_employees"
+        " WHERE active = 1 AND scope_type IN ('corporate', 'store')"
+        " GROUP BY role_id, lower(role), scope_type, scope_store_id"
+    ).fetchall()
+    return [(r["role_id"], r["role_lower"] or "", r["scope_type"],
+             r["scope_store_id"], r["n"]) for r in rows]
+
+
+def _hc_filled_for(groups, role_id, role_title, scope_type,
+                   scope_store_id):
+    """Filled seats for one target: active employees in the same scope
+    whose role_id matches, or -- for rows with no role_id -- whose
+    role string matches the role title case-insensitively (the legacy
+    fallback). Point-in-time: hire date is not consulted."""
+    total = 0
+    want = (role_title or "").lower()
+    for g_role_id, g_title, g_scope, g_store, n in groups:
+        if g_scope != scope_type or g_store != scope_store_id:
+            continue
+        if g_role_id is not None and g_role_id == role_id:
+            total += n
+        elif g_role_id is None and g_title == want:
+            total += n
+    return total
+
+
+def _hc_target_payload(conn, row, filled_groups):
+    role = _hr_role_row(conn, row["role_id"])
+    role_title = role["title"] if role else ""
+    role_active = bool(role["active"]) if role else False
+    period = _hc_period_row(conn, row["period_id"])
+    filled = _hc_filled_for(filled_groups, row["role_id"], role_title,
+                            row["scope_type"], row["scope_store_id"])
+    needed = row["needed"]
+    cost = row["cost_per_position_cents_annual"]
+    budget = needed * cost if cost is not None else None
+    store_deleted = False
+    store_closed = False
+    if row["scope_type"] == "store":
+        store = conn.execute("SELECT * FROM erp_stores WHERE id = ?",
+                             (row["scope_store_id"],)).fetchone()
+        if store is None:
+            store_deleted = True
+        elif store["status"] != "open":
+            store_closed = True
+    return {
+        "id": row["id"], "role_id": row["role_id"],
+        "role_title": role_title, "role_active": role_active,
+        "scope_type": row["scope_type"],
+        "scope_store_id": row["scope_store_id"],
+        "scope_label": _hc_scope_label(conn, row["scope_type"],
+                                       row["scope_store_id"]),
+        "store_deleted": store_deleted, "store_closed": store_closed,
+        "period_id": row["period_id"],
+        "period_label": period["label"] if period else "",
+        "needed": needed, "filled": filled,
+        "open": max(needed - filled, 0),
+        "over_by": max(filled - needed, 0),
+        "cost_per_position_cents_annual": cost,
+        "role_budget_cents_annual": budget,
+        "quarter_share_cents": (budget // 4) if budget is not None
+        else None,
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _hc_totals(targets):
+    """Rollup over target payloads. open is the sum of per-role opens
+    (never negative); over_by is the sum of per-role overs -- totals
+    never net overfilled roles against open ones. budget sums only
+    budgeted roles; partial_budget flags a total that understates the
+    plan because a role has no budget (NULL cost, never 0 by
+    default)."""
+    unbudgeted = sum(
+        1 for t in targets
+        if t["cost_per_position_cents_annual"] is None)
+    return {
+        "needed": sum(t["needed"] for t in targets),
+        "filled": sum(t["filled"] for t in targets),
+        "open": sum(t["open"] for t in targets),
+        "over_by": sum(t["over_by"] for t in targets),
+        "budget_cents_annual": sum(
+            t["role_budget_cents_annual"] for t in targets
+            if t["role_budget_cents_annual"] is not None),
+        "partial_budget": unbudgeted > 0,
+        "unbudgeted_roles": unbudgeted,
+    }
+
+
+def _hc_default_period(conn):
+    """The period containing today; else the next upcoming; else the
+    latest. None when no periods exist."""
+    today = datetime.now(timezone.utc).date().isoformat()
+    row = conn.execute(
+        "SELECT * FROM erp_hr_headcount_periods"
+        " WHERE start_date <= ? AND end_date >= ?"
+        " ORDER BY start_date LIMIT 1", (today, today)).fetchone()
+    if row:
+        return row
+    row = conn.execute(
+        "SELECT * FROM erp_hr_headcount_periods"
+        " WHERE start_date > ? ORDER BY start_date LIMIT 1",
+        (today,)).fetchone()
+    if row:
+        return row
+    return conn.execute(
+        "SELECT * FROM erp_hr_headcount_periods"
+        " ORDER BY end_date DESC, id DESC LIMIT 1").fetchone()
+
+
+def _hc_target_detail(period_label, scope_label, role_title):
+    return "%s · %s · %s" % (period_label, scope_label, role_title)
+
+
+@app.get("/api/erp/hr/headcount/periods")
+def hc_list_periods():
+    """List planning periods, ordered by start date. Starts empty --
+    nothing is seeded."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_headcount_periods"
+        " ORDER BY start_date, id").fetchall()
+    out = [_hc_period_payload(r) for r in rows]
+    conn.close()
+    return jsonify(periods=out)
+
+
+@app.post("/api/erp/hr/headcount/periods")
+def hc_create_period():
+    """Create a planning period (201). Label 1-100 chars, unique
+    case-insensitively; dates valid YYYY-MM-DD, start <= end; no
+    overlap with any other period (all 400s)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    label, start, end, verr = _hc_validate_period_fields(
+        conn, (data.get("label") or "").strip(),
+        (data.get("start_date") or "").strip(),
+        (data.get("end_date") or "").strip())
+    if verr:
+        conn.close()
+        return jsonify(error=verr), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_headcount_periods (label, start_date,"
+        " end_date, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, '', '')",
+        (label, start, end, actor, now))
+    period_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.headcount_period_created",
+                     "hr_headcount_period", period_id,
+                     "created planning period %s (%s to %s)"
+                     % (label, start, end))
+    conn.commit()
+    payload = _hc_period_payload(_hc_period_row(conn, period_id))
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.get("/api/erp/hr/headcount/periods/<int:period_id>")
+def hc_get_period(period_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hc_period_row(conn, period_id)
+    if not row:
+        conn.close()
+        return jsonify(error="planning period not found"), 404
+    payload = _hc_period_payload(row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/headcount/periods/<int:period_id>/update")
+def hc_update_period(period_id):
+    """Edit a period -- only provided fields change. Label/dates
+    re-run all validation, including overlap against every other
+    period."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _hc_period_row(conn, period_id)
+    if not row:
+        conn.close()
+        return jsonify(error="planning period not found"), 404
+    label = (data.get("label") or "").strip() if "label" in data \
+        else row["label"]
+    start = (data.get("start_date") or "").strip() \
+        if "start_date" in data else row["start_date"]
+    end = (data.get("end_date") or "").strip() \
+        if "end_date" in data else row["end_date"]
+    label, start, end, verr = _hc_validate_period_fields(
+        conn, label, start, end, exclude_id=period_id)
+    if verr:
+        conn.close()
+        return jsonify(error=verr), 400
+    sets = []
+    args = []
+    changes = []
+    if label != row["label"]:
+        sets.append("label = ?")
+        args.append(label)
+        changes.append("label: %s -> %s" % (row["label"], label))
+    if start != row["start_date"]:
+        sets.append("start_date = ?")
+        args.append(start)
+        changes.append("start_date: %s -> %s" % (row["start_date"], start))
+    if end != row["end_date"]:
+        sets.append("end_date = ?")
+        args.append(end)
+        changes.append("end_date: %s -> %s" % (row["end_date"], end))
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(period_id)
+        conn.execute("UPDATE erp_hr_headcount_periods SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "hr.headcount_period_updated",
+                         "hr_headcount_period", period_id,
+                         "%s: %s" % (row["label"], "; ".join(changes)))
+        conn.commit()
+    payload = _hc_period_payload(_hc_period_row(conn, period_id))
+    conn.close()
+    return jsonify(payload)
+
+
+@app.delete("/api/erp/hr/headcount/periods/<int:period_id>")
+def hc_delete_period(period_id):
+    """Delete a period. Refused (409) while any target references it
+    -- targets are deleted first; no cascade, a delete must never
+    silently erase admin-entered plans."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hc_period_row(conn, period_id)
+    if not row:
+        conn.close()
+        return jsonify(error="planning period not found"), 404
+    count = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_headcount_targets"
+        " WHERE period_id = ?", (period_id,)).fetchone()[0]
+    if count:
+        conn.close()
+        return jsonify(error="cannot delete a period with headcount"
+                       " targets (%d target(s) attached)" % count), 409
+    conn.execute("DELETE FROM erp_hr_headcount_periods WHERE id = ?",
+                 (period_id,))
+    _erp_staff_audit(conn, actor, "hr.headcount_period_deleted",
+                     "hr_headcount_period", period_id,
+                     "deleted planning period %s" % (row["label"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/hr/headcount/targets")
+def hc_list_targets():
+    """List targets, optionally filtered by ?period_id=, ?scope_type=
+    (corporate|store) and ?store_id=. Each row carries its computed
+    filled/open/budget, so the UI never recomputes."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    period_id = (request.args.get("period_id") or "").strip()
+    scope_type = (request.args.get("scope_type") or "").strip()
+    store_id = (request.args.get("store_id") or "").strip()
+    conn = db()
+    where = []
+    args = []
+    if period_id:
+        try:
+            pid = int(period_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="period_id must be a period id"), 400
+        if not _hc_period_row(conn, pid):
+            conn.close()
+            return jsonify(error="planning period not found"), 400
+        where.append("period_id = ?")
+        args.append(pid)
+    if scope_type:
+        if scope_type not in ("corporate", "store"):
+            conn.close()
+            return jsonify(error="scope_type must be corporate"
+                           " or store"), 400
+        where.append("scope_type = ?")
+        args.append(scope_type)
+    if store_id:
+        try:
+            sid = int(store_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="store_id must be a store id"), 400
+        where.append("scope_store_id = ?")
+        args.append(sid)
+    q = "SELECT * FROM erp_hr_headcount_targets"
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    rows = conn.execute(q, args).fetchall()
+    groups = _hc_filled_groups(conn)
+    out = [_hc_target_payload(conn, r, groups) for r in rows]
+    out.sort(key=lambda t: (t["period_label"], t["scope_label"],
+                            (t["role_title"] or "").lower()))
+    conn.close()
+    return jsonify(targets=out)
+
+
+@app.post("/api/erp/hr/headcount/targets")
+def hc_create_target():
+    """Create a target (201): role x scope x period -> positions
+    needed, with an optional annualized cost per position. The role
+    must be ACTIVE (400 otherwise); a store scope needs an existing
+    OPEN store; a duplicate (role, scope, period) is 409."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    role_row, rerr = _hr_resolve_active_role(conn, data.get("role_id"))
+    if rerr:
+        conn.close()
+        return jsonify(error=rerr), 400
+    scope_type = (data.get("scope_type") or "").strip() \
+        if isinstance(data.get("scope_type"), str) else data.get("scope_type")
+    if scope_type not in ("corporate", "store"):
+        conn.close()
+        return jsonify(error="scope_type must be corporate or store"), 400
+    scope_store_id = data.get("scope_store_id")
+    if scope_type == "store":
+        if scope_store_id in (None, ""):
+            conn.close()
+            return jsonify(error="scope_store_id is required for a"
+                           " store target"), 400
+        try:
+            scope_store_id = int(scope_store_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="store not found"), 400
+        store = conn.execute("SELECT * FROM erp_stores WHERE id = ?",
+                             (scope_store_id,)).fetchone()
+        if not store:
+            conn.close()
+            return jsonify(error="store not found"), 400
+        if store["status"] != "open":
+            conn.close()
+            return jsonify(error="store is closed"), 400
+    else:
+        if scope_store_id not in (None, ""):
+            conn.close()
+            return jsonify(error="scope_store_id must be blank for a"
+                           " corporate target"), 400
+        scope_store_id = None
+    try:
+        period_id = int(data.get("period_id"))
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="period_id must reference a planning"
+                       " period"), 400
+    period = _hc_period_row(conn, period_id)
+    if not period:
+        conn.close()
+        return jsonify(error="planning period not found"), 400
+    needed = _stores_int(data.get("needed"))
+    if needed is None or needed < 0:
+        conn.close()
+        return jsonify(error="positions needed must be a whole number,"
+                       " 0 or more"), 400
+    cost = _hr_parse_rate(data.get("cost_per_position_cents_annual"))
+    if cost is False:
+        conn.close()
+        return jsonify(error="cost per position must be a whole number"
+                       " of cents, 0 or more"), 400
+    for r in conn.execute(
+            "SELECT scope_type, scope_store_id"
+            " FROM erp_hr_headcount_targets"
+            " WHERE role_id = ? AND period_id = ?",
+            (role_row["id"], period_id)).fetchall():
+        if r["scope_type"] == scope_type \
+                and r["scope_store_id"] == scope_store_id:
+            conn.close()
+            return jsonify(error="a target already exists for this role,"
+                           " scope and period — edit it instead"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    scope_label = _hc_scope_label(conn, scope_type, scope_store_id)
+    cur = conn.execute(
+        "INSERT INTO erp_hr_headcount_targets (role_id, scope_type,"
+        " scope_store_id, period_id, needed,"
+        " cost_per_position_cents_annual, created_by, created_at,"
+        " updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', '')",
+        (role_row["id"], scope_type, scope_store_id, period_id, needed,
+         cost, actor, now))
+    target_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.headcount_target_created",
+                     "hr_headcount_target", target_id,
+                     "%s: needed %d%s" % (
+                         _hc_target_detail(period["label"], scope_label,
+                                           role_row["title"]),
+                         needed,
+                         (", cost %s/yr" % _hc_money(cost))
+                         if cost is not None else ""))
+    conn.commit()
+    payload = _hc_target_payload(
+        conn, _hc_target_row(conn, target_id), _hc_filled_groups(conn))
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.post("/api/erp/hr/headcount/targets/<int:target_id>/update")
+def hc_update_target(target_id):
+    """Edit a target -- only needed and cost_per_position_cents_annual
+    change. Role / scope / period are immutable: a body that tries to
+    change them is 400."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _hc_target_row(conn, target_id)
+    if not row:
+        conn.close()
+        return jsonify(error="headcount target not found"), 404
+    for key in ("role_id", "scope_type", "scope_store_id", "period_id"):
+        if key in data:
+            new = data.get(key)
+            if key in ("role_id", "scope_store_id", "period_id"):
+                if new in (None, ""):
+                    new = None
+                else:
+                    try:
+                        new = int(new)
+                    except (TypeError, ValueError):
+                        new = "___invalid___"
+            elif isinstance(new, str):
+                new = new.strip()
+            if new != row[key]:
+                conn.close()
+                return jsonify(error="role, scope and period cannot be"
+                               " changed — delete and recreate the"
+                               " target"), 400
+    needed = row["needed"]
+    cost = row["cost_per_position_cents_annual"]
+    if "needed" in data:
+        needed = _stores_int(data.get("needed"))
+        if needed is None or needed < 0:
+            conn.close()
+            return jsonify(error="positions needed must be a whole number,"
+                           " 0 or more"), 400
+    if "cost_per_position_cents_annual" in data:
+        cost = _hr_parse_rate(data.get("cost_per_position_cents_annual"))
+        if cost is False:
+            conn.close()
+            return jsonify(error="cost per position must be a whole number"
+                           " of cents, 0 or more"), 400
+    sets = []
+    args = []
+    changes = []
+    if needed != row["needed"]:
+        sets.append("needed = ?")
+        args.append(needed)
+        changes.append("needed %d -> %d" % (row["needed"], needed))
+    if cost != row["cost_per_position_cents_annual"]:
+        sets.append("cost_per_position_cents_annual = ?")
+        args.append(cost)
+        changes.append("cost %s -> %s" % (
+            _hc_money(row["cost_per_position_cents_annual"])
+            if row["cost_per_position_cents_annual"] is not None else "—",
+            _hc_money(cost) if cost is not None else "—"))
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(target_id)
+        conn.execute("UPDATE erp_hr_headcount_targets SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        period = _hc_period_row(conn, row["period_id"])
+        _hc_role = _hr_role_row(conn, row["role_id"])
+        _erp_staff_audit(conn, actor, "hr.headcount_target_updated",
+                         "hr_headcount_target", target_id,
+                         "%s: %s" % (
+                             _hc_target_detail(
+                                 period["label"] if period else "",
+                                 _hc_scope_label(conn, row["scope_type"],
+                                                 row["scope_store_id"]),
+                                 _hc_role["title"] if _hc_role else ""),
+                             "; ".join(changes)))
+        conn.commit()
+    payload = _hc_target_payload(
+        conn, _hc_target_row(conn, target_id), _hc_filled_groups(conn))
+    conn.close()
+    return jsonify(payload)
+
+
+@app.delete("/api/erp/hr/headcount/targets/<int:target_id>")
+def hc_delete_target(target_id):
+    """Delete a target. Always allowed -- targets are plans, not
+    people records."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hc_target_row(conn, target_id)
+    if not row:
+        conn.close()
+        return jsonify(error="headcount target not found"), 404
+    period = _hc_period_row(conn, row["period_id"])
+    role = _hr_role_row(conn, row["role_id"])
+    detail = _hc_target_detail(
+        period["label"] if period else "",
+        _hc_scope_label(conn, row["scope_type"], row["scope_store_id"]),
+        role["title"] if role else "")
+    conn.execute("DELETE FROM erp_hr_headcount_targets WHERE id = ?",
+                 (target_id,))
+    _erp_staff_audit(conn, actor, "hr.headcount_target_deleted",
+                     "hr_headcount_target", target_id,
+                     "deleted target %s" % detail)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/hr/headcount/forecast")
+def hc_forecast():
+    """Full rollup for one period: per-scope target rows (needed /
+    filled / open / budget, ordered by role title) with scope and
+    company totals. ?period_id= names the period (404 when it names
+    nothing); omitted, the default period applies (containing today,
+    else next upcoming, else latest). Orphaned store targets (store
+    row wiped) group under their "Store #<id> (deleted)" label, still
+    counted in the company totals, never dropped."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    period_id = (request.args.get("period_id") or "").strip()
+    conn = db()
+    if period_id:
+        try:
+            pid = int(period_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="planning period not found"), 404
+        period = _hc_period_row(conn, pid)
+        if not period:
+            conn.close()
+            return jsonify(error="planning period not found"), 404
+    else:
+        period = _hc_default_period(conn)
+        if not period:
+            conn.close()
+            return jsonify(period=None, scopes=[], totals={
+                "needed": 0, "filled": 0, "open": 0, "over_by": 0,
+                "budget_cents_annual": 0, "partial_budget": False,
+                "unbudgeted_roles": 0})
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_headcount_targets WHERE period_id = ?"
+        " ORDER BY id", (period["id"],)).fetchall()
+    groups = _hc_filled_groups(conn)
+    payloads = [_hc_target_payload(conn, r, groups) for r in rows]
+    by_scope = {}
+    for t in payloads:
+        by_scope.setdefault((t["scope_type"], t["scope_store_id"]),
+                            []).append(t)
+    def _scope_order(key):
+        first = by_scope[key][0]
+        if key[0] == "corporate":
+            return (0, "")
+        if first.get("store_deleted"):
+            return (2, (first["scope_label"] or "").lower())
+        return (1, (first["scope_label"] or "").lower())
+    scope_list = []
+    for key in sorted(by_scope.keys(), key=_scope_order):
+        ts = sorted(by_scope[key],
+                    key=lambda t: (t["role_title"] or "").lower())
+        scope_list.append({
+            "scope_type": key[0], "scope_store_id": key[1],
+            "scope_label": ts[0]["scope_label"],
+            "store_deleted": bool(ts[0].get("store_deleted")),
+            "store_closed": bool(ts[0].get("store_closed")),
+            "targets": ts, "totals": _hc_totals(ts)})
+    totals = _hc_totals(payloads)
+    conn.close()
+    return jsonify(period=_hc_period_payload(period), scopes=scope_list,
+                   totals=totals)
+
+
+@app.get("/api/erp/hr/headcount/unassigned")
+def hc_unassigned():
+    """Employees with no scope (scope_type IS NULL), so the planning UI
+    can list them for assignment without another call."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, name, role, hire_date FROM erp_hr_employees"
+        " WHERE scope_type IS NULL ORDER BY name, id").fetchall()
+    out = [{"id": r["id"], "name": r["name"], "role": r["role"] or "",
+            "hire_date": r["hire_date"] or ""} for r in rows]
+    conn.close()
+    return jsonify(employees=out)
 
 
 @app.get("/api/erp/hr/employees/<int:employee_id>/offboarding")
@@ -44861,6 +45801,14 @@ assert "erp_hr_applicants" not in _ERP_RESET_TABLES, \
     "erp_hr_applicants must survive the reset (HR applicants)"
 assert "erp_hr_roles" not in _ERP_RESET_TABLES, \
     "erp_hr_roles must survive the reset (HR job roles)"
+# Headcount planning: periods and targets are admin-entered planning
+# records like job roles -- a wipe must never erase the plan. Note
+# erp_stores IS wiped, so the forecast must tolerate orphaned store
+# targets (a store row deleted while its targets survive).
+assert "erp_hr_headcount_periods" not in _ERP_RESET_TABLES, \
+    "erp_hr_headcount_periods must survive the reset (headcount plan)"
+assert "erp_hr_headcount_targets" not in _ERP_RESET_TABLES, \
+    "erp_hr_headcount_targets must survive the reset (headcount plan)"
 # HR Wave B: events, roster links and time records are people records
 # like the Wave A tables -- a wipe must never erase them.
 assert "erp_hr_events" not in _ERP_RESET_TABLES, \
