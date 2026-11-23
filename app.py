@@ -1983,6 +1983,28 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_erp_hr_applicants_stage
             ON erp_hr_applicants (stage);
+        -- HR job roles (hiring): the defined roles an applicant can
+        -- apply for, each with a description shown to the hiring admin
+        -- (surfaced on the applicant payload as role_description).
+        -- An applicant's role_id must reference an ACTIVE role --
+        -- there is no free-text fallback. Title uniqueness is
+        -- enforced case-insensitively IN CODE (a lower(title) lookup
+        -- returning 400 on duplicates) rather than a UNIQUE index, so
+        -- a duplicate stays a clean 400 with a clear message instead
+        -- of an IntegrityError. Like the other HR tables this is a
+        -- people record, NOT in _ERP_RESET_TABLES -- a wipe must
+        -- never erase it. Applicants link via erp_hr_applicants.role_id
+        -- (added by the guarded ALTER after this script).
+        CREATE TABLE IF NOT EXISTS erp_hr_roles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
         CREATE TABLE IF NOT EXISTS erp_hr_offboarding (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             employee_id INTEGER NOT NULL,
@@ -3208,6 +3230,16 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_erp_prod_lines ON erp_order_production_lines (order_id);
         """
     )
+    # HR hiring: link applicants to their job role. Guarded for
+    # databases created before this column existed (the CREATE TABLE
+    # for erp_hr_applicants above does not include it on purpose --
+    # this ALTER is the only way the column appears, fresh or old).
+    # Migration order: after the applicants table it touches.
+    _arcols = [r["name"] for r in conn.execute(
+        "PRAGMA table_info(erp_hr_applicants)").fetchall()]
+    if "role_id" not in _arcols:
+        conn.execute(
+            "ALTER TABLE erp_hr_applicants ADD COLUMN role_id INTEGER")
     # Dept 10 Settings Wave A (item 1): seed the company profile once.
     # INSERT OR IGNORE so an admin-edited row is never overwritten.
     # Known values only: legal name FUDGETOPIA LLC; facility address is the
@@ -14174,9 +14206,24 @@ def _hr_applicant_row(conn, applicant_id):
                         (applicant_id,)).fetchone()
 
 
-def _hr_applicant_payload(row):
+def _hr_applicant_payload(row, conn=None):
+    # role_id is None for legacy applicants created before job roles
+    # existed; role_description is the linked role's CURRENT
+    # description ("" when no role is linked), so editing a role's
+    # description is reflected on the applicant without rewriting
+    # the applicant's stored role string.
+    try:
+        role_id = row["role_id"]
+    except (KeyError, IndexError, TypeError):
+        role_id = None
+    role_description = ""
+    if conn is not None and role_id:
+        rrow = _hr_role_row(conn, role_id)
+        if rrow:
+            role_description = rrow["description"] or ""
     return {
         "id": row["id"], "name": row["name"], "role": row["role"] or "",
+        "role_id": role_id, "role_description": role_description,
         "email": row["email"] or "", "phone": row["phone"] or "",
         "stage": row["stage"], "notes": row["notes"] or "",
         "source": row["source"] or "",
@@ -14189,27 +14236,83 @@ def _hr_applicant_payload(row):
     }
 
 
-def _hr_validate_applicant_fields(data, require_name_role=True):
+def _hr_role_row(conn, role_id):
+    try:
+        role_id = int(role_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_roles WHERE id = ?",
+                        (role_id,)).fetchone()
+
+
+def _hr_role_payload(conn, row):
+    count = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_applicants WHERE role_id = ?",
+        (row["id"],)).fetchone()[0]
+    return {
+        "id": row["id"], "title": row["title"],
+        "description": row["description"] or "",
+        "active": bool(row["active"]), "applicant_count": count,
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _hr_resolve_active_role(conn, role_id):
+    """Resolve a role_id from an applicant create/update body to its
+    role row. Returns (row, error-or-None). Missing, unknown, or
+    inactive roles are all 400s: an applicant's role must be a defined
+    ACTIVE job role -- there is no free-text fallback."""
+    if role_id is None:
+        return None, "role_id is required and must reference an active" \
+            " job role"
+    if isinstance(role_id, float) and not role_id.is_integer():
+        return None, "role_id must reference an active job role"
+    if isinstance(role_id, str):
+        role_id = role_id.strip()
+    try:
+        role_id = int(role_id)
+    except (TypeError, ValueError):
+        return None, "role_id must reference an active job role"
+    row = _hr_role_row(conn, role_id)
+    if not row:
+        return None, "unknown role_id: no such job role"
+    if not row["active"]:
+        return None, "role '%s' is inactive" % (row["title"] or "")
+    return row, None
+
+
+def _hr_coerce_active(value):
+    """Coerce a JSON active flag to 0/1 (accepts bool, int, or a
+    "true"/"false"/"1"/"0" string)."""
+    if isinstance(value, str):
+        return 1 if value.strip().lower() in ("1", "true", "yes", "on") \
+            else 0
+    return 1 if value else 0
+
+
+def _hr_validate_applicant_fields(data, require_name=True):
     """Validate applicant fields from a create/update body. Returns
     (values-dict, error-string-or-None). At least one contact
-    (email and/or phone) is required on create."""
+    (email and/or phone) is required on create. The free-text `role`
+    key in the body is IGNORED: an applicant's role comes from
+    role_id (a defined active job role -- see
+    _hr_resolve_active_role()), and the stored role string is set
+    from that role's title."""
     name = (data.get("name") or "").strip()
-    role = (data.get("role") or "").strip()
     email = (data.get("email") or "").strip().lower()
     phone = (data.get("phone") or "").strip()
     notes = (data.get("notes") or "").strip()
     source = (data.get("source") or "").strip()
     applied_date = (data.get("applied_date") or "").strip()
-    if require_name_role:
+    if require_name:
         if not name or len(name) > 100:
             return None, "name must be 1-100 characters"
-        if not role or len(role) > 100:
-            return None, "role must be 1-100 characters"
     else:
         if "name" in data and (not name or len(name) > 100):
             return None, "name must be 1-100 characters"
-        if "role" in data and (not role or len(role) > 100):
-            return None, "role must be 1-100 characters"
     if email and not EMAIL_RE.match(email):
         return None, "valid email required"
     if len(email) > 200 or len(phone) > 100 or len(notes) > 2000 \
@@ -14217,7 +14320,7 @@ def _hr_validate_applicant_fields(data, require_name_role=True):
         return None, "a field is too long"
     if applied_date and not _hr_valid_hire_date(applied_date):
         return None, "applied date must be YYYY-MM-DD"
-    return {"name": name, "role": role, "email": email, "phone": phone,
+    return {"name": name, "email": email, "phone": phone,
             "notes": notes, "source": source,
             "applied_date": applied_date}, None
 
@@ -14287,21 +14390,24 @@ def hr_list_applicants():
         rows = conn.execute(
             "SELECT * FROM erp_hr_applicants"
             " ORDER BY applied_date DESC, id DESC").fetchall()
-    out = [_hr_applicant_payload(r) for r in rows]
+    out = [_hr_applicant_payload(r, conn) for r in rows]
     conn.close()
     return jsonify(applicants=out)
 
 
 @app.post("/api/erp/hr/applicants")
 def hr_create_applicant():
-    """Create an applicant (201) at stage 'applied'. Name and role
-    are required; at least one contact (email and/or phone) is
-    required. applied_date defaults to today (UTC) when blank."""
+    """Create an applicant (201) at stage 'applied'. Name is required
+    and role_id must reference an ACTIVE job role (400 otherwise --
+    unknown id, inactive role, or missing; a free-text `role` in the
+    body is ignored). At least one contact (email and/or phone) is
+    required. applied_date defaults to today (UTC) when blank. The
+    stored role string is set from the role's title."""
     actor, err = _require_erp_admin()
     if err:
         return err
     data = request.get_json(force=True) or {}
-    vals, verr = _hr_validate_applicant_fields(data, require_name_role=True)
+    vals, verr = _hr_validate_applicant_fields(data, require_name=True)
     if verr:
         return jsonify(error=verr), 400
     if not vals["email"] and not vals["phone"]:
@@ -14309,19 +14415,24 @@ def hr_create_applicant():
     now = datetime.now(timezone.utc).isoformat()
     applied_date = vals["applied_date"] or datetime.now(timezone.utc).date().isoformat()
     conn = db()
+    role_row, rerr = _hr_resolve_active_role(conn, data.get("role_id"))
+    if rerr:
+        conn.close()
+        return jsonify(error=rerr), 400
     cur = conn.execute(
-        "INSERT INTO erp_hr_applicants (name, role, email, phone, stage,"
-        " notes, source, applied_date, hired_employee_id, created_by,"
-        " created_at, updated_by, updated_at)"
-        " VALUES (?, ?, ?, ?, 'applied', ?, ?, ?, NULL, ?, ?, '', '')",
-        (vals["name"], vals["role"], vals["email"], vals["phone"],
-         vals["notes"], vals["source"], applied_date, actor, now))
+        "INSERT INTO erp_hr_applicants (name, role, role_id, email, phone,"
+        " stage, notes, source, applied_date, hired_employee_id,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, 'applied', ?, ?, ?, NULL, ?, ?, '', '')",
+        (vals["name"], role_row["title"], role_row["id"], vals["email"],
+         vals["phone"], vals["notes"], vals["source"], applied_date,
+         actor, now))
     applicant_id = cur.lastrowid
     _erp_staff_audit(conn, actor, "hr.applicant_created", "hr_applicant",
-                     applicant_id, "applicant %s (%s)" % (vals["name"], vals["role"]))
+                     applicant_id, "applicant %s (%s)" % (vals["name"], role_row["title"]))
     conn.commit()
     row = _hr_applicant_row(conn, applicant_id)
-    payload = _hr_applicant_payload(row)
+    payload = _hr_applicant_payload(row, conn)
     conn.close()
     return jsonify(payload), 201
 
@@ -14336,7 +14447,7 @@ def hr_get_applicant(applicant_id):
     if not row:
         conn.close()
         return jsonify(error="applicant not found"), 404
-    payload = _hr_applicant_payload(row)
+    payload = _hr_applicant_payload(row, conn)
     conn.close()
     return jsonify(payload)
 
@@ -14345,7 +14456,12 @@ def hr_get_applicant(applicant_id):
 def hr_update_applicant(applicant_id):
     """Edit an applicant -- only provided fields change. A hired
     applicant is sealed (409) except notes, which are APPENDED to the
-    existing notes (never replaced) so the hiring record stays intact."""
+    existing notes (never replaced) so the hiring record stays intact.
+    When role_id is provided it must reference an ACTIVE job role
+    (400 otherwise); the stored role string is then set from that
+    role's title. A free-text `role` in the body is ignored, and an
+    existing applicant's stored role string is never rewritten except
+    through a role_id change."""
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -14378,14 +14494,14 @@ def hr_update_applicant(applicant_id):
                          "appended notes for hired applicant %s"
                          % (row["name"] or ""))
         conn.commit()
-        payload = _hr_applicant_payload(_hr_applicant_row(conn, applicant_id))
+        payload = _hr_applicant_payload(_hr_applicant_row(conn, applicant_id), conn)
         conn.close()
         return jsonify(payload)
-    vals, verr = _hr_validate_applicant_fields(data, require_name_role=False)
+    vals, verr = _hr_validate_applicant_fields(data, require_name=False)
     if verr:
         conn.close()
         return jsonify(error=verr), 400
-    fields = ("name", "role", "email", "phone", "notes", "source",
+    fields = ("name", "email", "phone", "notes", "source",
               "applied_date")
     sets = []
     args = []
@@ -14395,6 +14511,23 @@ def hr_update_applicant(applicant_id):
             sets.append("%s = ?" % f)
             args.append(vals[f])
             changes.append("%s: %s -> %s" % (f, row[f] or "", vals[f]))
+    if "role_id" in data:
+        role_row, rerr = _hr_resolve_active_role(conn, data.get("role_id"))
+        if rerr:
+            conn.close()
+            return jsonify(error=rerr), 400
+        try:
+            old_role_id = row["role_id"]
+        except (KeyError, IndexError, TypeError):
+            old_role_id = None
+        if role_row["title"] != (row["role"] or "") \
+                or role_row["id"] != old_role_id:
+            sets.append("role = ?")
+            args.append(role_row["title"])
+            sets.append("role_id = ?")
+            args.append(role_row["id"])
+            changes.append("role: %s -> %s"
+                           % (row["role"] or "", role_row["title"]))
     # Contact rule still holds after the edit: at least one of
     # email / phone must remain.
     new_email = vals["email"] if "email" in data else (row["email"] or "")
@@ -14415,7 +14548,7 @@ def hr_update_applicant(applicant_id):
                          applicant_id, "%s: %s"
                          % (row["name"] or "", "; ".join(changes)))
         conn.commit()
-    payload = _hr_applicant_payload(_hr_applicant_row(conn, applicant_id))
+    payload = _hr_applicant_payload(_hr_applicant_row(conn, applicant_id), conn)
     conn.close()
     return jsonify(payload)
 
@@ -14461,7 +14594,7 @@ def hr_change_applicant_stage(applicant_id):
                      "hr_applicant", applicant_id,
                      "%s: %s -> %s" % (row["name"] or "", row["stage"], target))
     conn.commit()
-    payload = _hr_applicant_payload(_hr_applicant_row(conn, applicant_id))
+    payload = _hr_applicant_payload(_hr_applicant_row(conn, applicant_id), conn)
     conn.close()
     return jsonify(payload)
 
@@ -14549,6 +14682,193 @@ def hr_delete_applicant(applicant_id):
     _erp_staff_audit(conn, actor, "hr.applicant_deleted", "hr_applicant",
                      applicant_id, "deleted applicant %s (%s)"
                      % (row["name"] or "", row["role"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# HR job roles: the defined roles applicants apply for. Admin-only via
+# _require_erp_admin(), like the rest of HR. Deactivating a role
+# (active=0) only removes it from the ?active=1 picker and blocks new
+# applicants using it -- it never touches applicant or employee
+# records. Deleting a role with applicants attached is refused (409);
+# deleting a role with no applicants never touches applicant or
+# employee records either.
+@app.get("/api/erp/hr/roles")
+def hr_list_roles():
+    """List job roles, ordered by title; ?active=1 lists active only
+    (the picker), ?active=0 lists inactive only."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    active = (request.args.get("active") or "").strip()
+    conn = db()
+    if active == "1":
+        rows = conn.execute(
+            "SELECT * FROM erp_hr_roles WHERE active = 1"
+            " ORDER BY lower(title), id").fetchall()
+    elif active == "0":
+        rows = conn.execute(
+            "SELECT * FROM erp_hr_roles WHERE active = 0"
+            " ORDER BY lower(title), id").fetchall()
+    elif active:
+        conn.close()
+        return jsonify(error="active must be 0 or 1"), 400
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_hr_roles ORDER BY lower(title), id"
+            ).fetchall()
+    out = [_hr_role_payload(conn, r) for r in rows]
+    conn.close()
+    return jsonify(roles=out)
+
+
+@app.post("/api/erp/hr/roles")
+def hr_create_role():
+    """Create a job role (201). Title is required, 1-100 chars;
+    description is optional, max 5000 chars. A duplicate title
+    (case-insensitive) is 400."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    title = (data.get("title") or "").strip()
+    description = (data.get("description") or "").strip()
+    if not title or len(title) > 100:
+        return jsonify(error="title must be 1-100 characters"), 400
+    if len(description) > 5000:
+        return jsonify(error="description must be 5000 characters"
+                       " or fewer"), 400
+    conn = db()
+    dup = conn.execute(
+        "SELECT id FROM erp_hr_roles WHERE lower(title) = lower(?)",
+        (title,)).fetchone()
+    if dup:
+        conn.close()
+        return jsonify(error="a job role with this title already"
+                       " exists"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_roles (title, description, active,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, 1, ?, ?, '', '')",
+        (title, description, actor, now))
+    role_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.role_created", "hr_role", role_id,
+                     "created job role %s" % title)
+    conn.commit()
+    payload = _hr_role_payload(conn, _hr_role_row(conn, role_id))
+    conn.close()
+    return jsonify(payload), 201
+
+
+@app.get("/api/erp/hr/roles/<int:role_id>")
+def hr_get_role(role_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_role_row(conn, role_id)
+    if not row:
+        conn.close()
+        return jsonify(error="role not found"), 404
+    payload = _hr_role_payload(conn, row)
+    conn.close()
+    return jsonify(payload)
+
+
+@app.post("/api/erp/hr/roles/<int:role_id>/update")
+def hr_update_role(role_id):
+    """Edit a job role -- only provided fields change. A title change
+    must not collide with another role (400). Deactivating (active=0)
+    is allowed even with applicants attached."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _hr_role_row(conn, role_id)
+    if not row:
+        conn.close()
+        return jsonify(error="role not found"), 404
+    sets = []
+    args = []
+    changes = []
+    if "title" in data:
+        title = (data.get("title") or "").strip()
+        if not title or len(title) > 100:
+            conn.close()
+            return jsonify(error="title must be 1-100 characters"), 400
+        dup = conn.execute(
+            "SELECT id FROM erp_hr_roles"
+            " WHERE lower(title) = lower(?) AND id != ?",
+            (title, role_id)).fetchone()
+        if dup:
+            conn.close()
+            return jsonify(error="a job role with this title already"
+                           " exists"), 400
+        if title != (row["title"] or ""):
+            sets.append("title = ?")
+            args.append(title)
+            changes.append("title: %s -> %s" % (row["title"] or "", title))
+    if "description" in data:
+        description = (data.get("description") or "").strip()
+        if len(description) > 5000:
+            conn.close()
+            return jsonify(error="description must be 5000 characters"
+                           " or fewer"), 400
+        if description != (row["description"] or ""):
+            sets.append("description = ?")
+            args.append(description)
+            changes.append("description updated")
+    if "active" in data:
+        active = _hr_coerce_active(data.get("active"))
+        if active != (1 if row["active"] else 0):
+            sets.append("active = ?")
+            args.append(active)
+            changes.append("active: %s -> %s"
+                           % (1 if row["active"] else 0, active))
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(role_id)
+        conn.execute("UPDATE erp_hr_roles SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "hr.role_updated", "hr_role",
+                         role_id, "%s: %s"
+                         % (row["title"] or "", "; ".join(changes)))
+        conn.commit()
+    payload = _hr_role_payload(conn, _hr_role_row(conn, role_id))
+    conn.close()
+    return jsonify(payload)
+
+
+@app.delete("/api/erp/hr/roles/<int:role_id>")
+def hr_delete_role(role_id):
+    """Delete a job role. Refused (409) while any applicant has
+    role_id = this role. Otherwise the row is deleted; applicant and
+    employee records are never touched."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_role_row(conn, role_id)
+    if not row:
+        conn.close()
+        return jsonify(error="role not found"), 404
+    count = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_applicants WHERE role_id = ?",
+        (role_id,)).fetchone()[0]
+    if count:
+        conn.close()
+        return jsonify(error="cannot delete a role with applicants"
+                       " (%d applicant(s) attached)" % count), 409
+    conn.execute("DELETE FROM erp_hr_roles WHERE id = ?", (role_id,))
+    _erp_staff_audit(conn, actor, "hr.role_deleted", "hr_role", role_id,
+                     "deleted job role %s" % (row["title"] or ""))
     conn.commit()
     conn.close()
     return jsonify(ok=True)
@@ -44535,6 +44855,12 @@ assert "erp_hr_employees" not in _ERP_RESET_TABLES, \
     "erp_hr_employees must survive the reset (HR records)"
 assert "erp_hr_onboarding" not in _ERP_RESET_TABLES, \
     "erp_hr_onboarding must survive the reset (onboarding items)"
+# HR Additions 7: hiring applicants and job roles are people records
+# like the Wave A tables -- a wipe must never erase them.
+assert "erp_hr_applicants" not in _ERP_RESET_TABLES, \
+    "erp_hr_applicants must survive the reset (HR applicants)"
+assert "erp_hr_roles" not in _ERP_RESET_TABLES, \
+    "erp_hr_roles must survive the reset (HR job roles)"
 # HR Wave B: events, roster links and time records are people records
 # like the Wave A tables -- a wipe must never erase them.
 assert "erp_hr_events" not in _ERP_RESET_TABLES, \
