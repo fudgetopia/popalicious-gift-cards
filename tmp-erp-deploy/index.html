@@ -39,7 +39,10 @@ button { font-family: inherit; }
    only their home moved, from the top bar into this sidebar. The tab's
    sub-tab row (when one exists) is hidden by [data-erp-subtabs] below and
    shown again as sub-items under its link; the sidebar item
-   delegates to the row's own button, so the handler runs exactly as before. */
+   delegates to the row's own button, so the handler runs exactly as before.
+   Sub-lists are an accordion (Nov 23, 2026): only the section you are in
+   is open; tapping a main section opens its sub-list, tapping the section
+   you are already in closes it again. */
 .erp-shell { display: flex; align-items: stretch; min-height: 100vh; background: #f4f5f8; }
 .erp-sidebar { width: 250px; flex: 0 0 250px; background: #393a3d; color: #fff;
   position: sticky; top: 0; height: 100vh; height: 100dvh;
@@ -61,8 +64,9 @@ button { font-family: inherit; }
 .app-nav a .erp-nav-chev { flex: 0 0 auto; display: none; opacity: .75; transition: transform .18s ease; }
 .app-nav a .erp-nav-chev svg { width: 14px; height: 14px; }
 .app-nav a.has-subs .erp-nav-chev { display: inline-flex; }
-.app-nav a.active .erp-nav-chev { transform: rotate(90deg); }
+.app-nav a.erp-nav-open .erp-nav-chev { transform: rotate(90deg); }
 .erp-sublist { background: #2e2f31; padding: 4px 0 6px; }
+.erp-sublist-closed { display: none; }
 .erp-sub-item { display: flex; align-items: center; gap: 8px; width: 100%; min-height: 36px;
   padding: 7px 14px 7px 49px; background: none; border: 0; border-left: 3px solid transparent;
   color: #c9cbcd; font-size: 13.5px; text-align: left; cursor: pointer; }
@@ -485,7 +489,7 @@ button { font-family: inherit; }
   <aside class="erp-sidebar" id="erpSidebar" aria-label="ERP navigation">
     <div class="app-brand erp-brand">Pop-A-Licious ERP</div>
     <nav class="app-nav" id="erpSidenav">
-      <a href="#/" data-route="home" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg></span><span class="erp-nav-lbl">Dashboard</span></a>
+      <a href="#/" data-route="home" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg></span><span class="erp-nav-lbl">Dashboard</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
       <a href="#/inventory" data-route="inventory" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M4 7.5l8 4.5 8-4.5"/><path d="M12 12v9"/></svg></span><span class="erp-nav-lbl">Inventory</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
       <a href="#/purchasing" data-route="purchasing" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9.5" cy="20" r="1.5"/><circle cx="17" cy="20" r="1.5"/><path d="M3 3.5h2.2l2.3 11h10l2-8H6"/></svg></span><span class="erp-nav-lbl">Purchasing</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
       <a href="#/production" data-route="production" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 21v-9.5L9 15V9l5.5 3.5V21"/><path d="M3.5 21h17"/><path d="M17.5 21v-5"/></svg></span><span class="erp-nav-lbl">Production</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
@@ -1661,6 +1665,7 @@ var ERP_SIDEBAR_SUBTABS = {
     subs: [["company", "Company profile"], ["integrations", "Integrations"], ["systems", "Systems"], ["quickbooks", "QuickBooks"], ["notifications", "Notifications"], ["audit", "Audit log"], ["data", "Data export & import"]] }
 };
 var erpSidebarSublistEls = []; // one .erp-sublist per visible main link
+var erpSidebarOpenRoute = null; // accordion: the route whose sub-list is expanded; null = all collapsed
 var erpSidebarLastSig = "";
 var erpSidebarLastRoute = "";
 var erpSidebarSection = null; // last clicked section label, for active styling
@@ -1745,6 +1750,9 @@ function erpSidebarModels() {
     // Keep the pending cross-route section highlighted once its tab lands.
     erpSidebarSection = (erpSidebarPendingSection && erpSidebarPendingSection.route === r)
       ? erpSidebarPendingSection.label : null;
+    // Accordion: arriving on a section opens its sub-list and closes
+    // the one that was open.
+    erpSidebarOpenRoute = r;
   }
   var routes = [];
   var sidenav = document.getElementById("erpSidenav");
@@ -1867,7 +1875,7 @@ function erpSyncSidebar() {
     if (sess && sess.role === "wholesale") return;
   }
   var models = erpSidebarModels();
-  var sig = models.map(function (m) {
+  var sig = "open=" + (erpSidebarOpenRoute || "") + ";" + models.map(function (m) {
     return m.route + "|" + m.subs.map(function (s) { return s.label + "=" + (s.active ? "1" : "0"); }).join(",");
   }).join(";");
   if (sig === erpSidebarLastSig) {
@@ -1891,9 +1899,15 @@ function erpSyncSidebar() {
     // renderRoute hides links the user cannot open; no sub-list under a hidden link.
     if (link.style && link.style.display === "none") return;
     var model = byRoute[route];
+    // Accordion: only the open section's sub-list shows; the rest stay
+    // in the DOM (collapsed) so counts and click delegation are unchanged.
+    var isOpen = (route === erpSidebarOpenRoute);
+    link.classList.toggle("erp-nav-open", isOpen);
+    if (model && model.subs.length) link.setAttribute("aria-expanded", isOpen ? "true" : "false");
+    else link.removeAttribute("aria-expanded");
     if (!model || !model.subs.length) return;
     var list = document.createElement("div");
-    list.className = "erp-sublist";
+    list.className = "erp-sublist" + (isOpen ? "" : " erp-sublist-closed");
     list.setAttribute("role", "group");
     list.setAttribute("aria-label", "Sub-pages");
     model.subs.forEach(function (sub) {
@@ -2032,7 +2046,21 @@ function erpMobileNavToggle() {
   var backdrop = document.getElementById("erpBackdrop");
   if (backdrop) backdrop.addEventListener("click", erpMobileNavClose);
   var sidenav = document.getElementById("erpSidenav");
-  if (sidenav) sidenav.addEventListener("click", function () { erpMobileNavClose(); });
+  // Tapping a main section on a phone closes the overlay once the new
+  // tab opens — except tapping the section you are already in, which
+  // only opens/closes its sub-list: the overlay stays open so the
+  // sub-list can actually be used.
+  if (sidenav) sidenav.addEventListener("click", function (e) {
+    var el = e && e.target ? e.target : null;
+    while (el && el !== sidenav) {
+      if (el.tagName === "A" && el.getAttribute && el.getAttribute("data-route")) {
+        if (currentRoute() === el.getAttribute("data-route")) return;
+        break;
+      }
+      el = el.parentNode;
+    }
+    erpMobileNavClose();
+  });
   // Same-route tap on a main link: the hash does not change, so no
   // hashchange fires and the tab never re-renders — a recipe (or item,
   // PO, order) detail stays open forever. Render the route directly
@@ -2045,7 +2073,15 @@ function erpMobileNavToggle() {
       if (el.tagName === "A" && el.getAttribute && el.getAttribute("data-route")) {
         // Explicit main-link tap overrides any pending cross-route jump.
         erpSidebarPendingSection = null;
-        if (currentRoute() === el.getAttribute("data-route")) renderRoute();
+        if (currentRoute() === el.getAttribute("data-route")) {
+          // Accordion: tapping the section you are already in toggles
+          // its sub-list closed/open. renderRoute still runs, so a
+          // detail view returns to the list view as before.
+          var route = el.getAttribute("data-route");
+          erpSidebarOpenRoute = (erpSidebarOpenRoute === route) ? null : route;
+          erpSidebarLastSig = "";
+          renderRoute();
+        }
         return;
       }
       el = el.parentNode;
