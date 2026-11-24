@@ -176,6 +176,27 @@ button { font-family: inherit; }
       .erp-form label { display: inline-flex; gap: 6px; align-items: center; font-weight: 700; font-size: 14px; }
       .erp-form input, .erp-form select { padding: 8px 10px; border: 2px solid var(--ink); font-size: 14px; }
       .erp-form button { padding: 8px 14px; border: 2px solid var(--ink); background: var(--yellow); font-weight: 800; cursor: pointer; }
+      /* Rich text editor (Nov 23, 2026): one shared factory, erpRichText().
+         The toolbar is hidden until the user clicks into the box; the
+         editor is a contenteditable div that behaves like a textarea
+         (the wrapper exposes .value). 16px text stops iOS Safari
+         auto-zoom on focus, same as the other inputs. */
+      .erp-rich-wrap { flex: 1 1 100%; min-width: 0; }
+      .erp-rich-toolbar { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding: 6px; border: 2px solid var(--ink); border-bottom: none; background: #f4f4f4; }
+      .erp-rich-toolbar button { min-height: 36px; min-width: 36px; padding: 6px 9px; border: 1px solid var(--ink); background: #fff; font-weight: 800; font-size: 14px; cursor: pointer; }
+      .erp-rich-toolbar button:active { background: var(--yellow); }
+      .erp-rich-toolbar select { min-height: 36px; padding: 4px 6px; border: 1px solid var(--ink); background: #fff; font-size: 14px; }
+      .erp-rich-sep { width: 1px; align-self: stretch; background: var(--line); margin: 2px 4px; }
+      .erp-rich-editor { min-height: 96px; max-height: 320px; overflow-y: auto; padding: 8px 10px; border: 2px solid var(--ink); background: #fff; font-size: 16px; line-height: 1.5; outline: none; }
+      .erp-rich-editor:focus { outline: 2px solid var(--red); outline-offset: -2px; }
+      .erp-rich-editor.erp-rich-empty:before { content: attr(data-placeholder); color: #888; pointer-events: none; }
+      .erp-rich-editor p { margin: 0 0 8px; }
+      .erp-rich-editor ul, .erp-rich-editor ol { margin: 0 0 8px; padding-left: 22px; }
+      .erp-rich-editor h1 { font-size: 20px; margin: 0 0 8px; }
+      .erp-rich-editor h2 { font-size: 17px; margin: 0 0 8px; }
+      .erp-rich-editor h3 { font-size: 15px; margin: 0 0 8px; }
+      .erp-rich-count { display: block; font-size: 12px; color: var(--muted); text-align: right; margin-top: 2px; }
+      .erp-rich-count.erp-rich-over { color: var(--red); font-weight: 800; }
       .erp-loyalty-search { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; margin: 12px 0 20px; padding: 14px; border: 2px solid var(--ink); background: var(--surface); }
       .erp-loyalty-search input { flex: 1 1 280px; min-height: 44px; padding: 10px 12px; border: 2px solid var(--ink); font-size: 16px; }
       .erp-loyalty-search button, .erp-loyalty button { min-height: 44px; padding: 10px 16px; border: 2px solid var(--ink); background: var(--yellow); font-weight: 800; cursor: pointer; font-size: 15px; }
@@ -11522,6 +11543,330 @@ function erpField(labelText, input) {
   return label;
 }
 
+/* ============ Rich text editor (Nov 23, 2026) ============
+   One shared factory for every typing box that holds free prose:
+   job role descriptions, training course descriptions, newsletter
+   body, staff notes, calibration / audit / drill notes, audit
+   findings, risk descriptions + mitigations, recall procedure steps,
+   and the Legal notes fields. Boxes that must stay plain text
+   (Instagram captions, social replies, win-back messages, website
+   flavor descriptions, ingredients, CSV imports, EDI config JSON,
+   onboarding steps, settings paste) keep their plain textareas —
+   see hidden_files/rich-text-design.md for the full scope call.
+   The toolbar is HIDDEN until the user clicks into the box (focus)
+   and hides again on blur — that is the requirement, not a bug.
+   The wrapper behaves like a textarea: read/write .value and it
+   holds sanitized HTML. Legacy plain-text values load as readable
+   text (newlines become line breaks). Never trust stored HTML:
+   every value passes through erpSanitizeRichHtml() on save AND on
+   every render. The sanitizer is a string tokenizer (no DOM parser
+   needed), so the node harness can test it directly. */
+function erpEscapeHtml(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+var ERP_RICH_ALLOWED_TAGS = { b: 1, strong: 1, i: 1, em: 1, u: 1, s: 1, strike: 1, p: 1, br: 1, ul: 1, ol: 1, li: 1, h1: 1, h2: 1, h3: 1, a: 1, span: 1, div: 1 };
+/* Drop with content (containers that can hide scripts/handlers). Void
+   tags are dropped alone — they never close, so entering drop mode
+   for one would swallow the rest of the value. Anything else unknown
+   is dropped as a tag only and its text is kept. */
+var ERP_RICH_DROP_CONTENT_TAGS = { script: 1, style: 1, iframe: 1, object: 1, embed: 1, form: 1, textarea: 1, title: 1, noscript: 1, svg: 1, math: 1, video: 1, audio: 1, button: 1, select: 1 };
+var ERP_RICH_DROP_VOID_TAGS = { img: 1, input: 1, link: 1, meta: 1, hr: 1, base: 1, area: 1, col: 1, source: 1, track: 1, wbr: 1 };
+function erpRichAttr(attrs, name) {
+  var re = new RegExp(name + "\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>\"']+))", "i");
+  var m = re.exec(attrs || "");
+  if (!m) return null;
+  if (m[1] !== undefined) return m[1];
+  if (m[2] !== undefined) return m[2];
+  return m[3];
+}
+function erpSanitizeRichHtml(html) {
+  var src = String(html == null ? "" : html);
+  var out = [];
+  var stack = [];
+  var dropTag = null;
+  var dropDepth = 0;
+  var re = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\/?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>|((?:[^<]|<(?!(?:[a-zA-Z]|\/[a-zA-Z]|!)))+)/g;
+  var m;
+  while ((m = re.exec(src))) {
+    if (m[3] !== undefined) {
+      if (!dropTag) out.push(erpEscapeHtml(m[3]));
+      continue;
+    }
+    if (m[0].indexOf("<!--") === 0 || m[0].indexOf("<![CDATA[") === 0) continue;
+    var tag = (m[1] || "").toLowerCase();
+    var isClose = m[0].charAt(1) === "/";
+    var attrs = m[2] || "";
+    if (dropTag) {
+      if (!isClose && tag === dropTag) dropDepth++;
+      else if (isClose && tag === dropTag) {
+        if (dropDepth > 0) dropDepth--;
+        else dropTag = null;
+      }
+      continue;
+    }
+    if (ERP_RICH_DROP_CONTENT_TAGS[tag]) {
+      if (!isClose) { dropTag = tag; dropDepth = 0; }
+      continue;
+    }
+    if (ERP_RICH_DROP_VOID_TAGS[tag]) continue;
+    if (!ERP_RICH_ALLOWED_TAGS[tag]) continue;
+    if (tag === "br") { if (!isClose) out.push("<br>"); continue; }
+    if (isClose) {
+      var idx = stack.lastIndexOf(tag);
+      if (idx === -1) continue;
+      var closing = stack.splice(idx);
+      for (var i = closing.length - 1; i >= 0; i--) out.push("</" + closing[i] + ">");
+      continue;
+    }
+    var attrOut = "";
+    if (tag === "a") {
+      var href = erpRichAttr(attrs, "href");
+      if (href) {
+        var h = String(href).replace(/[\u0000-\u0020]/g, "").trim();
+        if (/^(https?:|mailto:|\/)/i.test(h)) attrOut = ' href="' + erpEscapeHtml(h) + '"';
+      }
+    } else if (tag === "span") {
+      var style = erpRichAttr(attrs, "style");
+      if (style) {
+        var mm = /font-size\s*:\s*(\d+(?:\.\d+)?)(px|pt|em|%)\s*;?/i.exec(style);
+        if (mm) attrOut = ' style="font-size:' + mm[1] + mm[2] + '"';
+      }
+    }
+    out.push("<" + tag + attrOut + ">");
+    stack.push(tag);
+  }
+  while (stack.length) out.push("</" + stack.pop() + ">");
+  return out.join("");
+}
+/* execCommand("fontSize") makes <font size="N">; the editor only
+   speaks <span style="font-size:…">, so normalize on save/blur. */
+var ERP_RICH_FONT_SIZES = { 1: "12px", 2: "14px", 3: "16px", 4: "18px", 5: "20px", 6: "24px", 7: "28px" };
+function erpRichNormalizeHtml(html) {
+  var s = String(html == null ? "" : html);
+  s = s.replace(/<font\b[^>]*size\s*=\s*["']?([1-7])["']?[^>]*>/gi, function (m, n) {
+    return '<span style="font-size:' + ERP_RICH_FONT_SIZES[n] + '">';
+  });
+  s = s.replace(/<\/?font\b[^>]*>/gi, "");
+  return erpSanitizeRichHtml(s);
+}
+/* Render a stored value into an element: plain text stays readable
+   (newlines become line breaks), HTML is sanitized first. Use this
+   everywhere a rich-text field is shown — never innerHTML raw. */
+function erpSetRichHtml(el, value) {
+  if (!el) return;
+  var v = value == null ? "" : String(value);
+  if (!/<[a-zA-Z][^>]*>/.test(v)) {
+    el.innerHTML = erpEscapeHtml(v).replace(/\n/g, "<br>");
+  } else {
+    el.innerHTML = erpSanitizeRichHtml(v);
+  }
+}
+/* Build a list row mixing plain text and sanitized rich values:
+   parts: ["plain text", { rich: storedHtml }, "more plain text"].
+   Used for rows that embed a rich-text field (a note, a description)
+   in one line — the plain parts stay plain text, the rich part is
+   sanitized HTML, never raw tags on screen. */
+function erpRichRow(parts) {
+  var p = document.createElement("p");
+  p.style.flex = "1 1 100%";
+  (parts || []).forEach(function (part) {
+    if (part === null || part === undefined || part === "") return;
+    if (typeof part === "string") { p.appendChild(document.createTextNode(part)); return; }
+    if (part.rich) {
+      var s = document.createElement("span");
+      erpSetRichHtml(s, part.rich);
+      p.appendChild(s);
+    }
+  });
+  return p;
+}
+function erpRichExec(cmd, val) {
+  try {
+    if (cmd && document.execCommand) document.execCommand(cmd, false, val);
+  } catch (e) { /* execCommand is best-effort; the value is sanitized on save either way */ }
+}
+function erpRichText(opts) {
+  opts = opts || {};
+  var wrap = document.createElement("div");
+  wrap.className = "erp-rich-wrap";
+  var toolbar = document.createElement("div");
+  toolbar.className = "erp-rich-toolbar";
+  toolbar.hidden = true;
+  wrap.appendChild(toolbar);
+  var editor = document.createElement("div");
+  editor.className = "erp-rich-editor erp-rich-empty";
+  editor.contentEditable = "true";
+  editor.setAttribute("role", "textbox");
+  editor.setAttribute("aria-multiline", "true");
+  if (opts.placeholder) editor.setAttribute("data-placeholder", opts.placeholder);
+  if (opts.minHeight) editor.style.minHeight = opts.minHeight;
+  wrap.appendChild(editor);
+  var count = null;
+  var maxLength = opts.maxLength || 0;
+  if (maxLength > 0) {
+    count = document.createElement("span");
+    count.className = "erp-rich-count";
+    wrap.appendChild(count);
+  }
+  function syncEmpty() {
+    var t = "";
+    try { t = editor.textContent || ""; } catch (e) {}
+    var empty = !t.replace(/\u00a0/g, "").trim();
+    if (editor.classList) editor.classList.toggle("erp-rich-empty", empty);
+  }
+  function updateCount() {
+    if (!count) return;
+    var n = wrap.value.length;
+    count.textContent = n.toLocaleString() + " / " + maxLength.toLocaleString() + " characters";
+    if (count.classList) count.classList.toggle("erp-rich-over", n > maxLength);
+  }
+  function richBtn(label, title, cmd, val) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.title = title;
+    b.setAttribute("aria-label", title);
+    b.addEventListener("mousedown", function (e) { if (e.preventDefault) e.preventDefault(); });
+    b.addEventListener("click", function () {
+      try { editor.focus(); } catch (e) {}
+      erpRichExec(cmd, val);
+      syncEmpty();
+      updateCount();
+    });
+    return b;
+  }
+  function richSelect(pairs, title, onChange) {
+    var s = document.createElement("select");
+    s.title = title;
+    s.setAttribute("aria-label", title);
+    pairs.forEach(function (p) {
+      var o = document.createElement("option");
+      o.value = p[0];
+      o.textContent = p[1];
+      s.appendChild(o);
+    });
+    s.addEventListener("change", function () {
+      try { editor.focus(); } catch (e) {}
+      onChange(s.value);
+      syncEmpty();
+      updateCount();
+    });
+    return s;
+  }
+  function richSep() {
+    var s = document.createElement("span");
+    s.className = "erp-rich-sep";
+    return s;
+  }
+  var bBtn = richBtn("B", "Bold", "bold");
+  bBtn.style.fontWeight = "800";
+  toolbar.appendChild(bBtn);
+  var iBtn = richBtn("I", "Italic", "italic");
+  iBtn.style.fontStyle = "italic";
+  toolbar.appendChild(iBtn);
+  var uBtn = richBtn("U", "Underline", "underline");
+  uBtn.style.textDecoration = "underline";
+  toolbar.appendChild(uBtn);
+  var sBtn = richBtn("S", "Strikethrough", "strikeThrough");
+  sBtn.style.textDecoration = "line-through";
+  toolbar.appendChild(sBtn);
+  toolbar.appendChild(richSep());
+  toolbar.appendChild(richSelect([["", "Size"], ["1", "Small"], ["3", "Normal"], ["5", "Large"], ["7", "Huge"]], "Font size", function (v) {
+    if (v) erpRichExec("fontSize", v);
+  }));
+  toolbar.appendChild(richSelect([["p", "Paragraph"], ["h1", "Heading 1"], ["h2", "Heading 2"], ["h3", "Heading 3"]], "Heading", function (v) {
+    erpRichExec("formatBlock", v);
+  }));
+  toolbar.appendChild(richSep());
+  toolbar.appendChild(richBtn("• List", "Bullet list", "insertUnorderedList"));
+  toolbar.appendChild(richBtn("1. List", "Numbered list", "insertOrderedList"));
+  toolbar.appendChild(richSep());
+  toolbar.appendChild(richBtn("Left", "Align left", "justifyLeft"));
+  toolbar.appendChild(richBtn("Center", "Align center", "justifyCenter"));
+  toolbar.appendChild(richBtn("Right", "Align right", "justifyRight"));
+  toolbar.appendChild(richSep());
+  var linkBtn = richBtn("Link", "Insert link", null, null);
+  linkBtn.addEventListener("click", function () {
+    var url = null;
+    try { url = window.prompt("Link URL:", "https://"); } catch (e) {}
+    if (!url) return;
+    url = String(url).trim();
+    if (!/^(https?:|mailto:)/i.test(url)) url = "https://" + url;
+    try { editor.focus(); } catch (e) {}
+    erpRichExec("createLink", url);
+    syncEmpty();
+    updateCount();
+  });
+  toolbar.appendChild(linkBtn);
+  toolbar.appendChild(richSep());
+  toolbar.appendChild(richBtn("Undo", "Undo", "undo"));
+  toolbar.appendChild(richBtn("Redo", "Redo", "redo"));
+  var clearBtn = richBtn("Clear", "Clear formatting", null, null);
+  clearBtn.addEventListener("click", function () {
+    try { editor.focus(); } catch (e) {}
+    erpRichExec("removeFormat");
+    erpRichExec("formatBlock", "p");
+    syncEmpty();
+    updateCount();
+  });
+  toolbar.appendChild(clearBtn);
+  var hideTimer = null;
+  function showToolbar() {
+    if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+    toolbar.hidden = false;
+  }
+  function hideToolbarSoon() {
+    if (hideTimer) clearTimeout(hideTimer);
+    hideTimer = setTimeout(function () {
+      hideTimer = null;
+      var ae = null;
+      try { ae = document.activeElement; } catch (e) {}
+      if (ae && wrap.contains && wrap.contains(ae)) return;
+      toolbar.hidden = true;
+      try { editor.innerHTML = erpRichNormalizeHtml(editor.innerHTML); } catch (e) {}
+      syncEmpty();
+      updateCount();
+    }, 200);
+  }
+  editor.addEventListener("focus", showToolbar);
+  editor.addEventListener("blur", hideToolbarSoon);
+  editor.addEventListener("input", function () { syncEmpty(); updateCount(); });
+  editor.addEventListener("paste", function (e) {
+    var clip = null;
+    try { clip = e.clipboardData || window.clipboardData || null; } catch (err) {}
+    if (!clip) return;
+    var html = null;
+    var text = "";
+    try { html = clip.getData("text/html"); } catch (err2) {}
+    try { text = clip.getData("text/plain") || clip.getData("text") || ""; } catch (err3) {}
+    if (e.preventDefault) e.preventDefault();
+    if (html) erpRichExec("insertHTML", erpSanitizeRichHtml(html));
+    else if (text) erpRichExec("insertText", text);
+    syncEmpty();
+    updateCount();
+  });
+  /* The wrapper behaves like a textarea: .value reads/writes
+     sanitized HTML, so existing save code needs no changes. */
+  Object.defineProperty(wrap, "value", {
+    get: function () {
+      var raw = "";
+      try { raw = editor.innerHTML || ""; } catch (e) {}
+      return erpRichNormalizeHtml(raw);
+    },
+    set: function (v) {
+      var s = v == null ? "" : String(v);
+      if (!s) { editor.innerHTML = ""; }
+      else if (!/<[a-zA-Z][^>]*>/.test(s)) { editor.innerHTML = erpEscapeHtml(s).replace(/\n/g, "<br>"); }
+      else { editor.innerHTML = erpSanitizeRichHtml(s); }
+      syncEmpty();
+      updateCount();
+    },
+    configurable: true
+  });
+  updateCount();
+  return wrap;
+}
+
 function erpTextInput(name, placeholder, required) {
   var input = document.createElement("input");
   input.name = name;
@@ -19678,12 +20023,18 @@ function mktNote(text) {
   p.textContent = text;
   return p;
 }
-function mktMetricRow(label, value) {
+function mktMetricRow(label, value, rich) {
   var row = document.createElement("div");
   var b = document.createElement("b");
   b.textContent = label + ": ";
   row.appendChild(b);
-  row.appendChild(document.createTextNode(value === null || value === undefined || value === "" ? "unavailable" : String(value)));
+  if (rich) {
+    var v = document.createElement("span");
+    erpSetRichHtml(v, value === null || value === undefined || value === "" ? "unavailable" : String(value));
+    row.appendChild(v);
+  } else {
+    row.appendChild(document.createTextNode(value === null || value === undefined || value === "" ? "unavailable" : String(value)));
+  }
   return row;
 }
 
@@ -19963,7 +20314,8 @@ function renderMktNewsletter(body) {
       }
     }
     var pv = document.createElement("p");
-    pv.textContent = current.body_html || "(no draft body yet)";
+    if (current.body_html) erpSetRichHtml(pv, current.body_html);
+    else pv.textContent = "(no draft body yet)";
     card.appendChild(pv);
     var row = document.createElement("div");
     row.className = "erp-toolbar";
@@ -20014,8 +20366,7 @@ function renderMktNewsletter(body) {
     var suIn = document.createElement("input");
     suIn.type = "text";
     form.appendChild(erpField("Subject", suIn));
-    var boIn = document.createElement("textarea");
-    boIn.placeholder = "Newsletter HTML body";
+    var boIn = erpRichText({ placeholder: "Newsletter HTML body", minHeight: "160px" });
     form.appendChild(erpField("Body", boIn));
     var st = document.createElement("p");
     st.style.color = "var(--muted)";
@@ -20126,7 +20477,7 @@ function renderMktCustomers(body) {
     detail.appendChild(mktMetricRow("First / last order", (c.first_order_at || "—") + " / " + (c.last_order_at || "—")));
     if (c.loyalty) detail.appendChild(mktMetricRow("Loyalty", c.loyalty.tier + " · " + c.loyalty.kernels + " kernels"));
     if ((c.tags || []).length) detail.appendChild(mktMetricRow("Tags", c.tags.join(", ")));
-    if (c.note) detail.appendChild(mktMetricRow("Note", c.note));
+    if (c.note) detail.appendChild(mktMetricRow("Note", c.note, true));
     detail.appendChild(mktBtn("Open", function () { loadMktCustomerDetail(c.key); }));
     custList.appendChild(card);
   });
@@ -20183,9 +20534,8 @@ function renderMktCustomerDetail(body) {
     tagsIn.value = (c.tags || []).join(", ");
     tagsIn.placeholder = "Tags, comma-separated";
     form.appendChild(erpField("Tags (comma-separated, max 20)", tagsIn));
-    var noteIn = document.createElement("textarea");
+    var noteIn = erpRichText({ placeholder: "Staff note about this customer", maxLength: 2000 });
     noteIn.value = c.note || "";
-    noteIn.placeholder = "Staff note about this customer";
     form.appendChild(erpField("Note", noteIn));
     if (c.note_updated_by) form.appendChild(mktMetricRow("Last updated by", c.note_updated_by + (c.note_updated_at ? " · " + mktDate(c.note_updated_at) : "")));
     var st = document.createElement("p");
@@ -20855,7 +21205,7 @@ function renderMktSupport(body) {
       rt.textContent = rLabel + " — " + (r.author || "") + " · " + mktDate(r.created_at) + (r.sent_at ? " · sent via " + (r.sent_via || "email") + " " + mktDate(r.sent_at) + (r.sent_by ? " by " + r.sent_by : "") : (r.is_internal_note ? "" : " · not sent (draft)"));
       rb.appendChild(rt);
       var rx = document.createElement("p");
-      rx.textContent = r.body || "";
+      erpSetRichHtml(rx, r.body || "");
       rb.appendChild(rx);
       if (!r.is_internal_note && !r.sent_at && mktCanSupWrite()) {
         var srow = document.createElement("div");
@@ -20899,8 +21249,7 @@ function renderMktSupport(body) {
       form.appendChild(mktBtn("Save reply draft", function () {
         erpPost("/api/erp/marketing/support/tickets/" + det.id + "/replies", { body: ta.value, is_internal_note: false }).then(function () { loadMktTicketDetail(det.id); }).catch(function (e) { fst.textContent = e.message; });
       }));
-      var na = document.createElement("textarea");
-      na.placeholder = "Internal note (never sent)…";
+      var na = erpRichText({ placeholder: "Internal note (never sent)…" });
       form.appendChild(erpField("Internal note", na));
       var nst = document.createElement("p");
       nst.style.color = "var(--muted)";
@@ -23096,7 +23445,7 @@ function renderErpHrRoleRow(role, status, reload, openInfo) {
   detail.hidden = true;
   if (role.description) {
     var desc = document.createElement("p");
-    desc.textContent = role.description;
+    erpSetRichHtml(desc, role.description);
     detail.appendChild(desc);
   }
   // Headcount planning: open seats for the default forecast period,
@@ -23154,7 +23503,7 @@ function renderErpHrRoleRow(role, status, reload, openInfo) {
     titleInput.type = "text";
     titleInput.value = role.title;
     editForm.appendChild(erpField("Title", titleInput));
-    var descInput = document.createElement("textarea");
+    var descInput = erpRichText({ placeholder: "Description", maxLength: 5000 });
     descInput.value = role.description || "";
     editForm.appendChild(erpField("Description", descInput));
     var saveBtn = document.createElement("button");
@@ -23221,8 +23570,7 @@ function renderErpHrHiringSection(reload) {
   roleTitleInput.type = "text";
   roleTitleInput.placeholder = "Title";
   roleForm.appendChild(erpField("Title", roleTitleInput));
-  var roleDescInput = document.createElement("textarea");
-  roleDescInput.placeholder = "Description";
+  var roleDescInput = erpRichText({ placeholder: "Description", maxLength: 5000 });
   roleForm.appendChild(erpField("Description", roleDescInput));
   var addRoleBtn = document.createElement("button");
   addRoleBtn.type = "button";
@@ -23425,7 +23773,10 @@ function renderErpHrHiringSection(reload) {
         });
         if (a.role_description) {
           var roleDesc = document.createElement("p");
-          roleDesc.textContent = "Role: " + a.role + " — " + a.role_description;
+          roleDesc.appendChild(document.createTextNode("Role: " + a.role + " — "));
+          var roleDescBody = document.createElement("span");
+          erpSetRichHtml(roleDescBody, a.role_description);
+          roleDesc.appendChild(roleDescBody);
           detail.appendChild(roleDesc);
         }
         var meta = document.createElement("p");
@@ -24156,7 +24507,7 @@ function renderErpHrTrainingSection(reload) {
       });
       if (course.description) {
         var desc = document.createElement("p");
-        desc.textContent = course.description;
+        erpSetRichHtml(desc, course.description);
         detail.appendChild(desc);
       }
       var toggleBtn = document.createElement("button");
@@ -24200,7 +24551,7 @@ function renderErpHrTrainingSection(reload) {
         tInput.type = "text";
         tInput.value = course.title;
         editForm.appendChild(erpField("Title", tInput));
-        var dInput = document.createElement("textarea");
+        var dInput = erpRichText({ placeholder: "Description", maxLength: 5000 });
         dInput.value = course.description || "";
         editForm.appendChild(erpField("Description", dInput));
         var mInput = document.createElement("input");
@@ -24239,8 +24590,7 @@ function renderErpHrTrainingSection(reload) {
     titleInput.type = "text";
     titleInput.placeholder = "Title";
     form.appendChild(erpField("Title", titleInput));
-    var descInput = document.createElement("textarea");
-    descInput.placeholder = "Description (optional)";
+    var descInput = erpRichText({ placeholder: "Description (optional)", maxLength: 5000 });
     form.appendChild(erpField("Description", descInput));
     var monthsInput = document.createElement("input");
     monthsInput.type = "number";
@@ -26082,7 +26432,7 @@ function renderErpQualityDetail(data) {
   var contactsArea = qArea("Recall team contacts — names, roles, phone numbers", 3);
   contactsArea.value = plan ? plan.team_contacts : "";
   planCard.appendChild(qAreaField("Recall team contacts", contactsArea));
-  var stepsArea = qArea("Procedure steps — what to do, in order, when a recall is needed", 6);
+  var stepsArea = erpRichText({ placeholder: "Procedure steps — what to do, in order, when a recall is needed", maxLength: 20000, minHeight: "160px" });
   stepsArea.value = plan ? plan.procedure_steps : "";
   planCard.appendChild(qAreaField("Procedure steps", stepsArea));
   var planMeta = qNote(plan ? ("Last updated by " + (plan.updated_by || "—") + " at " + (plan.updated_at || "—") + ".") : "No recall plan saved yet.");
@@ -26157,7 +26507,7 @@ function renderErpQualityDetail(data) {
   drillCard.appendChild(erpField("Scope", drillScope));
   var drillOutcome = qInput("Outcome — e.g. passed, trace completed in 2 hours");
   drillCard.appendChild(erpField("Outcome", drillOutcome));
-  var drillNotes = qArea("Notes (optional)", 2);
+  var drillNotes = erpRichText({ placeholder: "Notes (optional)", maxLength: 5000 });
   drillCard.appendChild(qAreaField("Notes", drillNotes));
   var drillStatus = qStatus();
   drillCard.appendChild(drillStatus);
@@ -26181,7 +26531,7 @@ function renderErpQualityDetail(data) {
     drillCard.appendChild(qNote("No drills logged yet."));
   }
   drills.forEach(function (d) {
-    drillCard.appendChild(qRow(d.drill_date + " — " + d.scope + (d.outcome ? (" · " + d.outcome) : "") + (d.actor ? (" (" + d.actor + ")") : "") + (d.notes ? (" — " + d.notes) : "")));
+    drillCard.appendChild(erpRichRow([d.drill_date + " — " + d.scope + (d.outcome ? (" · " + d.outcome) : "") + (d.actor ? (" (" + d.actor + ")") : "") + (d.notes ? " — " : ""), d.notes ? { rich: d.notes } : null]));
   });
   els.body.appendChild(drillCard);
   // --- Supplier COAs per lot. ---
@@ -26951,8 +27301,7 @@ function renderErpQualityCalibrationSection(wrap, reload) {
             calList.appendChild(n);
           }
           cals.forEach(function (c) {
-            var row = document.createElement("p");
-            row.textContent = "Calibrated " + c.calibration_date + " · due " + c.due_date + " (" + dueLabel(c.due_status) + ") · " + c.result + " · by " + c.performed_by + (c.notes ? " — " + c.notes : "");
+            var row = erpRichRow(["Calibrated " + c.calibration_date + " · due " + c.due_date + " (" + dueLabel(c.due_status) + ") · " + c.result + " · by " + c.performed_by + (c.notes ? " — " : ""), c.notes ? { rich: c.notes } : null]);
             calList.appendChild(row);
             var delBtn = document.createElement("button");
             delBtn.type = "button";
@@ -26999,8 +27348,7 @@ function renderErpQualityCalibrationSection(wrap, reload) {
         byInput.type = "text";
         byInput.placeholder = "Who calibrated it";
         calForm.appendChild(erpField("Performed by", byInput));
-        var notesInput = document.createElement("textarea");
-        notesInput.placeholder = "Notes (optional)";
+        var notesInput = erpRichText({ placeholder: "Notes (optional)", maxLength: 5000 });
         calForm.appendChild(erpField("Notes", notesInput));
         var saveBtn = document.createElement("button");
         saveBtn.type = "button";
@@ -27159,7 +27507,7 @@ function renderErpQualityAuditSection(wrap, reload) {
       detail.appendChild(counts);
       if (a.notes) {
         var n = document.createElement("p");
-        n.textContent = a.notes;
+        erpSetRichHtml(n, a.notes);
         detail.appendChild(n);
       }
       var detailWrap = document.createElement("div");
@@ -27229,8 +27577,7 @@ function renderErpQualityAuditSection(wrap, reload) {
     auditorInput.type = "text";
     auditorInput.placeholder = "Auditor name";
     form.appendChild(erpField("Auditor", auditorInput));
-    var notesInput = document.createElement("textarea");
-    notesInput.placeholder = "Notes (optional)";
+    var notesInput = erpRichText({ placeholder: "Notes (optional)", maxLength: 5000 });
     form.appendChild(erpField("Notes", notesInput));
     var addBtn = document.createElement("button");
     addBtn.type = "button";
@@ -27303,8 +27650,7 @@ function renderErpQualityAuditSection(wrap, reload) {
     (audit.findings || []).forEach(function (f) {
       var fCard = document.createElement("div");
       fCard.className = "erp-form";
-      var fp = document.createElement("p");
-      fp.textContent = "[" + f.severity + "] " + f.description + " · " + f.status + " · " + f.open_actions + " open action" + (f.open_actions === 1 ? "" : "s");
+      var fp = erpRichRow(["[" + f.severity + "] ", { rich: f.description }, " · " + f.status + " · " + f.open_actions + " open action" + (f.open_actions === 1 ? "" : "s")]);
       fCard.appendChild(fp);
       (f.actions || []).forEach(function (act) {
         var ap = document.createElement("p");
@@ -27375,8 +27721,7 @@ function renderErpQualityAuditSection(wrap, reload) {
       fCard.appendChild(fDelBtn);
       detailWrap.appendChild(fCard);
     });
-    var fDesc = document.createElement("textarea");
-    fDesc.placeholder = "Finding description";
+    var fDesc = erpRichText({ placeholder: "Finding description", maxLength: 5000 });
     detailWrap.appendChild(erpField("Add finding", fDesc));
     var sevSelect = document.createElement("select");
     [["minor", "Minor"], ["major", "Major"], ["critical", "Critical"]].forEach(function (o) {
@@ -27452,9 +27797,13 @@ function renderErpLegalDetail(data) {
     return input;
   }
   function lArea(placeholder, rows) {
-    var area = document.createElement("textarea");
-    area.placeholder = placeholder || "";
-    area.rows = rows || 4;
+    // Rich text: every Legal textarea is free prose read back in the
+    // ERP (IP / agreement / license / compliance notes, risk
+    // description + mitigation). The editor replaces the plain box;
+    // .value still reads/writes the same field. Risk description and
+    // mitigation cap at 5000 stored chars server-side; the notes
+    // fields have no backend limit, so no count is shown here.
+    var area = erpRichText({ placeholder: placeholder || "" });
     area.style.width = "100%";
     return area;
   }
@@ -27583,7 +27932,7 @@ function renderErpLegalDetail(data) {
       detail.hidden = !open;
       headBtn.setAttribute("aria-expanded", open ? "true" : "false");
     });
-    detail.appendChild(lRow(rec.name + " — " + rec.type + " · " + rec.status + (rec.filing_date ? (" · filed " + rec.filing_date) : "") + (rec.registration_date ? (" · registered " + rec.registration_date) : "") + (rec.renewal_deadline ? (" · renewal due " + rec.renewal_deadline + (rec.is_renewal_overdue ? " — OVERDUE" : "")) : " · no renewal deadline") + (rec.notes ? (" — " + rec.notes) : "")));
+    detail.appendChild(erpRichRow([rec.name + " — " + rec.type + " · " + rec.status + (rec.filing_date ? (" · filed " + rec.filing_date) : "") + (rec.registration_date ? (" · registered " + rec.registration_date) : "") + (rec.renewal_deadline ? (" · renewal due " + rec.renewal_deadline + (rec.is_renewal_overdue ? " — OVERDUE" : "")) : " · no renewal deadline") + (rec.notes ? " — " : ""), rec.notes ? { rich: rec.notes } : null]));
     var editBtn = lButton("Edit");
     editBtn.addEventListener("click", function () {
       renderErpLegalIpEditForm(rowCard, rec, ipAddStatus, loadErpLegalDetail);
@@ -27707,7 +28056,7 @@ function renderErpLegalDetail(data) {
       detail.hidden = !open;
       headBtn.setAttribute("aria-expanded", open ? "true" : "false");
     });
-    detail.appendChild(lRow(rec.title + " — " + rec.counterparty + " · " + rec.type + (rec.start_date ? (" · from " + rec.start_date) : "") + (rec.end_date ? (" · ends " + rec.end_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no end date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "") + (rec.has_image ? " · 📷 Photo" : "")));
+    detail.appendChild(erpRichRow([rec.title + " — " + rec.counterparty + " · " + rec.type + (rec.start_date ? (" · from " + rec.start_date) : "") + (rec.end_date ? (" · ends " + rec.end_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no end date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? " — " : ""), rec.notes ? { rich: rec.notes } : null, rec.has_image ? " · 📷 Photo" : ""]));
     var editBtn = lButton("Edit");
     editBtn.addEventListener("click", function () {
       renderErpLegalAgreementEditForm(rowCard, rec, agAddStatus, loadErpLegalDetail);
@@ -27836,7 +28185,7 @@ function renderErpLegalDetail(data) {
       detail.hidden = !open;
       headBtn.setAttribute("aria-expanded", open ? "true" : "false");
     });
-    detail.appendChild(lRow(rec.name + " — " + (rec.authority || "no authority") + " · " + rec.type + (rec.license_number ? (" · #" + rec.license_number) : "") + (rec.issue_date ? (" · issued " + rec.issue_date) : "") + (rec.expiry_date ? (" · expires " + rec.expiry_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no expiry date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "") + (rec.has_image ? " · 📷 Photo" : "")));
+    detail.appendChild(erpRichRow([rec.name + " — " + (rec.authority || "no authority") + " · " + rec.type + (rec.license_number ? (" · #" + rec.license_number) : "") + (rec.issue_date ? (" · issued " + rec.issue_date) : "") + (rec.expiry_date ? (" · expires " + rec.expiry_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no expiry date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? " — " : ""), rec.notes ? { rich: rec.notes } : null, rec.has_image ? " · 📷 Photo" : ""]));
     var editBtn = lButton("Edit");
     editBtn.addEventListener("click", function () {
       renderErpLegalLicenseEditForm(rowCard, rec, licAddStatus, loadErpLegalDetail);
@@ -27929,7 +28278,7 @@ function renderErpLegalDetail(data) {
       detail.hidden = !open;
       headBtn.setAttribute("aria-expanded", open ? "true" : "false");
     });
-    detail.appendChild(lRow(rec.obligation + (rec.authority ? (" — " + rec.authority) : "") + (rec.due_date ? (" · due " + rec.due_date) : " · no due date") + " · " + rec.status + (rec.notes ? (" — " + rec.notes) : "")));
+    detail.appendChild(erpRichRow([rec.obligation + (rec.authority ? (" — " + rec.authority) : "") + (rec.due_date ? (" · due " + rec.due_date) : " · no due date") + " · " + rec.status + (rec.notes ? " — " : ""), rec.notes ? { rich: rec.notes } : null]));
     var doneBtn = lButton(rec.status === "done" ? "Reopen" : "Mark done");
     doneBtn.addEventListener("click", function () {
       doneBtn.disabled = true;
@@ -28040,7 +28389,7 @@ function renderErpLegalDetail(data) {
       detail.hidden = !open;
       headBtn.setAttribute("aria-expanded", open ? "true" : "false");
     });
-    detail.appendChild(lRow(rec.title + " · " + rec.likelihood + " × " + rec.impact + " — score " + rec.risk_score + (rec.review_date ? (" · review " + rec.review_date) : " · no review date") + " · " + rec.review_status + (rec.owner ? (" · owner " + rec.owner) : "") + (rec.description ? (" — " + rec.description) : "") + (rec.mitigation ? (" — mitigation: " + rec.mitigation) : "")));
+    detail.appendChild(erpRichRow([rec.title + " · " + rec.likelihood + " × " + rec.impact + " — score " + rec.risk_score + (rec.review_date ? (" · review " + rec.review_date) : " · no review date") + " · " + rec.review_status + (rec.owner ? (" · owner " + rec.owner) : "") + (rec.description ? " — " : ""), rec.description ? { rich: rec.description } : null, rec.mitigation ? " — mitigation: " : "", rec.mitigation ? { rich: rec.mitigation } : null]));
     var riskEditBtn = lButton("Edit");
     riskEditBtn.addEventListener("click", function () {
       renderErpLegalRiskEditForm(rowCard, rec, riskAddStatus, loadErpLegalDetail);
@@ -28239,7 +28588,8 @@ function renderErpLegalIpEditForm(card, rec, status, reload) {
   card.appendChild(erpField("Registration date", registrationInput));
   var renewalInput = eInput(rec.renewal_deadline, "Renewal deadline (YYYY-MM-DD)");
   card.appendChild(erpField("Renewal deadline", renewalInput));
-  var notesInput = eInput(rec.notes, "Notes");
+  var notesInput = erpRichText({ placeholder: "Notes" });
+  notesInput.value = rec.notes || "";
   card.appendChild(erpField("Notes", notesInput));
   var saveBtn = document.createElement("button");
   saveBtn.type = "button";
@@ -28448,7 +28798,8 @@ function renderErpLegalAgreementEditForm(card, rec, status, reload) {
   card.appendChild(erpField("End / expiry date", endInput));
   var noticeInput = eInput(rec.renewal_notice_days, "Renewal notice (days)", "number");
   card.appendChild(erpField("Renewal notice (days)", noticeInput));
-  var notesInput = eInput(rec.notes, "Notes");
+  var notesInput = erpRichText({ placeholder: "Notes" });
+  notesInput.value = rec.notes || "";
   card.appendChild(erpField("Notes", notesInput));
   card.appendChild(renderErpLegalPhotoBox("agreements", rec, status, reload));
   var saveBtn = document.createElement("button");
@@ -28514,7 +28865,8 @@ function renderErpLegalLicenseEditForm(card, rec, status, reload) {
   card.appendChild(erpField("Expiry date", expiryInput));
   var noticeInput = eInput(rec.renewal_notice_days, "Renewal notice (days)", "number");
   card.appendChild(erpField("Renewal notice (days)", noticeInput));
-  var notesInput = eInput(rec.notes, "Notes");
+  var notesInput = erpRichText({ placeholder: "Notes" });
+  notesInput.value = rec.notes || "";
   card.appendChild(erpField("Notes", notesInput));
   card.appendChild(renderErpLegalPhotoBox("licenses", rec, status, reload));
   var saveBtn = document.createElement("button");
@@ -28560,7 +28912,8 @@ function renderErpLegalComplianceEditForm(card, rec, status, reload) {
   card.appendChild(erpField("Authority", authorityInput));
   var dueInput = eInput(rec.due_date, "Due date (YYYY-MM-DD)");
   card.appendChild(erpField("Due date", dueInput));
-  var notesInput = eInput(rec.notes, "Notes");
+  var notesInput = erpRichText({ placeholder: "Notes" });
+  notesInput.value = rec.notes || "";
   card.appendChild(erpField("Notes", notesInput));
   var saveBtn = document.createElement("button");
   saveBtn.type = "button";
@@ -28597,9 +28950,10 @@ function renderErpLegalRiskEditForm(card, rec, status, reload) {
     return input;
   }
   function eArea(value, placeholder, rows) {
-    var area = document.createElement("textarea");
-    area.placeholder = placeholder || "";
-    area.rows = rows || 2;
+    // Rich text: the risk edit form's two textareas are the risk
+    // description and the mitigation — free prose, 5000 stored chars
+    // max server-side. The editor replaces the plain box.
+    var area = erpRichText({ placeholder: placeholder || "", maxLength: 5000 });
     area.style.width = "100%";
     area.value = value || "";
     return area;
