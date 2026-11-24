@@ -11585,14 +11585,14 @@ function erpSanitizeRichHtml(html) {
   var stack = [];
   var dropTag = null;
   var dropDepth = 0;
-  var re = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\/?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>|((?:[^<]|<(?!(?:[a-zA-Z]|\/[a-zA-Z]|!)))+)/g;
+  var re = /\x3c!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\/?([a-zA-Z][a-zA-Z0-9]*)\b([^>]*)>|((?:[^<]|<(?!(?:[a-zA-Z]|\/[a-zA-Z]|!)))+)/g;
   var m;
   while ((m = re.exec(src))) {
     if (m[3] !== undefined) {
       if (!dropTag) out.push(erpEscapeHtml(m[3]));
       continue;
     }
-    if (m[0].indexOf("<!--") === 0 || m[0].indexOf("<![CDATA[") === 0) continue;
+    if (m[0].indexOf("\x3c!--") === 0 || m[0].indexOf("<![CDATA[") === 0) continue;
     var tag = (m[1] || "").toLowerCase();
     var isClose = m[0].charAt(1) === "/";
     var attrs = m[2] || "";
