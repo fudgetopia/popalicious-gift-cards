@@ -14744,15 +14744,6 @@ def _hr_resolve_active_role(conn, role_id):
     return row, None
 
 
-def _hr_coerce_active(value):
-    """Coerce a JSON active flag to 0/1 (accepts bool, int, or a
-    "true"/"false"/"1"/"0" string)."""
-    if isinstance(value, str):
-        return 1 if value.strip().lower() in ("1", "true", "yes", "on") \
-            else 0
-    return 1 if value else 0
-
-
 def _hr_validate_applicant_fields(data, require_name=True):
     """Validate applicant fields from a create/update body. Returns
     (values-dict, error-string-or-None). At least one contact
@@ -15173,7 +15164,8 @@ def hr_delete_applicant(applicant_id):
 @app.get("/api/erp/hr/roles")
 def hr_list_roles():
     """List job roles, ordered by title; ?active=1 lists active only
-    (the picker), ?active=0 lists inactive only."""
+    (the picker). Roles are never deactivated (Nov 23, 2026) -- every
+    row is active, so ?active=0 lists nothing."""
     _, err = _require_erp_admin()
     if err:
         return err
@@ -15256,12 +15248,21 @@ def hr_get_role(role_id):
 @app.post("/api/erp/hr/roles/<int:role_id>/update")
 def hr_update_role(role_id):
     """Edit a job role -- only provided fields change. A title change
-    must not collide with another role (400). Deactivating (active=0)
-    is allowed even with applicants attached."""
+    must not collide with another role (400). There is no deactivate:
+    roles are either present or deleted (Nov 23, 2026) -- an "active"
+    key in the body is refused with 400."""
     actor, err = _require_erp_admin()
     if err:
         return err
     data = request.get_json(force=True) or {}
+    if "active" in data:
+        conn = db()
+        if not _hr_role_row(conn, role_id):
+            conn.close()
+            return jsonify(error="role not found"), 404
+        conn.close()
+        return jsonify(error="roles cannot be deactivated -- delete the"
+                       " role instead"), 400
     conn = db()
     row = _hr_role_row(conn, role_id)
     if not row:
@@ -15297,13 +15298,6 @@ def hr_update_role(role_id):
             sets.append("description = ?")
             args.append(description)
             changes.append("description updated")
-    if "active" in data:
-        active = _hr_coerce_active(data.get("active"))
-        if active != (1 if row["active"] else 0):
-            sets.append("active = ?")
-            args.append(active)
-            changes.append("active: %s -> %s"
-                           % (1 if row["active"] else 0, active))
     if sets:
         now = datetime.now(timezone.utc).isoformat()
         sets.append("updated_by = ?")
@@ -15324,10 +15318,13 @@ def hr_update_role(role_id):
 
 @app.delete("/api/erp/hr/roles/<int:role_id>")
 def hr_delete_role(role_id):
-    """Delete a job role. Refused (409) while any applicant has
-    role_id = this role, or while any headcount target references it.
-    Otherwise the row is deleted; applicant and employee records are
-    never touched."""
+    """Delete a job role, permanently -- the role and its description
+    are gone; there is no restore. Applicants attached to the role
+    keep their stored role-title snapshot (their role_description
+    becomes empty once the role row is gone); applicant and employee
+    records are never touched. Refused (409) while any headcount
+    target references the role: deleting a planned role would orphan
+    admin-entered budget data, so targets must be removed first."""
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -15336,13 +15333,6 @@ def hr_delete_role(role_id):
     if not row:
         conn.close()
         return jsonify(error="role not found"), 404
-    count = conn.execute(
-        "SELECT COUNT(*) FROM erp_hr_applicants WHERE role_id = ?",
-        (role_id,)).fetchone()[0]
-    if count:
-        conn.close()
-        return jsonify(error="cannot delete a role with applicants"
-                       " (%d applicant(s) attached)" % count), 409
     tcount = conn.execute(
         "SELECT COUNT(*) FROM erp_hr_headcount_targets WHERE role_id = ?",
         (role_id,)).fetchone()[0]
