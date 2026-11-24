@@ -38,7 +38,7 @@ button { font-family: inherit; }
    links are the same static <a data-route> anchors the top header used;
    only their home moved, from the top bar into this sidebar. The tab's
    sub-tab row (when one exists) is hidden by [data-erp-subtabs] below and
-   shown again as sub-items under the active link; the sidebar item
+   shown again as sub-items under its link; the sidebar item
    delegates to the row's own button, so the handler runs exactly as before. */
 .erp-shell { display: flex; align-items: stretch; min-height: 100vh; background: #f4f5f8; }
 .erp-sidebar { width: 250px; flex: 0 0 250px; background: #393a3d; color: #fff;
@@ -68,6 +68,19 @@ button { font-family: inherit; }
   color: #c9cbcd; font-size: 13.5px; text-align: left; cursor: pointer; }
 .erp-sub-item:hover { background: rgba(255,255,255,.07); color: #fff; }
 .erp-sub-item.active { color: #fff; font-weight: 600; background: rgba(44,160,28,.28); border-left-color: #2ca01c; }
+/* Compact lists: long flat lists show titles only; expand/click for
+   the detail, plus a search box. One shared pattern everywhere:
+   .erp-compact-item (the row), .erp-compact-title (the title button),
+   .erp-compact-detail (hidden until expanded), .erp-compact-search
+   (the filter box). Tables get the same search box via
+   erpAddTableSearch() instead of being rebuilt as cards. */
+.erp-compact-search { width: 100%; max-width: 420px; margin: 6px 0 10px; }
+.erp-compact-item { margin-bottom: 8px; }
+.erp-compact-title { display: block; width: 100%; text-align: left; font-weight: 700;
+  background: none; border: 0; padding: 2px 0; cursor: pointer; color: inherit; font-size: inherit; }
+.erp-compact-title::before { content: "▸ "; color: var(--muted); }
+.erp-compact-title[aria-expanded="true"]::before { content: "▾ "; }
+.erp-compact-detail { margin-top: 6px; }
 .erp-side-foot { flex: 0 0 auto; border-top: 1px solid rgba(255,255,255,.12); padding: 12px 14px 14px; }
 .app-user { display: flex; flex-direction: column; align-items: stretch; gap: 10px; font-size: 14px; }
 .app-user button { width: 100%; min-height: 38px; background: rgba(255,255,255,.08); color: #fff;
@@ -472,7 +485,7 @@ button { font-family: inherit; }
   <aside class="erp-sidebar" id="erpSidebar" aria-label="ERP navigation">
     <div class="app-brand erp-brand">Pop-A-Licious ERP</div>
     <nav class="app-nav" id="erpSidenav">
-      <a href="#/" data-route="home"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg></span><span class="erp-nav-lbl">Dashboard</span></a>
+      <a href="#/" data-route="home" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.5"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.5"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.5"/></svg></span><span class="erp-nav-lbl">Dashboard</span></a>
       <a href="#/inventory" data-route="inventory" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3z"/><path d="M4 7.5l8 4.5 8-4.5"/><path d="M12 12v9"/></svg></span><span class="erp-nav-lbl">Inventory</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
       <a href="#/purchasing" data-route="purchasing" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="9.5" cy="20" r="1.5"/><circle cx="17" cy="20" r="1.5"/><path d="M3 3.5h2.2l2.3 11h10l2-8H6"/></svg></span><span class="erp-nav-lbl">Purchasing</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
       <a href="#/production" data-route="production" class="has-subs"><span class="erp-nav-ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 21v-9.5L9 15V9l5.5 3.5V21"/><path d="M3.5 21h17"/><path d="M17.5 21v-5"/></svg></span><span class="erp-nav-lbl">Production</span><span class="erp-nav-chev"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg></span></a>
@@ -1587,22 +1600,33 @@ function renderRoute() {
 /* ---------- Left sidebar navigation (Nov 17, 2026) ---------- */
 // QuickBooks-style left sidebar. The 16 main links are the same static
 // <a data-route> anchors the top header used; only their home moved.
-// Sub-items under the active link come from the tab's own sub-tab row when
-// one is rendered (that row is hidden by CSS; the sidebar item delegates
-// to the row's button, so the exact same handler runs), or from the tab's
-// real sections (scroll-to-section) when the tab has no sub-tab row.
-// Tabs with no sub-tab row show their real sections, as in the approved
-// preview: Dashboard has none; the rest list their sections below.
+// Section lists (scroll-to-section tabs). Every main section lists its
+// real subsections underneath it in the sidebar (Nov 23, 2026): these
+// lists were audited against what each page actually renders — only
+// real headings and toggle buttons, in render order. An entry's
+// optional second element is a perm gate ("admin", a perm string, or
+// ["any", ...perms]); a gated entry is hidden from users without it.
+// Nested h3/h4 detail inside a section (e.g. Headcount "Planning
+// periods") is reached by scrolling to its parent and is not listed
+// separately — except Job roles, listed under Hiring pipeline because
+// it is where descriptions are added. Conditional sections (e.g.
+// "Website flavors staged for preview", "Closed stores") are listed
+// even when they have nothing to show right now; tapping one then
+// lands at the top of the page, as a missing section always has.
 var ERP_SIDEBAR_SECTIONS = {
-  inventory: ["Items", "Lots & expiry", "Shrinkage", "Replenishment"],
+  home: ["Needs attention", "Recent orders", "Sales trend", ["Executive trends", "admin"]],
+  inventory: ["Items", ["Locations", "admin"], "Inventory count", "Lots & expiry", "Shrinkage", "Replenishment"],
   purchasing: ["Vendors", "Purchase orders", "Vendor scorecards"],
-  production: ["Recipes", "Batches"],
-  "staff-perms": ["Staff", "Add staff member"],
-  hr: ["Employee records", "Overtime alerts", "Add employee", "Training records"],
-  quality: ["Recall plan", "Trace a lot", "Recall drills", "Supplier COAs", "HACCP plan", "Complaint trending", "Equipment calibration", "Internal audits", "SOP Library"],
-  legal: ["Trademark + IP register", "Contracts + insurance", "Licenses & permits", "Compliance calendar", "Risk register"],
-  stores: ["All stores", "Add store", "Transfers", "Fleet register"]
+  production: [["Batches", "batches.read"], "Yield & waste trend", "Finished-goods stock vs targets", "Demand forecast & MRP", "Production calendar", ["Recipes", "recipes.read"], ["Website flavors staged for preview", "recipes.read"]],
+  "staff-perms": ["Staff", "Add staff member", "Staff audit log"],
+  hr: ["Employee records", "Overtime alerts", "Add employee", "Onboarding templates — by role", "Events — scheduling & roster", "Time tracking — per-person totals", "Time off (PTO)", "Performance reviews", "Feed to payrun — event staff (opt-in only)", "Recurring schedules", "Documents expiring soon", "Hiring pipeline", "Job roles", "Headcount planning", "Training records"],
+  quality: ["Recall plan", "Trace a lot", "Recall drills", "Supplier COAs", "HACCP plan", "Complaint trending", "Digital quality checklists", "Equipment calibration", "Internal audits", "SOP Library"],
+  legal: ["Trademark + IP register", "Contracts + insurance", "Licenses & permits", "Compliance calendar", "Risk register", "Lease accounting — ASC 842"],
+  stores: ["All stores", "Add store", "Closed stores", "Transfers", "Fleet register"]
 };
+// Staff see a different HR page ("My HR" self-service), so they get
+// its own sidebar list instead of the admin one.
+var ERP_SIDEBAR_SECTIONS_HR_STAFF = ["Your profile", "Time off (PTO)", "Performance reviews", "Recurring schedule", "Events you're assigned to", "Your time + cash", "Your documents"];
 // Tabs with a real sub-tab row. The subs lists below are the same lists
 // the rows build (same keys, same labels, same order) and are only used
 // as a fallback when the row is not in the DOM — in a detail view, where
@@ -1610,12 +1634,16 @@ var ERP_SIDEBAR_SECTIONS = {
 // the view, and re-renders: the same end state as tapping the row's
 // button from the list view. The reset lists copy the row buttons'
 // own handlers (Marketing clears its nine detail fields, and so on).
+// A sub's optional third element is a perm gate, same as the section
+// lists above ("admin", a perm string, or ["any", ...perms]) — the
+// fallback applies the same gates as the rows, so a user never sees a
+// tab they cannot open.
 var ERP_SIDEBAR_SUBTABS = {
   accounting: { view: "acctView", render: function () { renderErpAccountingDetail(); }, reset: function () {},
-    subs: [["accounts", "Chart of accounts"], ["journal", "Journal"], ["trial", "Trial balance"], ["invoices", "Invoices"], ["bills", "Bills"], ["aging", "Aging"], ["banking", "Banking"], ["reports", "Reports"], ["audit", "Audit log"], ["sales", "Sales posting"], ["snapshot", "Dashboard"], ["statements", "Statements"], ["matching", "Matching"], ["diff", "QB diff"], ["draws", "Owner draws"], ["tax", "Sales Tax"], ["payroll", "Payroll"]] },
+    subs: [["accounts", "Chart of accounts"], ["journal", "Journal"], ["trial", "Trial balance"], ["invoices", "Invoices"], ["bills", "Bills"], ["aging", "Aging"], ["banking", "Banking"], ["reports", "Reports", "accounting.read"], ["audit", "Audit log", "accounting.read"], ["sales", "Sales posting", "accounting.read"], ["snapshot", "Dashboard", "accounting.read"], ["statements", "Statements", "accounting.read"], ["matching", "Matching", "accounting.read"], ["diff", "QB diff", "accounting.read"], ["draws", "Owner draws", "accounting.read"], ["budgets", "Budgets", "admin"], ["treasury", "Treasury", "admin"], ["tax", "Sales Tax", "tax.read"], ["payroll", "Payroll", "payroll.read"]] },
   orders: { view: "ordersView", render: function () { renderErpOrdersDetail(); },
     reset: function () { erpState.selectedOrderSource = null; erpState.selectedOrderId = null; erpState.selectedAccountId = null; },
-    subs: [["queue", "Queue"], ["wholesale", "Wholesale orders"], ["accounts", "Accounts"]] },
+    subs: [["queue", "Queue"], ["wholesale", "Wholesale orders"], ["accounts", "Accounts", "accounts.read"]] },
   edi: { view: "ediView", render: function () { renderErpEdiDetail(); },
     reset: function () { erpState.selectedEdiDocId = null; erpState.selectedEdiPartnerId = null; },
     subs: [["documents", "Documents"], ["partners", "Partners"]] },
@@ -1624,7 +1652,7 @@ var ERP_SIDEBAR_SUBTABS = {
     subs: [["sales", "Sales"], ["valuation", "Inventory valuation"], ["margin", "Production margin"], ["wholesale", "Wholesale performance"], ["spend", "Spend by vendor"], ["customers", "Customers"], ["profitability", "Channel profitability"], ["programs", "Programs"], ["forecast", "Forecast"], ["summaries", "Sales summaries"], ["esg", "ESG metrics"]] },
   marketing: { view: "mktView", render: function () { renderErpMarketingDetail(); },
     reset: function () { erpState.mktSelectedTicketId = null; erpState.mktTicketDetail = null; erpState.mktCustomerDetail = null; erpState.mktCalDetail = null; erpState.mktPromos = null; erpState.mktInbox = null; erpState.mktAutomation = null; erpState.mktWinback = null; erpState.mktReviews = null; },
-    subs: [["instagram", "Instagram"], ["newsletter", "Newsletter"], ["support", "Support inbox"], ["customers", "Customers"], ["calendar", "Content calendar"], ["promos", "Promo calendar"], ["inbox", "Social inbox"], ["automation", "Automation"], ["reviews", "Reviews"]] },
+    subs: [["instagram", "Instagram", "instagram.read"], ["newsletter", "Newsletter", "newsletter.read"], ["support", "Support inbox", "support.read"], ["customers", "Customers", ["any", "instagram.read", "newsletter.read", "support.read"]], ["calendar", "Content calendar", ["any", "instagram.read", "newsletter.read", "support.read"]], ["promos", "Promo calendar", "newsletter.read"], ["inbox", "Social inbox", "instagram.read"], ["automation", "Automation", "newsletter.read"], ["reviews", "Reviews", "support.read"]] },
   loyalty: { view: "loyaltyView", render: function () { renderErpLoyaltyDetail(); },
     reset: function () { erpState.loyaltyConfirm = null; erpState.loyaltySelfConfirm = null; },
     subs: [["find", "Find member"], ["signup", "Sign up new member"], ["profile", "My profile"]] },
@@ -1632,48 +1660,101 @@ var ERP_SIDEBAR_SUBTABS = {
     reset: function () { erpState.showCompanyEdit = false; },
     subs: [["company", "Company profile"], ["integrations", "Integrations"], ["systems", "Systems"], ["quickbooks", "QuickBooks"], ["notifications", "Notifications"], ["audit", "Audit log"], ["data", "Data export & import"]] }
 };
-var erpSidebarSublistEl = null;
+var erpSidebarSublistEls = []; // one .erp-sublist per visible main link
 var erpSidebarLastSig = "";
 var erpSidebarLastRoute = "";
 var erpSidebarSection = null; // last clicked section label, for active styling
+var erpSidebarPendingSection = null; // cross-route jump waiting on the new tab's render: {route, label, tries}
 function erpSidebarClearSubs() {
-  if (erpSidebarSublistEl && erpSidebarSublistEl.parentNode) erpSidebarSublistEl.parentNode.removeChild(erpSidebarSublistEl);
-  erpSidebarSublistEl = null;
+  erpSidebarSublistEls.forEach(function (el) {
+    if (el && el.parentNode) el.parentNode.removeChild(el);
+  });
+  erpSidebarSublistEls = [];
   erpSidebarLastSig = "";
+}
+// Perm gate for a sidebar entry: "admin", a perm string, or
+// ["any", ...perms]. Ungated entries are visible to everyone who can
+// see the route itself.
+function erpSidebarGate(gate) {
+  if (!gate) return true;
+  if (gate === "admin") return erpIsAdmin();
+  if (typeof gate === "string") return erpCan(gate);
+  if (Array.isArray(gate) && gate[0] === "any") {
+    for (var i = 1; i < gate.length; i++) if (erpCan(gate[i])) return true;
+    return false;
+  }
+  return true;
 }
 function erpSidebarSubRow() {
   var body = document.getElementById("appBody");
   if (!body || typeof body.querySelector !== "function") return null;
   return body.querySelector("[data-erp-subtabs]");
 }
-function erpSidebarModel() {
-  var r = currentRoute();
-  if (r !== erpSidebarLastRoute) { erpSidebarLastRoute = r; erpSidebarSection = null; }
+// Sub-items for ONE route. The ACTIVE route mirrors its live sub-tab
+// row when one is rendered (exact perm gating, clicks delegate to the
+// row's own buttons); every other route uses the audited fallback or
+// section lists, perm-filtered. Staff get their own HR list (the "My
+// HR" self-service view renders different sections than the admin page).
+function erpSidebarModelFor(route) {
+  var active = (route === currentRoute());
   var subs = [];
-  var row = erpSidebarSubRow();
-  if (row) {
-    // The row's own buttons, in order: the sidebar mirrors them exactly
-    // (perm-gating included) and delegates clicks back to them.
-    var btns = row.children || [];
-    Array.prototype.forEach.call(btns, function (b) {
-      if (!b || b.tagName !== "BUTTON") return;
-      subs.push({ route: r, label: (b.textContent || "").trim(),
-        active: !!(b.disabled || (b.classList && b.classList.contains("active"))),
-        button: b, key: null, section: false });
-    });
-  } else if (ERP_SIDEBAR_SUBTABS[r]) {
-    var def = ERP_SIDEBAR_SUBTABS[r];
+  if (active) {
+    var row = erpSidebarSubRow();
+    if (row) {
+      // The row's own buttons, in order: the sidebar mirrors them exactly
+      // (perm-gating included) and delegates clicks back to them.
+      var btns = row.children || [];
+      Array.prototype.forEach.call(btns, function (b) {
+        if (!b || b.tagName !== "BUTTON") return;
+        subs.push({ route: route, label: (b.textContent || "").trim(),
+          active: !!(b.disabled || (b.classList && b.classList.contains("active"))),
+          button: b, key: null, section: false });
+      });
+      return { route: route, subs: subs };
+    }
+  }
+  if (ERP_SIDEBAR_SUBTABS[route]) {
+    var def = ERP_SIDEBAR_SUBTABS[route];
     def.subs.forEach(function (s) {
-      subs.push({ route: r, label: s[1], active: erpState[def.view] === s[0],
+      if (!erpSidebarGate(s[2])) return;
+      subs.push({ route: route, label: s[1], active: active && erpState[def.view] === s[0],
         button: null, key: s[0], section: false });
     });
-  } else if (ERP_SIDEBAR_SECTIONS[r]) {
-    ERP_SIDEBAR_SECTIONS[r].forEach(function (label) {
-      subs.push({ route: r, label: label, active: erpSidebarSection === label,
+    return { route: route, subs: subs };
+  }
+  var sections = ERP_SIDEBAR_SECTIONS[route];
+  if (route === "hr" && !erpIsAdmin()) sections = ERP_SIDEBAR_SECTIONS_HR_STAFF;
+  if (sections) {
+    sections.forEach(function (entry) {
+      var label = Array.isArray(entry) ? entry[0] : entry;
+      var gate = Array.isArray(entry) ? entry[1] : null;
+      if (!erpSidebarGate(gate)) return;
+      subs.push({ route: route, label: label, active: active && erpSidebarSection === label,
         button: null, key: null, section: true });
     });
   }
-  return { route: r, subs: subs };
+  return { route: route, subs: subs };
+}
+// Sub-items under EVERY main section, not just the active one —
+// clicking one opens that department if needed and jumps to that
+// subsection, so nothing has to be scrolled to find.
+function erpSidebarModels() {
+  var r = currentRoute();
+  if (r !== erpSidebarLastRoute) {
+    erpSidebarLastRoute = r;
+    // Keep the pending cross-route section highlighted once its tab lands.
+    erpSidebarSection = (erpSidebarPendingSection && erpSidebarPendingSection.route === r)
+      ? erpSidebarPendingSection.label : null;
+  }
+  var routes = [];
+  var sidenav = document.getElementById("erpSidenav");
+  if (sidenav) {
+    Array.prototype.forEach.call(sidenav.children || [], function (a) {
+      if (a && a.tagName === "A" && a.getAttribute) routes.push(a.getAttribute("data-route"));
+    });
+  }
+  if (!routes.length) routes = ["home"];
+  return routes.map(function (r) { return erpSidebarModelFor(r); });
 }
 function erpSidebarScrollEl(el) {
   if (!el) return false;
@@ -1698,14 +1779,55 @@ function erpSidebarScrollTo(label) {
     var wrap = body.querySelector(".admin-orders-wrap");
     if (wrap) return erpSidebarScrollEl(wrap);
   }
-  // No section matched (e.g. Production "Batches", which has no heading):
-  // land at the top of the page, where that section lives.
+  // No section matched: land at the top of the page, where that
+  // section lives (a conditional section with nothing to show).
   var h2 = body.querySelector("h2");
   if (h2) return erpSidebarScrollEl(h2);
   return false;
 }
+// Same matcher as erpSidebarScrollTo, but WITHOUT the fall back to the
+// page title: true only when the section really exists in the DOM.
+// Used for pending cross-route jumps — the new tab renders async, so a
+// miss means "not rendered yet", not "land at the top".
+function erpSidebarScrollToExact(label) {
+  var body = document.getElementById("appBody");
+  if (!body || typeof body.querySelectorAll !== "function") return false;
+  var want = String(label).toLowerCase();
+  var els = body.querySelectorAll("h2, h3, h4, button");
+  function norm(s) { return String(s || "").trim().toLowerCase(); }
+  var i, el, text;
+  for (i = 0; i < els.length; i++) { el = els[i]; if (norm(el.textContent) === want) return erpSidebarScrollEl(el); }
+  for (i = 0; i < els.length; i++) { el = els[i]; text = norm(el.textContent); if (text && text.indexOf(want) === 0) return erpSidebarScrollEl(el); }
+  for (i = 0; i < els.length; i++) { el = els[i]; text = norm(el.textContent); if (text && (text.indexOf(want) >= 0 || want.indexOf(text) >= 0)) return erpSidebarScrollEl(el); }
+  if (label === "Items") {
+    var wrap = body.querySelector(".admin-orders-wrap");
+    if (wrap) return erpSidebarScrollEl(wrap);
+  }
+  return false;
+}
 function erpSidebarSubClick(sub) {
   erpMobileNavClose();
+  // Cross-route jump: switch tabs first, then apply the subsection.
+  // Sub-tab views are set before navigating — renderRoute does not
+  // reset view state, so the new tab renders on the chosen view.
+  // Sections wait on the new tab's async render (pending scroll below).
+  if (sub.route !== currentRoute()) {
+    if (sub.key && ERP_SIDEBAR_SUBTABS[sub.route]) {
+      var def = ERP_SIDEBAR_SUBTABS[sub.route];
+      def.reset();
+      erpState[def.view] = sub.key;
+      erpSidebarPendingSection = null;
+      location.hash = sub.route === "home" ? "#/" : "#/" + sub.route;
+      return;
+    }
+    if (sub.section) {
+      erpSidebarPendingSection = { route: sub.route, label: sub.label, tries: 0 };
+      erpSidebarSection = sub.label;
+      location.hash = sub.route === "home" ? "#/" : "#/" + sub.route;
+      return;
+    }
+    return;
+  }
   if (sub.button) {
     // The row is rendered: delegate to its button so the exact same
     // handler runs. The active one is already showing; leave it alone.
@@ -1713,18 +1835,17 @@ function erpSidebarSubClick(sub) {
     return;
   }
   if (sub.key && ERP_SIDEBAR_SUBTABS[sub.route]) {
-    var def = ERP_SIDEBAR_SUBTABS[sub.route];
-    def.reset();
-    erpState[def.view] = sub.key;
-    def.render();
+    var def2 = ERP_SIDEBAR_SUBTABS[sub.route];
+    def2.reset();
+    erpState[def2.view] = sub.key;
+    def2.render();
     return;
   }
   if (sub.section) {
     // Production detail open: a section tap must leave the detail and
-    // show the list first. The detail view has no "Recipes" heading
-    // (its heading is the recipe name) and no "Batches" heading, so
-    // scrolling alone changes nothing visible. Clear the detail state
-    // and re-render the list, then scroll to the section in it.
+    // show the list first. The detail view's heading is the recipe or
+    // batch name, so scrolling alone changes nothing visible. Clear the
+    // detail state and re-render the list, then scroll to the section.
     if (sub.route === "production" && (erpState.selectedRecipeId || erpState.selectedBatchId)) {
       erpState.selectedRecipeId = null;
       erpState.selectedBatchId = null;
@@ -1745,36 +1866,144 @@ function erpSyncSidebar() {
     var sess = erpSession();
     if (sess && sess.role === "wholesale") return;
   }
-  var model = erpSidebarModel();
-  var sig = model.route + "|" + model.subs.map(function (s) { return s.label + "=" + (s.active ? "1" : "0"); }).join(",");
-  if (sig === erpSidebarLastSig) return;
+  var models = erpSidebarModels();
+  var sig = models.map(function (m) {
+    return m.route + "|" + m.subs.map(function (s) { return s.label + "=" + (s.active ? "1" : "0"); }).join(",");
+  }).join(";");
+  if (sig === erpSidebarLastSig) {
+    // No rebuild needed — but a pending cross-route jump may have
+    // become scrollable since the last mutation.
+    erpSidebarTryPending();
+    return;
+  }
   erpSidebarClearSubs();
   erpSidebarLastSig = sig;
-  if (!model.subs.length) return;
-  var activeLink = null;
-  var links = sidenav.children || [];
-  for (var i = 0; i < links.length; i++) {
-    var a = links[i];
-    if (a && a.tagName === "A" && a.getAttribute && a.getAttribute("data-route") === model.route) { activeLink = a; break; }
-  }
-  if (!activeLink) return;
-  var list = document.createElement("div");
-  list.className = "erp-sublist";
-  list.setAttribute("role", "group");
-  list.setAttribute("aria-label", "Sub-pages");
-  model.subs.forEach(function (sub) {
-    var b = document.createElement("button");
-    b.type = "button";
-    b.className = "erp-sub-item" + (sub.active ? " active" : "");
-    b.textContent = sub.label;
-    if (sub.active) b.setAttribute("aria-current", "page");
-    b.addEventListener("click", function () { erpSidebarSubClick(sub); });
-    list.appendChild(b);
+  // Snapshot the main links first: inserting a sub-list changes
+  // sidenav.children, so the links must be collected up front.
+  var links = [];
+  Array.prototype.forEach.call(sidenav.children || [], function (a) {
+    if (a && a.tagName === "A" && a.getAttribute) links.push(a);
   });
-  if (typeof sidenav.insertBefore === "function" && activeLink.nextSibling) sidenav.insertBefore(list, activeLink.nextSibling);
-  else if (typeof sidenav.insertBefore === "function") sidenav.insertBefore(list, null);
-  else sidenav.appendChild(list);
-  erpSidebarSublistEl = list;
+  var byRoute = {};
+  models.forEach(function (m) { byRoute[m.route] = m; });
+  links.forEach(function (link) {
+    var route = link.getAttribute("data-route");
+    // renderRoute hides links the user cannot open; no sub-list under a hidden link.
+    if (link.style && link.style.display === "none") return;
+    var model = byRoute[route];
+    if (!model || !model.subs.length) return;
+    var list = document.createElement("div");
+    list.className = "erp-sublist";
+    list.setAttribute("role", "group");
+    list.setAttribute("aria-label", "Sub-pages");
+    model.subs.forEach(function (sub) {
+      var b = document.createElement("button");
+      b.type = "button";
+      b.className = "erp-sub-item" + (sub.active ? " active" : "");
+      b.textContent = sub.label;
+      if (sub.active) b.setAttribute("aria-current", "page");
+      b.addEventListener("click", function () { erpSidebarSubClick(sub); });
+      list.appendChild(b);
+    });
+    // Insert right after this link, by position in the live children
+    // list — not via link.nextSibling, which can be a whitespace text
+    // node (real DOM) or a stale pointer to a removed sub-list.
+    var kids = sidenav.children || [];
+    var pos = -1;
+    for (var k = 0; k < kids.length; k++) if (kids[k] === link) { pos = k; break; }
+    if (pos >= 0 && typeof sidenav.insertBefore === "function") sidenav.insertBefore(list, kids[pos + 1] || null);
+    else sidenav.appendChild(list);
+    erpSidebarSublistEls.push(list);
+  });
+  erpSidebarTryPending();
+}
+// A cross-route section jump waits for the new tab's render: the tab
+// loads async, so each sidebar sync retries the exact scroll. A miss
+// means "not rendered yet" — after enough retries the section plainly
+// does not exist in this state (conditional, nothing to show) and the
+// pending jump is dropped instead of retrying forever.
+function erpSidebarTryPending() {
+  var p = erpSidebarPendingSection;
+  if (!p) return;
+  if (p.route !== currentRoute()) return;
+  p.tries = (p.tries || 0) + 1;
+  if (erpSidebarScrollToExact(p.label)) { erpSidebarPendingSection = null; return; }
+  if (p.tries >= 30) erpSidebarPendingSection = null;
+}
+/* ---------- Compact lists (shared pattern) ----------
+   Long flat lists show titles/names only; expand/click for the
+   detail, plus a search box. Card lists use erpCompactSearchBox +
+   erpCompactFilter (items are .erp-compact-item, titles are
+   .erp-compact-title); tables keep their rows and get a search box
+   via erpAddTableSearch. One pattern, not a widget per section. */
+function erpCompactSearchBox(placeholder, onInput) {
+  var input = document.createElement("input");
+  input.type = "search";
+  input.className = "erp-compact-search";
+  input.placeholder = placeholder || "Search…";
+  input.setAttribute("aria-label", placeholder || "Search");
+  input.addEventListener("input", function () { onInput(input.value); });
+  return input;
+}
+// Show only the card items whose title contains the query
+// (case-insensitive); an empty query shows everything.
+function erpCompactFilter(container, query) {
+  if (!container) return;
+  var q = String(query || "").trim().toLowerCase();
+  var items = container.querySelectorAll ? container.querySelectorAll(".erp-compact-item") : [];
+  Array.prototype.forEach.call(items, function (item) {
+    var t = item.querySelector ? item.querySelector(".erp-compact-title") : null;
+    var text = t ? (t.textContent || "") : (item.textContent || "");
+    item.style.display = (!q || text.toLowerCase().indexOf(q) >= 0) ? "" : "none";
+  });
+}
+// Make a card list compact: wrap each row's title in a toggle button
+// and hide the rest until expanded. Rows are expected to have a
+// first-child title element (h3/h4) followed by the detail nodes;
+// pass titleSel to match a different title element.
+function erpCompactSection(container, titleSel) {
+  if (!container || !container.children) return;
+  Array.prototype.forEach.call(container.children, function (row) {
+    if (!row || row.classList.contains("erp-compact-item")) return;
+    var titleEl = titleSel ? row.querySelector(titleSel) : row.querySelector("h3, h4");
+    if (!titleEl) return;
+    row.classList.add("erp-compact-item");
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    headBtn.textContent = titleEl.textContent;
+    headBtn.setAttribute("aria-expanded", "false");
+    titleEl.replaceWith(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    // Everything except the title button moves into the detail, in
+    // order — nodes after the title first, then nodes before it.
+    var node = headBtn.nextSibling;
+    while (node) { var next = node.nextSibling; detail.appendChild(node); node = next; }
+    var prev = headBtn.previousSibling;
+    while (prev) { var p = prev.previousSibling; detail.insertBefore(prev, detail.firstChild); prev = p; }
+    row.appendChild(detail);
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+  });
+}
+// Add a search box above a table: filters rows by their visible text
+// (case-insensitive, header row untouched). Returns the input.
+function erpAddTableSearch(table, placeholder) {
+  if (!table || !table.parentNode) return null;
+  var input = erpCompactSearchBox(placeholder || "Search…", function (q) {
+    var query = String(q || "").trim().toLowerCase();
+    var rows = table.querySelectorAll ? table.querySelectorAll("tbody tr") : [];
+    Array.prototype.forEach.call(rows, function (tr) {
+      tr.style.display = (!query || (tr.textContent || "").toLowerCase().indexOf(query) >= 0) ? "" : "none";
+    });
+  });
+  table.parentNode.insertBefore(input, table);
+  return input;
 }
 /* ---------- Mobile navigation (left sidebar as overlay) ---------- */
 function erpMobileNavOpen() {
@@ -1814,6 +2043,8 @@ function erpMobileNavToggle() {
     var el = e && e.target ? e.target : null;
     while (el) {
       if (el.tagName === "A" && el.getAttribute && el.getAttribute("data-route")) {
+        // Explicit main-link tap overrides any pending cross-route jump.
+        erpSidebarPendingSection = null;
         if (currentRoute() === el.getAttribute("data-route")) renderRoute();
         return;
       }
@@ -3931,6 +4162,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             });
             table.appendChild(tbody);
             wrap.appendChild(table);
+            erpAddTableSearch(table, "Search lots…");
           }
           filterSel.addEventListener("change", render);
           function loadLots() {
@@ -4659,6 +4891,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           });
           table.appendChild(tb);
           wrap.appendChild(table);
+          erpAddTableSearch(table, "Search movements…");
           body.appendChild(wrap);
         }
         function erpAdjustForm(item) {
@@ -5054,7 +5287,23 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             if (erpAcctCanWrite()) jToolbar.appendChild(newEntryBtn);
             els.body.appendChild(jToolbar);
             if (erpState.showNewEntry && erpAcctCanWrite()) els.body.appendChild(erpAcctNewEntryForm());
-            els.body.appendChild(erpAcctJournalTable());
+            var journalTable = erpAcctJournalTable();
+            els.body.appendChild(journalTable);
+            // Journal rows come in entry + lines pairs: filter both together
+            // so a lines row never shows without its entry (and vice versa).
+            var journalSearch = erpCompactSearchBox("Search journal…", function (q) {
+              var query = String(q || "").trim().toLowerCase();
+              var entries = journalTable.querySelectorAll("tr.erp-journal-entry");
+              Array.prototype.forEach.call(entries, function (tr) {
+                var lines = tr.nextElementSibling;
+                var hasLines = lines && lines.classList && lines.classList.contains("erp-journal-lines");
+                var text = (tr.textContent || "") + " " + (hasLines ? (lines.textContent || "") : "");
+                var show = !query || text.toLowerCase().indexOf(query) >= 0;
+                tr.style.display = show ? "" : "none";
+                if (hasLines) lines.style.display = show ? "" : "none";
+              });
+            });
+            journalTable.parentNode.insertBefore(journalSearch, journalTable);
           } else if (erpState.acctView === "trial") {
             els.body.appendChild(erpAcctTrialBalanceTable());
           } else if (erpState.acctView === "invoices") {
@@ -5087,7 +5336,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               invCo.textContent = "Invoices issued by " + erpCompanyLine(erpState.acctCompany);
               els.body.appendChild(invCo);
             }
-            els.body.appendChild(erpAcctInvoicesTable());
+            var invoicesTable = erpAcctInvoicesTable();
+            els.body.appendChild(invoicesTable);
+            erpAddTableSearch(invoicesTable, "Search invoices…");
           } else if (erpState.acctView === "bills") {
             var bToolbar = document.createElement("div");
             bToolbar.className = "erp-toolbar";
@@ -5106,7 +5357,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               if (_pbill) els.body.appendChild(erpAcctPayBillForm(_pbill));
             }
             if (erpState.acctBillMatchId) els.body.appendChild(erpAcctBillMatchSection());
-            els.body.appendChild(erpAcctBillsTable());
+            var billsTable = erpAcctBillsTable();
+            els.body.appendChild(billsTable);
+            erpAddTableSearch(billsTable, "Search bills…");
             els.body.appendChild(erpAcctBillPayRequestsSection());
           } else if (erpState.acctView === "aging") {
             els.body.appendChild(erpAcctAgingTable());
@@ -5159,7 +5412,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
                 });
                 if (_mtxn) els.body.appendChild(erpAcctMatchTxnForm(_mtxn));
               }
-              els.body.appendChild(erpAcctBankTxnsTable());
+              var bankTxnsWrap = erpAcctBankTxnsTable();
+              els.body.appendChild(bankTxnsWrap);
+              erpAddTableSearch(bankTxnsWrap.querySelector("table"), "Search transactions…");
               els.body.appendChild(erpAcctReconSection());
             }
           } else if (erpState.acctView === "snapshot") {
@@ -5246,7 +5501,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           } else if (erpState.acctView === "audit") {
             if (erpAcctCanRead()) {
               if (!erpState.acctAuditLoaded) erpAcctLoadAudit();
-              els.body.appendChild(erpAcctAuditSection());
+              var auditWrap = erpAcctAuditSection();
+              els.body.appendChild(auditWrap);
+              erpAddTableSearch(auditWrap.querySelector("table"), "Search audit log…");
             } else {
               var noAccess = document.createElement("p");
               noAccess.textContent = "Admin access required.";
@@ -5287,7 +5544,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               if (!erpState.acctBackupLoaded) erpAcctLoadBackupStatus();
               els.body.appendChild(erpAcctBackupSection());
             }
-            els.body.appendChild(erpAcctAccountsTable());
+            var acctTable = erpAcctAccountsTable();
+            els.body.appendChild(acctTable);
+            erpAddTableSearch(acctTable, "Search accounts…");
           }
         }
         var ERP_ACCT_AUDIT_ACTIONS = ["account.create", "account.deactivate", "journal.post", "journal.reverse", "invoice.create", "invoice.pay", "invoice.void", "bill.create", "bill.pay", "bill.void", "bank.create", "bank.sync", "bank.auto_match", "bank.match", "bank.unmatch", "bank.close", "tax.rate.add", "tax.filing.create", "tax.remit", "tax.file", "payroll.employee.create", "payroll.employee.update", "payroll.employee.deactivate", "payroll.run.create", "payroll.run.approve", "payroll.run.pay", "payroll.tax.file", "migration.import", "period.lock", "period.unlock", "backup.export", "backup.restore", "sale.post", "sale.backfill", "sale.post_failed", "credit_note.create", "bill_po.link", "draw.request", "draw.approve", "draw.reject", "draw.cancel", "billpay.request", "billpay.approve", "billpay.reject", "billpay.cancel", "tax.checklist", "tax.remind", "budget.create", "budget.update", "budget.delete"];
@@ -5387,6 +5646,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             empty.appendChild(etd);
             table.appendChild(empty);
           }
+          var tbody = document.createElement("tbody");
           erpState.acctAudit.forEach(function (row) {
             var tr = document.createElement("tr");
             var time = document.createElement("td");
@@ -5404,8 +5664,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             var det = document.createElement("td");
             det.textContent = row.detail || "";
             tr.appendChild(det);
-            table.appendChild(tr);
+            tbody.appendChild(tr);
           });
+          table.appendChild(tbody);
           wrap.appendChild(table);
           var pager = document.createElement("div");
           pager.className = "erp-toolbar";
@@ -5692,10 +5953,25 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             wrap.appendChild(none);
             return wrap;
           }
+          var budgetRows = [];
+          var budgetSearch = erpCompactSearchBox("Search budgets…", function (q) {
+            var query = String(q || "").trim().toLowerCase();
+            var anyUnbudgeted = false;
+            budgetRows.forEach(function (r) {
+              var show = !query || (r.el.textContent || "").toLowerCase().indexOf(query) >= 0;
+              r.el.style.display = show ? "" : "none";
+              if (r.btn) r.btn.style.display = show ? "" : "none";
+              if (r.unbudgeted && show) anyUnbudgeted = true;
+            });
+            if (unHead) unHead.style.display = (!query || anyUnbudgeted) ? "" : "none";
+          });
+          wrap.appendChild(budgetSearch);
           (v.rows || []).forEach(function (row) {
             var line = document.createElement("p");
             line.textContent = row.code + " " + row.name + " \u2014 Budget " + erpMoney(row.budget_cents) + " \u2014 Actual " + erpMoney(row.actual_cents) + " \u2014 Variance " + erpMoney(row.variance_cents) + (row.variance_pct === null || row.variance_pct === undefined ? " (no %: zero budget)" : " (" + row.variance_pct + "%)");
             wrap.appendChild(line);
+            var budgetEntry = {el: line, btn: null, unbudgeted: false};
+            budgetRows.push(budgetEntry);
             var budget = null;
             (erpState.acctBudgets || []).forEach(function (b) {
               if (String(b.account_id) === String(row.account_id)) budget = b;
@@ -5720,6 +5996,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
                 });
               });
               wrap.appendChild(delBtn);
+              budgetEntry.btn = delBtn;
             }
           });
           if ((v.unbudgeted || []).length) {
@@ -5730,6 +6007,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               var line = document.createElement("p");
               line.textContent = row.code + " " + row.name + " \u2014 Actual " + erpMoney(row.actual_cents) + " \u2014 no budget set";
               wrap.appendChild(line);
+              budgetRows.push({el: line, btn: null, unbudgeted: true});
             });
           }
           return wrap;
@@ -6666,6 +6944,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             table.appendChild(empty);
             return table;
           }
+          var tbody = document.createElement("tbody");
           erpState.acctAccounts.forEach(function (a) {
             var tr = document.createElement("tr");
             tr.appendChild(erpCell("Code", a.code));
@@ -6697,8 +6976,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               if (erpAcctCanWrite()) actionCell.appendChild(deact);
             }
             tr.appendChild(actionCell);
-            table.appendChild(tr);
+            tbody.appendChild(tr);
           });
+          table.appendChild(tbody);
           return table;
         }
         function erpAcctAddAccountForm() {
@@ -6786,6 +7066,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           }
           erpState.acctJournal.forEach(function (e) {
             var tr = document.createElement("tr");
+            tr.className = "erp-journal-entry";
             tr.appendChild(erpCell("Date", e.date));
             tr.appendChild(erpCell("Memo", e.memo));
             tr.appendChild(erpCell("Source", e.source));
@@ -6817,6 +7098,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             tr.appendChild(actionCell);
             table.appendChild(tr);
             var linesRow = document.createElement("tr");
+            linesRow.className = "erp-journal-lines";
             var linesCell = document.createElement("td");
             linesCell.colSpan = 7;
             linesCell.textContent = (e.lines || []).map(function (l) {
@@ -7639,7 +7921,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           if ((erpState.showAddPayrollEmployee || erpState.editPayrollEmployeeId) && erpPayrollCanWrite()) {
             wrap.appendChild(erpAcctPayrollEmployeeForm(erpState.editPayrollEmployeeId ? erpPayrollEmployeeById(erpState.editPayrollEmployeeId) : null));
           }
-          wrap.appendChild(erpAcctPayrollEmployeesTable());
+          var payrollEmpsTable = erpAcctPayrollEmployeesTable();
+          wrap.appendChild(payrollEmpsTable);
+          erpAddTableSearch(payrollEmpsTable, "Search employees…");
           wrap.appendChild(erpSectionTitle("Pay runs"));
           var rToolbar = document.createElement("div");
           rToolbar.className = "erp-toolbar";
@@ -7653,7 +7937,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           if (erpPayrollCanWrite()) rToolbar.appendChild(newRunBtn);
           wrap.appendChild(rToolbar);
           if (erpState.showNewPayrollRun && erpPayrollCanWrite()) wrap.appendChild(erpAcctPayrollRunForm());
-          wrap.appendChild(erpAcctPayrollRunsTable());
+          var payrollRunsTable = erpAcctPayrollRunsTable();
+          wrap.appendChild(payrollRunsTable);
+          erpAddTableSearch(payrollRunsTable, "Search pay runs…");
           if (erpState.selectedPayrollRunId) {
             var _run = erpPayrollRunById(erpState.selectedPayrollRunId);
             if (_run) wrap.appendChild(erpAcctPayrollRunDetail(_run));
@@ -7688,6 +7974,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             table.appendChild(empty);
             return table;
           }
+          var tbody = document.createElement("tbody");
           emps.forEach(function (e) {
             var tr = document.createElement("tr");
             tr.appendChild(erpCell("Employee", e.first_name + " " + e.last_name));
@@ -7736,8 +8023,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               actionCell.appendChild(deBtn);
             }
             tr.appendChild(actionCell);
-            table.appendChild(tr);
+            tbody.appendChild(tr);
           });
+          table.appendChild(tbody);
           return table;
         }
         function erpAcctPayrollEmployeeForm(emp) {
@@ -7863,6 +8151,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             table.appendChild(empty);
             return table;
           }
+          var tbody = document.createElement("tbody");
           runs.forEach(function (run) {
             var tr = document.createElement("tr");
             tr.appendChild(erpCell("Period", run.period_start + " to " + run.period_end));
@@ -7929,8 +8218,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               actionCell.appendChild(payBtn);
             }
             tr.appendChild(actionCell);
-            table.appendChild(tr);
+            tbody.appendChild(tr);
           });
+          table.appendChild(tbody);
           return table;
         }
         function erpAcctPayrollRunForm() {
@@ -8249,6 +8539,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             table.appendChild(empty);
             return table;
           }
+          var tbody = document.createElement("tbody");
           erpState.acctInvoices.forEach(function (inv) {
             var tr = document.createElement("tr");
             tr.id = "invoice-" + inv.id;
@@ -8317,8 +8608,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               if (erpAcctCanWrite()) actionCell.appendChild(voidBtn);
             }
             tr.appendChild(actionCell);
-            table.appendChild(tr);
+            tbody.appendChild(tr);
           });
+          table.appendChild(tbody);
           return table;
         }
         function erpAcctNewInvoiceForm() {
@@ -8761,6 +9053,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             table.appendChild(empty);
             return table;
           }
+          var tbody = document.createElement("tbody");
           erpState.acctBills.forEach(function (bill) {
             var tr = document.createElement("tr");
             tr.id = "bill-" + bill.id;
@@ -8810,8 +9103,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               if (erpAcctCanWrite()) actionCell.appendChild(voidBtn);
             }
             tr.appendChild(actionCell);
-            table.appendChild(tr);
+            tbody.appendChild(tr);
           });
+          table.appendChild(tbody);
           return table;
         }
         function erpAcctNewBillForm() {
@@ -9258,6 +9552,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             head.appendChild(th);
           });
           table.appendChild(head);
+          var tbody = document.createElement("tbody");
           erpState.acctBankTxns.forEach(function (t) {
             var tr = document.createElement("tr");
             [t.date, t.description, erpMoney(-t.amount_cents), t.status,
@@ -9291,8 +9586,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               actionCell.appendChild(unmatch);
             }
             tr.appendChild(actionCell);
-            table.appendChild(tr);
+            tbody.appendChild(tr);
           });
+          table.appendChild(tbody);
           wrap.appendChild(table);
           return wrap;
         }
@@ -9609,6 +9905,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           });
           table.appendChild(body);
           wrap.appendChild(table);
+          erpAddTableSearch(table, "Search vendors…");
           return wrap;
         }
         function erpPOTable() {
@@ -9651,6 +9948,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           });
           table.appendChild(body);
           wrap.appendChild(table);
+          erpAddTableSearch(table, "Search purchase orders…");
           return wrap;
         }
         function erpNewPOForm() {
@@ -10666,7 +10964,7 @@ function renderErpProductionDetail() {
   // ---- Batches section ----
   if (erpCan("batches.read")) {
   var h2 = document.createElement("h2");
-  h2.textContent = "Production";
+  h2.textContent = "Batches";
   els.body.appendChild(h2);
 
   var toolbar = document.createElement("div");
@@ -10798,6 +11096,7 @@ function renderErpProductionDetail() {
     table.appendChild(tbody);
     wrap.appendChild(table);
     els.body.appendChild(wrap);
+    erpAddTableSearch(table, "Search batches…");
   }
 
   }
@@ -10876,6 +11175,7 @@ function renderErpProductionDetail() {
     rtable.appendChild(rtbody);
     rwrap.appendChild(rtable);
     els.body.appendChild(rwrap);
+    erpAddTableSearch(rtable, "Search recipes…");
   }
   }
   renderErpWebsiteFlavorRequests(els.body);
@@ -16197,6 +16497,7 @@ function renderErpFaireSection(body) {
     });
     table.appendChild(tbody);
     box.appendChild(table);
+    erpAddTableSearch(table, "Search Faire imports…");
   } else if (st) {
     var none = document.createElement("p");
     none.className = "admin-orders-empty";
@@ -16278,6 +16579,7 @@ function renderErpWholesaleOrders(body) {
   });
   table.appendChild(tbody);
   wrap.appendChild(table);
+  erpAddTableSearch(table, "Search wholesale orders…");
 }
 
 /* ---------- flavor categories + picker (Nov 18, 2026) ---------- */
@@ -16744,6 +17046,7 @@ function renderErpAccounts(body) {
   });
   table.appendChild(tbody);
   wrap.appendChild(table);
+  erpAddTableSearch(table, "Search wholesale accounts…");
 }
 
 function erpNewAccountForm() {
@@ -17723,6 +18026,7 @@ function renderErpEdiDocuments(body) {
   });
   table.appendChild(tbody);
   wrap.appendChild(table);
+  erpAddTableSearch(table, "Search EDI documents…");
 }
 
 function erpEdiUploadForm() {
@@ -18073,6 +18377,7 @@ function renderErpEdiPartners(body) {
   });
   table.appendChild(tbody);
   wrap.appendChild(table);
+  erpAddTableSearch(table, "Search partners…");
 }
 
 function erpNewEdiPartnerForm() {
@@ -19755,23 +20060,39 @@ function renderMktCustomers(body) {
   body.appendChild(mktMetricRow("Loyalty members", String(s.loyalty_members || 0)));
   var list = d.customers || [];
   if (!list.length) { body.appendChild(mktNote("No customers yet.")); return; }
+  var custList = document.createElement("div");
+  // Compact customer list: title-only rows + search (compact-list pattern).
+  // The server search above stays: it reloads the list, this one filters it.
+  body.appendChild(erpCompactSearchBox("Search customers…", function (q) { erpCompactFilter(custList, q); }));
+  body.appendChild(custList);
   list.forEach(function (c) {
     var card = document.createElement("div");
-    card.className = "erp-form";
-    var h = document.createElement("h3");
-    h.textContent = c.display || c.email || "(no email)";
-    h.style.flex = "1 1 100%";
-    card.appendChild(h);
-    card.appendChild(mktMetricRow("Type", mktCustomerType(c)));
-    card.appendChild(mktMetricRow("Orders", String(c.order_count || 0) + (c.repeat ? " · repeat" : "")));
-    card.appendChild(mktMetricRow("Bags", String(c.total_bags || 0)));
-    card.appendChild(mktMetricRow("Lifetime spend", erpMoney(c.total_spent_cents || 0)));
-    card.appendChild(mktMetricRow("First / last order", (c.first_order_at || "—") + " / " + (c.last_order_at || "—")));
-    if (c.loyalty) card.appendChild(mktMetricRow("Loyalty", c.loyalty.tier + " · " + c.loyalty.kernels + " kernels"));
-    if ((c.tags || []).length) card.appendChild(mktMetricRow("Tags", c.tags.join(", ")));
-    if (c.note) card.appendChild(mktMetricRow("Note", c.note));
-    card.appendChild(mktBtn("Open", function () { loadMktCustomerDetail(c.key); }));
-    body.appendChild(card);
+    card.className = "erp-form erp-compact-item";
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    headBtn.textContent = (c.display || c.email || "(no email)") + " · " + (c.order_count || 0) + " order" + ((c.order_count || 0) === 1 ? "" : "s") + " · " + erpMoney(c.total_spent_cents || 0);
+    headBtn.setAttribute("aria-expanded", "false");
+    card.appendChild(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    card.appendChild(detail);
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    detail.appendChild(mktMetricRow("Type", mktCustomerType(c)));
+    detail.appendChild(mktMetricRow("Orders", String(c.order_count || 0) + (c.repeat ? " · repeat" : "")));
+    detail.appendChild(mktMetricRow("Bags", String(c.total_bags || 0)));
+    detail.appendChild(mktMetricRow("Lifetime spend", erpMoney(c.total_spent_cents || 0)));
+    detail.appendChild(mktMetricRow("First / last order", (c.first_order_at || "—") + " / " + (c.last_order_at || "—")));
+    if (c.loyalty) detail.appendChild(mktMetricRow("Loyalty", c.loyalty.tier + " · " + c.loyalty.kernels + " kernels"));
+    if ((c.tags || []).length) detail.appendChild(mktMetricRow("Tags", c.tags.join(", ")));
+    if (c.note) detail.appendChild(mktMetricRow("Note", c.note));
+    detail.appendChild(mktBtn("Open", function () { loadMktCustomerDetail(c.key); }));
+    custList.appendChild(card);
   });
 }
 function renderMktCustomerDetail(body) {
@@ -20056,6 +20377,7 @@ function renderMktPromos(body) {
   });
   table.appendChild(tbody);
   body.appendChild(table);
+  erpAddTableSearch(table, "Search promo codes…");
   var h2 = document.createElement("h3");
   h2.textContent = "National-day promo calendar (approved Oct 29, 2026 — repeats yearly)";
   body.appendChild(h2);
@@ -20127,26 +20449,43 @@ function renderMktSocialInbox(body) {
     body.appendChild(mktNote("No " + filter + " comments stored yet. Comments appear here once the IG sync job stores them."));
     return;
   }
+  var inboxList = document.createElement("div");
+  // Compact inbox list: title-only rows + search (compact-list pattern).
+  body.appendChild(erpCompactSearchBox("Search comments…", function (q) { erpCompactFilter(inboxList, q); }));
+  body.appendChild(inboxList);
   comments.forEach(function (c) {
     var wrap = document.createElement("div");
-    wrap.className = "erp-form";
-    var h = document.createElement("h3");
-    h.textContent = "@" + (c.username || "(unknown)") + " — " + mktDate(c.commented_at);
-    h.style.flex = "1 1 100%";
-    wrap.appendChild(h);
+    wrap.className = "erp-form erp-compact-item";
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    var firstLine = String(c.text || "").split("\n")[0];
+    if (firstLine.length > 80) firstLine = firstLine.slice(0, 80) + "…";
+    headBtn.textContent = "@" + (c.username || "(unknown)") + " — " + mktDate(c.commented_at) + (firstLine ? " — " + firstLine : "");
+    headBtn.setAttribute("aria-expanded", "false");
+    wrap.appendChild(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    wrap.appendChild(detail);
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
     var txt = document.createElement("p");
     txt.textContent = c.text || "";
-    wrap.appendChild(txt);
+    detail.appendChild(txt);
     var meta = document.createElement("p");
     meta.className = "admin-orders-empty";
     meta.textContent = "On: " + (c.post_kind || "post") + " — " + (c.post_caption || "").slice(0, 80) + (c.post_publish_at ? " · " + mktDate(c.post_publish_at) : "") + " · Status: " + c.status;
-    wrap.appendChild(meta);
+    detail.appendChild(meta);
     if (mktCanIgWrite() && c.status !== "archived") {
       var replyBox = document.createElement("textarea");
       replyBox.placeholder = "Reply as @popaliciouslv…";
       replyBox.rows = 2;
       replyBox.style.width = "100%";
-      wrap.appendChild(replyBox);
+      detail.appendChild(replyBox);
       var row = document.createElement("div");
       row.className = "erp-toolbar";
       row.appendChild(mktBtn("Reply", function () {
@@ -20174,9 +20513,9 @@ function renderMktSocialInbox(body) {
         if (!window.confirm("Archive this comment? It leaves the queue; nothing is deleted on Instagram.")) return;
         erpPost("/api/erp/marketing/instagram/comments/" + c.id + "/mark", { status: "archived" }).then(function () { erpState.mktInbox = null; renderErpMarketingDetail(); }).catch(function (e) { setAdminDetailStatus(e.message, true); });
       }));
-      wrap.appendChild(row);
+      detail.appendChild(row);
     }
-    body.appendChild(wrap);
+    inboxList.appendChild(wrap);
   });
 }
 
@@ -20245,6 +20584,7 @@ function renderMktAutomation(body) {
     });
     table.appendChild(tbody);
     body.appendChild(table);
+    erpAddTableSearch(table, "Search abandoned carts…");
   }
   var h2 = document.createElement("h3");
   h2.textContent = "Win-back — no order in 90 days";
@@ -20300,6 +20640,7 @@ function renderMktAutomation(body) {
   });
   table2.appendChild(tbody2);
   body.appendChild(table2);
+  erpAddTableSearch(table2, "Search win-back customers…");
 }
 
 /* ---------------- Review management (Dept 8 item 8, Wave D) ---------------- */
@@ -20370,20 +20711,31 @@ function renderMktReviews(body) {
 
 function mktTicketLine(t) {
   var wrap = document.createElement("div");
-  wrap.className = "erp-form";
-  var h = document.createElement("h3");
-  h.textContent = t.subject + " — " + (t.customer_email || "");
-  h.style.flex = "1 1 100%";
-  wrap.appendChild(h);
+  wrap.className = "erp-form erp-compact-item";
+  var headBtn = document.createElement("button");
+  headBtn.type = "button";
+  headBtn.className = "erp-compact-title";
+  headBtn.textContent = t.subject + " — " + (t.customer_email || "") + " · " + t.status + " · " + mktDate(t.created_at);
+  headBtn.setAttribute("aria-expanded", "false");
+  wrap.appendChild(headBtn);
+  var detail = document.createElement("div");
+  detail.className = "erp-compact-detail";
+  detail.hidden = true;
+  wrap.appendChild(detail);
+  headBtn.addEventListener("click", function () {
+    var open = detail.hidden;
+    detail.hidden = !open;
+    headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  });
   var meta = document.createElement("p");
   meta.className = "admin-orders-empty";
   meta.textContent = "Status: " + t.status + " · " + mktDate(t.created_at) + (t.order ? " · Order " + (t.order.number || "") : "");
-  wrap.appendChild(meta);
+  detail.appendChild(meta);
   var btn = mktBtn("Open ticket", function () {
     erpState.mktSelectedTicketId = t.id;
     loadMktTicketDetail(t.id);
   });
-  wrap.appendChild(btn);
+  detail.appendChild(btn);
   return wrap;
 }
 
@@ -20530,7 +20882,11 @@ function renderMktSupport(body) {
   lh.textContent = "Tickets";
   body.appendChild(lh);
   if (!tickets.length) body.appendChild(mktNote("No tickets yet."));
-  tickets.forEach(function (t) { body.appendChild(mktTicketLine(t)); });
+  var ticketList = document.createElement("div");
+  // Compact ticket list: title-only rows + search (compact-list pattern).
+  body.appendChild(erpCompactSearchBox("Search tickets…", function (q) { erpCompactFilter(ticketList, q); }));
+  body.appendChild(ticketList);
+  tickets.forEach(function (t) { ticketList.appendChild(mktTicketLine(t)); });
   if (mktCanSupWrite()) {
     var form = document.createElement("div");
     form.className = "erp-form";
@@ -21698,12 +22054,19 @@ function renderErpHrDetail(data, staffList, events, timeTotals, overtimeAlerts, 
   var employees = data.employees || [];
   var activeEmps = employees.filter(function (e) { return e.active; });
   var inactiveEmps = employees.filter(function (e) { return !e.active; });
-  activeEmps.forEach(function (e) { els.body.appendChild(renderErpHrCard(e)); });
+  // Compact employee list: title-only rows + search (compact-list pattern).
+  var empList = document.createElement("div");
+  els.body.appendChild(erpCompactSearchBox("Search employees…", function (q) { erpCompactFilter(empList, q); }));
+  els.body.appendChild(empList);
+  activeEmps.forEach(function (e) { empList.appendChild(renderErpHrCard(e)); });
   if (inactiveEmps.length) {
     var inTitle = document.createElement("h3");
     inTitle.textContent = "Inactive employees";
     els.body.appendChild(inTitle);
-    inactiveEmps.forEach(function (e) { els.body.appendChild(renderErpHrCard(e)); });
+    var inEmpList = document.createElement("div");
+    els.body.appendChild(erpCompactSearchBox("Search inactive employees…", function (q) { erpCompactFilter(inEmpList, q); }));
+    els.body.appendChild(inEmpList);
+    inactiveEmps.forEach(function (e) { inEmpList.appendChild(renderErpHrCard(e)); });
   }
   if (!employees.length) {
     var none = document.createElement("p");
@@ -21727,13 +22090,26 @@ function renderErpHrDetail(data, staffList, events, timeTotals, overtimeAlerts, 
 }
 function renderErpHrCard(e) {
   var card = document.createElement("div");
-  card.className = "erp-form";
-  var h3 = document.createElement("h3");
-  h3.textContent = e.name + (e.email ? " (" + e.email + ")" : "") + (e.active ? "" : " — inactive");
-  card.appendChild(h3);
+  card.className = "erp-form erp-compact-item";
+  var headBtn = document.createElement("button");
+  headBtn.type = "button";
+  headBtn.className = "erp-compact-title";
+  headBtn.textContent = e.name + (e.role ? " — " + e.role : "") + " · " + (e.scope_label || "No scope set") + (e.active ? "" : " — inactive");
+  headBtn.setAttribute("aria-expanded", "false");
+  card.appendChild(headBtn);
+  var detail = document.createElement("div");
+  detail.className = "erp-compact-detail";
+  detail.hidden = true;
+  card.appendChild(detail);
+  headBtn.addEventListener("click", function () {
+    var open = detail.hidden;
+    detail.hidden = !open;
+    headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  });
   var meta = document.createElement("p");
   meta.className = "admin-orders-empty";
   var bits = [];
+  if (e.email) bits.push(e.email);
   if (e.role) bits.push(e.role);
   if (e.department) bits.push(e.department);
   if (e.phone) bits.push(e.phone);
@@ -21744,25 +22120,25 @@ function renderErpHrCard(e) {
   bits.push(e.payroll_eligible ? "Payroll: eligible (opt-in)" : "Payroll: cash only");
   bits.push("Onboarding: " + e.onboarding_done + "/" + e.onboarding_total + " done");
   meta.textContent = bits.join(" · ");
-  card.appendChild(meta);
+  detail.appendChild(meta);
   var status = document.createElement("p");
   status.style.color = "var(--muted)";
   status.style.flex = "1 1 100%";
-  card.appendChild(status);
+  detail.appendChild(status);
   var viewBtn = document.createElement("button");
   viewBtn.type = "button";
   viewBtn.textContent = "View onboarding";
-  viewBtn.addEventListener("click", function () { renderErpHrDetailView(card, e, status, loadErpHrDetail); });
-  card.appendChild(viewBtn);
+  viewBtn.addEventListener("click", function () { renderErpHrDetailView(detail, e, status, loadErpHrDetail); });
+  detail.appendChild(viewBtn);
   var editBtn = document.createElement("button");
   editBtn.type = "button";
   editBtn.textContent = "Edit";
   editBtn.addEventListener("click", function () {
-    erpGet("/api/erp/hr/employees/" + encodeURIComponent(String(e.id))).then(function (detail) {
-      renderErpHrEditForm(card, detail, status, loadErpHrDetail);
+    erpGet("/api/erp/hr/employees/" + encodeURIComponent(String(e.id))).then(function (empDetail) {
+      renderErpHrEditForm(detail, empDetail, status, loadErpHrDetail);
     }).catch(function (error) { status.textContent = error.message; });
   });
-  card.appendChild(editBtn);
+  detail.appendChild(editBtn);
   if (e.active) {
     var deBtn = document.createElement("button");
     deBtn.type = "button";
@@ -21778,7 +22154,7 @@ function renderErpHrCard(e) {
         deBtn.disabled = false;
       });
     });
-    card.appendChild(deBtn);
+    detail.appendChild(deBtn);
   } else {
     var reBtn = document.createElement("button");
     reBtn.type = "button";
@@ -21793,7 +22169,7 @@ function renderErpHrCard(e) {
         reBtn.disabled = false;
       });
     });
-    card.appendChild(reBtn);
+    detail.appendChild(reBtn);
   }
   return card;
 }
@@ -22406,7 +22782,12 @@ function renderErpHrEventsSection(events, employees, reload) {
     none.textContent = "No events yet. Add the first one above.";
     wrap.appendChild(none);
   }
-  events.forEach(function (ev) { wrap.appendChild(renderErpHrEventCard(ev, employees, reload)); });
+  // Compact event list: title-only rows + search (compact-list pattern).
+  var evList = document.createElement("div");
+  wrap.appendChild(erpCompactSearchBox("Search events…", function (q) { erpCompactFilter(evList, q); }));
+  wrap.appendChild(evList);
+  events.forEach(function (ev) { evList.appendChild(renderErpHrEventCard(ev, employees, reload)); });
+  erpCompactSection(evList);
   return wrap;
 }
 function renderErpHrEventCard(ev, employees, reload) {
@@ -22656,23 +23037,31 @@ function erpHrHeadcountForecast(periodId) {
   }
   return erpHrForecastCache[key];
 }
-/* HR roles: one row per defined job role. Edit opens an inline
-   title/description form; Deactivate/Activate flips the active flag
-   (inactive roles leave the applicant picker on the next reload);
-   Delete is refused by the backend with a 409 while applicants are
-   attached, and that message is shown in the section status line. */
+/* HR roles: one row per defined job role, compact — the title only,
+   expanded on click for the description, open seats, Edit and Delete.
+   There is no Deactivate: a role is present or deleted. Delete is
+   permanent and removes the role + description; it asks first (two
+   taps — the button turns into "Confirm delete" and the status line
+   says what will be lost) and still deletes when applicants are
+   attached: they keep their stored role-title snapshot only. */
 function renderErpHrRoleRow(role, status, reload, openInfo) {
   var card = document.createElement("div");
-  card.className = "erp-form";
-  var h4 = document.createElement("h4");
-  var head = role.title + " (" + (role.active ? "Active" : "Inactive") + ")";
+  card.className = "erp-form erp-compact-item";
+  var headBtn = document.createElement("button");
+  headBtn.type = "button";
+  headBtn.className = "erp-compact-title";
+  var head = role.title;
   if (role.applicant_count > 0) head += " · " + role.applicant_count + " applicant" + (role.applicant_count === 1 ? "" : "s");
-  h4.textContent = head;
-  card.appendChild(h4);
+  headBtn.textContent = head;
+  headBtn.setAttribute("aria-expanded", "false");
+  card.appendChild(headBtn);
+  var detail = document.createElement("div");
+  detail.className = "erp-compact-detail";
+  detail.hidden = true;
   if (role.description) {
     var desc = document.createElement("p");
     desc.textContent = role.description;
-    card.appendChild(desc);
+    detail.appendChild(desc);
   }
   // Headcount planning: open seats for the default forecast period,
   // per scope. Numbers only -- nothing here ever blocks applicants
@@ -22683,30 +23072,28 @@ function renderErpHrRoleRow(role, status, reload, openInfo) {
     openLine.textContent = "Open (" + openInfo.periodLabel + "): " + openInfo.byRole[role.id].map(function (t) {
       return t.scope_label + (t.over_by > 0 ? " over by " + t.over_by : " " + t.open);
     }).join(" · ");
-    card.appendChild(openLine);
+    detail.appendChild(openLine);
   }
   var editBtn = document.createElement("button");
   editBtn.type = "button";
   editBtn.textContent = "Edit";
-  card.appendChild(editBtn);
-  var toggleBtn = document.createElement("button");
-  toggleBtn.type = "button";
-  toggleBtn.textContent = role.active ? "Deactivate" : "Activate";
-  toggleBtn.addEventListener("click", function () {
-    toggleBtn.disabled = true;
-    status.textContent = role.active ? "Deactivating role…" : "Activating role…";
-    erpPost("/api/erp/hr/roles/" + encodeURIComponent(String(role.id)) + "/update", { active: !role.active }).then(function () {
-      if (typeof reload === "function") reload();
-    }).catch(function (error) {
-      status.textContent = error.message;
-      toggleBtn.disabled = false;
-    });
-  });
-  card.appendChild(toggleBtn);
+  detail.appendChild(editBtn);
   var delBtn = document.createElement("button");
   delBtn.type = "button";
   delBtn.textContent = "Delete";
   delBtn.addEventListener("click", function () {
+    // Two-tap confirm: the first tap arms it and says what will be
+    // lost; the second tap deletes. No window.confirm — it
+    // auto-dismisses in the browser, which would read as a cancel.
+    if (!delBtn.dataset.armed) {
+      delBtn.dataset.armed = "1";
+      delBtn.textContent = "Confirm delete";
+      status.textContent = "Delete " + role.title + " permanently? The role and its description are gone for good" +
+        (role.applicant_count > 0 ? " — " + role.applicant_count + " applicant" + (role.applicant_count === 1 ? "" : "s") +
+          " keep" + (role.applicant_count === 1 ? "s" : "") + " only the role title" : "") +
+        ". Tap Confirm delete to delete, or Edit to change your mind.";
+      return;
+    }
     delBtn.disabled = true;
     status.textContent = "Deleting role…";
     erpDelete("/api/erp/hr/roles/" + encodeURIComponent(String(role.id))).then(function () {
@@ -22714,11 +23101,16 @@ function renderErpHrRoleRow(role, status, reload, openInfo) {
     }).catch(function (error) {
       status.textContent = error.message;
       delBtn.disabled = false;
+      delete delBtn.dataset.armed;
+      delBtn.textContent = "Delete";
     });
   });
-  card.appendChild(delBtn);
+  detail.appendChild(delBtn);
   var editForm = null;
   editBtn.addEventListener("click", function () {
+    // Editing disarms a pending delete.
+    delete delBtn.dataset.armed;
+    delBtn.textContent = "Delete";
     if (editForm) { editForm.remove(); editForm = null; return; }
     editForm = document.createElement("div");
     editForm.className = "erp-form";
@@ -22748,8 +23140,15 @@ function renderErpHrRoleRow(role, status, reload, openInfo) {
     cancelBtn.textContent = "Cancel";
     cancelBtn.addEventListener("click", function () { editForm.remove(); editForm = null; });
     editForm.appendChild(cancelBtn);
-    card.appendChild(editForm);
+    detail.appendChild(editForm);
   });
+  headBtn.addEventListener("click", function () {
+    var open = detail.hidden;
+    detail.hidden = !open;
+    headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    if (!open) { delete delBtn.dataset.armed; delBtn.textContent = "Delete"; }
+  });
+  card.appendChild(detail);
   return card;
 }
 function renderErpHrHiringSection(reload) {
@@ -22762,8 +23161,8 @@ function renderErpHrHiringSection(reload) {
   note.textContent = "Applicants start empty — add them by hand; nothing is pre-filled. Stages move forward only: applied → screening → interview → offer → hired. Rejected can be set from any stage. Hired is only reached through the Hire action, which creates the employee record and seeds their onboarding checklist. A hired applicant's record is sealed (notes can still be appended).";
   wrap.appendChild(note);
   /* Job roles: the defined roles applicants apply for. The Add
-     applicant picker below only offers active roles, so the list
-     and the picker are reloaded together after any role change. */
+     applicant picker below offers every role, so the list and the
+     picker are reloaded together after any role change. */
   var rolesWrap = document.createElement("div");
   var rolesTitle = document.createElement("h3");
   rolesTitle.textContent = "Job roles";
@@ -22772,6 +23171,9 @@ function renderErpHrHiringSection(reload) {
   rolesStatus.style.color = "var(--muted)";
   rolesStatus.style.flex = "1 1 100%";
   rolesWrap.appendChild(rolesStatus);
+  // Search the role list by title (compact-list pattern).
+  var rolesSearch = erpCompactSearchBox("Search roles…", function (q) { erpCompactFilter(rolesList, q); });
+  rolesWrap.appendChild(rolesSearch);
   var rolesList = document.createElement("div");
   rolesWrap.appendChild(rolesList);
   var roleForm = document.createElement("div");
@@ -22947,6 +23349,8 @@ function renderErpHrHiringSection(reload) {
   });
   wrap.appendChild(filterSel);
   var listWrap = document.createElement("div");
+  // Compact applicant list: title-only rows + search (compact-list pattern).
+  wrap.appendChild(erpCompactSearchBox("Search applicants…", function (q) { erpCompactFilter(listWrap, q); }));
   wrap.appendChild(listWrap);
   var listStatus = document.createElement("p");
   listStatus.className = "admin-orders-empty";
@@ -22967,14 +23371,26 @@ function renderErpHrHiringSection(reload) {
       }
       applicants.forEach(function (a) {
         var card = document.createElement("div");
-        card.className = "erp-form";
-        var h3 = document.createElement("h3");
-        h3.textContent = a.name + " — " + a.role + " (" + a.stage + ")";
-        card.appendChild(h3);
+        card.className = "erp-form erp-compact-item";
+        var headBtn = document.createElement("button");
+        headBtn.type = "button";
+        headBtn.className = "erp-compact-title";
+        headBtn.textContent = a.name + " — " + a.role + " (" + a.stage + ")";
+        headBtn.setAttribute("aria-expanded", "false");
+        card.appendChild(headBtn);
+        var detail = document.createElement("div");
+        detail.className = "erp-compact-detail";
+        detail.hidden = true;
+        card.appendChild(detail);
+        headBtn.addEventListener("click", function () {
+          var open = detail.hidden;
+          detail.hidden = !open;
+          headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+        });
         if (a.role_description) {
           var roleDesc = document.createElement("p");
           roleDesc.textContent = "Role: " + a.role + " — " + a.role_description;
-          card.appendChild(roleDesc);
+          detail.appendChild(roleDesc);
         }
         var meta = document.createElement("p");
         meta.className = "admin-orders-empty";
@@ -22986,11 +23402,11 @@ function renderErpHrHiringSection(reload) {
         if (a.stage === "hired" && a.hired_employee_id) bits.push("Hired as employee #" + a.hired_employee_id);
         if (a.notes) bits.push("Notes: " + a.notes);
         meta.textContent = bits.join(" · ");
-        card.appendChild(meta);
+        detail.appendChild(meta);
         var status = document.createElement("p");
         status.style.color = "var(--muted)";
         status.style.flex = "1 1 100%";
-        card.appendChild(status);
+        detail.appendChild(status);
         var next = HR_ADD7_NEXT_STAGE[a.stage];
         if (next) {
           var nextBtn = document.createElement("button");
@@ -23006,7 +23422,7 @@ function renderErpHrHiringSection(reload) {
               nextBtn.disabled = false;
             });
           });
-          card.appendChild(nextBtn);
+          detail.appendChild(nextBtn);
         }
         if (a.stage === "offer") {
           var hireBtn = document.createElement("button");
@@ -23066,13 +23482,13 @@ function renderErpHrHiringSection(reload) {
                 status.textContent = "";
               });
               hireForm.appendChild(hireCancelBtn);
-              card.appendChild(hireForm);
+              detail.appendChild(hireForm);
             }).catch(function (error) {
               status.textContent = error.message;
               hireBtn.disabled = false;
             });
           });
-          card.appendChild(hireBtn);
+          detail.appendChild(hireBtn);
         }
         if (a.stage !== "hired" && a.stage !== "rejected") {
           var rejBtn = document.createElement("button");
@@ -23088,7 +23504,7 @@ function renderErpHrHiringSection(reload) {
               rejBtn.disabled = false;
             });
           });
-          card.appendChild(rejBtn);
+          detail.appendChild(rejBtn);
         }
         if (a.stage !== "hired") {
           var delBtn = document.createElement("button");
@@ -23104,7 +23520,7 @@ function renderErpHrHiringSection(reload) {
               delBtn.disabled = false;
             });
           });
-          card.appendChild(delBtn);
+          detail.appendChild(delBtn);
         }
         listWrap.appendChild(card);
       });
@@ -23675,6 +24091,8 @@ function renderErpHrTrainingSection(reload) {
     var h = document.createElement("h4");
     h.textContent = "Courses";
     coursesWrap.appendChild(h);
+    // Compact course list: title-only rows + search (compact-list pattern).
+    coursesWrap.appendChild(erpCompactSearchBox("Search courses…", function (q) { erpCompactFilter(coursesWrap, q); }));
     if (!courses.length) {
       var none = document.createElement("p");
       none.className = "admin-orders-empty";
@@ -23683,15 +24101,27 @@ function renderErpHrTrainingSection(reload) {
     }
     courses.forEach(function (course) {
       var card = document.createElement("div");
-      card.className = "erp-form";
-      var h4 = document.createElement("h4");
-      h4.textContent = course.title + " (" + (course.active ? "Active" : "Inactive") + ") · " + expiryText(course)
+      card.className = "erp-form erp-compact-item";
+      var headBtn = document.createElement("button");
+      headBtn.type = "button";
+      headBtn.className = "erp-compact-title";
+      headBtn.textContent = course.title + " (" + (course.active ? "Active" : "Inactive") + ") · " + expiryText(course)
         + " · " + course.completion_count + " completion" + (course.completion_count === 1 ? "" : "s");
-      card.appendChild(h4);
+      headBtn.setAttribute("aria-expanded", "false");
+      card.appendChild(headBtn);
+      var detail = document.createElement("div");
+      detail.className = "erp-compact-detail";
+      detail.hidden = true;
+      card.appendChild(detail);
+      headBtn.addEventListener("click", function () {
+        var open = detail.hidden;
+        detail.hidden = !open;
+        headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      });
       if (course.description) {
         var desc = document.createElement("p");
         desc.textContent = course.description;
-        card.appendChild(desc);
+        detail.appendChild(desc);
       }
       var toggleBtn = document.createElement("button");
       toggleBtn.type = "button";
@@ -23706,7 +24136,7 @@ function renderErpHrTrainingSection(reload) {
           toggleBtn.disabled = false;
         });
       });
-      card.appendChild(toggleBtn);
+      detail.appendChild(toggleBtn);
       var delBtn = document.createElement("button");
       delBtn.type = "button";
       delBtn.textContent = "Delete";
@@ -23720,11 +24150,11 @@ function renderErpHrTrainingSection(reload) {
           delBtn.disabled = false;
         });
       });
-      card.appendChild(delBtn);
+      detail.appendChild(delBtn);
       var editBtn = document.createElement("button");
       editBtn.type = "button";
       editBtn.textContent = "Edit";
-      card.appendChild(editBtn);
+      detail.appendChild(editBtn);
       var editForm = null;
       editBtn.addEventListener("click", function () {
         if (editForm) { editForm.remove(); editForm = null; return; }
@@ -23760,7 +24190,7 @@ function renderErpHrTrainingSection(reload) {
           });
         });
         editForm.appendChild(saveBtn);
-        card.appendChild(editForm);
+        detail.appendChild(editForm);
       });
       coursesWrap.appendChild(card);
     });
@@ -24491,6 +24921,8 @@ function renderErpHrRecurringSection(employees, reload) {
   status.style.flex = "1 1 100%";
   wrap.appendChild(status);
   var listWrap = document.createElement("div");
+  // Compact template list: title-only rows + search (compact-list pattern).
+  wrap.appendChild(erpCompactSearchBox("Search recurring schedules…", function (q) { erpCompactFilter(listWrap, q); }));
   wrap.appendChild(listWrap);
   var activeEmps = (employees || []).filter(function (e) { return e.active; });
   // select.value is the first option in a real browser; fall back to
@@ -24519,6 +24951,7 @@ function renderErpHrRecurringSection(employees, reload) {
       return;
     }
     templates.forEach(function (t) { listWrap.appendChild(renderErpHrRecurringCard(t)); });
+    erpCompactSection(listWrap);
   }
   function renderErpHrRecurringCard(t) {
     var card = document.createElement("div");
@@ -24983,6 +25416,8 @@ function renderErpHrReviewsSection(employees, reload) {
     pickCard.appendChild(erpField("Review cycle", cycleSel));
     var listWrap = document.createElement("div");
     listWrap.style.flex = "1 1 100%";
+    // Compact review list: title-only rows + search (compact-list pattern).
+    pickCard.appendChild(erpCompactSearchBox("Search reviews…", function (q) { erpCompactFilter(listWrap, q); }));
     pickCard.appendChild(listWrap);
     var formStatus = document.createElement("p");
     formStatus.style.color = "var(--muted)";
@@ -25047,25 +25482,38 @@ function renderErpHrReviewsSection(employees, reload) {
         }
         reviews.forEach(function (rv) {
           var row = document.createElement("div");
-          row.className = "erp-form";
+          row.className = "erp-form erp-compact-item";
           row.style.flex = "1 1 100%";
-          var rt = document.createElement("h4");
-          rt.textContent = (rv.employee_name || ("Employee #" + rv.employee_id))
-            + " — reviewed by " + (rv.reviewer_name || "—");
-          row.appendChild(rt);
+          var headBtn = document.createElement("button");
+          headBtn.type = "button";
+          headBtn.className = "erp-compact-title";
+          headBtn.textContent = (rv.employee_name || ("Employee #" + rv.employee_id))
+            + " — reviewed by " + (rv.reviewer_name || "—")
+            + " · " + hrReviewRatingText(rv.rating) + " · " + rv.status;
+          headBtn.setAttribute("aria-expanded", "false");
+          row.appendChild(headBtn);
+          var detail = document.createElement("div");
+          detail.className = "erp-compact-detail";
+          detail.hidden = true;
+          row.appendChild(detail);
+          headBtn.addEventListener("click", function () {
+            var open = detail.hidden;
+            detail.hidden = !open;
+            headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+          });
           var meta = document.createElement("p");
           meta.className = "admin-orders-empty";
           meta.textContent = "Rating: " + hrReviewRatingText(rv.rating)
             + " · Status: " + rv.status
             + (rv.status === "acknowledged" && rv.acknowledged_at ? " (acknowledged " + rv.acknowledged_at.slice(0, 10) + ")" : "")
             + (rv.reviewer_email ? " · Reviewer email: " + rv.reviewer_email : "");
-          row.appendChild(meta);
+          detail.appendChild(meta);
           [["Strengths", rv.strengths], ["Growth areas", rv.growth_areas],
            ["Goals", rv.goals]].forEach(function (pair) {
             if (!pair[1]) return;
             var p = document.createElement("p");
             p.textContent = pair[0] + ": " + pair[1];
-            row.appendChild(p);
+            detail.appendChild(p);
           });
           if (rv.status === "draft") {
             var subBtn = rvButton("Submit review");
@@ -25078,7 +25526,7 @@ function renderErpHrReviewsSection(employees, reload) {
                 subBtn.disabled = false;
               });
             });
-            row.appendChild(subBtn);
+            detail.appendChild(subBtn);
           }
           if (rv.status !== "acknowledged") {
             var editBtn = rvButton("Edit");
@@ -25123,7 +25571,7 @@ function renderErpHrReviewsSection(employees, reload) {
               cancelBtn.addEventListener("click", function () { reload(); });
               row.appendChild(cancelBtn);
             });
-            row.appendChild(editBtn);
+            detail.appendChild(editBtn);
           }
           listWrap.appendChild(row);
         });
@@ -26411,6 +26859,8 @@ function renderErpQualityCalibrationSection(wrap, reload) {
     var h = document.createElement("h4");
     h.textContent = "Equipment register";
     listWrap.appendChild(h);
+    // Compact equipment list: title-only rows + search (compact-list pattern).
+    listWrap.appendChild(erpCompactSearchBox("Search equipment…", function (q) { erpCompactFilter(listWrap, q); }));
     if (!items.length) {
       var none = document.createElement("p");
       none.className = "admin-orders-empty";
@@ -26419,18 +26869,35 @@ function renderErpQualityCalibrationSection(wrap, reload) {
     }
     items.forEach(function (eq) {
       var card = document.createElement("div");
-      card.className = "erp-form";
-      var h4 = document.createElement("h4");
-      h4.textContent = eq.name + " (" + (eq.active ? "Active" : "Inactive") + ")"
+      card.className = "erp-form erp-compact-item";
+      var fullText = eq.name + " (" + (eq.active ? "Active" : "Inactive") + ")"
         + (eq.type ? " · " + eq.type : "")
         + (eq.location ? " · " + eq.location : "")
         + (eq.serial ? " · SN " + eq.serial : "")
         + " · " + eq.calibration_count + " calibration" + (eq.calibration_count === 1 ? "" : "s")
         + " · " + dueLabel(eq.due_status)
         + (eq.due_date ? " (due " + eq.due_date + ")" : "");
-      card.appendChild(h4);
+      var headBtn = document.createElement("button");
+      headBtn.type = "button";
+      headBtn.className = "erp-compact-title";
+      headBtn.textContent = eq.name + " (" + (eq.active ? "Active" : "Inactive") + ") · " + dueLabel(eq.due_status)
+        + (eq.due_date ? " (due " + eq.due_date + ")" : "");
+      headBtn.setAttribute("aria-expanded", "false");
+      card.appendChild(headBtn);
+      var detail = document.createElement("div");
+      detail.className = "erp-compact-detail";
+      detail.hidden = true;
+      card.appendChild(detail);
+      headBtn.addEventListener("click", function () {
+        var open = detail.hidden;
+        detail.hidden = !open;
+        headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+      var full = document.createElement("p");
+      full.textContent = fullText;
+      detail.appendChild(full);
       var calList = document.createElement("div");
-      card.appendChild(calList);
+      detail.appendChild(calList);
       var calToggle = document.createElement("button");
       calToggle.type = "button";
       calToggle.textContent = "Calibrations";
@@ -26468,11 +26935,11 @@ function renderErpQualityCalibrationSection(wrap, reload) {
           });
         }).catch(function (error) { status.textContent = error.message; });
       });
-      card.appendChild(calToggle);
+      detail.appendChild(calToggle);
       var addCalBtn = document.createElement("button");
       addCalBtn.type = "button";
       addCalBtn.textContent = "Record calibration";
-      card.appendChild(addCalBtn);
+      detail.appendChild(addCalBtn);
       var calForm = null;
       addCalBtn.addEventListener("click", function () {
         if (calForm) { calForm.remove(); calForm = null; return; }
@@ -26516,7 +26983,7 @@ function renderErpQualityCalibrationSection(wrap, reload) {
           });
         });
         calForm.appendChild(saveBtn);
-        card.appendChild(calForm);
+        detail.appendChild(calForm);
       });
       var toggleBtn = document.createElement("button");
       toggleBtn.type = "button";
@@ -26531,7 +26998,7 @@ function renderErpQualityCalibrationSection(wrap, reload) {
           toggleBtn.disabled = false;
         });
       });
-      card.appendChild(toggleBtn);
+      detail.appendChild(toggleBtn);
       var delBtn = document.createElement("button");
       delBtn.type = "button";
       delBtn.textContent = "Delete";
@@ -26545,7 +27012,7 @@ function renderErpQualityCalibrationSection(wrap, reload) {
           delBtn.disabled = false;
         });
       });
-      card.appendChild(delBtn);
+      detail.appendChild(delBtn);
       listWrap.appendChild(card);
     });
     var form = document.createElement("div");
@@ -26624,6 +27091,8 @@ function renderErpQualityAuditSection(wrap, reload) {
     var h = document.createElement("h4");
     h.textContent = "Audit program";
     listWrap.appendChild(h);
+    // Compact audit list: title-only rows + search (compact-list pattern).
+    listWrap.appendChild(erpCompactSearchBox("Search audits…", function (q) { erpCompactFilter(listWrap, q); }));
     if (!audits.length) {
       var none = document.createElement("p");
       none.className = "admin-orders-empty";
@@ -26632,19 +27101,33 @@ function renderErpQualityAuditSection(wrap, reload) {
     }
     audits.forEach(function (a) {
       var card = document.createElement("div");
-      card.className = "erp-form";
-      var h4 = document.createElement("h4");
-      h4.textContent = a.audit_date + " · SOPs " + a.scope + " · " + a.auditor + " · " + a.status
-        + " · " + a.finding_count + " finding" + (a.finding_count === 1 ? "" : "s")
+      card.className = "erp-form erp-compact-item";
+      var headBtn = document.createElement("button");
+      headBtn.type = "button";
+      headBtn.className = "erp-compact-title";
+      headBtn.textContent = a.audit_date + " · SOPs " + a.scope + " · " + a.auditor + " · " + a.status;
+      headBtn.setAttribute("aria-expanded", "false");
+      card.appendChild(headBtn);
+      var detail = document.createElement("div");
+      detail.className = "erp-compact-detail";
+      detail.hidden = true;
+      card.appendChild(detail);
+      headBtn.addEventListener("click", function () {
+        var open = detail.hidden;
+        detail.hidden = !open;
+        headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      });
+      var counts = document.createElement("p");
+      counts.textContent = a.finding_count + " finding" + (a.finding_count === 1 ? "" : "s")
         + " (" + a.open_findings + " open) · " + a.open_actions + " open action" + (a.open_actions === 1 ? "" : "s");
-      card.appendChild(h4);
+      detail.appendChild(counts);
       if (a.notes) {
         var n = document.createElement("p");
         n.textContent = a.notes;
-        card.appendChild(n);
+        detail.appendChild(n);
       }
       var detailWrap = document.createElement("div");
-      card.appendChild(detailWrap);
+      detail.appendChild(detailWrap);
       var openBtn = document.createElement("button");
       openBtn.type = "button";
       openBtn.textContent = "Open audit";
@@ -26656,7 +27139,7 @@ function renderErpQualityAuditSection(wrap, reload) {
           renderAuditDetail(detailWrap, data.audit);
         }).catch(function (error) { status.textContent = error.message; });
       });
-      card.appendChild(openBtn);
+      detail.appendChild(openBtn);
       var statusSelect = document.createElement("select");
       [["planned", "Planned"], ["in_progress", "In progress"], ["completed", "Completed"]].forEach(function (o) {
         var opt = document.createElement("option");
@@ -26671,7 +27154,7 @@ function renderErpQualityAuditSection(wrap, reload) {
           if (typeof reload === "function") reload();
         }).catch(function (error) { status.textContent = error.message; });
       });
-      card.appendChild(erpField("Status", statusSelect));
+      detail.appendChild(erpField("Status", statusSelect));
       var delBtn = document.createElement("button");
       delBtn.type = "button";
       delBtn.textContent = "Delete";
@@ -26685,7 +27168,7 @@ function renderErpQualityAuditSection(wrap, reload) {
           delBtn.disabled = false;
         });
       });
-      card.appendChild(delBtn);
+      detail.appendChild(delBtn);
       listWrap.appendChild(card);
     });
     var form = document.createElement("div");
@@ -27041,16 +27524,35 @@ function renderErpLegalDetail(data) {
   if (!ipRecords.length) {
     ipCard.appendChild(lNote("No IP records yet."));
   }
+  var ipList = document.createElement("div");
+  // Compact IP list: title-only rows + search (compact-list pattern).
+  ipCard.appendChild(erpCompactSearchBox("Search IP records…", function (q) { erpCompactFilter(ipList, q); }));
+  ipCard.appendChild(ipList);
   ipRecords.forEach(function (rec) {
     var rowCard = document.createElement("div");
-    rowCard.className = "erp-form";
+    rowCard.className = "erp-form erp-compact-item";
     rowCard.style.flex = "1 1 100%";
-    rowCard.appendChild(lRow(rec.name + " — " + rec.type + " · " + rec.status + (rec.filing_date ? (" · filed " + rec.filing_date) : "") + (rec.registration_date ? (" · registered " + rec.registration_date) : "") + (rec.renewal_deadline ? (" · renewal due " + rec.renewal_deadline + (rec.is_renewal_overdue ? " — OVERDUE" : "")) : " · no renewal deadline") + (rec.notes ? (" — " + rec.notes) : "")));
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    headBtn.textContent = rec.name + " — " + rec.type + " · " + rec.status + (rec.is_renewal_overdue ? " — OVERDUE" : "");
+    headBtn.setAttribute("aria-expanded", "false");
+    rowCard.appendChild(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    rowCard.appendChild(detail);
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    detail.appendChild(lRow(rec.name + " — " + rec.type + " · " + rec.status + (rec.filing_date ? (" · filed " + rec.filing_date) : "") + (rec.registration_date ? (" · registered " + rec.registration_date) : "") + (rec.renewal_deadline ? (" · renewal due " + rec.renewal_deadline + (rec.is_renewal_overdue ? " — OVERDUE" : "")) : " · no renewal deadline") + (rec.notes ? (" — " + rec.notes) : "")));
     var editBtn = lButton("Edit");
     editBtn.addEventListener("click", function () {
       renderErpLegalIpEditForm(rowCard, rec, ipAddStatus, loadErpLegalDetail);
     });
-    rowCard.appendChild(editBtn);
+    detail.appendChild(editBtn);
     var delBtn = lButton("Delete");
     delBtn.addEventListener("click", function () {
       delBtn.disabled = true;
@@ -27061,8 +27563,8 @@ function renderErpLegalDetail(data) {
         delBtn.disabled = false;
       });
     });
-    rowCard.appendChild(delBtn);
-    ipCard.appendChild(rowCard);
+    detail.appendChild(delBtn);
+    ipList.appendChild(rowCard);
   });
   els.body.appendChild(ipCard);
   // --- Contracts + insurance register. ---
@@ -27146,16 +27648,35 @@ function renderErpLegalDetail(data) {
   if (!agreements.length) {
     agCard.appendChild(lNote("No agreements recorded yet."));
   }
+  var agList = document.createElement("div");
+  // Compact agreement list: title-only rows + search (compact-list pattern).
+  agCard.appendChild(erpCompactSearchBox("Search agreements…", function (q) { erpCompactFilter(agList, q); }));
+  agCard.appendChild(agList);
   agreements.forEach(function (rec) {
     var rowCard = document.createElement("div");
-    rowCard.className = "erp-form";
+    rowCard.className = "erp-form erp-compact-item";
     rowCard.style.flex = "1 1 100%";
-    rowCard.appendChild(lRow(rec.title + " — " + rec.counterparty + " · " + rec.type + (rec.start_date ? (" · from " + rec.start_date) : "") + (rec.end_date ? (" · ends " + rec.end_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no end date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "") + (rec.has_image ? " · 📷 Photo" : "")));
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    headBtn.textContent = rec.title + " — " + rec.counterparty + " · " + rec.type + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""));
+    headBtn.setAttribute("aria-expanded", "false");
+    rowCard.appendChild(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    rowCard.appendChild(detail);
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    detail.appendChild(lRow(rec.title + " — " + rec.counterparty + " · " + rec.type + (rec.start_date ? (" · from " + rec.start_date) : "") + (rec.end_date ? (" · ends " + rec.end_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no end date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "") + (rec.has_image ? " · 📷 Photo" : "")));
     var editBtn = lButton("Edit");
     editBtn.addEventListener("click", function () {
       renderErpLegalAgreementEditForm(rowCard, rec, agAddStatus, loadErpLegalDetail);
     });
-    rowCard.appendChild(editBtn);
+    detail.appendChild(editBtn);
     if (rec.has_image) {
       rowCard.appendChild(erpLegalPhotoViewButton("agreements", rec, rowCard, agAddStatus));
     }
@@ -27169,8 +27690,8 @@ function renderErpLegalDetail(data) {
         delBtn.disabled = false;
       });
     });
-    rowCard.appendChild(delBtn);
-    agCard.appendChild(rowCard);
+    detail.appendChild(delBtn);
+    agList.appendChild(rowCard);
   });
   els.body.appendChild(agCard);
   // --- Licenses & permits register (Nov 17, 2026). ---
@@ -27256,16 +27777,35 @@ function renderErpLegalDetail(data) {
   if (!licenses.length) {
     licCard.appendChild(lNote("No licenses recorded yet."));
   }
+  var licList = document.createElement("div");
+  // Compact license list: title-only rows + search (compact-list pattern).
+  licCard.appendChild(erpCompactSearchBox("Search licenses…", function (q) { erpCompactFilter(licList, q); }));
+  licCard.appendChild(licList);
   licenses.forEach(function (rec) {
     var rowCard = document.createElement("div");
-    rowCard.className = "erp-form";
+    rowCard.className = "erp-form erp-compact-item";
     rowCard.style.flex = "1 1 100%";
-    rowCard.appendChild(lRow(rec.name + " — " + (rec.authority || "no authority") + " · " + rec.type + (rec.license_number ? (" · #" + rec.license_number) : "") + (rec.issue_date ? (" · issued " + rec.issue_date) : "") + (rec.expiry_date ? (" · expires " + rec.expiry_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no expiry date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "") + (rec.has_image ? " · 📷 Photo" : "")));
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    headBtn.textContent = rec.name + " — " + (rec.authority || "no authority") + " · " + rec.type + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""));
+    headBtn.setAttribute("aria-expanded", "false");
+    rowCard.appendChild(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    rowCard.appendChild(detail);
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    detail.appendChild(lRow(rec.name + " — " + (rec.authority || "no authority") + " · " + rec.type + (rec.license_number ? (" · #" + rec.license_number) : "") + (rec.issue_date ? (" · issued " + rec.issue_date) : "") + (rec.expiry_date ? (" · expires " + rec.expiry_date + (rec.is_expired ? " — EXPIRED" : (rec.expiring_soon ? " — expiring soon" : ""))) : " · no expiry date") + " · renewal notice " + rec.renewal_notice_days + " days" + (rec.notes ? (" — " + rec.notes) : "") + (rec.has_image ? " · 📷 Photo" : "")));
     var editBtn = lButton("Edit");
     editBtn.addEventListener("click", function () {
       renderErpLegalLicenseEditForm(rowCard, rec, licAddStatus, loadErpLegalDetail);
     });
-    rowCard.appendChild(editBtn);
+    detail.appendChild(editBtn);
     if (rec.has_image) {
       rowCard.appendChild(erpLegalPhotoViewButton("licenses", rec, rowCard, licAddStatus));
     }
@@ -27279,8 +27819,8 @@ function renderErpLegalDetail(data) {
         delBtn.disabled = false;
       });
     });
-    rowCard.appendChild(delBtn);
-    licCard.appendChild(rowCard);
+    detail.appendChild(delBtn);
+    licList.appendChild(rowCard);
   });
   els.body.appendChild(licCard);
   // --- Compliance calendar. ---
@@ -27330,11 +27870,30 @@ function renderErpLegalDetail(data) {
   if (!items.length) {
     compCard.appendChild(lNote("No compliance obligations yet."));
   }
+  var compList = document.createElement("div");
+  // Compact obligation list: title-only rows + search (compact-list pattern).
+  compCard.appendChild(erpCompactSearchBox("Search obligations…", function (q) { erpCompactFilter(compList, q); }));
+  compCard.appendChild(compList);
   items.forEach(function (rec) {
     var rowCard = document.createElement("div");
-    rowCard.className = "erp-form";
+    rowCard.className = "erp-form erp-compact-item";
     rowCard.style.flex = "1 1 100%";
-    rowCard.appendChild(lRow(rec.obligation + (rec.authority ? (" — " + rec.authority) : "") + (rec.due_date ? (" · due " + rec.due_date) : " · no due date") + " · " + rec.status + (rec.notes ? (" — " + rec.notes) : "")));
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    headBtn.textContent = rec.obligation + (rec.authority ? " — " + rec.authority : "") + (rec.due_date ? " · due " + rec.due_date : " · no due date") + " · " + rec.status;
+    headBtn.setAttribute("aria-expanded", "false");
+    rowCard.appendChild(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    rowCard.appendChild(detail);
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    detail.appendChild(lRow(rec.obligation + (rec.authority ? (" — " + rec.authority) : "") + (rec.due_date ? (" · due " + rec.due_date) : " · no due date") + " · " + rec.status + (rec.notes ? (" — " + rec.notes) : "")));
     var doneBtn = lButton(rec.status === "done" ? "Reopen" : "Mark done");
     doneBtn.addEventListener("click", function () {
       doneBtn.disabled = true;
@@ -27347,12 +27906,12 @@ function renderErpLegalDetail(data) {
         doneBtn.disabled = false;
       });
     });
-    rowCard.appendChild(doneBtn);
+    detail.appendChild(doneBtn);
     var editBtn = lButton("Edit");
     editBtn.addEventListener("click", function () {
       renderErpLegalComplianceEditForm(rowCard, rec, compAddStatus, loadErpLegalDetail);
     });
-    rowCard.appendChild(editBtn);
+    detail.appendChild(editBtn);
     var delBtn = lButton("Delete");
     delBtn.addEventListener("click", function () {
       delBtn.disabled = true;
@@ -27363,8 +27922,8 @@ function renderErpLegalDetail(data) {
         delBtn.disabled = false;
       });
     });
-    rowCard.appendChild(delBtn);
-    compCard.appendChild(rowCard);
+    detail.appendChild(delBtn);
+    compList.appendChild(rowCard);
   });
   els.body.appendChild(compCard);
   var leaseWrap = document.createElement("div");
@@ -27422,16 +27981,35 @@ function renderErpLegalDetail(data) {
   if (!risks.length) {
     riskCard.appendChild(lNote("No risks recorded yet."));
   }
+  var riskList = document.createElement("div");
+  // Compact risk list: title-only rows + search (compact-list pattern).
+  riskCard.appendChild(erpCompactSearchBox("Search risks…", function (q) { erpCompactFilter(riskList, q); }));
+  riskCard.appendChild(riskList);
   risks.forEach(function (rec) {
     var rowCard = document.createElement("div");
-    rowCard.className = "erp-form";
+    rowCard.className = "erp-form erp-compact-item";
     rowCard.style.flex = "1 1 100%";
-    rowCard.appendChild(lRow(rec.title + " · " + rec.likelihood + " × " + rec.impact + " — score " + rec.risk_score + (rec.review_date ? (" · review " + rec.review_date) : " · no review date") + " · " + rec.review_status + (rec.owner ? (" · owner " + rec.owner) : "") + (rec.description ? (" — " + rec.description) : "") + (rec.mitigation ? (" — mitigation: " + rec.mitigation) : "")));
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    headBtn.textContent = rec.title + " · " + rec.likelihood + " × " + rec.impact + " — score " + rec.risk_score + " · " + rec.review_status;
+    headBtn.setAttribute("aria-expanded", "false");
+    rowCard.appendChild(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    rowCard.appendChild(detail);
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
+    detail.appendChild(lRow(rec.title + " · " + rec.likelihood + " × " + rec.impact + " — score " + rec.risk_score + (rec.review_date ? (" · review " + rec.review_date) : " · no review date") + " · " + rec.review_status + (rec.owner ? (" · owner " + rec.owner) : "") + (rec.description ? (" — " + rec.description) : "") + (rec.mitigation ? (" — mitigation: " + rec.mitigation) : "")));
     var riskEditBtn = lButton("Edit");
     riskEditBtn.addEventListener("click", function () {
       renderErpLegalRiskEditForm(rowCard, rec, riskAddStatus, loadErpLegalDetail);
     });
-    rowCard.appendChild(riskEditBtn);
+    detail.appendChild(riskEditBtn);
     var riskDelBtn = lButton("Delete");
     riskDelBtn.addEventListener("click", function () {
       riskDelBtn.disabled = true;
@@ -27442,8 +28020,8 @@ function renderErpLegalDetail(data) {
         riskDelBtn.disabled = false;
       });
     });
-    rowCard.appendChild(riskDelBtn);
-    riskCard.appendChild(rowCard);
+    detail.appendChild(riskDelBtn);
+    riskList.appendChild(rowCard);
   });
   els.body.appendChild(riskCard);
 }
@@ -28162,15 +28740,25 @@ function renderErpStoresDetail(data, locations, transfers, items, fleet) {
   var stores = data.stores || [];
   var openStores = stores.filter(function (st) { return st.status === "open"; });
   var closedStores = stores.filter(function (st) { return st.status !== "open"; });
+  var allStoresTitle = document.createElement("h3");
+  allStoresTitle.textContent = "All stores";
+  els.body.appendChild(allStoresTitle);
+  var storeList = document.createElement("div");
+  // Compact store list: title-only rows + search (compact-list pattern).
+  els.body.appendChild(erpCompactSearchBox("Search stores…", function (q) { erpCompactFilter(storeList, q); }));
+  els.body.appendChild(storeList);
   openStores.forEach(function (st) {
-    els.body.appendChild(renderErpStoresCard(st, locations, loadErpStoresDetail));
+    storeList.appendChild(renderErpStoresCard(st, locations, loadErpStoresDetail));
   });
   if (closedStores.length) {
     var closedTitle = document.createElement("h3");
     closedTitle.textContent = "Closed stores";
     els.body.appendChild(closedTitle);
+    var closedStoreList = document.createElement("div");
+    els.body.appendChild(erpCompactSearchBox("Search closed stores…", function (q) { erpCompactFilter(closedStoreList, q); }));
+    els.body.appendChild(closedStoreList);
     closedStores.forEach(function (st) {
-      els.body.appendChild(renderErpStoresCard(st, locations, loadErpStoresDetail));
+      closedStoreList.appendChild(renderErpStoresCard(st, locations, loadErpStoresDetail));
     });
   }
   if (!stores.length) {
@@ -28326,8 +28914,28 @@ function renderErpStoresDetail(data, locations, transfers, items, fleet) {
     flNone.textContent = "No vehicles yet.";
     fleetCard.appendChild(flNone);
   }
+  var fleetListWrap = document.createElement("div");
+  // Compact fleet list: title-only rows + search (compact-list pattern).
+  fleetCard.appendChild(erpCompactSearchBox("Search vehicles…", function (q) { erpCompactFilter(fleetListWrap, q); }));
+  fleetCard.appendChild(fleetListWrap);
   fleetList.forEach(function (v) {
     var row = document.createElement("div");
+    row.className = "erp-compact-item";
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    headBtn.textContent = v.name + " · " + v.status;
+    headBtn.setAttribute("aria-expanded", "false");
+    row.appendChild(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    row.appendChild(detail);
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    });
     var meta = document.createElement("p");
     var desc = [v.make, v.model, v.year].filter(function (x) { return x; }).join(" ");
     meta.textContent = v.name
@@ -28338,7 +28946,7 @@ function renderErpStoresDetail(data, locations, transfers, items, fleet) {
       + " · " + v.maintenance_count + " maintenance · " + v.fuel_count + " fuel"
       + " · maintenance " + erpMoney(v.maintenance_total_cents)
       + " · fuel " + erpMoney(v.fuel_total_cents);
-    row.appendChild(meta);
+    detail.appendChild(meta);
     var viewBtn = stButton(erpState.fleetVehicleId === v.id ? "Hide logs" : "View logs");
     viewBtn.addEventListener("click", function () {
       if (erpState.fleetVehicleId === v.id) {
@@ -28353,8 +28961,8 @@ function renderErpStoresDetail(data, locations, transfers, items, fleet) {
         renderErpStoresDetail(data, locations, transfers, items, fleetList);
       }).catch(function (error) { fleetStatus.textContent = error.message; });
     });
-    row.appendChild(viewBtn);
-    fleetCard.appendChild(row);
+    detail.appendChild(viewBtn);
+    fleetListWrap.appendChild(row);
   });
   if (erpState.fleetVehicleId && erpState.fleetDetail) {
     var fd = erpState.fleetDetail;
@@ -28524,10 +29132,22 @@ function renderErpStoresDetail(data, locations, transfers, items, fleet) {
 }
 function renderErpStoresCard(st, locations, reload) {
   var card = document.createElement("div");
-  card.className = "erp-form";
-  var h3 = document.createElement("h3");
-  h3.textContent = st.name + (st.status === "open" ? "" : " — closed");
-  card.appendChild(h3);
+  card.className = "erp-form erp-compact-item";
+  var headBtn = document.createElement("button");
+  headBtn.type = "button";
+  headBtn.className = "erp-compact-title";
+  headBtn.textContent = st.name + " · " + (st.type === "fresh-made" ? "Fresh-made" : "Prepackaged only") + (st.status === "open" ? "" : " — closed");
+  headBtn.setAttribute("aria-expanded", "false");
+  card.appendChild(headBtn);
+  var detail = document.createElement("div");
+  detail.className = "erp-compact-detail";
+  detail.hidden = true;
+  card.appendChild(detail);
+  headBtn.addEventListener("click", function () {
+    var open = detail.hidden;
+    detail.hidden = !open;
+    headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+  });
   var meta = document.createElement("p");
   var loc = null;
   (locations || []).forEach(function (l) { if (String(l.id) === String(st.location_id)) loc = l; });
@@ -28535,25 +29155,25 @@ function renderErpStoresCard(st, locations, reload) {
     + (st.address ? " · " + st.address : "")
     + (st.open_date ? " · opened " + st.open_date : "")
     + " · " + (loc ? ("Inventory: " + loc.code + " — " + loc.name) : "No inventory location linked");
-  card.appendChild(meta);
+  detail.appendChild(meta);
   var status = document.createElement("p");
   status.style.color = "var(--muted)";
   status.style.flex = "1 1 100%";
-  card.appendChild(status);
+  detail.appendChild(status);
   var viewBtn = document.createElement("button");
   viewBtn.type = "button";
   viewBtn.textContent = "View detail";
   viewBtn.addEventListener("click", function () {
     renderErpStoresDetailView(card, st, status, reload);
   });
-  card.appendChild(viewBtn);
+  detail.appendChild(viewBtn);
   var editBtn = document.createElement("button");
   editBtn.type = "button";
   editBtn.textContent = "Edit";
   editBtn.addEventListener("click", function () {
     renderErpStoresEditForm(card, st, locations, status, reload);
   });
-  card.appendChild(editBtn);
+  detail.appendChild(editBtn);
   var toggleBtn = document.createElement("button");
   toggleBtn.type = "button";
   toggleBtn.textContent = st.status === "open" ? "Deactivate" : "Reactivate";
@@ -28566,7 +29186,7 @@ function renderErpStoresCard(st, locations, reload) {
       toggleBtn.disabled = false;
     });
   });
-  card.appendChild(toggleBtn);
+  detail.appendChild(toggleBtn);
   return card;
 }
 function erpStoresLedgerText(sale) {
