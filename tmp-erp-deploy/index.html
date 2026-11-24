@@ -182,12 +182,18 @@ button { font-family: inherit; }
          (the wrapper exposes .value). 16px text stops iOS Safari
          auto-zoom on focus, same as the other inputs. */
       .erp-rich-wrap { flex: 1 1 100%; min-width: 0; }
+      /* erpField() wraps a rich editor in this div (NOT a <label> — a
+         label would fire its activation behavior on the toolbar's Bold
+         button; see erpField). Same look as a form label, and full-width
+         so the editor is a usable writing box, not a squeezed column. */
+      .erp-field-rich { display: inline-flex; gap: 6px; align-items: center; flex: 1 1 100%; min-width: 0; font-size: 14px; font-weight: 400; }
+      .erp-field-rich .erp-field-label { font-weight: 700; font-size: 14px; }
       .erp-rich-toolbar { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; padding: 6px; border: 2px solid var(--ink); border-bottom: none; background: #f4f4f4; }
       .erp-rich-toolbar button { min-height: 36px; min-width: 36px; padding: 6px 9px; border: 1px solid var(--ink); background: #fff; font-weight: 800; font-size: 14px; cursor: pointer; }
       .erp-rich-toolbar button:active { background: var(--yellow); }
       .erp-rich-toolbar select { min-height: 36px; padding: 4px 6px; border: 1px solid var(--ink); background: #fff; font-size: 14px; }
       .erp-rich-sep { width: 1px; align-self: stretch; background: var(--line); margin: 2px 4px; }
-      .erp-rich-editor { min-height: 96px; max-height: 320px; overflow-y: auto; padding: 8px 10px; border: 2px solid var(--ink); background: #fff; font-size: 16px; line-height: 1.5; outline: none; }
+      .erp-rich-editor { min-height: 96px; max-height: 320px; overflow-y: auto; padding: 8px 10px; border: 2px solid var(--ink); background: #fff; font-size: 16px; line-height: 1.5; outline: none; font-weight: 400; /* Explicit normal weight: without it the editor text inherits any bold ancestor (e.g. .erp-form label is font-weight 700), so queryCommandState('bold') is always true and execCommand('bold') toggles bold OFF. The <label>-activation defect (a label click firing the toolbar Bold button) is fixed structurally in erpField, which wraps rich editors in a div; this weight is the remaining defense. */ }
       .erp-rich-editor:focus { outline: 2px solid var(--red); outline-offset: -2px; }
       .erp-rich-editor.erp-rich-empty:before { content: attr(data-placeholder); color: #888; pointer-events: none; }
       .erp-rich-editor p { margin: 0 0 8px; }
@@ -11537,6 +11543,23 @@ function erpBackButton(label, onBack) {
 }
 
 function erpField(labelText, input) {
+  if (input && input.classList && input.classList.contains("erp-rich-wrap")) {
+    /* Rich editors must NOT sit inside a <label>: a label's activation
+       behavior fires a synthetic click on its labeled control — the
+       first labelable descendant — which is the toolbar's Bold button.
+       Every click into the editor (or on the label text) silently
+       toggles Bold, so plain typing comes out <b>-wrapped and the Bold
+       button never sticks. A plain <div> has no activation behavior;
+       the span keeps the label text looking identical. */
+    var wrap = document.createElement("div");
+    wrap.className = "erp-field-rich";
+    var t = document.createElement("span");
+    t.className = "erp-field-label";
+    t.textContent = labelText;
+    wrap.appendChild(t);
+    wrap.appendChild(input);
+    return wrap;
+  }
   var label = document.createElement("label");
   label.textContent = labelText + " ";
   label.appendChild(input);
@@ -11564,6 +11587,24 @@ function erpField(labelText, input) {
 function erpEscapeHtml(s) {
   return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
+/* Entity-aware escape for HTML values: text that has already been
+   through a browser (editor.innerHTML, stored HTML) carries real
+   entities such as &nbsp; — escaping their & to &amp; would leak the
+   literal text "&nbsp;" onto cards and compound on every load/edit cycle
+   (&amp;nbsp; -> &amp;amp;nbsp; -> …). A & that starts a valid entity
+   (named &name;, numeric &#123;, hex &#x7B;) passes through; a bare &
+   still becomes &amp;. Entities in text position can never create
+   elements — the browser decodes them to text — so this does not weaken
+   the sanitizer. Used by the sanitizer AND by the tag-less render/load
+   branches (a stored rich value with no tags can still carry &nbsp;).
+   Plain-text values that were never in the editor keep full escaping
+   only in the sense that a literally-typed "&nbsp;" now renders as a
+   space instead of as text — the only accepted tradeoff. */
+function erpEscapeHtmlKeepEntities(s) {
+  return String(s == null ? "" : s)
+    .replace(/&(?!(?:#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]+);)/g, "&amp;")
+    .replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 var ERP_RICH_ALLOWED_TAGS = { b: 1, strong: 1, i: 1, em: 1, u: 1, s: 1, strike: 1, p: 1, br: 1, ul: 1, ol: 1, li: 1, h1: 1, h2: 1, h3: 1, a: 1, span: 1, div: 1 };
 /* Drop with content (containers that can hide scripts/handlers). Void
    tags are dropped alone — they never close, so entering drop mode
@@ -11589,7 +11630,7 @@ function erpSanitizeRichHtml(html) {
   var m;
   while ((m = re.exec(src))) {
     if (m[3] !== undefined) {
-      if (!dropTag) out.push(erpEscapeHtml(m[3]));
+      if (!dropTag) out.push(erpEscapeHtmlKeepEntities(m[3]));
       continue;
     }
     if (m[0].indexOf("\x3c!--") === 0 || m[0].indexOf("<![CDATA[") === 0) continue;
@@ -11623,7 +11664,7 @@ function erpSanitizeRichHtml(html) {
       var href = erpRichAttr(attrs, "href");
       if (href) {
         var h = String(href).replace(/[\u0000-\u0020]/g, "").trim();
-        if (/^(https?:|mailto:|\/)/i.test(h)) attrOut = ' href="' + erpEscapeHtml(h) + '"';
+        if (/^(https?:|mailto:|\/)/i.test(h)) attrOut = ' href="' + erpEscapeHtmlKeepEntities(h) + '"';
       }
     } else if (tag === "span") {
       var style = erpRichAttr(attrs, "style");
@@ -11656,7 +11697,10 @@ function erpSetRichHtml(el, value) {
   if (!el) return;
   var v = value == null ? "" : String(value);
   if (!/<[a-zA-Z][^>]*>/.test(v)) {
-    el.innerHTML = erpEscapeHtml(v).replace(/\n/g, "<br>");
+    /* Entity-aware: a stored rich value with no tags (e.g. "events.&nbsp;
+       Next") still carries real entities from the editor — full escaping
+       would leak "&nbsp;" as literal text and compound on every reload. */
+    el.innerHTML = erpEscapeHtmlKeepEntities(v).replace(/\n/g, "<br>");
   } else {
     el.innerHTML = erpSanitizeRichHtml(v);
   }
@@ -11856,7 +11900,7 @@ function erpRichText(opts) {
     set: function (v) {
       var s = v == null ? "" : String(v);
       if (!s) { editor.innerHTML = ""; }
-      else if (!/<[a-zA-Z][^>]*>/.test(s)) { editor.innerHTML = erpEscapeHtml(s).replace(/\n/g, "<br>"); }
+      else if (!/<[a-zA-Z][^>]*>/.test(s)) { editor.innerHTML = erpEscapeHtmlKeepEntities(s).replace(/\n/g, "<br>"); /* entity-aware: see erpSetRichHtml — a tag-less stored value can still carry &nbsp; from the editor */ }
       else { editor.innerHTML = erpSanitizeRichHtml(s); }
       syncEmpty();
       updateCount();
