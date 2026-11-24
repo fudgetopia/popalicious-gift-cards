@@ -1798,6 +1798,26 @@ def init_db():
             detail TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
+        -- Big-company package, Module A (Systems / IT): cache of the
+        -- last post-backup security-check run. The check itself runs on
+        -- the VM (hidden_files/acct_backup_security_check.py, called by
+        -- acct_backup_job.py after each backup); its results live in the
+        -- VM backup index (hidden_files/acct-backups/index.json), which
+        -- the deployed backend cannot read. The job therefore POSTs each
+        -- run to /api/erp/settings/security-check (cron-secret) and this
+        -- table is the only copy the ERP can surface. NOT in
+        -- _ERP_RESET_TABLES: like the audit logs, the record of a
+        -- security check must survive a wipe. No row = no run has ever
+        -- been recorded -- the Systems view says so, never a pass.
+        CREATE TABLE IF NOT EXISTS erp_security_check_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at TEXT NOT NULL,
+            manifest_id TEXT NOT NULL DEFAULT '',
+            ok INTEGER NOT NULL DEFAULT 0,
+            failures_json TEXT NOT NULL DEFAULT '[]',
+            notes_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL
+        );
         -- Dept 11 Staff & permissions: audit log for staff/permission
         -- actions ONLY (staff.created/reactivated/deactivated/updated,
         -- staff.password_reset, staff.permissions_changed). Deliberately
@@ -2044,6 +2064,48 @@ def init_db():
             ON erp_hr_headcount_targets (role_id);
         CREATE INDEX IF NOT EXISTS idx_erp_hc_targets_scope
             ON erp_hr_headcount_targets (scope_type, scope_store_id);
+        -- Training records (Dept 12, Module D, Nov 2026): admin-defined
+        -- courses + per-employee completion records. This replaces the
+        -- onboarding checklist's "Training done" tick with real records
+        -- (the checklist step itself is untouched -- it stays a manual
+        -- tick, see SOP 12.3; the record lives here). Nothing is seeded
+        -- and nobody is auto-marked trained: courses are admin-defined
+        -- and every completion is admin-entered. expiry_months on a
+        -- course is the re-training period in whole months, or NULL for
+        -- no expiry; a completion's expiry_date is computed from it
+        -- (completed_date + months) unless the admin types one. Both
+        -- tables are people records, NOT in _ERP_RESET_TABLES -- a
+        -- wipe must never erase training history.
+        CREATE TABLE IF NOT EXISTS erp_hr_training_courses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            expiry_months INTEGER,
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_hr_training_completions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            course_id INTEGER NOT NULL,
+            completed_date TEXT NOT NULL,
+            expiry_date TEXT NOT NULL DEFAULT '',
+            certificate TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_training_compl_employee
+            ON erp_hr_training_completions (employee_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_training_compl_course
+            ON erp_hr_training_completions (course_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_training_compl_expiry
+            ON erp_hr_training_completions (expiry_date);
         CREATE TABLE IF NOT EXISTS erp_hr_offboarding (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             employee_id INTEGER NOT NULL,
@@ -2329,6 +2391,108 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_erp_quality_checklists_store_date
             ON erp_quality_checklists (store_id, checklist_date);
+        -- Equipment calibration (Dept 13, Module E, Nov 2026): a
+        -- standing equipment register + dated calibration records.
+        -- Nothing is pre-registered; the admin adds equipment. A
+        -- calibration record's due_date drives the due/overdue list
+        -- (computed from stored dates vs today, never stored as a
+        -- status). Equipment and calibration records are NOT in
+        -- _ERP_RESET_TABLES -- a wipe must never erase the register
+        -- or its calibration history.
+        CREATE TABLE IF NOT EXISTS erp_quality_equipment (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            serial TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_quality_calibrations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            equipment_id INTEGER NOT NULL,
+            calibration_date TEXT NOT NULL,
+            due_date TEXT NOT NULL,
+            result TEXT NOT NULL DEFAULT 'pass',
+            performed_by TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_calib_equipment
+            ON erp_quality_calibrations (equipment_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_calib_due
+            ON erp_quality_calibrations (due_date);
+        -- Internal audit program (Dept 13, Module F, Nov 2026): the
+        -- quality audit program -- scheduled audits with a scope of
+        -- SOP numbers, a checklist per audit, findings, and corrective
+        -- actions with owners and due dates. This is NOT the accounting
+        -- audit log (erp_acct_audit) and NOT the staff audit log: those
+        -- stay as-is. Auditor and action owners are free-text
+        -- admin-entered names, because an auditor may be an external
+        -- consultant with no ERP login; no auditor is ever invented.
+        -- Scope is a comma-separated list of SOP numbers (e.g.
+        -- "13.1, 13.6"); each must be a well-formed number and, when
+        -- the SOP Library has been imported, must exist there. Audit,
+        -- finding, checklist and action records are NOT in
+        -- _ERP_RESET_TABLES -- a wipe must never erase audit history.
+        CREATE TABLE IF NOT EXISTS erp_quality_audits (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            audit_date TEXT NOT NULL,
+            scope TEXT NOT NULL DEFAULT '',
+            auditor TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'planned',
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_quality_audit_checklist (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            audit_id INTEGER NOT NULL,
+            item TEXT NOT NULL,
+            done INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_audit_checklist_audit
+            ON erp_quality_audit_checklist (audit_id);
+        CREATE TABLE IF NOT EXISTS erp_quality_audit_findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            audit_id INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'minor',
+            status TEXT NOT NULL DEFAULT 'open',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_audit_findings_audit
+            ON erp_quality_audit_findings (audit_id);
+        CREATE TABLE IF NOT EXISTS erp_quality_audit_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            finding_id INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            owner TEXT NOT NULL DEFAULT '',
+            due_date TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'open',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_audit_actions_finding
+            ON erp_quality_audit_actions (finding_id);
         -- SOP Library: the read copy of the SOP files
         -- (files/sops/SOP-dept-*.md), imported by hidden_files/
         -- sop_import.py. One row per SOP: dept 1-15, number is the
@@ -2478,6 +2642,33 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_erp_legal_compliance_due
             ON erp_legal_compliance (due_date);
+        -- Risk register (Dept 14, Module G, Nov 2026): one row per
+        -- risk -- title, description, likelihood + impact on the
+        -- low/medium/high scale, mitigation, owner, review date.
+        -- Starts EMPTY -- no risk is ever invented or seeded. Owner
+        -- is a free-text admin-entered name: the owner may be an
+        -- external adviser with no ERP login. review_date drives the
+        -- due/overdue review list (computed from the stored date vs
+        -- today, never stored as a status), exactly like the
+        -- compliance calendar's overdue flag. Like the other legal
+        -- tables, NOT in _ERP_RESET_TABLES -- a wipe must never erase
+        -- the register.
+        CREATE TABLE IF NOT EXISTS erp_legal_risks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            likelihood TEXT NOT NULL DEFAULT 'medium',
+            impact TEXT NOT NULL DEFAULT 'medium',
+            mitigation TEXT NOT NULL DEFAULT '',
+            owner TEXT NOT NULL DEFAULT '',
+            review_date TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_legal_risks_review
+            ON erp_legal_risks (review_date);
         -- Dept 14 (Stores) Wave A: store locations, the transfer
         -- workflow, POS sales intake and Z-reports. Stores start
         -- EMPTY -- nothing is seeded, and the Henderson facility (HEN)
@@ -2954,6 +3145,65 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_erp_store_tasks_store
             ON erp_store_tasks (store_id);
+        -- Fleet register (Dept 15, Nov 2026): vehicles that serve the
+        -- stores (deliveries, transfers, market runs) + their
+        -- maintenance and fuel logs. Starts with ZERO vehicles --
+        -- nothing is seeded and no vehicle is invented. A vehicle is
+        -- a standing asset record, not transactional data, so these
+        -- tables are deliberately NOT in _ERP_RESET_TABLES (see the
+        -- asserts below): a wipe must never erase the register or its
+        -- service history. The tables hold no people records -- no
+        -- driver or staff field by design.
+        -- erp_fleet_vehicles: one row per vehicle. Only name is
+        -- required; make/model/year/plate are optional, store_id is
+        -- an optional link to a store, status is active/retired.
+        CREATE TABLE IF NOT EXISTS erp_fleet_vehicles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            make TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            year INTEGER,
+            plate TEXT NOT NULL DEFAULT '',
+            store_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'active',
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_fleet_vehicles_store
+            ON erp_fleet_vehicles (store_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_fleet_vehicles_status
+            ON erp_fleet_vehicles (status);
+        -- erp_fleet_maintenance: dated service entries tied to a
+        -- vehicle (oil change, tires, repair...). cost_cents is the
+        -- total paid; odometer is the reading at service time.
+        CREATE TABLE IF NOT EXISTS erp_fleet_maintenance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vehicle_id INTEGER NOT NULL,
+            service_date TEXT NOT NULL,
+            description TEXT NOT NULL,
+            cost_cents INTEGER NOT NULL DEFAULT 0,
+            odometer REAL,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_fleet_maintenance_vehicle
+            ON erp_fleet_maintenance (vehicle_id);
+        -- erp_fleet_fuel: dated fuel fills tied to a vehicle.
+        CREATE TABLE IF NOT EXISTS erp_fleet_fuel (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vehicle_id INTEGER NOT NULL,
+            fuel_date TEXT NOT NULL,
+            gallons REAL NOT NULL,
+            cost_cents INTEGER NOT NULL DEFAULT 0,
+            odometer REAL,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_fleet_fuel_vehicle
+            ON erp_fleet_fuel (vehicle_id);
         -- Dept 10 Settings Wave C (items 5 + 6): wipe-export tokens and
         -- deletion tombstones. Both deliberately NOT in _ERP_RESET_TABLES
         -- (see the asserts below): a wipe must not erase the record of
@@ -3938,6 +4188,65 @@ def init_db():
             filed_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL
         );
+        """
+    )
+    # Dept 9 big-company package, module B: monthly budgets. One row per
+    # account per YYYY-MM month; planning data only, never a ledger entry.
+    # Only income/expense accounts are budgeted (see the endpoints below).
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS erp_acct_budgets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            period TEXT NOT NULL,
+            amount_cents INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(account_id, period)
+        );
+        """
+    )
+    # Dept 7 big-company package, module H: ESG metrics (Nov 2026).
+    # Admin-entered sustainability metrics by month -- energy use,
+    # waste, packaging, or any other metric the admin defines. Two
+    # tables: metric definitions (name + unit, free-form -- no metric
+    # is ever invented or seeded) and period values (one row per
+    # metric per YYYY-MM month). Monthly matches how this ERP already
+    # thinks in months -- budgets, BI months, period locks, tax
+    # filings -- and a quarter is just the sum of its three months,
+    # so no second period shape is stored. No baselines, no
+    # benchmarks, no external data: a month with no entered value is
+    # reported as no value, never as zero. Both tables are NOT in
+    # _ERP_RESET_TABLES -- a wipe must never erase admin-entered
+    # metric definitions or their history.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS erp_reports_esg_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            unit TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_reports_esg_values (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            metric_id INTEGER NOT NULL,
+            period TEXT NOT NULL,
+            value REAL NOT NULL,
+            note TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            UNIQUE(metric_id, period)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_reports_esg_values_metric
+            ON erp_reports_esg_values (metric_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_reports_esg_values_period
+            ON erp_reports_esg_values (period);
         """
     )
     conn.executescript("""
@@ -15814,6 +16123,489 @@ def hc_unassigned():
     return jsonify(employees=out)
 
 
+# ---------------- Training records (Dept 12, Module D, Nov 2026) ----------------
+# Admin-defined courses + per-employee completion records. Admin-only via
+# _require_erp_admin(), like the rest of HR. Courses are never seeded and
+# nobody is ever auto-marked trained; a completion links to a real ERP
+# employee only. Expiry is computed, never stored as a status: a
+# completion's expiry_date is completed_date + the course's expiry_months
+# (unless the admin types one), and expiry_status (none / current /
+# due_soon / expired) is derived from stored dates vs today (UTC) on
+# every read. Deleting a course is refused (409) while completions are
+# attached, like a job role with applicants; deactivation is allowed and
+# blocks new completions but keeps history. Deleting a completion is
+# allowed -- it is a record entry, not a standing register item. The
+# onboarding "Training done" tick is untouched (SOP 12.3): it stays a
+# manual checklist tick; the record lives here.
+def _training_today():
+    return datetime.now(timezone.utc).date()
+
+
+def _training_add_months(d, months):
+    """d + months calendar months, clamped to the last day of the month."""
+    import calendar
+    total = (d.year * 12 + (d.month - 1)) + int(months)
+    year, month = divmod(total, 12)
+    month += 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return datetime(year, month, day).date()
+
+
+def _training_expiry_status(expiry_date, today=None):
+    """none / current / due_soon (expires within 30 days) / expired,
+    computed from the stored expiry_date vs today. Never stored."""
+    if not expiry_date:
+        return "none"
+    today = today or _training_today()
+    try:
+        exp = datetime.strptime(expiry_date, "%Y-%m-%d").date()
+    except ValueError:
+        return "none"
+    if exp < today:
+        return "expired"
+    if (exp - today).days <= 30:
+        return "due_soon"
+    return "current"
+
+
+def _training_course_row(conn, course_id):
+    try:
+        course_id = int(course_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute(
+        "SELECT * FROM erp_hr_training_courses WHERE id = ?",
+        (course_id,)).fetchone()
+
+
+def _training_course_dict(conn, row):
+    d = dict(row)
+    d["active"] = bool(d["active"])
+    d["completion_count"] = int(conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_training_completions WHERE course_id = ?",
+        (row["id"],)).fetchone()[0])
+    return d
+
+
+def _training_completion_dict(conn, row):
+    d = dict(row)
+    emp = conn.execute(
+        "SELECT name FROM erp_hr_employees WHERE id = ?",
+        (row["employee_id"],)).fetchone()
+    course = conn.execute(
+        "SELECT title FROM erp_hr_training_courses WHERE id = ?",
+        (row["course_id"],)).fetchone()
+    d["employee_name"] = emp["name"] if emp else ""
+    d["course_title"] = course["title"] if course else ""
+    d["expiry_status"] = _training_expiry_status(row["expiry_date"])
+    return d
+
+
+def _training_validate_expiry_months(data):
+    """Whole months 1-120, or None for no expiry. Returns (value, error)."""
+    raw = data.get("expiry_months")
+    if raw in ("", None):
+        return None, None
+    try:
+        months = int(raw)
+    except (TypeError, ValueError):
+        return None, "expiry_months must be a whole number of months"
+    if months < 1 or months > 120:
+        return None, "expiry_months must be between 1 and 120"
+    return months, None
+
+
+@app.get("/api/erp/hr/training/courses")
+def hr_training_courses_list():
+    """All training courses, with completion counts. Starts empty."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_training_courses ORDER BY active DESC,"
+        " lower(title), id").fetchall()
+    out = [_training_course_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(courses=out)
+
+
+@app.post("/api/erp/hr/training/courses")
+def hr_training_course_create():
+    """Add a training course. Only the title is required; expiry_months
+    is the re-training period in whole months, blank = never expires."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    title = (data.get("title") or "").strip()
+    if not title:
+        conn.close()
+        return jsonify(error="title is required"), 400
+    if len(title) > 200:
+        conn.close()
+        return jsonify(error="title must be 200 characters or fewer"), 400
+    description = (data.get("description") or "").strip()
+    if len(description) > 5000:
+        conn.close()
+        return jsonify(error="description must be 5000 characters or fewer"), 400
+    months, m_err = _training_validate_expiry_months(data)
+    if m_err:
+        conn.close()
+        return jsonify(error=m_err), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_training_courses (title, description,"
+        " expiry_months, active, created_by, created_at, updated_by,"
+        " updated_at) VALUES (?, ?, ?, 1, ?, ?, ?, ?)",
+        (title, description, months, actor, now, actor, now))
+    row = _training_course_row(conn, cur.lastrowid)
+    out = _training_course_dict(conn, row)
+    _erp_staff_audit(conn, actor, "hr.training_course_created",
+                     "hr_training_course", row["id"],
+                     "created training course %s" % title)
+    conn.commit()
+    conn.close()
+    return jsonify(course=out), 201
+
+
+@app.post("/api/erp/hr/training/courses/<int:course_id>/update")
+def hr_training_course_update(course_id):
+    """Edit a course (title, description, expiry_months, active).
+    Deactivation is allowed any time; it blocks new completions."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _training_course_row(conn, course_id)
+    if not row:
+        conn.close()
+        return jsonify(error="course not found"), 404
+    sets, args, changes = [], [], []
+    if "title" in data:
+        title = (data.get("title") or "").strip()
+        if not title:
+            conn.close()
+            return jsonify(error="title is required"), 400
+        if len(title) > 200:
+            conn.close()
+            return jsonify(error="title must be 200 characters or fewer"), 400
+        if title != row["title"]:
+            sets.append("title = ?")
+            args.append(title)
+            changes.append("title updated")
+    if "description" in data:
+        description = (data.get("description") or "").strip()
+        if len(description) > 5000:
+            conn.close()
+            return jsonify(error="description must be 5000 characters or fewer"), 400
+        if description != (row["description"] or ""):
+            sets.append("description = ?")
+            args.append(description)
+            changes.append("description updated")
+    if "expiry_months" in data:
+        months, m_err = _training_validate_expiry_months(data)
+        if m_err:
+            conn.close()
+            return jsonify(error=m_err), 400
+        if months != row["expiry_months"]:
+            sets.append("expiry_months = ?")
+            args.append(months)
+            changes.append("expiry_months updated")
+    if "active" in data:
+        active = 1 if data.get("active") else 0
+        if active != (1 if row["active"] else 0):
+            sets.append("active = ?")
+            args.append(active)
+            changes.append("active: %s -> %s"
+                           % (1 if row["active"] else 0, active))
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(course_id)
+        conn.execute("UPDATE erp_hr_training_courses SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "hr.training_course_updated",
+                         "hr_training_course", course_id,
+                         "%s: %s" % (row["title"] or "", "; ".join(changes)))
+        conn.commit()
+    out = _training_course_dict(conn, _training_course_row(conn, course_id))
+    conn.close()
+    return jsonify(course=out)
+
+
+@app.delete("/api/erp/hr/training/courses/<int:course_id>")
+def hr_training_course_delete(course_id):
+    """Delete a course. Refused (409) while any completion is attached;
+    delete the completions first. History is never silently dropped."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _training_course_row(conn, course_id)
+    if not row:
+        conn.close()
+        return jsonify(error="course not found"), 404
+    count = conn.execute(
+        "SELECT COUNT(*) FROM erp_hr_training_completions WHERE course_id = ?",
+        (course_id,)).fetchone()[0]
+    if count:
+        conn.close()
+        return jsonify(error="cannot delete a course with completions"
+                       " (%d completion(s) attached)" % count), 409
+    conn.execute("DELETE FROM erp_hr_training_courses WHERE id = ?",
+                 (course_id,))
+    _erp_staff_audit(conn, actor, "hr.training_course_deleted",
+                     "hr_training_course", course_id,
+                     "deleted training course %s" % (row["title"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+def _training_completion_expiry(course, completed_date, expiry_date):
+    """The stored expiry_date for a completion: the admin-typed date
+    when given, else completed_date + the course's expiry_months, else
+    blank (no expiry)."""
+    if expiry_date:
+        return expiry_date
+    if course["expiry_months"] is None:
+        return ""
+    done = datetime.strptime(completed_date, "%Y-%m-%d").date()
+    return _training_add_months(done, course["expiry_months"]).isoformat()
+
+
+@app.get("/api/erp/hr/training/completions")
+def hr_training_completions_list():
+    """All completion records, with employee + course names and the
+    computed expiry_status. ?status=expired|due_soon|current|none
+    filters by that status; ?employee_id= and ?course_id= filter too."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    status = (request.args.get("status") or "").strip()
+    employee_id = request.args.get("employee_id")
+    course_id = request.args.get("course_id")
+    q = "SELECT * FROM erp_hr_training_completions"
+    conds, args = [], []
+    if employee_id not in (None, ""):
+        try:
+            conds.append("employee_id = ?")
+            args.append(int(employee_id))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="employee_id must be an employee id"), 400
+    if course_id not in (None, ""):
+        try:
+            conds.append("course_id = ?")
+            args.append(int(course_id))
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="course_id must be a course id"), 400
+    if conds:
+        q += " WHERE " + " AND ".join(conds)
+    q += " ORDER BY completed_date DESC, id DESC"
+    rows = conn.execute(q, args).fetchall()
+    out = [_training_completion_dict(conn, r) for r in rows]
+    if status in ("expired", "due_soon", "current", "none"):
+        out = [c for c in out if c["expiry_status"] == status]
+    conn.close()
+    return jsonify(completions=out)
+
+
+@app.get("/api/erp/hr/training/overdue")
+def hr_training_overdue():
+    """Expiry / overdue list: expired completions and ones due within
+    30 days, each with the employee and course names. Computed from
+    stored dates vs today on every read."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_training_completions"
+        " WHERE expiry_date != '' ORDER BY expiry_date, id").fetchall()
+    out = [_training_completion_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(expired=[c for c in out if c["expiry_status"] == "expired"],
+                   due_soon=[c for c in out
+                             if c["expiry_status"] == "due_soon"])
+
+
+@app.post("/api/erp/hr/training/completions")
+def hr_training_completion_create():
+    """Record a completion. Employee and course must exist; the course
+    must be active. completed_date is required (YYYY-MM-DD); expiry_date
+    is optional and defaults to completed_date + the course's
+    expiry_months. certificate is an optional reference (e.g. a file
+    name or number) -- the ERP stores no certificate files."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    try:
+        employee_id = int(data.get("employee_id"))
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="employee_id must be an employee id"), 400
+    if not conn.execute("SELECT id FROM erp_hr_employees WHERE id = ?",
+                        (employee_id,)).fetchone():
+        conn.close()
+        return jsonify(error="employee not found"), 400
+    course = _training_course_row(conn, data.get("course_id"))
+    if not course:
+        conn.close()
+        return jsonify(error="course not found"), 400
+    if not course["active"]:
+        conn.close()
+        return jsonify(error="course is inactive"), 400
+    completed_date = (data.get("completed_date") or "").strip()
+    if not completed_date or not _legal_valid_date(completed_date):
+        conn.close()
+        return jsonify(error="completed_date must be YYYY-MM-DD"), 400
+    expiry_date = (data.get("expiry_date") or "").strip()
+    if expiry_date and not _legal_valid_date(expiry_date):
+        conn.close()
+        return jsonify(error="expiry_date must be YYYY-MM-DD"), 400
+    expiry_date = _training_completion_expiry(course, completed_date,
+                                              expiry_date)
+    certificate = (data.get("certificate") or "").strip()
+    notes = (data.get("notes") or "").strip()
+    if len(certificate) > 500 or len(notes) > 5000:
+        conn.close()
+        return jsonify(error="certificate must be 500 characters or fewer"
+                       " and notes 5000 or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_training_completions (employee_id, course_id,"
+        " completed_date, expiry_date, certificate, notes, created_by,"
+        " created_at, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?,"
+        " ?, ?, ?, ?)",
+        (employee_id, course["id"], completed_date, expiry_date,
+         certificate, notes, actor, now, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_hr_training_completions WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    out = _training_completion_dict(conn, row)
+    _erp_staff_audit(conn, actor, "hr.training_completion_created",
+                     "hr_training_completion", row["id"],
+                     "recorded %s for employee %d"
+                     % (course["title"] or "", employee_id))
+    conn.commit()
+    conn.close()
+    return jsonify(completion=out), 201
+
+
+@app.post("/api/erp/hr/training/completions/<int:completion_id>/update")
+def hr_training_completion_update(completion_id):
+    """Edit a completion. Changing completed_date without typing an
+    expiry_date re-derives it from the course's expiry_months."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_hr_training_completions WHERE id = ?",
+        (completion_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="completion not found"), 404
+    course = _training_course_row(conn, row["course_id"])
+    sets, args, changes = [], [], []
+    completed_date = row["completed_date"]
+    if "completed_date" in data:
+        completed_date = (data.get("completed_date") or "").strip()
+        if not completed_date or not _legal_valid_date(completed_date):
+            conn.close()
+            return jsonify(error="completed_date must be YYYY-MM-DD"), 400
+        if completed_date != row["completed_date"]:
+            sets.append("completed_date = ?")
+            args.append(completed_date)
+            changes.append("completed_date updated")
+    if "expiry_date" in data:
+        expiry_date = (data.get("expiry_date") or "").strip()
+        if expiry_date and not _legal_valid_date(expiry_date):
+            conn.close()
+            return jsonify(error="expiry_date must be YYYY-MM-DD"), 400
+        if expiry_date != (row["expiry_date"] or ""):
+            sets.append("expiry_date = ?")
+            args.append(expiry_date)
+            changes.append("expiry_date updated")
+    elif "completed_date" in data and completed_date != row["completed_date"]:
+        # Re-derive the expiry from the (possibly new) completed date.
+        derived = _training_completion_expiry(course, completed_date, "")
+        if derived != (row["expiry_date"] or ""):
+            sets.append("expiry_date = ?")
+            args.append(derived)
+            changes.append("expiry_date re-derived")
+    if "certificate" in data:
+        certificate = (data.get("certificate") or "").strip()
+        if len(certificate) > 500:
+            conn.close()
+            return jsonify(error="certificate must be 500 characters or fewer"), 400
+        if certificate != (row["certificate"] or ""):
+            sets.append("certificate = ?")
+            args.append(certificate)
+            changes.append("certificate updated")
+    if "notes" in data:
+        notes = (data.get("notes") or "").strip()
+        if len(notes) > 5000:
+            conn.close()
+            return jsonify(error="notes must be 5000 characters or fewer"), 400
+        if notes != (row["notes"] or ""):
+            sets.append("notes = ?")
+            args.append(notes)
+            changes.append("notes updated")
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(completion_id)
+        conn.execute("UPDATE erp_hr_training_completions SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "hr.training_completion_updated",
+                         "hr_training_completion", completion_id,
+                         "; ".join(changes))
+        conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_hr_training_completions WHERE id = ?",
+        (completion_id,)).fetchone()
+    out = _training_completion_dict(conn, row)
+    conn.close()
+    return jsonify(completion=out)
+
+
+@app.delete("/api/erp/hr/training/completions/<int:completion_id>")
+def hr_training_completion_delete(completion_id):
+    """Delete one completion record. Allowed: a completion is a record
+    entry, not a standing register item. The course is untouched."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_hr_training_completions WHERE id = ?",
+        (completion_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="completion not found"), 404
+    conn.execute("DELETE FROM erp_hr_training_completions WHERE id = ?",
+                 (completion_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
 @app.get("/api/erp/hr/employees/<int:employee_id>/offboarding")
 def hr_get_offboarding(employee_id):
     """The employee's offboarding record (with its items), or null
@@ -19420,6 +20212,1095 @@ def quality_sop_delete(sop_id):
     return jsonify(deleted=sop_id)
 
 
+# ---------------- Equipment calibration (Dept 13, Module E, Nov 2026) ----------------
+# Equipment register + calibration records. Admin-only via
+# _require_erp_admin(), like the rest of Quality. Nothing is
+# pre-registered; the admin adds equipment. A calibration record's
+# due_date drives the due/overdue list: due_status (current / due_soon
+# within 30 days / overdue) is computed from stored dates vs today
+# (UTC) on every read, never stored. Deleting equipment is refused
+# (409) while calibration records are attached, like a job role with
+# applicants. Deleting a calibration record is allowed -- it is a
+# record entry, not a standing register item.
+_CALIB_RESULTS = ("pass", "fail", "adjusted")
+
+
+def _cal_due_status(due_date, today=None):
+    """current / due_soon (due within 30 days) / overdue, computed from
+    the stored due_date vs today. Never stored."""
+    if not due_date:
+        return "current"
+    today = today or _training_today()
+    try:
+        due = datetime.strptime(due_date, "%Y-%m-%d").date()
+    except ValueError:
+        return "current"
+    if due < today:
+        return "overdue"
+    if (due - today).days <= 30:
+        return "due_soon"
+    return "current"
+
+
+def _cal_equipment_row(conn, equipment_id):
+    try:
+        equipment_id = int(equipment_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute(
+        "SELECT * FROM erp_quality_equipment WHERE id = ?",
+        (equipment_id,)).fetchone()
+
+
+def _cal_equipment_dict(conn, row):
+    d = dict(row)
+    d["active"] = bool(d["active"])
+    cal = conn.execute(
+        "SELECT * FROM erp_quality_calibrations WHERE equipment_id = ?"
+        " ORDER BY due_date DESC, calibration_date DESC, id DESC",
+        (row["id"],)).fetchall()
+    d["calibration_count"] = len(cal)
+    d["latest_calibration"] = (_cal_record_dict(cal[0])
+                               if cal else None)
+    # Due/overdue is driven by the LATEST calibration's due date.
+    d["due_status"] = (_cal_due_status(cal[0]["due_date"])
+                       if cal else "none")
+    d["due_date"] = cal[0]["due_date"] if cal else ""
+    return d
+
+
+def _cal_record_dict(row):
+    d = dict(row)
+    d["due_status"] = _cal_due_status(row["due_date"])
+    return d
+
+
+@app.get("/api/erp/quality/equipment")
+def quality_equipment_list():
+    """All equipment, with calibration counts and the due status driven
+    by each item's latest calibration. Starts empty."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_quality_equipment ORDER BY active DESC,"
+        " lower(name), id").fetchall()
+    out = [_cal_equipment_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(equipment=out)
+
+
+@app.post("/api/erp/quality/equipment")
+def quality_equipment_create():
+    """Add equipment. Only the name is required; type (scales,
+    thermometers, etc.), location and serial are free text, serial
+    optional."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    name = (data.get("name") or "").strip()
+    if not name:
+        conn.close()
+        return jsonify(error="name is required"), 400
+    if len(name) > 200:
+        conn.close()
+        return jsonify(error="name must be 200 characters or fewer"), 400
+    etype = (data.get("type") or "").strip()
+    location = (data.get("location") or "").strip()
+    serial = (data.get("serial") or "").strip()
+    if len(etype) > 100 or len(location) > 200 or len(serial) > 100:
+        conn.close()
+        return jsonify(error="type must be 100 characters or fewer,"
+                       " location 200 or fewer, serial 100 or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_equipment (name, type, location, serial,"
+        " active, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
+        (name, etype, location, serial, actor, now, actor, now))
+    row = _cal_equipment_row(conn, cur.lastrowid)
+    out = _cal_equipment_dict(conn, row)
+    _erp_staff_audit(conn, actor, "quality.equipment_created",
+                     "quality_equipment", row["id"],
+                     "added equipment %s" % name)
+    conn.commit()
+    conn.close()
+    return jsonify(equipment=out), 201
+
+
+@app.post("/api/erp/quality/equipment/<int:equipment_id>/update")
+def quality_equipment_update(equipment_id):
+    """Edit equipment (name, type, location, serial, active).
+    Deactivation is allowed any time; it blocks new calibrations."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _cal_equipment_row(conn, equipment_id)
+    if not row:
+        conn.close()
+        return jsonify(error="equipment not found"), 404
+    sets, args, changes = [], [], []
+    for field, limit in (("name", 200), ("type", 100),
+                         ("location", 200), ("serial", 100)):
+        if field in data:
+            value = (data.get(field) or "").strip()
+            if field == "name" and not value:
+                conn.close()
+                return jsonify(error="name is required"), 400
+            if len(value) > limit:
+                conn.close()
+                return jsonify(error="%s must be %d characters or fewer"
+                               % (field, limit)), 400
+            if value != (row[field] or ""):
+                sets.append("%s = ?" % field)
+                args.append(value)
+                changes.append("%s updated" % field)
+    if "active" in data:
+        active = 1 if data.get("active") else 0
+        if active != (1 if row["active"] else 0):
+            sets.append("active = ?")
+            args.append(active)
+            changes.append("active: %s -> %s"
+                           % (1 if row["active"] else 0, active))
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(equipment_id)
+        conn.execute("UPDATE erp_quality_equipment SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "quality.equipment_updated",
+                         "quality_equipment", equipment_id,
+                         "%s: %s" % (row["name"] or "", "; ".join(changes)))
+        conn.commit()
+    out = _cal_equipment_dict(conn, _cal_equipment_row(conn, equipment_id))
+    conn.close()
+    return jsonify(equipment=out)
+
+
+@app.delete("/api/erp/quality/equipment/<int:equipment_id>")
+def quality_equipment_delete(equipment_id):
+    """Delete equipment. Refused (409) while calibration records are
+    attached; delete the records first. History is never silently
+    dropped."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _cal_equipment_row(conn, equipment_id)
+    if not row:
+        conn.close()
+        return jsonify(error="equipment not found"), 404
+    count = conn.execute(
+        "SELECT COUNT(*) FROM erp_quality_calibrations WHERE equipment_id = ?",
+        (equipment_id,)).fetchone()[0]
+    if count:
+        conn.close()
+        return jsonify(error="cannot delete equipment with calibration"
+                       " records (%d record(s) attached)" % count), 409
+    conn.execute("DELETE FROM erp_quality_equipment WHERE id = ?",
+                 (equipment_id,))
+    _erp_staff_audit(conn, actor, "quality.equipment_deleted",
+                     "quality_equipment", equipment_id,
+                     "deleted equipment %s" % (row["name"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/quality/equipment/<int:equipment_id>/calibrations")
+def quality_calibrations_list(equipment_id):
+    """All calibration records for one piece of equipment, newest due
+    date first, each with its computed due_status."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _cal_equipment_row(conn, equipment_id)
+    if not row:
+        conn.close()
+        return jsonify(error="equipment not found"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_quality_calibrations WHERE equipment_id = ?"
+        " ORDER BY due_date DESC, calibration_date DESC, id DESC",
+        (equipment_id,)).fetchall()
+    out = [_cal_record_dict(r) for r in rows]
+    equip = _cal_equipment_dict(conn, row)
+    conn.close()
+    return jsonify(equipment=equip, calibrations=out)
+
+
+@app.post("/api/erp/quality/equipment/<int:equipment_id>/calibrations")
+def quality_calibration_create(equipment_id):
+    """Record a calibration. calibration_date and due_date are required
+    (YYYY-MM-DD); result is pass / fail / adjusted; performed_by is the
+    admin-entered name of whoever calibrated it."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _cal_equipment_row(conn, equipment_id)
+    if not row:
+        conn.close()
+        return jsonify(error="equipment not found"), 404
+    if not row["active"]:
+        conn.close()
+        return jsonify(error="equipment is inactive"), 400
+    calibration_date = (data.get("calibration_date") or "").strip()
+    due_date = (data.get("due_date") or "").strip()
+    if not calibration_date or not _legal_valid_date(calibration_date):
+        conn.close()
+        return jsonify(error="calibration_date must be YYYY-MM-DD"), 400
+    if not due_date or not _legal_valid_date(due_date):
+        conn.close()
+        return jsonify(error="due_date must be YYYY-MM-DD"), 400
+    result = (data.get("result") or "pass").strip().lower()
+    if result not in _CALIB_RESULTS:
+        conn.close()
+        return jsonify(error="result must be pass, fail or adjusted"), 400
+    performed_by = (data.get("performed_by") or "").strip()
+    if not performed_by:
+        conn.close()
+        return jsonify(error="performed_by is required"), 400
+    if len(performed_by) > 200:
+        conn.close()
+        return jsonify(error="performed_by must be 200 characters or fewer"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        conn.close()
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_calibrations (equipment_id,"
+        " calibration_date, due_date, result, performed_by, notes,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (equipment_id, calibration_date, due_date, result, performed_by,
+         notes, actor, now, actor, now))
+    cal = conn.execute(
+        "SELECT * FROM erp_quality_calibrations WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    _erp_staff_audit(conn, actor, "quality.calibration_created",
+                     "quality_calibration", cal["id"],
+                     "calibrated %s (%s)" % (row["name"] or "", result))
+    conn.commit()
+    conn.close()
+    return jsonify(calibration=_cal_record_dict(cal)), 201
+
+
+@app.post("/api/erp/quality/calibrations/<int:calibration_id>/update")
+def quality_calibration_update(calibration_id):
+    """Edit a calibration record (dates, result, performed_by, notes)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_calibrations WHERE id = ?",
+        (calibration_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="calibration not found"), 404
+    sets, args, changes = [], [], []
+    for field in ("calibration_date", "due_date"):
+        if field in data:
+            value = (data.get(field) or "").strip()
+            if not value or not _legal_valid_date(value):
+                conn.close()
+                return jsonify(error="%s must be YYYY-MM-DD" % field), 400
+            if value != row[field]:
+                sets.append("%s = ?" % field)
+                args.append(value)
+                changes.append("%s updated" % field)
+    if "result" in data:
+        result = (data.get("result") or "").strip().lower()
+        if result not in _CALIB_RESULTS:
+            conn.close()
+            return jsonify(error="result must be pass, fail or adjusted"), 400
+        if result != row["result"]:
+            sets.append("result = ?")
+            args.append(result)
+            changes.append("result updated")
+    for field, limit in (("performed_by", 200), ("notes", 5000)):
+        if field in data:
+            value = (data.get(field) or "").strip()
+            if field == "performed_by" and not value:
+                conn.close()
+                return jsonify(error="performed_by is required"), 400
+            if len(value) > limit:
+                conn.close()
+                return jsonify(error="%s must be %d characters or fewer"
+                               % (field, limit)), 400
+            if value != (row[field] or ""):
+                sets.append("%s = ?" % field)
+                args.append(value)
+                changes.append("%s updated" % field)
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(calibration_id)
+        conn.execute("UPDATE erp_quality_calibrations SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "quality.calibration_updated",
+                         "quality_calibration", calibration_id,
+                         "; ".join(changes))
+        conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_calibrations WHERE id = ?",
+        (calibration_id,)).fetchone()
+    conn.close()
+    return jsonify(calibration=_cal_record_dict(row))
+
+
+@app.delete("/api/erp/quality/calibrations/<int:calibration_id>")
+def quality_calibration_delete(calibration_id):
+    """Delete one calibration record. Allowed: a calibration is a
+    record entry, not a standing register item. The equipment is
+    untouched."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_calibrations WHERE id = ?",
+        (calibration_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="calibration not found"), 404
+    conn.execute("DELETE FROM erp_quality_calibrations WHERE id = ?",
+                 (calibration_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/quality/calibrations/due")
+def quality_calibrations_due():
+    """Due / overdue list: every calibration whose due date is past or
+    within 30 days, with the equipment name. Computed from stored due
+    dates vs today on every read. The latest calibration per item is
+    what counts -- an older overdue record is superseded by a newer
+    calibration, so only the latest record per equipment is listed."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT c.*, e.name AS equipment_name FROM erp_quality_calibrations c"
+        " JOIN erp_quality_equipment e ON e.id = c.equipment_id"
+        " WHERE c.id IN (SELECT MAX(id) FROM erp_quality_calibrations"
+        " GROUP BY equipment_id)"
+        " ORDER BY c.due_date, c.id").fetchall()
+    out = []
+    for r in rows:
+        d = _cal_record_dict(r)
+        d["equipment_name"] = r["equipment_name"] or ""
+        if d["due_status"] in ("overdue", "due_soon"):
+            out.append(d)
+    conn.close()
+    return jsonify(overdue=[c for c in out if c["due_status"] == "overdue"],
+                   due_soon=[c for c in out if c["due_status"] == "due_soon"])
+
+
+# ---------------- Internal audit program (Dept 13, Module F, Nov 2026) ----------------
+# Quality audit program: scheduled audits (date, SOP scope, auditor),
+# a checklist per audit, findings, and corrective actions with owners
+# and due dates. Admin-only via _require_erp_admin(), like the rest of
+# Quality. Auditor and action owners are free-text admin-entered names
+# (an auditor may be an external consultant with no ERP login); no
+# auditor is ever invented. Scope is a comma-separated list of SOP
+# numbers; each must be well-formed (N.N) and, when the SOP Library has
+# been imported, must exist there. Deleting an audit is refused (409)
+# while findings or checklist items are attached; deleting a finding
+# is refused (409) while corrective actions are attached; deleting a
+# corrective action or a checklist item is allowed. This is NOT the
+# accounting audit log (erp_acct_audit) or the staff audit log -- those
+# stay as-is.
+_AUDIT_STATUSES = ("planned", "in_progress", "completed")
+_FINDING_SEVERITIES = ("minor", "major", "critical")
+_OPEN_DONE = ("open", "done")
+
+
+def _audit_validate_scope(conn, scope):
+    """Scope text -> cleaned list of SOP numbers, or an error string.
+    Each entry must look like N.N; when the SOP Library holds any
+    rows, each number must exist in it."""
+    parts = [p.strip() for p in (scope or "").split(",")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return None, "scope is required (one or more SOP numbers, e.g. 13.1, 13.6)"
+    for p in parts:
+        if not re.match(r"^\d+\.\d+$", p):
+            return None, "scope entries must be SOP numbers like 13.1"
+    has_library = conn.execute(
+        "SELECT COUNT(*) FROM erp_quality_sops").fetchone()[0] > 0
+    if has_library:
+        known = {r[0] for r in conn.execute(
+            "SELECT number FROM erp_quality_sops WHERE number != ''"
+            ).fetchall()}
+        missing = [p for p in parts if p not in known]
+        if missing:
+            return None, ("scope references SOP(s) not in the SOP Library: "
+                          + ", ".join(missing))
+    return ", ".join(parts), None
+
+
+def _audit_dict(conn, row, nested=False):
+    d = dict(row)
+    if nested:
+        items = conn.execute(
+            "SELECT * FROM erp_quality_audit_checklist WHERE audit_id = ?"
+            " ORDER BY id", (row["id"],)).fetchall()
+        d["checklist"] = [dict(i) for i in items]
+        d["checklist_done"] = sum(1 for i in items if i["done"])
+        d["checklist_total"] = len(items)
+        findings = conn.execute(
+            "SELECT * FROM erp_quality_audit_findings WHERE audit_id = ?"
+            " ORDER BY id", (row["id"],)).fetchall()
+        flist = []
+        for f in findings:
+            fd = dict(f)
+            actions = conn.execute(
+                "SELECT * FROM erp_quality_audit_actions WHERE finding_id = ?"
+                " ORDER BY due_date, id", (f["id"],)).fetchall()
+            fd["actions"] = [dict(a) for a in actions]
+            fd["open_actions"] = sum(1 for a in actions
+                                     if a["status"] == "open")
+            flist.append(fd)
+        d["findings"] = flist
+        d["finding_count"] = len(flist)
+        d["open_findings"] = sum(1 for f in flist if f["status"] == "open")
+        d["open_actions"] = sum(f["open_actions"] for f in flist)
+    else:
+        d["finding_count"] = int(conn.execute(
+            "SELECT COUNT(*) FROM erp_quality_audit_findings"
+            " WHERE audit_id = ?", (row["id"],)).fetchone()[0])
+        d["open_findings"] = int(conn.execute(
+            "SELECT COUNT(*) FROM erp_quality_audit_findings"
+            " WHERE audit_id = ? AND status = 'open'",
+            (row["id"],)).fetchone()[0])
+        d["open_actions"] = int(conn.execute(
+            "SELECT COUNT(*) FROM erp_quality_audit_actions a"
+            " JOIN erp_quality_audit_findings f ON f.id = a.finding_id"
+            " WHERE f.audit_id = ? AND a.status = 'open'",
+            (row["id"],)).fetchone()[0])
+    return d
+
+
+@app.get("/api/erp/quality/audits")
+def quality_audits_list():
+    """All internal audits, newest first, with finding/action counts.
+    Starts empty."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_quality_audits ORDER BY audit_date DESC, id DESC"
+        ).fetchall()
+    out = [_audit_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(audits=out)
+
+
+@app.post("/api/erp/quality/audits")
+def quality_audit_create():
+    """Schedule an internal audit. audit_date, scope (SOP numbers) and
+    auditor are required; status starts planned unless given."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    audit_date = (data.get("audit_date") or "").strip()
+    if not audit_date or not _legal_valid_date(audit_date):
+        conn.close()
+        return jsonify(error="audit_date must be YYYY-MM-DD"), 400
+    scope, s_err = _audit_validate_scope(conn, data.get("scope") or "")
+    if s_err:
+        conn.close()
+        return jsonify(error=s_err), 400
+    auditor = (data.get("auditor") or "").strip()
+    if not auditor:
+        conn.close()
+        return jsonify(error="auditor is required"), 400
+    if len(auditor) > 200:
+        conn.close()
+        return jsonify(error="auditor must be 200 characters or fewer"), 400
+    status = (data.get("status") or "planned").strip().lower()
+    if status not in _AUDIT_STATUSES:
+        conn.close()
+        return jsonify(error="status must be planned, in_progress or completed"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        conn.close()
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_audits (audit_date, scope, auditor,"
+        " status, notes, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (audit_date, scope, auditor, status, notes, actor, now, actor, now))
+    row = conn.execute("SELECT * FROM erp_quality_audits WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    out = _audit_dict(conn, row)
+    _erp_staff_audit(conn, actor, "quality.audit_created",
+                     "quality_audit", row["id"],
+                     "scheduled audit %s (%s)" % (audit_date, scope))
+    conn.commit()
+    conn.close()
+    return jsonify(audit=out), 201
+
+
+@app.get("/api/erp/quality/audits/<int:audit_id>")
+def quality_audit_get(audit_id):
+    """One audit with its checklist, findings and corrective actions."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_quality_audits WHERE id = ?",
+                       (audit_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="audit not found"), 404
+    out = _audit_dict(conn, row, nested=True)
+    conn.close()
+    return jsonify(audit=out)
+
+
+@app.post("/api/erp/quality/audits/<int:audit_id>/update")
+def quality_audit_update(audit_id):
+    """Edit an audit (date, scope, auditor, status, notes)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_quality_audits WHERE id = ?",
+                       (audit_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="audit not found"), 404
+    sets, args, changes = [], [], []
+    if "audit_date" in data:
+        audit_date = (data.get("audit_date") or "").strip()
+        if not audit_date or not _legal_valid_date(audit_date):
+            conn.close()
+            return jsonify(error="audit_date must be YYYY-MM-DD"), 400
+        if audit_date != row["audit_date"]:
+            sets.append("audit_date = ?")
+            args.append(audit_date)
+            changes.append("audit_date updated")
+    if "scope" in data:
+        scope, s_err = _audit_validate_scope(conn, data.get("scope") or "")
+        if s_err:
+            conn.close()
+            return jsonify(error=s_err), 400
+        if scope != row["scope"]:
+            sets.append("scope = ?")
+            args.append(scope)
+            changes.append("scope updated")
+    if "auditor" in data:
+        auditor = (data.get("auditor") or "").strip()
+        if not auditor:
+            conn.close()
+            return jsonify(error="auditor is required"), 400
+        if len(auditor) > 200:
+            conn.close()
+            return jsonify(error="auditor must be 200 characters or fewer"), 400
+        if auditor != row["auditor"]:
+            sets.append("auditor = ?")
+            args.append(auditor)
+            changes.append("auditor updated")
+    if "status" in data:
+        status = (data.get("status") or "").strip().lower()
+        if status not in _AUDIT_STATUSES:
+            conn.close()
+            return jsonify(error="status must be planned, in_progress or completed"), 400
+        if status != row["status"]:
+            sets.append("status = ?")
+            args.append(status)
+            changes.append("status updated")
+    if "notes" in data:
+        notes = (data.get("notes") or "").strip()
+        if len(notes) > 5000:
+            conn.close()
+            return jsonify(error="notes must be 5000 characters or fewer"), 400
+        if notes != (row["notes"] or ""):
+            sets.append("notes = ?")
+            args.append(notes)
+            changes.append("notes updated")
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(audit_id)
+        conn.execute("UPDATE erp_quality_audits SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "quality.audit_updated",
+                         "quality_audit", audit_id, "; ".join(changes))
+        conn.commit()
+    row = conn.execute("SELECT * FROM erp_quality_audits WHERE id = ?",
+                       (audit_id,)).fetchone()
+    out = _audit_dict(conn, row)
+    conn.close()
+    return jsonify(audit=out)
+
+
+@app.delete("/api/erp/quality/audits/<int:audit_id>")
+def quality_audit_delete(audit_id):
+    """Delete an audit. Refused (409) while checklist items or findings
+    are attached; remove those first. An empty scheduled audit deletes
+    cleanly."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_quality_audits WHERE id = ?",
+                       (audit_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="audit not found"), 404
+    items = conn.execute(
+        "SELECT COUNT(*) FROM erp_quality_audit_checklist WHERE audit_id = ?",
+        (audit_id,)).fetchone()[0]
+    findings = conn.execute(
+        "SELECT COUNT(*) FROM erp_quality_audit_findings WHERE audit_id = ?",
+        (audit_id,)).fetchone()[0]
+    if items or findings:
+        conn.close()
+        return jsonify(error="cannot delete an audit with checklist items"
+                       " or findings (%d item(s), %d finding(s) attached)"
+                       % (items, findings)), 409
+    conn.execute("DELETE FROM erp_quality_audits WHERE id = ?",
+                 (audit_id,))
+    _erp_staff_audit(conn, actor, "quality.audit_deleted",
+                     "quality_audit", audit_id,
+                     "deleted audit %s" % (row["audit_date"] or ""))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/quality/audits/<int:audit_id>/checklist")
+def quality_audit_checklist_add(audit_id):
+    """Add a checklist item to an audit."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not conn.execute("SELECT id FROM erp_quality_audits WHERE id = ?",
+                        (audit_id,)).fetchone():
+        conn.close()
+        return jsonify(error="audit not found"), 404
+    item = (data.get("item") or "").strip()
+    if not item:
+        conn.close()
+        return jsonify(error="item is required"), 400
+    if len(item) > 1000:
+        conn.close()
+        return jsonify(error="item must be 1000 characters or fewer"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        conn.close()
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_audit_checklist (audit_id, item, done,"
+        " notes, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, 0, ?, ?, ?, ?, ?)",
+        (audit_id, item, notes, actor, now, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_checklist WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(item=dict(row)), 201
+
+
+@app.post("/api/erp/quality/audit-checklist/<int:item_id>/update")
+def quality_audit_checklist_update(item_id):
+    """Edit a checklist item (text, done, notes)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_checklist WHERE id = ?",
+        (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="checklist item not found"), 404
+    sets, args, changes = [], [], []
+    if "item" in data:
+        item = (data.get("item") or "").strip()
+        if not item:
+            conn.close()
+            return jsonify(error="item is required"), 400
+        if len(item) > 1000:
+            conn.close()
+            return jsonify(error="item must be 1000 characters or fewer"), 400
+        if item != row["item"]:
+            sets.append("item = ?")
+            args.append(item)
+            changes.append("item updated")
+    if "done" in data:
+        done = 1 if data.get("done") else 0
+        if done != (1 if row["done"] else 0):
+            sets.append("done = ?")
+            args.append(done)
+            changes.append("done: %s -> %s"
+                           % (1 if row["done"] else 0, done))
+    if "notes" in data:
+        notes = (data.get("notes") or "").strip()
+        if len(notes) > 5000:
+            conn.close()
+            return jsonify(error="notes must be 5000 characters or fewer"), 400
+        if notes != (row["notes"] or ""):
+            sets.append("notes = ?")
+            args.append(notes)
+            changes.append("notes updated")
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(item_id)
+        conn.execute("UPDATE erp_quality_audit_checklist SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_checklist WHERE id = ?",
+        (item_id,)).fetchone()
+    conn.close()
+    return jsonify(item=dict(row))
+
+
+@app.delete("/api/erp/quality/audit-checklist/<int:item_id>")
+def quality_audit_checklist_delete(item_id):
+    """Delete one checklist item. Allowed: it is a single checklist
+    line, not a finding."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_checklist WHERE id = ?",
+        (item_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="checklist item not found"), 404
+    conn.execute("DELETE FROM erp_quality_audit_checklist WHERE id = ?",
+                 (item_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/quality/audits/<int:audit_id>/findings")
+def quality_audit_finding_create(audit_id):
+    """Add a finding to an audit. severity is minor / major / critical;
+    status starts open unless given."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not conn.execute("SELECT id FROM erp_quality_audits WHERE id = ?",
+                        (audit_id,)).fetchone():
+        conn.close()
+        return jsonify(error="audit not found"), 404
+    description = (data.get("description") or "").strip()
+    if not description:
+        conn.close()
+        return jsonify(error="description is required"), 400
+    if len(description) > 5000:
+        conn.close()
+        return jsonify(error="description must be 5000 characters or fewer"), 400
+    severity = (data.get("severity") or "minor").strip().lower()
+    if severity not in _FINDING_SEVERITIES:
+        conn.close()
+        return jsonify(error="severity must be minor, major or critical"), 400
+    status = (data.get("status") or "open").strip().lower()
+    if status not in _OPEN_DONE:
+        conn.close()
+        return jsonify(error="status must be open or done"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_audit_findings (audit_id, description,"
+        " severity, status, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (audit_id, description, severity, status, actor, now, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_findings WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    _erp_staff_audit(conn, actor, "quality.audit_finding_created",
+                     "quality_audit_finding", row["id"],
+                     "finding (%s) on audit %d" % (severity, audit_id))
+    conn.commit()
+    conn.close()
+    return jsonify(finding=dict(row)), 201
+
+
+@app.post("/api/erp/quality/audit-findings/<int:finding_id>/update")
+def quality_audit_finding_update(finding_id):
+    """Edit a finding (description, severity, status)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_findings WHERE id = ?",
+        (finding_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="finding not found"), 404
+    sets, args, changes = [], [], []
+    if "description" in data:
+        description = (data.get("description") or "").strip()
+        if not description:
+            conn.close()
+            return jsonify(error="description is required"), 400
+        if len(description) > 5000:
+            conn.close()
+            return jsonify(error="description must be 5000 characters or fewer"), 400
+        if description != row["description"]:
+            sets.append("description = ?")
+            args.append(description)
+            changes.append("description updated")
+    if "severity" in data:
+        severity = (data.get("severity") or "").strip().lower()
+        if severity not in _FINDING_SEVERITIES:
+            conn.close()
+            return jsonify(error="severity must be minor, major or critical"), 400
+        if severity != row["severity"]:
+            sets.append("severity = ?")
+            args.append(severity)
+            changes.append("severity updated")
+    if "status" in data:
+        status = (data.get("status") or "").strip().lower()
+        if status not in _OPEN_DONE:
+            conn.close()
+            return jsonify(error="status must be open or done"), 400
+        if status != row["status"]:
+            sets.append("status = ?")
+            args.append(status)
+            changes.append("status updated")
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(finding_id)
+        conn.execute("UPDATE erp_quality_audit_findings SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "quality.audit_finding_updated",
+                         "quality_audit_finding", finding_id,
+                         "; ".join(changes))
+        conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_findings WHERE id = ?",
+        (finding_id,)).fetchone()
+    conn.close()
+    return jsonify(finding=dict(row))
+
+
+@app.delete("/api/erp/quality/audit-findings/<int:finding_id>")
+def quality_audit_finding_delete(finding_id):
+    """Delete a finding. Refused (409) while corrective actions are
+    attached; delete the actions first."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_findings WHERE id = ?",
+        (finding_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="finding not found"), 404
+    count = conn.execute(
+        "SELECT COUNT(*) FROM erp_quality_audit_actions WHERE finding_id = ?",
+        (finding_id,)).fetchone()[0]
+    if count:
+        conn.close()
+        return jsonify(error="cannot delete a finding with corrective"
+                       " actions (%d action(s) attached)" % count), 409
+    conn.execute("DELETE FROM erp_quality_audit_findings WHERE id = ?",
+                 (finding_id,))
+    _erp_staff_audit(conn, actor, "quality.audit_finding_deleted",
+                     "quality_audit_finding", finding_id,
+                     "deleted finding on audit %d" % row["audit_id"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/quality/audit-findings/<int:finding_id>/actions")
+def quality_audit_action_create(finding_id):
+    """Add a corrective action to a finding. Owner is a free-text
+    admin-entered name; due_date is YYYY-MM-DD; status starts open."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    if not conn.execute("SELECT id FROM erp_quality_audit_findings"
+                        " WHERE id = ?", (finding_id,)).fetchone():
+        conn.close()
+        return jsonify(error="finding not found"), 404
+    description = (data.get("description") or "").strip()
+    if not description:
+        conn.close()
+        return jsonify(error="description is required"), 400
+    if len(description) > 5000:
+        conn.close()
+        return jsonify(error="description must be 5000 characters or fewer"), 400
+    owner = (data.get("owner") or "").strip()
+    if not owner:
+        conn.close()
+        return jsonify(error="owner is required"), 400
+    if len(owner) > 200:
+        conn.close()
+        return jsonify(error="owner must be 200 characters or fewer"), 400
+    due_date = (data.get("due_date") or "").strip()
+    if not due_date or not _legal_valid_date(due_date):
+        conn.close()
+        return jsonify(error="due_date must be YYYY-MM-DD"), 400
+    status = (data.get("status") or "open").strip().lower()
+    if status not in _OPEN_DONE:
+        conn.close()
+        return jsonify(error="status must be open or done"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_audit_actions (finding_id, description,"
+        " owner, due_date, status, created_by, created_at, updated_by,"
+        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (finding_id, description, owner, due_date, status, actor, now,
+         actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_actions WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(action=dict(row)), 201
+
+
+@app.post("/api/erp/quality/audit-actions/<int:action_id>/update")
+def quality_audit_action_update(action_id):
+    """Edit a corrective action (description, owner, due_date, status)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_actions WHERE id = ?",
+        (action_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="action not found"), 404
+    sets, args, changes = [], [], []
+    if "description" in data:
+        description = (data.get("description") or "").strip()
+        if not description:
+            conn.close()
+            return jsonify(error="description is required"), 400
+        if len(description) > 5000:
+            conn.close()
+            return jsonify(error="description must be 5000 characters or fewer"), 400
+        if description != row["description"]:
+            sets.append("description = ?")
+            args.append(description)
+            changes.append("description updated")
+    if "owner" in data:
+        owner = (data.get("owner") or "").strip()
+        if not owner:
+            conn.close()
+            return jsonify(error="owner is required"), 400
+        if len(owner) > 200:
+            conn.close()
+            return jsonify(error="owner must be 200 characters or fewer"), 400
+        if owner != (row["owner"] or ""):
+            sets.append("owner = ?")
+            args.append(owner)
+            changes.append("owner updated")
+    if "due_date" in data:
+        due_date = (data.get("due_date") or "").strip()
+        if not due_date or not _legal_valid_date(due_date):
+            conn.close()
+            return jsonify(error="due_date must be YYYY-MM-DD"), 400
+        if due_date != row["due_date"]:
+            sets.append("due_date = ?")
+            args.append(due_date)
+            changes.append("due_date updated")
+    if "status" in data:
+        status = (data.get("status") or "").strip().lower()
+        if status not in _OPEN_DONE:
+            conn.close()
+            return jsonify(error="status must be open or done"), 400
+        if status != row["status"]:
+            sets.append("status = ?")
+            args.append(status)
+            changes.append("status updated")
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(action_id)
+        conn.execute("UPDATE erp_quality_audit_actions SET %s WHERE id = ?"
+                     % ", ".join(sets), args)
+        conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_actions WHERE id = ?",
+        (action_id,)).fetchone()
+    conn.close()
+    return jsonify(action=dict(row))
+
+
+@app.delete("/api/erp/quality/audit-actions/<int:action_id>")
+def quality_audit_action_delete(action_id):
+    """Delete one corrective action. Allowed: it is a single action
+    entry, not a standing record."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_audit_actions WHERE id = ?",
+        (action_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="action not found"), 404
+    conn.execute("DELETE FROM erp_quality_audit_actions WHERE id = ?",
+                 (action_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
 # ---------------- Dept 14 Legal & Compliance (Wave B) ----------------
 # Admin-only. Three registers: trademark/IP, contracts + insurance,
 # and a compliance calendar. No new permissions -- admin-only via
@@ -19694,6 +21575,79 @@ def _legal_compliance_fields(data):
         return jsonify(error="notes must be 5000 characters or fewer"), 400
     return {"obligation": obligation, "authority": authority,
             "due_date": due, "status": status, "notes": notes}
+
+
+# Risk register (Dept 14, Module G, Nov 2026). Likelihood and impact
+# share one fixed scale -- low / medium / high, scored 1 / 2 / 3 --
+# and risk_score is likelihood x impact (1-9), computed at read
+# time, never stored. review_status is computed from review_date vs
+# today, like the compliance calendar's overdue flag: a risk whose
+# review date has passed reads overdue, one due within 30 days reads
+# due soon, a risk with no review date reads no review date. The
+# 30-day window matches the legal registers' default renewal notice.
+_LEGAL_RISK_LEVELS = ("low", "medium", "high")
+_LEGAL_RISK_SCORES = {"low": 1, "medium": 2, "high": 3}
+_LEGAL_RISK_REVIEW_SOON_DAYS = 30
+
+
+def _legal_risk_dict(row):
+    d = dict(row)
+    d["risk_score"] = (_LEGAL_RISK_SCORES.get(row["likelihood"], 2)
+                       * _LEGAL_RISK_SCORES.get(row["impact"], 2))
+    review = row["review_date"] or ""
+    today = datetime.now(timezone.utc).date()
+    days = None
+    if review:
+        try:
+            days = (datetime.strptime(review, "%Y-%m-%d").date()
+                    - today).days
+        except ValueError:
+            days = None
+    d["days_until_review"] = days
+    if not review:
+        d["review_status"] = "no review date"
+    elif days is not None and days < 0:
+        d["review_status"] = "overdue"
+    elif days is not None and days <= _LEGAL_RISK_REVIEW_SOON_DAYS:
+        d["review_status"] = "due soon"
+    else:
+        d["review_status"] = "current"
+    return d
+
+
+def _legal_risk_fields(data):
+    """Validate risk-register fields. title is required; likelihood
+    and impact default to medium and must be low/medium/high.
+    Returns the cleaned fields dict, or (error_response, status)."""
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify(error="title is required"), 400
+    if len(title) > 500:
+        return jsonify(error="title must be 500 characters or fewer"), 400
+    description = (data.get("description") or "").strip()
+    if len(description) > 5000:
+        return jsonify(error="description must be 5000 characters"
+                       " or fewer"), 400
+    likelihood = (data.get("likelihood") or "medium").strip()
+    if likelihood not in _LEGAL_RISK_LEVELS:
+        return jsonify(error="likelihood must be low, medium or high"), 400
+    impact = (data.get("impact") or "medium").strip()
+    if impact not in _LEGAL_RISK_LEVELS:
+        return jsonify(error="impact must be low, medium or high"), 400
+    mitigation = (data.get("mitigation") or "").strip()
+    if len(mitigation) > 5000:
+        return jsonify(error="mitigation must be 5000 characters"
+                       " or fewer"), 400
+    owner = (data.get("owner") or "").strip()
+    if len(owner) > 200:
+        return jsonify(error="owner must be 200 characters or fewer"), 400
+    review_date = (data.get("review_date") or "").strip()
+    if not _legal_valid_date(review_date):
+        return jsonify(error="review_date must be YYYY-MM-DD"), 400
+    return {"title": title, "description": description,
+            "likelihood": likelihood, "impact": impact,
+            "mitigation": mitigation, "owner": owner,
+            "review_date": review_date}
 
 
 @app.get("/api/erp/legal/ip")
@@ -20589,6 +22543,138 @@ def legal_compliance_delete(record_id):
     return jsonify(ok=True)
 
 
+# ---------------- Risk register (Dept 14, Module G, Nov 2026) ----------------
+# Admin-only, like every other Legal register. The register starts
+# empty -- no risk is ever invented or seeded. Deleting a risk is
+# allowed: a register entry is a judgement call the admin owns, so a
+# wrong or retired risk is removed outright (unlike a lease schedule
+# with posted months, which must stay to explain the ledger).
+
+@app.get("/api/erp/legal/risks")
+def legal_risks_list():
+    """Risk register, highest risk score first, then soonest review
+    date (risks with no review date last). risk_score and
+    review_status are computed -- see _legal_risk_dict."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute("SELECT * FROM erp_legal_risks").fetchall()
+    out = [_legal_risk_dict(r) for r in rows]
+    out.sort(key=lambda d: (-d["risk_score"],
+                           d["review_date"] == "",
+                           d["review_date"] or "9999-99-99",
+                           d["id"]))
+    conn.close()
+    return jsonify(risks=out)
+
+
+@app.get("/api/erp/legal/risks/review-due")
+def legal_risks_review_due():
+    """Due/overdue review list, computed from the stored review dates
+    vs today: overdue is past its review date, due soon is within 30
+    days. Risks with no review date appear in neither list -- they
+    are listed on the register itself as 'no review date'."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = [_legal_risk_dict(r) for r in conn.execute(
+        "SELECT * FROM erp_legal_risks").fetchall()]
+    conn.close()
+    overdue = [d for d in rows if d["review_status"] == "overdue"]
+    due_soon = [d for d in rows if d["review_status"] == "due soon"]
+    overdue.sort(key=lambda d: (d["review_date"], d["id"]))
+    due_soon.sort(key=lambda d: (d["review_date"], d["id"]))
+    return jsonify(overdue=overdue, due_soon=due_soon)
+
+
+@app.post("/api/erp/legal/risks")
+def legal_risks_create():
+    """Add a risk. title is required; likelihood and impact default
+    to medium."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields = _legal_risk_fields(data)
+    if isinstance(fields, tuple):
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_legal_risks (title, description, likelihood,"
+        " impact, mitigation, owner, review_date, created_by,"
+        " created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["title"], fields["description"], fields["likelihood"],
+         fields["impact"], fields["mitigation"], fields["owner"],
+         fields["review_date"], actor, now, actor, now))
+    row = conn.execute("SELECT * FROM erp_legal_risks WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(risk=_legal_risk_dict(row)), 201
+
+
+@app.post("/api/erp/legal/risks/<int:risk_id>/update")
+def legal_risks_update(risk_id):
+    """Edit a risk (omitted fields keep their value)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_risks WHERE id = ?",
+                       (risk_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Risk not found"), 404
+    merged = {"title": data.get("title", row["title"]),
+              "description": data.get("description", row["description"]),
+              "likelihood": data.get("likelihood", row["likelihood"]),
+              "impact": data.get("impact", row["impact"]),
+              "mitigation": data.get("mitigation", row["mitigation"]),
+              "owner": data.get("owner", row["owner"]),
+              "review_date": data.get("review_date", row["review_date"])}
+    fields = _legal_risk_fields(merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_legal_risks SET title = ?, description = ?,"
+        " likelihood = ?, impact = ?, mitigation = ?, owner = ?,"
+        " review_date = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+        (fields["title"], fields["description"], fields["likelihood"],
+         fields["impact"], fields["mitigation"], fields["owner"],
+         fields["review_date"], actor, now, risk_id))
+    row = conn.execute("SELECT * FROM erp_legal_risks WHERE id = ?",
+                       (risk_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(risk=_legal_risk_dict(row))
+
+
+@app.post("/api/erp/legal/risks/<int:risk_id>/delete")
+def legal_risks_delete(risk_id):
+    """Delete a risk (a retired or wrongly entered register entry)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_legal_risks WHERE id = ?",
+                       (risk_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Risk not found"), 404
+    conn.execute("DELETE FROM erp_legal_risks WHERE id = ?",
+                 (risk_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
 # ---------------------------------------------------------------- Dept 14 (Stores) Wave A
 # Core stores: store locations, a request/approve/receive transfer
 # workflow on top of the existing immediate-transfer movement model,
@@ -20892,6 +22978,401 @@ def stores_reactivate(store_id):
     conn.commit()
     conn.close()
     return jsonify(store=_stores_dict(row))
+
+
+# ---------------- Fleet register (Dept 15, Module J, Nov 2026) ----------------
+# Vehicles that serve the stores + their maintenance and fuel logs.
+# Admin-only CRUD (same pattern as Stores itself: _require_erp_admin).
+# Starts with ZERO vehicles; nothing is seeded and no vehicle, log, or
+# figure is invented -- every row is admin-entered and every total is
+# computed from the stored logs. Deleting a vehicle is refused (409)
+# while any maintenance or fuel log is attached (same rule as deleting
+# a job role with applicants); delete the logs first. Logs are deleted
+# one at a time from the vehicle detail. The tables survive a wipe
+# (see the _ERP_RESET_TABLES asserts): the register is a standing
+# asset record, not transactional data.
+_FLEET_STATUSES = ("active", "retired")
+
+
+def _fleet_vehicle_row(conn, vehicle_id):
+    try:
+        vehicle_id = int(vehicle_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute(
+        "SELECT v.*, s.name AS store_name FROM erp_fleet_vehicles v"
+        " LEFT JOIN erp_stores s ON s.id = v.store_id WHERE v.id = ?",
+        (vehicle_id,)).fetchone()
+
+
+def _fleet_vehicle_dict(conn, row):
+    d = dict(row)
+    counts = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM erp_fleet_maintenance"
+        " WHERE vehicle_id = ?) AS m,"
+        " (SELECT COUNT(*) FROM erp_fleet_fuel"
+        " WHERE vehicle_id = ?) AS f,"
+        " (SELECT COALESCE(SUM(cost_cents), 0) FROM erp_fleet_maintenance"
+        " WHERE vehicle_id = ?) AS mc,"
+        " (SELECT COALESCE(SUM(cost_cents), 0) FROM erp_fleet_fuel"
+        " WHERE vehicle_id = ?) AS fc,"
+        " (SELECT COALESCE(SUM(gallons), 0) FROM erp_fleet_fuel"
+        " WHERE vehicle_id = ?) AS g",
+        (row["id"], row["id"], row["id"], row["id"],
+         row["id"])).fetchone()
+    d["maintenance_count"] = int(counts["m"] or 0)
+    d["fuel_count"] = int(counts["f"] or 0)
+    d["maintenance_total_cents"] = int(counts["mc"] or 0)
+    d["fuel_total_cents"] = int(counts["fc"] or 0)
+    d["fuel_total_gallons"] = float(counts["g"] or 0)
+    return d
+
+
+def _fleet_log_dict(row):
+    d = dict(row)
+    d["cost_cents"] = int(d["cost_cents"] or 0)
+    d["odometer"] = (float(d["odometer"])
+                     if d["odometer"] is not None else None)
+    return d
+
+
+def _fleet_vehicle_fields(conn, data):
+    """Validate vehicle fields. Returns the cleaned dict, or
+    (error_response, status) on a bad value. Only name is required;
+    make/model/year/plate are optional and store_id is an optional
+    link to an existing store."""
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    if len(name) > 200:
+        return jsonify(error="name must be 200 characters or fewer"), 400
+    make = (data.get("make") or "").strip()
+    model = (data.get("model") or "").strip()
+    plate = (data.get("plate") or "").strip()
+    if len(make) > 100 or len(model) > 100:
+        return jsonify(error="make and model must be 100 characters or fewer"), 400
+    if len(plate) > 20:
+        return jsonify(error="plate must be 20 characters or fewer"), 400
+    year = data.get("year")
+    if year in ("", None):
+        year = None
+    else:
+        try:
+            year = int(year)
+        except (TypeError, ValueError):
+            return jsonify(error="year must be a whole year"), 400
+        if year < 1900 or year > 2100:
+            return jsonify(error="year must be between 1900 and 2100"), 400
+    status = (data.get("status") or "active").strip().lower()
+    if status not in _FLEET_STATUSES:
+        return jsonify(error="status must be active or retired"), 400
+    store_id = data.get("store_id")
+    if store_id in ("", None):
+        store_id = None
+    else:
+        try:
+            store_id = int(store_id)
+        except (TypeError, ValueError):
+            return jsonify(error="store_id must be a store id"), 400
+        if not conn.execute("SELECT id FROM erp_stores WHERE id = ?",
+                            (store_id,)).fetchone():
+            return jsonify(error="store not found"), 400
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 2000:
+        return jsonify(error="notes must be 2000 characters or fewer"), 400
+    return {"name": name, "make": make, "model": model, "year": year,
+            "plate": plate, "store_id": store_id, "status": status,
+            "notes": notes}
+
+
+def _fleet_cost_cents(data):
+    """Whole-number cents for a log entry, or (error_response, status).
+    Optional: omitted cost is 0."""
+    raw = data.get("cost_cents")
+    if raw in ("", None):
+        return 0
+    cents = _stores_int(raw)
+    if cents is None or cents < 0:
+        return jsonify(error="cost_cents must be a whole number of cents, 0 or more"), 400
+    return cents
+
+
+def _fleet_odometer(data):
+    """Optional odometer reading: a number >= 0, or None."""
+    raw = data.get("odometer")
+    if raw in ("", None):
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return jsonify(error="odometer must be a number"), 400
+    if value < 0:
+        return jsonify(error="odometer must be 0 or more"), 400
+    return value
+
+
+@app.get("/api/erp/fleet/vehicles")
+def fleet_list():
+    """All vehicles, with log counts and cost/fuel totals computed
+    from their logs. Starts empty -- nothing is seeded."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT v.*, s.name AS store_name FROM erp_fleet_vehicles v"
+        " LEFT JOIN erp_stores s ON s.id = v.store_id"
+        " ORDER BY v.name, v.id").fetchall()
+    out = [_fleet_vehicle_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(vehicles=out)
+
+
+@app.post("/api/erp/fleet/vehicles")
+def fleet_create():
+    """Add a vehicle. Only name is required."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    fields = _fleet_vehicle_fields(conn, data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_fleet_vehicles (name, make, model, year, plate,"
+        " store_id, status, notes, created_by, created_at, updated_by,"
+        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["name"], fields["make"], fields["model"], fields["year"],
+         fields["plate"], fields["store_id"], fields["status"],
+         fields["notes"], actor, now, actor, now))
+    row = _fleet_vehicle_row(conn, cur.lastrowid)
+    out = _fleet_vehicle_dict(conn, row)
+    conn.commit()
+    conn.close()
+    return jsonify(vehicle=out), 201
+
+
+@app.get("/api/erp/fleet/vehicles/<int:vehicle_id>")
+def fleet_get(vehicle_id):
+    """One vehicle, plus its maintenance and fuel logs."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _fleet_vehicle_row(conn, vehicle_id)
+    if not row:
+        conn.close()
+        return jsonify(error="vehicle not found"), 404
+    vehicle = _fleet_vehicle_dict(conn, row)
+    maint = [_fleet_log_dict(r) for r in conn.execute(
+        "SELECT * FROM erp_fleet_maintenance WHERE vehicle_id = ?"
+        " ORDER BY service_date DESC, id DESC", (vehicle_id,)).fetchall()]
+    fuel = [_fleet_log_dict(r) for r in conn.execute(
+        "SELECT * FROM erp_fleet_fuel WHERE vehicle_id = ?"
+        " ORDER BY fuel_date DESC, id DESC", (vehicle_id,)).fetchall()]
+    conn.close()
+    return jsonify(vehicle=vehicle, maintenance=maint, fuel=fuel)
+
+
+@app.post("/api/erp/fleet/vehicles/<int:vehicle_id>/update")
+def fleet_update(vehicle_id):
+    """Edit a vehicle (omitted fields keep their value)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _fleet_vehicle_row(conn, vehicle_id)
+    if not row:
+        conn.close()
+        return jsonify(error="vehicle not found"), 404
+    merged = {"name": data.get("name", row["name"]),
+              "make": data.get("make", row["make"]),
+              "model": data.get("model", row["model"]),
+              "year": data.get("year", row["year"]),
+              "plate": data.get("plate", row["plate"]),
+              "store_id": data.get("store_id", row["store_id"]),
+              "status": data.get("status", row["status"]),
+              "notes": data.get("notes", row["notes"])}
+    fields = _fleet_vehicle_fields(conn, merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_fleet_vehicles SET name = ?, make = ?, model = ?,"
+        " year = ?, plate = ?, store_id = ?, status = ?, notes = ?,"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (fields["name"], fields["make"], fields["model"], fields["year"],
+         fields["plate"], fields["store_id"], fields["status"],
+         fields["notes"], actor, now, vehicle_id))
+    row = _fleet_vehicle_row(conn, vehicle_id)
+    out = _fleet_vehicle_dict(conn, row)
+    conn.commit()
+    conn.close()
+    return jsonify(vehicle=out)
+
+
+@app.delete("/api/erp/fleet/vehicles/<int:vehicle_id>")
+def fleet_delete(vehicle_id):
+    """Delete a vehicle. Refused (409) while any maintenance or fuel
+    log is attached -- delete the logs first. Otherwise the row is
+    deleted; the store it was linked to is never touched."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _fleet_vehicle_row(conn, vehicle_id)
+    if not row:
+        conn.close()
+        return jsonify(error="vehicle not found"), 404
+    mcount = conn.execute(
+        "SELECT COUNT(*) FROM erp_fleet_maintenance WHERE vehicle_id = ?",
+        (vehicle_id,)).fetchone()[0]
+    fcount = conn.execute(
+        "SELECT COUNT(*) FROM erp_fleet_fuel WHERE vehicle_id = ?",
+        (vehicle_id,)).fetchone()[0]
+    if mcount or fcount:
+        conn.close()
+        return jsonify(error="cannot delete a vehicle with logs attached"
+                       " (%d maintenance, %d fuel)" % (mcount, fcount)), 409
+    conn.execute("DELETE FROM erp_fleet_vehicles WHERE id = ?",
+                 (vehicle_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/fleet/vehicles/<int:vehicle_id>/maintenance")
+def fleet_add_maintenance(vehicle_id):
+    """Add a maintenance log entry to a vehicle."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _fleet_vehicle_row(conn, vehicle_id)
+    if not row:
+        conn.close()
+        return jsonify(error="vehicle not found"), 404
+    service_date = (data.get("service_date") or "").strip()
+    if not service_date or not _legal_valid_date(service_date):
+        conn.close()
+        return jsonify(error="service_date must be YYYY-MM-DD"), 400
+    description = (data.get("description") or "").strip()
+    if not description:
+        conn.close()
+        return jsonify(error="description is required"), 400
+    if len(description) > 1000:
+        conn.close()
+        return jsonify(error="description must be 1000 characters or fewer"), 400
+    cents = _fleet_cost_cents(data)
+    if isinstance(cents, tuple):
+        conn.close()
+        return cents
+    odometer = _fleet_odometer(data)
+    if isinstance(odometer, tuple):
+        conn.close()
+        return odometer
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_fleet_maintenance (vehicle_id, service_date,"
+        " description, cost_cents, odometer, created_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (vehicle_id, service_date, description, cents, odometer,
+         actor, now))
+    log = conn.execute(
+        "SELECT * FROM erp_fleet_maintenance WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(maintenance=_fleet_log_dict(log)), 201
+
+
+@app.delete("/api/erp/fleet/maintenance/<int:log_id>")
+def fleet_delete_maintenance(log_id):
+    """Delete one maintenance log entry."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_fleet_maintenance WHERE id = ?",
+        (log_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="maintenance log not found"), 404
+    conn.execute("DELETE FROM erp_fleet_maintenance WHERE id = ?",
+                 (log_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/fleet/vehicles/<int:vehicle_id>/fuel")
+def fleet_add_fuel(vehicle_id):
+    """Add a fuel log entry to a vehicle."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _fleet_vehicle_row(conn, vehicle_id)
+    if not row:
+        conn.close()
+        return jsonify(error="vehicle not found"), 404
+    fuel_date = (data.get("fuel_date") or "").strip()
+    if not fuel_date or not _legal_valid_date(fuel_date):
+        conn.close()
+        return jsonify(error="fuel_date must be YYYY-MM-DD"), 400
+    try:
+        gallons = float(data.get("gallons"))
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="gallons must be a number"), 400
+    if gallons <= 0:
+        conn.close()
+        return jsonify(error="gallons must be more than 0"), 400
+    cents = _fleet_cost_cents(data)
+    if isinstance(cents, tuple):
+        conn.close()
+        return cents
+    odometer = _fleet_odometer(data)
+    if isinstance(odometer, tuple):
+        conn.close()
+        return odometer
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_fleet_fuel (vehicle_id, fuel_date, gallons,"
+        " cost_cents, odometer, created_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (vehicle_id, fuel_date, gallons, cents, odometer, actor, now))
+    log = conn.execute(
+        "SELECT * FROM erp_fleet_fuel WHERE id = ?", (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(fuel=_fleet_log_dict(log)), 201
+
+
+@app.delete("/api/erp/fleet/fuel/<int:log_id>")
+def fleet_delete_fuel(log_id):
+    """Delete one fuel log entry."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_fleet_fuel WHERE id = ?", (log_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="fuel log not found"), 404
+    conn.execute("DELETE FROM erp_fleet_fuel WHERE id = ?", (log_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
 
 
 @app.get("/api/erp/stores/transfers")
@@ -32609,7 +35090,7 @@ def erp_acct_list_audit():
 # Nightly accounting-only SQLite snapshot, produced by the backend
 # (export endpoint, cron-secret gated), pulled by a VM job, stored in
 # two failure domains (VM + Google Drive), verified weekly by a drill.
-# Snapshot format (3.3): acct-backup.db holds ONLY the 20 erp_acct_*
+# Snapshot format (3.3): acct-backup.db holds ONLY the 28 erp_acct_*
 # tables below (including erp_acct_period_locks: a lock is a gate, not
 # ledger data, but a restore that drops locks silently reopens locked
 # periods -- user-approved Nov 9, the locks are in the set);
@@ -32630,9 +35111,10 @@ class _AcctBackupError(Exception):
         self.message = message
 
 
-# The 24 accounting tables, in restore dependency order (spec 3.6):
+# The 28 accounting tables, in restore dependency order (spec 3.6):
 # (Dept 9 wave C adds erp_acct_credit_notes after invoices and
-# erp_acct_bill_po_links after bills; wave D adds erp_acct_draws.)
+# erp_acct_bill_po_links after bills; wave D adds erp_acct_draws;
+# big-company package module B adds erp_acct_budgets.)
 # accounts -> journal -> journal_lines -> invoices -> bills -> payments
 # -> bank_* -> tax_* -> reconciliations -> employees -> payruns ->
 # payrun_lines -> payroll_* -> migration_links -> audit.
@@ -32649,6 +35131,7 @@ _ACCT_BACKUP_TABLES = (
     "erp_acct_period_locks", "erp_acct_sale_posts",
     "erp_acct_draws", "erp_acct_bill_payment_requests",
     "erp_acct_tax_checklist", "erp_acct_tax_reminders",
+    "erp_acct_budgets",
 )
 _ACCT_BACKUP_RATE_LIMIT_SECONDS = 300
 _ACCT_BACKUP_LAST_EXPORT_TS = 0.0
@@ -32930,18 +35413,14 @@ def erp_acct_backup_export():
     return resp
 
 
-@app.get("/api/erp/accounting/backup/status")
-def erp_acct_backup_status():
-    """Backup status card data (spec 3.7), perm accounting.read. Reads
-    the latest backup.export audit rows only -- it does not read backup
+def _erp_backup_status_data(conn):
+    """Backup status card data (spec 3.7), shared by the Accounting
+    backup-status endpoint and the Module A Systems view. Reads the
+    latest backup.export audit rows only -- it does not read backup
     files. latest_drill_result/latest_drill_at are null: the weekly
     drill never touches the live backend, so its result lives in the
     VM backup index (hidden_files/acct-backups/index.json), not in the
     audit log; the card says so instead of inventing a drill result."""
-    actor, err = _erp_check_perm("accounting.read")
-    if err:
-        return err
-    conn = db()
     latest = conn.execute(
         "SELECT * FROM erp_acct_audit WHERE action = 'backup.export'"
         " ORDER BY id DESC LIMIT 1").fetchone()
@@ -32954,7 +35433,6 @@ def erp_acct_backup_status():
     restore = conn.execute(
         "SELECT * FROM erp_acct_audit WHERE action = 'backup.restore'"
         " ORDER BY id DESC LIMIT 1").fetchone()
-    conn.close()
 
     def _field(row, pattern):
         if not row:
@@ -32965,18 +35443,30 @@ def erp_acct_backup_status():
     manifest_id = _field(latest, r"manifest (\S+)")
     rows_backed = _field(latest, r"rows (\d+)")
     tables = _field(latest, r"tables (\d+)")
-    return jsonify(
-        has_backup=bool(latest),
-        last_backup_utc=latest["created_at"] if latest else None,
-        manifest_id=manifest_id,
-        tables=int(tables) if tables else None,
-        rows_backed_up=int(rows_backed) if rows_backed else None,
-        total_backups=total,
-        oldest_backup_utc=oldest["created_at"] if oldest else None,
-        latest_drill_result=None,
-        latest_drill_at=None,
-        latest_restore_utc=restore["created_at"] if restore else None,
-        latest_restore_manifest_id=_field(restore, r"manifest (\S+)"))
+    return {
+        "has_backup": bool(latest),
+        "last_backup_utc": latest["created_at"] if latest else None,
+        "manifest_id": manifest_id,
+        "tables": int(tables) if tables else None,
+        "rows_backed_up": int(rows_backed) if rows_backed else None,
+        "total_backups": total,
+        "oldest_backup_utc": oldest["created_at"] if oldest else None,
+        "latest_drill_result": None,
+        "latest_drill_at": None,
+        "latest_restore_utc": restore["created_at"] if restore else None,
+        "latest_restore_manifest_id": _field(restore, r"manifest (\S+)"),
+    }
+
+
+@app.get("/api/erp/accounting/backup/status")
+def erp_acct_backup_status():
+    actor, err = _erp_check_perm("accounting.read")
+    if err:
+        return err
+    conn = db()
+    data = _erp_backup_status_data(conn)
+    conn.close()
+    return jsonify(data)
 
 
 def _acct_apply_snapshot(conn, snap_conn):
@@ -36031,6 +38521,382 @@ def erp_acct_snapshot():
             error="start must not be after end, and end must not be after as_of"), 400
     conn = db()
     out = _acct_snapshot(conn, as_of, start, end)
+    conn.close()
+    return jsonify(out)
+
+
+# ---- Budgets vs actual + treasury cash view (Dept 9, big-company
+# package, modules B + K) ----
+# Module B: MONTHLY budgets (period YYYY-MM), one row per account per
+# month. Monthly matches how this ERP already thinks in months --
+# period locks are YYYY-MM, tax filings are monthly, the P&L takes a
+# date range -- and a quarter is just the sum of its three months, so
+# the variance endpoint rolls months into quarters instead of storing
+# a second period shape. Budgets are PLANNING data: they never post to
+# the ledger and never touch the trial balance. Only income and expense
+# accounts can be budgeted (a balance-sheet account has no P&L
+# "actual" to compare against); actuals come from _acct_balances, the
+# same source the P&L uses. A period/account with no budget row is
+# reported as unbudgeted, never as zero-spent. All four budget
+# endpoints and the treasury endpoint are admin-only via
+# _require_erp_admin() -- stricter than Dept 9's usual
+# accounting.read/write, per the build brief for these two modules.
+# Module K: a read-only treasury view over the same data -- cash-account
+# GL balances (via _acct_cash_account_ids + _acct_balances, the same
+# computation the cash-flow report uses) plus a forecast that is just
+# the schedule of open invoices (money in) and open bills (money out)
+# by due date. No new tables, no data entry, nothing invented: the
+# forecast assumes every open item settles in full on its due date,
+# and says so in the response and on screen.
+ERP_ACCT_BUDGET_QUARTER_RE = re.compile(r"^\d{4}-Q[1-4]$")
+
+
+def _acct_budget_month_range(period):
+    """(start, end) dates for a YYYY-MM period, or (None, None)."""
+    if not _acct_period_valid(period):
+        return None, None
+    year, month = int(period[:4]), int(period[5:7])
+    first = datetime(year, month, 1)
+    nxt = datetime(year + (month == 12), month % 12 + 1, 1)
+    last = (nxt - timedelta(days=1)).strftime("%Y-%m-%d")
+    return first.strftime("%Y-%m-%d"), last
+
+
+def _acct_budget_quarter_range(quarter):
+    """(start, end, [YYYY-MM, ...]) for a YYYY-Qn quarter, or Nones."""
+    if not isinstance(quarter, str) or not ERP_ACCT_BUDGET_QUARTER_RE.match(quarter):
+        return None, None, []
+    year = int(quarter[:4])
+    q = int(quarter[6])
+    months = ["%04d-%02d" % (year, (q - 1) * 3 + m) for m in (1, 2, 3)]
+    start, _ = _acct_budget_month_range(months[0])
+    _, end = _acct_budget_month_range(months[2])
+    return start, end, months
+
+
+def _acct_actual_cents(row):
+    """Period activity for one _acct_balances row, signed the way the
+    P&L reads it: income is credits minus debits, expense is debits
+    minus credits. (Budgets only cover income/expense accounts.)"""
+    if row["type"] == "income":
+        return row["credits"] - row["debits"]
+    return row["debits"] - row["credits"]
+
+
+def _acct_budget_dict(conn, row):
+    d = dict(row)
+    acct = conn.execute(
+        "SELECT code, name, type FROM erp_acct_accounts WHERE id = ?",
+        (row["account_id"],)).fetchone()
+    d["code"] = acct["code"] if acct else ""
+    d["name"] = acct["name"] if acct else ""
+    d["type"] = acct["type"] if acct else ""
+    return d
+
+
+def _acct_budget_variance(conn, start, end, periods):
+    """Budget vs actual for [start, end]. `periods` is the list of
+    YYYY-MM months whose budgets count (one for a month, three for a
+    quarter, every month touched by a custom range -- a partial month
+    still counts its whole monthly budget; see SOP 9.29). Actuals come
+    from _acct_balances, the same source the P&L uses. Only
+    income/expense accounts appear: budgeted ones in `rows`, accounts
+    with activity but no budget in `unbudgeted` (never as zero-spent).
+    Variance is actual minus budget; variance_pct is null when the
+    budget is zero (a ratio against zero is meaningless, not 0%)."""
+    bals = {r["id"]: r for r in _acct_balances(conn, start, end)}
+    budgets = {}
+    if periods:
+        ph = ",".join("?" * len(periods))
+        for b in conn.execute(
+                "SELECT account_id, SUM(amount_cents) AS total"
+                " FROM erp_acct_budgets WHERE period IN (" + ph + ")"
+                " GROUP BY account_id", periods).fetchall():
+            budgets[b["account_id"]] = b["total"]
+    rows = []
+    unbudgeted = []
+    for acct in conn.execute(
+            "SELECT * FROM erp_acct_accounts"
+            " WHERE type IN ('income', 'expense') AND active = 1"
+            " ORDER BY code").fetchall():
+        bal = bals.get(acct["id"])
+        actual = _acct_actual_cents(bal) if bal else 0
+        if acct["id"] in budgets:
+            budget = budgets[acct["id"]]
+            var = actual - budget
+            rows.append({"account_id": acct["id"], "code": acct["code"],
+                         "name": acct["name"], "type": acct["type"],
+                         "budget_cents": budget, "actual_cents": actual,
+                         "variance_cents": var,
+                         "variance_pct": (round(var * 100.0 / budget, 1)
+                                        if budget != 0 else None),
+                         "budgeted": True})
+        elif actual != 0:
+            unbudgeted.append({"account_id": acct["id"],
+                               "code": acct["code"], "name": acct["name"],
+                               "type": acct["type"], "budget_cents": None,
+                               "actual_cents": actual,
+                               "variance_cents": None,
+                               "variance_pct": None, "budgeted": False})
+    total_budget = sum(r["budget_cents"] for r in rows)
+    total_actual = sum(r["actual_cents"] for r in rows)
+    total_var = total_actual - total_budget
+    return {"rows": rows, "unbudgeted": unbudgeted,
+            "totals": {"budget_cents": total_budget,
+                       "actual_cents": total_actual,
+                       "variance_cents": total_var,
+                       "variance_pct": (round(total_var * 100.0 / total_budget, 1)
+                                      if total_budget != 0 else None),
+                       "budgeted_account_count": len(rows),
+                       "unbudgeted_account_count": len(unbudgeted),
+                       "unbudgeted_actual_cents": sum(
+                           u["actual_cents"] for u in unbudgeted)}}
+
+
+@app.get("/api/erp/accounting/budgets")
+def erp_acct_list_budgets():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    period = (request.args.get("period") or "").strip()
+    conn = db()
+    if period:
+        if not _acct_period_valid(period):
+            conn.close()
+            return jsonify(error="period must be YYYY-MM"), 400
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_budgets WHERE period = ?"
+            " ORDER BY account_id", (period,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM erp_acct_budgets ORDER BY period, account_id"
+            ).fetchall()
+    out = [_acct_budget_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(budgets=out)
+
+
+@app.post("/api/erp/accounting/budgets")
+def erp_acct_create_budget():
+    """Upsert one monthly budget. A second save for the same account +
+    month replaces the amount (200, created false); a first save
+    creates it (201). Period locks do NOT gate budgets: they are
+    planning data, not ledger postings, and comparing a locked month
+    against its budget is the point of the variance view."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    try:
+        account_id = int(data.get("account_id") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="account_id must be a number"), 400
+    period = (data.get("period") or "").strip()
+    amount = _acct_int_cents(data.get("amount_cents"))
+    if not _acct_period_valid(period):
+        return jsonify(error="period must be YYYY-MM"), 400
+    if amount is None or amount < 0:
+        return jsonify(error="amount_cents must be whole cents of at least 0"), 400
+    conn = db()
+    acct = conn.execute(
+        "SELECT * FROM erp_acct_accounts WHERE id = ?",
+        (account_id,)).fetchone()
+    if not acct:
+        conn.close()
+        return jsonify(error="unknown account_id %s" % account_id), 400
+    if not acct["active"]:
+        conn.close()
+        return jsonify(error="account %s is inactive" % (acct["code"],)), 400
+    if acct["type"] not in ("income", "expense"):
+        conn.close()
+        return jsonify(error="only income and expense accounts can be budgeted"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    existing = conn.execute(
+        "SELECT * FROM erp_acct_budgets WHERE account_id = ? AND period = ?",
+        (account_id, period)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE erp_acct_budgets SET amount_cents = ?, updated_at = ?"
+            " WHERE id = ?", (amount, now, existing["id"]))
+        _acct_audit(conn, actor, "budget.update", "budget", existing["id"],
+                    "%s %s %d -> %d" % (acct["code"], period,
+                                        existing["amount_cents"], amount))
+        budget_id, created = existing["id"], False
+    else:
+        cur = conn.execute(
+            "INSERT INTO erp_acct_budgets (account_id, period, amount_cents,"
+            " created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (account_id, period, amount, actor or "", now, now))
+        budget_id, created = cur.lastrowid, True
+        _acct_audit(conn, actor, "budget.create", "budget", budget_id,
+                    "%s %s %d" % (acct["code"], period, amount))
+    conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_acct_budgets WHERE id = ?", (budget_id,)).fetchone()
+    out = _acct_budget_dict(conn, row)
+    conn.close()
+    return jsonify(budget=out, created=created), (201 if created else 200)
+
+
+@app.delete("/api/erp/accounting/budgets/<int:budget_id>")
+def erp_acct_delete_budget(budget_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_acct_budgets WHERE id = ?", (budget_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="budget not found"), 404
+    acct = conn.execute(
+        "SELECT code FROM erp_acct_accounts WHERE id = ?",
+        (row["account_id"],)).fetchone()
+    conn.execute("DELETE FROM erp_acct_budgets WHERE id = ?", (budget_id,))
+    _acct_audit(conn, actor, "budget.delete", "budget", budget_id,
+                "%s %s %d" % (acct["code"] if acct else "?",
+                              row["period"], row["amount_cents"]))
+    conn.commit()
+    conn.close()
+    return jsonify(deleted=budget_id)
+
+
+@app.get("/api/erp/accounting/budgets/variance")
+def erp_acct_budget_variance():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    period = (request.args.get("period") or "").strip()
+    quarter = (request.args.get("quarter") or "").strip()
+    start = (request.args.get("start") or "").strip()
+    end = (request.args.get("end") or "").strip()
+    conn = db()
+    if quarter:
+        start, end, periods = _acct_budget_quarter_range(quarter)
+        if start is None:
+            conn.close()
+            return jsonify(error="quarter must be YYYY-Q1 to YYYY-Q4"), 400
+        kind, label = "quarter", quarter
+    elif period:
+        start, end = _acct_budget_month_range(period)
+        if start is None:
+            conn.close()
+            return jsonify(error="period must be YYYY-MM"), 400
+        periods, kind, label = [period], "month", period
+    elif start or end:
+        if not _acct_valid_date(start) or not _acct_valid_date(end) \
+                or start > end:
+            conn.close()
+            return jsonify(
+                error="start and end must be YYYY-MM-DD with start not after end"), 400
+        periods = []
+        cur = start[:7]
+        while cur <= end[:7]:
+            periods.append(cur)
+            y, m = int(cur[:4]), int(cur[5:7])
+            cur = "%04d-%02d" % (y + (m == 12), m % 12 + 1)
+        kind, label = "range", "%s to %s" % (start, end)
+    else:
+        period = datetime.now(timezone.utc).strftime("%Y-%m")
+        start, end = _acct_budget_month_range(period)
+        periods, kind, label = [period], "month", period
+    out = _acct_budget_variance(conn, start, end, periods)
+    out.update({"kind": kind, "label": label,
+                "period": period or None, "quarter": quarter or None,
+                "start": start, "end": end})
+    conn.close()
+    return jsonify(out)
+
+
+def _acct_treasury(conn, as_of):
+    """Cash position + cash-flow forecast as of a date. Cash balances
+    come from _acct_balances over _acct_cash_account_ids (the 1000
+    hierarchy plus bank-linked GL accounts -- the same computation the
+    cash-flow report uses for its ending cash, with the same
+    liability-sign rule the snapshot uses for bank book balances).
+    The forecast is the schedule of open invoices (money in) and open
+    bills (money out) by due date, from the same open-document queries
+    the aging endpoint uses. Nothing is invented: no future sales,
+    payroll, or other commitments appear. Overdue items are listed at
+    their due date and included in the projected balance as if settled
+    today; the assumptions list says all of this in plain language."""
+    cash_ids = _acct_cash_account_ids(conn)
+    accounts = []
+    total = 0
+    for r in _acct_balances(conn, end=as_of):
+        if r["id"] not in cash_ids:
+            continue
+        bal = (r["credits"] - r["debits"]) if r["type"] == "liability" \
+            else (r["debits"] - r["credits"])
+        accounts.append({"account_id": r["id"], "code": r["code"],
+                         "name": r["name"], "balance_cents": bal})
+        total += bal
+    schedule = []
+    for inv in conn.execute(
+            "SELECT * FROM erp_acct_invoices WHERE status = 'open'"
+            " AND balance_cents > 0 ORDER BY due_date, id").fetchall():
+        schedule.append({"date": inv["due_date"], "kind": "in",
+                         "ref": "Invoice #%d" % inv["id"],
+                         "name": inv["customer_name"],
+                         "amount_cents": inv["balance_cents"],
+                         "overdue": inv["due_date"] < as_of})
+    for bill in conn.execute(
+            "SELECT * FROM erp_acct_bills WHERE status = 'open'"
+            " AND balance_cents > 0 ORDER BY due_date, id").fetchall():
+        schedule.append({"date": bill["due_date"], "kind": "out",
+                         "ref": "Bill #%d" % bill["id"],
+                         "name": bill["vendor_name"],
+                         "amount_cents": bill["balance_cents"],
+                         "overdue": bill["due_date"] < as_of})
+    schedule.sort(key=lambda s: (s["date"],
+                                 0 if s["kind"] == "in" else 1, s["ref"]))
+    running = total
+    for s in schedule:
+        running += s["amount_cents"] if s["kind"] == "in" \
+            else -s["amount_cents"]
+        s["running_balance_cents"] = running
+    expected_in = sum(s["amount_cents"] for s in schedule
+                      if s["kind"] == "in")
+    expected_out = sum(s["amount_cents"] for s in schedule
+                       if s["kind"] == "out")
+    overdue_in = sum(s["amount_cents"] for s in schedule
+                     if s["kind"] == "in" and s["overdue"])
+    overdue_out = sum(s["amount_cents"] for s in schedule
+                      if s["kind"] == "out" and s["overdue"])
+    empty = conn.execute(
+        "SELECT COUNT(*) FROM erp_acct_journal").fetchone()[0] == 0 \
+        and not schedule
+    return {"as_of": as_of, "empty": empty,
+            "cash": {"accounts": accounts, "total_cents": total},
+            "schedule": schedule,
+            "totals": {"expected_in_cents": expected_in,
+                       "expected_out_cents": expected_out,
+                       "overdue_in_cents": overdue_in,
+                       "overdue_out_cents": overdue_out,
+                       "open_invoice_count": sum(
+                           1 for s in schedule if s["kind"] == "in"),
+                       "open_bill_count": sum(
+                           1 for s in schedule if s["kind"] == "out"),
+                       "projected_balance_cents":
+                           total + expected_in - expected_out},
+            "assumptions": [
+                "Assumes every open invoice is collected in full on its due date.",
+                "Assumes every open bill is paid in full on its due date.",
+                "Overdue items are included in the projected balance as if settled today.",
+                "No future sales, payroll, or other commitments are included -- only open invoices and bills already in the ERP."]}
+
+
+@app.get("/api/erp/accounting/treasury")
+def erp_acct_treasury():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    as_of = (request.args.get("as_of") or "").strip() \
+        or datetime.now(timezone.utc).date().isoformat()
+    if not _acct_valid_date(as_of):
+        return jsonify(error="as_of must be YYYY-MM-DD"), 400
+    conn = db()
+    out = _acct_treasury(conn, as_of)
     conn.close()
     return jsonify(out)
 
@@ -41135,11 +44001,29 @@ def _erp_po_last_receipt_date(conn, po_number):
 
 
 def _erp_vendor_performance(conn, vendor_id):
-    """On-time %, fill rate, avg lead time, overdue POs for one vendor.
+    """On-time %, fill rate, OTIF %, avg lead time, overdue POs for one
+    vendor.
 
     On-time and lead time cover completed POs (received/closed) that have an
     expected date and a receipt row; fill rate covers every ordered PO
     (sent/partial/received/closed) — drafts and cancelled POs are excluded.
+
+    OTIF (Module C, Nov 2026) — the share of deliveries that were BOTH
+    on-time AND in-full, per completed PO:
+      on-time: last receipt date <= expected date (needs an expected
+        date and a receipt row; same rule as the on-time %).
+      in-full: total qty received >= total qty ordered across the PO's
+        lines (tolerance 1e-9; /receive can never over-receive, but a
+        data fix could, and that still counts as full). A PO with no
+        lines / zero ordered cannot be scored in-full.
+      OTIF denominator: completed POs with an expected date, a receipt
+        row, AND ordered qty > 0 -- the POs where both halves can be
+        judged. Draft/sent/partial/cancelled POs are never scored: a PO
+        still in transit has no delivery to judge yet.
+    in-full % on its own covers every completed PO with ordered qty > 0
+    (no expected date needed). Vendors with no completed POs get nulls
+    for every percentage -- "no data", never a zero score. The per-PO
+    rows ("pos") make every score auditable back to the PO.
     """
     pos = conn.execute(
         "SELECT * FROM erp_purchase_orders WHERE vendor_id = ? ORDER BY id",
@@ -41176,6 +44060,41 @@ def _erp_vendor_performance(conn, vendor_id):
                 (p["id"],)).fetchall():
             ordered += float(l["qty_ordered"] or 0)
             received += float(l["qty_received"] or 0)
+    # Per-PO OTIF rows (see the docstring for the definitions).
+    po_rows = []
+    otif_count = 0
+    otif_denom = 0
+    in_full_count = 0
+    in_full_denom = 0
+    for p in completed:
+        lines = conn.execute(
+            "SELECT qty_ordered, qty_received FROM erp_po_lines WHERE po_id = ?",
+            (p["id"],)).fetchall()
+        po_ordered = sum(float(l["qty_ordered"] or 0) for l in lines)
+        po_received = sum(float(l["qty_received"] or 0) for l in lines)
+        last = _erp_po_last_receipt_date(conn, p["po_number"])
+        expected = (p["expected_date"] or "")
+        on_time_po = (last <= expected) if (expected and last) else None
+        in_full_po = ((po_received >= po_ordered - 1e-9)
+                      if po_ordered > 1e-9 else None)
+        if in_full_po is not None:
+            in_full_denom += 1
+            if in_full_po:
+                in_full_count += 1
+        otif_po = None
+        if on_time_po is not None and in_full_po is not None:
+            otif_denom += 1
+            otif_po = bool(on_time_po and in_full_po)
+            if otif_po:
+                otif_count += 1
+        po_rows.append({
+            "po_id": p["id"], "po_number": p["po_number"],
+            "status": p["status"],
+            "order_date": (p["order_date"] or "")[:10],
+            "expected_date": expected, "last_receipt_date": last,
+            "qty_ordered": po_ordered, "qty_received": po_received,
+            "on_time": on_time_po, "in_full": in_full_po,
+            "otif": otif_po})
     overdue = []
     for p in pos:
         if (p["status"] in ("sent", "partial") and (p["expected_date"] or "")
@@ -41200,6 +44119,15 @@ def _erp_vendor_performance(conn, vendor_id):
         "on_time_denominator": on_time_denom,
         "fill_rate_pct": (round(100.0 * received / ordered, 1)
                           if ordered > 0 else None),
+        "otif_pct": (round(100.0 * otif_count / otif_denom, 1)
+                     if otif_denom else None),
+        "otif_count": otif_count,
+        "otif_denominator": otif_denom,
+        "in_full_pct": (round(100.0 * in_full_count / in_full_denom, 1)
+                        if in_full_denom else None),
+        "in_full_count": in_full_count,
+        "in_full_denominator": in_full_denom,
+        "pos": po_rows,
         "avg_lead_days": (round(sum(lead_days) / len(lead_days), 1)
                           if lead_days else None),
         "overdue": overdue,
@@ -41445,6 +44373,36 @@ def erp_vendor_performance(vendor_id):
     result = _erp_vendor_performance(conn, vendor_id)
     conn.close()
     return jsonify(vendor=dict(vendor), performance=result)
+
+
+def _erp_vendor_scorecards(conn):
+    """One scorecard row per vendor (active and inactive), each the
+    same _erp_vendor_performance computation as the per-vendor
+    endpoint. Vendors with no completed POs carry null percentages --
+    "no data", never a zero score."""
+    out = []
+    for v in conn.execute(
+            "SELECT * FROM erp_vendors ORDER BY lower(name), id").fetchall():
+        perf = _erp_vendor_performance(conn, v["id"])
+        row = {"vendor_id": v["id"], "vendor_name": v["name"],
+               "active": bool(v["active"])}
+        row.update(perf)
+        out.append(row)
+    return out
+
+
+@app.get("/api/erp/vendors/scorecards")
+def erp_vendor_scorecards():
+    """All-vendor OTIF scorecard (Module C). Read-only computation
+    from POs + receipts; purchasing.read like the per-vendor
+    performance endpoint. No new data is entered here."""
+    actor, err = _erp_check_perm("purchasing.read")
+    if err:
+        return err
+    conn = db()
+    rows = _erp_vendor_scorecards(conn)
+    conn.close()
+    return jsonify(scorecards=rows, count=len(rows))
 
 
 @app.get("/api/erp/vendors/<int:vendor_id>/price-history")
@@ -45871,6 +48829,50 @@ assert "erp_wipe_exports" not in _ERP_RESET_TABLES, \
     "erp_wipe_exports must survive the reset (wipe authorization record)"
 assert "erp_deleted_keys" not in _ERP_RESET_TABLES, \
     "erp_deleted_keys must survive the reset (deleted stays deleted)"
+# Fleet register (Dept 15): vehicles + maintenance/fuel logs are a
+# standing asset register, not transactional data -- a wipe must never
+# erase the vehicle register or its service history. The tables hold
+# no people records (no driver or staff field by design), so there is
+# nothing people-adjacent to protect by wiping them either.
+assert "erp_fleet_vehicles" not in _ERP_RESET_TABLES, \
+    "erp_fleet_vehicles must survive the reset (fleet register)"
+assert "erp_fleet_maintenance" not in _ERP_RESET_TABLES, \
+    "erp_fleet_maintenance must survive the reset (fleet logs)"
+assert "erp_fleet_fuel" not in _ERP_RESET_TABLES, \
+    "erp_fleet_fuel must survive the reset (fleet logs)"
+# Risk register (Dept 14, Module G): risks are standing legal
+# records, not transactional data -- a wipe must never erase the
+# register.
+assert "erp_legal_risks" not in _ERP_RESET_TABLES, \
+    "erp_legal_risks must survive the reset (risk register)"
+# ESG metrics (Dept 7, Module H): metric definitions + period
+# values are admin-entered standing records, not transactional
+# data -- a wipe must never erase them or their history.
+assert "erp_reports_esg_metrics" not in _ERP_RESET_TABLES, \
+    "erp_reports_esg_metrics must survive the reset (ESG definitions)"
+assert "erp_reports_esg_values" not in _ERP_RESET_TABLES, \
+    "erp_reports_esg_values must survive the reset (ESG values)"
+# Training records (Dept 12, Module D): courses + completions are
+# people records -- a wipe must never erase training history.
+assert "erp_hr_training_courses" not in _ERP_RESET_TABLES, \
+    "erp_hr_training_courses must survive the reset (training courses)"
+assert "erp_hr_training_completions" not in _ERP_RESET_TABLES, \
+    "erp_hr_training_completions must survive the reset (training records)"
+# Equipment calibration + internal audit (Dept 13, Modules E + F):
+# the register, its calibration history and the audit program are
+# standing quality records, not transactional data.
+assert "erp_quality_equipment" not in _ERP_RESET_TABLES, \
+    "erp_quality_equipment must survive the reset (equipment register)"
+assert "erp_quality_calibrations" not in _ERP_RESET_TABLES, \
+    "erp_quality_calibrations must survive the reset (calibration records)"
+assert "erp_quality_audits" not in _ERP_RESET_TABLES, \
+    "erp_quality_audits must survive the reset (internal audits)"
+assert "erp_quality_audit_checklist" not in _ERP_RESET_TABLES, \
+    "erp_quality_audit_checklist must survive the reset (audit checklists)"
+assert "erp_quality_audit_findings" not in _ERP_RESET_TABLES, \
+    "erp_quality_audit_findings must survive the reset (audit findings)"
+assert "erp_quality_audit_actions" not in _ERP_RESET_TABLES, \
+    "erp_quality_audit_actions must survive the reset (corrective actions)"
 
 
 
@@ -50234,13 +53236,11 @@ def erp_report_forecast():
 
 # ---------- report: inventory valuation ----------
 
-@app.get("/api/erp/reports/inventory-valuation")
-def erp_report_inventory_valuation():
-    actor, err = _erp_check_perm("reports.read")
-    if err:
-        return err
-    fmt = (request.args.get("format") or "json").strip().lower()
-    conn = db()
+def _erp_inventory_valuation(conn):
+    """Current inventory valuation, shared by the Reports
+    inventory-valuation endpoint and the Module I BI dashboard: on-hand
+    per item+location from the stock ledger, valued at each item's
+    average cost. Returns (items, total_cents)."""
     rows = conn.execute(
         "SELECT i.id, i.sku, i.name, i.type, l.code AS location_code,"
         " l.name AS location_name, SUM(s.qty_change) AS on_hand,"
@@ -50262,6 +53262,17 @@ def erp_report_inventory_valuation():
             "location_code": r["location_code"], "location_name": r["location_name"],
             "on_hand": on_hand, "avg_cost_cents": avg, "value_cents": value_cents,
         })
+    return items, total_cents
+
+
+@app.get("/api/erp/reports/inventory-valuation")
+def erp_report_inventory_valuation():
+    actor, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    fmt = (request.args.get("format") or "json").strip().lower()
+    conn = db()
+    items, total_cents = _erp_inventory_valuation(conn)
     conn.close()
     if fmt == "csv":
         return _erp_csv_response(
@@ -50381,6 +53392,580 @@ def erp_report_wholesale_performance():
               a["last_order_at"] or ""] for a in accounts])
     return jsonify({"accounts": accounts,
                     "total_revenue_cents": sum(a["revenue_cents"] for a in accounts)})
+
+
+# ---------- Big-company package, Module I: executive BI dashboard ----------
+# Read-only KPI trends for the Dashboard (Dept 1), computed ONLY from
+# data the ERP already stores. Monthly buckets for the last 12 months
+# (current month + prior 11): twelve months is long enough to see a
+# trend and short enough that every bucket is backed by live data, and
+# it matches the existing /api/admin/analytics monthly grouping.
+# Admin-only, like the dashboard's existing sales-trend chart
+# (/api/admin/analytics) and KPI endpoint (/api/admin/dashboard):
+# payroll totals and wholesale AR are not staff-readable. Months with
+# no data report 0 / null with has_data=false -- never a fabricated
+# trend. Honest limits, per KPI:
+#  - sales/orders: same row sources and de-dup rule as the Sales report
+#    (_erp_online_sales_rows: orders excluding paypal-sourced copies
+#    UNION ALL captured paypal_orders, plus wholesale orders valued
+#    from their lines).
+#  - inventory value: the month-end on-hand from the stock ledger
+#    valued at each item's CURRENT average cost (historical unit costs
+#    are not retained, so a past month's value is an approximation,
+#    labelled as such); the current total is the same computation as
+#    the inventory-valuation report (_erp_inventory_valuation).
+#  - payroll: approved + paid pay runs only (draft runs are not payroll
+#    yet), grouped by pay_date; total cost = gross + employer tax.
+#  - wholesale AR: the open balance is current state only (payment
+#    dates are not stored, so a historical month-end AR cannot be
+#    reconstructed). The trend shown is new invoices billed per month;
+#    the open balance is broken down by invoice month as a current
+#    snapshot, labelled as such.
+def _erp_bi_months(n=12):
+    """Last n calendar months as YYYY-MM, ascending, ending with the
+    current month (UTC, matching the ledger's ISO timestamps)."""
+    today = datetime.now(timezone.utc).date()
+    months = []
+    y, m = today.year, today.month
+    for _ in range(n):
+        months.append("%04d-%02d" % (y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    return sorted(months)
+
+
+def _erp_bi_change_pct(cur, prev):
+    """Period-over-period change in percent, rounded to 1dp; null when
+    there is no previous month to compare against or it was zero."""
+    if prev is None or prev == 0:
+        return None
+    return round((cur - prev) / prev * 100, 1)
+
+
+@app.get("/api/erp/dashboard/bi")
+def erp_dashboard_bi():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    import calendar as _calendar
+    months = _erp_bi_months(12)
+    conn = db()
+    # --- sales + orders: same sources as the Sales report. ---
+    sales = {m: {"revenue_cents": 0, "order_count": 0} for m in months}
+    for r in _erp_online_sales_rows(conn, "", ""):
+        m = (r["created_at"] or "")[:7]
+        if m in sales:
+            sales[m]["revenue_cents"] += int(r["amount_total_cents"] or 0)
+            sales[m]["order_count"] += 1
+    for r in conn.execute(
+            "SELECT substr(o.created_at, 1, 7) AS month, o.id,"
+            " COALESCE(SUM(l.line_total_cents), 0) AS total"
+            " FROM erp_wholesale_orders o"
+            " LEFT JOIN erp_wholesale_order_lines l ON l.order_id = o.id"
+            " GROUP BY o.id").fetchall():
+        m = r["month"] or ""
+        if m in sales:
+            sales[m]["revenue_cents"] += int(r["total"] or 0)
+            sales[m]["order_count"] += 1
+    sales_series = []
+    prev_rev = None
+    for m in months:
+        s = sales[m]
+        sales_series.append({
+            "month": m, "revenue_cents": s["revenue_cents"],
+            "order_count": s["order_count"],
+            "change_pct": _erp_bi_change_pct(s["revenue_cents"], prev_rev),
+        })
+        prev_rev = s["revenue_cents"]
+    sales_has_data = any(s["revenue_cents"] or s["order_count"]
+                         for s in sales.values())
+    # --- inventory value: current total from the valuation report;
+    # monthly = month-end on-hand at current average cost. ---
+    _items, current_total = _erp_inventory_valuation(conn)
+    has_ledger = conn.execute(
+        "SELECT COUNT(*) FROM erp_stock_ledger").fetchone()[0] > 0
+    inv_monthly = []
+    for m in months:
+        y, mo = int(m[:4]), int(m[5:7])
+        last_day = _calendar.monthrange(y, mo)[1]
+        month_end = "%s-%02d" % (m, last_day)
+        rows = conn.execute(
+            "SELECT i.id, i.avg_cost_cents AS avg,"
+            " SUM(s.qty_change) AS q"
+            " FROM erp_stock_ledger s"
+            " JOIN erp_items i ON i.id = s.item_id"
+            " WHERE substr(s.created_at, 1, 10) <= ?"
+            " GROUP BY i.id HAVING q != 0", (month_end,)).fetchall()
+        value = 0
+        for r in rows:
+            value += int(round(float(r["q"] or 0) * int(r["avg"] or 0)))
+        inv_monthly.append({"month": m,
+                            "value_cents": value if has_ledger else None})
+    # --- payroll: approved + paid runs, by pay_date. ---
+    payroll = {m: {"gross_cents": 0, "total_cost_cents": 0, "run_count": 0}
+               for m in months}
+    for r in conn.execute(
+            "SELECT substr(pay_date, 1, 7) AS month, COUNT(*) AS n,"
+            " COALESCE(SUM(gross_cents), 0) AS gross,"
+            " COALESCE(SUM(employer_tax_cents), 0) AS tax"
+            " FROM erp_acct_payruns"
+            " WHERE status IN ('approved', 'paid')"
+            " GROUP BY month").fetchall():
+        m = r["month"] or ""
+        if m in payroll:
+            payroll[m] = {"gross_cents": int(r["gross"] or 0),
+                          "total_cost_cents": int(r["gross"] or 0)
+                          + int(r["tax"] or 0),
+                          "run_count": int(r["n"] or 0)}
+    payroll_series = [{"month": m,
+                       "gross_cents": payroll[m]["gross_cents"],
+                       "total_cost_cents": payroll[m]["total_cost_cents"],
+                       "run_count": payroll[m]["run_count"]}
+                      for m in months]
+    payroll_has_data = any(p["run_count"] for p in payroll.values())
+    # --- wholesale AR: current open balance + billed per month. ---
+    ar = conn.execute(
+        "SELECT COALESCE(SUM(balance_cents), 0) AS t, COUNT(*) AS n"
+        " FROM erp_acct_invoices WHERE status = 'open'"
+        " AND balance_cents > 0 AND customer_type = 'wholesale'").fetchone()
+    by_invoice_month = [
+        {"month": r["month"], "open_cents": int(r["t"] or 0),
+         "invoice_count": int(r["n"] or 0)}
+        for r in conn.execute(
+            "SELECT substr(date, 1, 7) AS month,"
+            " COALESCE(SUM(balance_cents), 0) AS t, COUNT(*) AS n"
+            " FROM erp_acct_invoices WHERE status = 'open'"
+            " AND balance_cents > 0 AND customer_type = 'wholesale'"
+            " GROUP BY month ORDER BY month").fetchall()]
+    billed = {m: {"billed_cents": 0, "invoice_count": 0} for m in months}
+    for r in conn.execute(
+            "SELECT substr(date, 1, 7) AS month, COUNT(*) AS n,"
+            " COALESCE(SUM(total_cents), 0) AS t"
+            " FROM erp_acct_invoices"
+            " WHERE customer_type = 'wholesale' AND status != 'void'"
+            " GROUP BY month").fetchall():
+        m = r["month"] or ""
+        if m in billed:
+            billed[m] = {"billed_cents": int(r["t"] or 0),
+                         "invoice_count": int(r["n"] or 0)}
+    billed_series = [{"month": m, "billed_cents": billed[m]["billed_cents"],
+                      "invoice_count": billed[m]["invoice_count"]}
+                     for m in months]
+    conn.close()
+    return jsonify({
+        "months": months,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "sales": sales_series,
+        "sales_has_data": sales_has_data,
+        "sales_note": ("Online (Stripe + captured PayPal, de-duplicated"
+                       " like the Sales report) + wholesale orders valued"
+                       " from their lines."),
+        "inventory_value": {
+            "current_total_cents": current_total if has_ledger else None,
+            "monthly": inv_monthly,
+            "note": ("Monthly values are the month-end on-hand valued at"
+                     " each item's CURRENT average cost -- historical unit"
+                     " costs are not retained, so past months are an"
+                     " approximation. The current total matches the"
+                     " inventory-valuation report."),
+        },
+        "payroll": payroll_series,
+        "payroll_has_data": payroll_has_data,
+        "payroll_note": ("Approved + paid pay runs only, by pay date;"
+                         " total cost = gross + employer tax. Draft runs"
+                         " are not payroll yet."),
+        "wholesale_ar": {
+            "current_open_cents": int(ar["t"] or 0),
+            "open_invoice_count": int(ar["n"] or 0),
+            "by_invoice_month": by_invoice_month,
+            "billed_monthly": billed_series,
+            "note": ("Open balance is current state only -- payment"
+                     " dates are not stored, so a historical month-end AR"
+                     " cannot be reconstructed. Billed per month is new"
+                     " wholesale invoices; open balance by invoice month"
+                     " is a current snapshot."),
+        },
+    })
+
+
+# ---------- ESG metrics (Dept 7, Module H, Nov 2026) ----------
+# Admin-entered sustainability metrics by month. Metric definitions
+# (name + unit) are free-form -- the admin defines whatever the
+# business tracks (energy use, waste, packaging, ...); period values
+# are one number per metric per YYYY-MM month, with an optional note.
+# Reads use the Dept 7 pattern -- reports.read, so staff with that
+# grant can read the metrics; every write (definitions and values)
+# is admin-only. Period-over-period change compares a month against
+# the previous month that has an entered value for that metric;
+# change_pct is null when there is no previous value or it was zero
+# (same rule as _erp_bi_change_pct). A month with no entered value is
+# reported as null, never as zero -- no baseline, no benchmark, no
+# external data, nothing invented.
+def _esg_metric_dict(row):
+    return dict(row)
+
+
+def _esg_value_dict(row):
+    return dict(row)
+
+
+def _esg_metric_fields(data):
+    """Validate a metric definition. name is required; unit defaults
+    to '' (a count with no unit is still a metric)."""
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    if len(name) > 200:
+        return jsonify(error="name must be 200 characters or fewer"), 400
+    unit = (data.get("unit") or "").strip()
+    if len(unit) > 50:
+        return jsonify(error="unit must be 50 characters or fewer"), 400
+    return {"name": name, "unit": unit}
+
+
+def _esg_value_fields(conn, data, metric_id=None, exclude_id=None):
+    """Validate a period value. metric_id must name a metric, period
+    must be YYYY-MM, value must be a number >= 0 (a measured amount
+    can be zero, never negative). One value per metric per month:
+    saving again for the same metric + month replaces the value
+    (upsert, like monthly budgets)."""
+    if metric_id is None:
+        try:
+            metric_id = int(data.get("metric_id") or 0)
+        except (TypeError, ValueError):
+            return jsonify(error="metric_id must be a number"), 400
+    metric = conn.execute(
+        "SELECT * FROM erp_reports_esg_metrics WHERE id = ?",
+        (metric_id,)).fetchone()
+    if not metric:
+        return jsonify(error="unknown metric_id %s" % metric_id), 400
+    period = (data.get("period") or "").strip()
+    if not _acct_period_valid(period):
+        return jsonify(error="period must be YYYY-MM"), 400
+    raw = data.get("value")
+    if isinstance(raw, bool) or raw is None or raw == "":
+        return jsonify(error="value is required"), 400
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return jsonify(error="value must be a number"), 400
+    if value < 0:
+        return jsonify(error="value must be 0 or more"), 400
+    note = (data.get("note") or "").strip()
+    if len(note) > 5000:
+        return jsonify(error="note must be 5000 characters or fewer"), 400
+    return {"metric_id": metric_id, "period": period,
+            "value": value, "note": note}
+
+
+def _esg_series(conn, metric_id, months):
+    """Period-over-period series for one metric over `months`
+    (ascending YYYY-MM). Each entry carries the entered value (null
+    when nothing was entered that month), the change vs the previous
+    month with an entered value, and change_pct (null when there is
+    no previous value or it was zero)."""
+    stored = {r["period"]: float(r["value"]) for r in conn.execute(
+        "SELECT period, value FROM erp_reports_esg_values"
+        " WHERE metric_id = ?", (metric_id,)).fetchall()}
+    series = []
+    prev_value = None
+    for m in months:
+        value = stored.get(m)
+        if value is None:
+            series.append({"period": m, "value": None, "change": None,
+                           "change_pct": None})
+            continue
+        change = None if prev_value is None else value - prev_value
+        series.append({"period": m, "value": value, "change": change,
+                       "change_pct": _erp_bi_change_pct(value, prev_value)})
+        prev_value = value
+    return series
+
+
+@app.get("/api/erp/reports/esg/metrics")
+def erp_esg_metrics_list():
+    """ESG metric definitions, by name. Starts empty."""
+    _, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_reports_esg_metrics ORDER BY name, id"
+        ).fetchall()
+    out = [_esg_metric_dict(r) for r in rows]
+    conn.close()
+    return jsonify(metrics=out)
+
+
+@app.post("/api/erp/reports/esg/metrics")
+def erp_esg_metric_create():
+    """Add an ESG metric definition (admin-only)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields = _esg_metric_fields(data)
+    if isinstance(fields, tuple):
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn = db()
+    if conn.execute(
+            "SELECT 1 FROM erp_reports_esg_metrics WHERE name = ?",
+            (fields["name"],)).fetchone():
+        conn.close()
+        return jsonify(error="a metric named %s already exists"
+                       % fields["name"]), 409
+    cur = conn.execute(
+        "INSERT INTO erp_reports_esg_metrics (name, unit, created_by,"
+        " created_at, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (fields["name"], fields["unit"], actor, now, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_reports_esg_metrics WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(metric=_esg_metric_dict(row)), 201
+
+
+@app.post("/api/erp/reports/esg/metrics/<int:metric_id>/update")
+def erp_esg_metric_update(metric_id):
+    """Edit a metric definition (admin-only; omitted fields keep
+    their value)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_reports_esg_metrics WHERE id = ?",
+        (metric_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Metric not found"), 404
+    merged = {"name": data.get("name", row["name"]),
+              "unit": data.get("unit", row["unit"])}
+    fields = _esg_metric_fields(merged)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    if fields["name"] != row["name"] and conn.execute(
+            "SELECT 1 FROM erp_reports_esg_metrics WHERE name = ?"
+            " AND id != ?", (fields["name"], metric_id)).fetchone():
+        conn.close()
+        return jsonify(error="a metric named %s already exists"
+                       % fields["name"]), 409
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_reports_esg_metrics SET name = ?, unit = ?,"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (fields["name"], fields["unit"], actor, now, metric_id))
+    row = conn.execute(
+        "SELECT * FROM erp_reports_esg_metrics WHERE id = ?",
+        (metric_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(metric=_esg_metric_dict(row))
+
+
+@app.delete("/api/erp/reports/esg/metrics/<int:metric_id>")
+def erp_esg_metric_delete(metric_id):
+    """Delete a metric definition (admin-only). Refused while period
+    values exist -- delete the values first, like a fleet vehicle
+    with logs attached."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_reports_esg_metrics WHERE id = ?",
+        (metric_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Metric not found"), 404
+    count = conn.execute(
+        "SELECT COUNT(*) FROM erp_reports_esg_values WHERE metric_id = ?",
+        (metric_id,)).fetchone()[0]
+    if count:
+        conn.close()
+        return jsonify(error="metric has %d recorded value(s); delete"
+                       " them first" % count), 409
+    conn.execute("DELETE FROM erp_reports_esg_metrics WHERE id = ?",
+                 (metric_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(deleted=metric_id)
+
+
+@app.get("/api/erp/reports/esg")
+def erp_esg_view():
+    """Period-over-period ESG view: every metric with its monthly
+    series over the trailing 12 months (the BI window), each month
+    carrying value / change / change_pct. Months with no entered
+    value carry null, never zero."""
+    _, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    months = _erp_bi_months(12)
+    conn = db()
+    metrics = [_esg_metric_dict(r) for r in conn.execute(
+        "SELECT * FROM erp_reports_esg_metrics ORDER BY name, id"
+        ).fetchall()]
+    out = []
+    for m in metrics:
+        series = _esg_series(conn, m["id"], months)
+        out.append({"metric": m, "series": series,
+                    "has_data": any(s["value"] is not None
+                                    for s in series)})
+    conn.close()
+    return jsonify(months=months, metrics=out)
+
+
+@app.get("/api/erp/reports/esg/values")
+def erp_esg_values_list():
+    """All recorded ESG values, newest period first. Optional
+    ?metric_id= narrows to one metric."""
+    _, err = _erp_check_perm("reports.read")
+    if err:
+        return err
+    conn = db()
+    metric_id = (request.args.get("metric_id") or "").strip()
+    if metric_id:
+        try:
+            metric_id = int(metric_id)
+        except ValueError:
+            conn.close()
+            return jsonify(error="metric_id must be a number"), 400
+        rows = conn.execute(
+            "SELECT v.*, m.name AS metric_name, m.unit AS metric_unit"
+            " FROM erp_reports_esg_values v"
+            " JOIN erp_reports_esg_metrics m ON m.id = v.metric_id"
+            " WHERE v.metric_id = ? ORDER BY v.period DESC, v.id",
+            (metric_id,)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT v.*, m.name AS metric_name, m.unit AS metric_unit"
+            " FROM erp_reports_esg_values v"
+            " JOIN erp_reports_esg_metrics m ON m.id = v.metric_id"
+            " ORDER BY v.period DESC, m.name, v.id").fetchall()
+    out = [_esg_value_dict(r) for r in rows]
+    conn.close()
+    return jsonify(values=out)
+
+
+@app.post("/api/erp/reports/esg/values")
+def erp_esg_value_create():
+    """Record (or replace) one monthly value (admin-only). A second
+    save for the same metric + month replaces the value (200,
+    created false); a first save creates it (201)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    fields = _esg_value_fields(conn, data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    existing = conn.execute(
+        "SELECT * FROM erp_reports_esg_values"
+        " WHERE metric_id = ? AND period = ?",
+        (fields["metric_id"], fields["period"])).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE erp_reports_esg_values SET value = ?, note = ?,"
+            " updated_by = ?, updated_at = ? WHERE id = ?",
+            (fields["value"], fields["note"], actor, now,
+             existing["id"]))
+        value_id, created = existing["id"], False
+    else:
+        cur = conn.execute(
+            "INSERT INTO erp_reports_esg_values (metric_id, period,"
+            " value, note, created_by, created_at, updated_by,"
+            " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (fields["metric_id"], fields["period"], fields["value"],
+             fields["note"], actor, now, actor, now))
+        value_id, created = cur.lastrowid, True
+    conn.commit()
+    row = conn.execute(
+        "SELECT v.*, m.name AS metric_name, m.unit AS metric_unit"
+        " FROM erp_reports_esg_values v"
+        " JOIN erp_reports_esg_metrics m ON m.id = v.metric_id"
+        " WHERE v.id = ?", (value_id,)).fetchone()
+    conn.close()
+    return jsonify(value=_esg_value_dict(row), created=created), \
+        (201 if created else 200)
+
+
+@app.post("/api/erp/reports/esg/values/<int:value_id>/update")
+def erp_esg_value_update(value_id):
+    """Edit one recorded value (admin-only; omitted fields keep
+    their value). Moving the period onto a month that already has a
+    value for the same metric is refused."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_reports_esg_values WHERE id = ?",
+        (value_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Value not found"), 404
+    merged = {"metric_id": data.get("metric_id", row["metric_id"]),
+              "period": data.get("period", row["period"]),
+              "value": data.get("value", row["value"]),
+              "note": data.get("note", row["note"])}
+    fields = _esg_value_fields(conn, merged,
+                               metric_id=merged["metric_id"])
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    clash = conn.execute(
+        "SELECT 1 FROM erp_reports_esg_values"
+        " WHERE metric_id = ? AND period = ? AND id != ?",
+        (fields["metric_id"], fields["period"], value_id)).fetchone()
+    if clash:
+        conn.close()
+        return jsonify(error="that metric already has a value for %s"
+                       % fields["period"]), 409
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_reports_esg_values SET metric_id = ?, period = ?,"
+        " value = ?, note = ?, updated_by = ?, updated_at = ?"
+        " WHERE id = ?",
+        (fields["metric_id"], fields["period"], fields["value"],
+         fields["note"], actor, now, value_id))
+    row = conn.execute(
+        "SELECT v.*, m.name AS metric_name, m.unit AS metric_unit"
+        " FROM erp_reports_esg_values v"
+        " JOIN erp_reports_esg_metrics m ON m.id = v.metric_id"
+        " WHERE v.id = ?", (value_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return jsonify(value=_esg_value_dict(row))
+
+
+@app.delete("/api/erp/reports/esg/values/<int:value_id>")
+def erp_esg_value_delete(value_id):
+    """Delete one recorded value (admin-only)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_reports_esg_values WHERE id = ?",
+        (value_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="Value not found"), 404
+    conn.execute("DELETE FROM erp_reports_esg_values WHERE id = ?",
+                 (value_id,))
+    conn.commit()
+    conn.close()
+    return jsonify(deleted=value_id)
 
 
 # ---------- sales summaries (weekly online rollups for QuickBooks) ----------
@@ -52035,6 +55620,117 @@ def erp_settings_integrations():
     out = _erp_integration_health(conn)
     conn.close()
     return jsonify(out)
+
+
+# ---------- Big-company package, Module A: Systems / IT status view ----------
+# One consolidated read-only view for Settings: integration health (the
+# same _erp_integration_health data as the Integrations tab), backup
+# status (the same _erp_backup_status_data as the Accounting backup
+# card), the last post-backup security-check run, and an access review
+# (who holds admin + every staff member's grants). Nothing here writes
+# anything; each section links out to the screen that owns it.
+@app.get("/api/erp/settings/systems")
+def erp_settings_systems():
+    # Same Settings gate as the integrations endpoint (qb.manage).
+    actor, err = _erp_check_perm("qb.manage")
+    if err:
+        return err
+    conn = db()
+    health = _erp_integration_health(conn)
+    backup = _erp_backup_status_data(conn)
+    sec = conn.execute(
+        "SELECT * FROM erp_security_check_runs"
+        " ORDER BY id DESC LIMIT 1").fetchone()
+    security_check = None
+    if sec:
+        try:
+            failures = json.loads(sec["failures_json"] or "[]")
+        except (TypeError, ValueError):
+            failures = []
+        try:
+            notes = json.loads(sec["notes_json"] or "[]")
+        except (TypeError, ValueError):
+            notes = []
+        if not isinstance(failures, list):
+            failures = [str(failures)]
+        if not isinstance(notes, list):
+            notes = [str(notes)]
+        security_check = {
+            "run_at": sec["run_at"],
+            "manifest_id": sec["manifest_id"] or "",
+            "ok": bool(sec["ok"]),
+            "failures": failures,
+            "notes": notes,
+        }
+    admins = []
+    for email in ADMIN_EMAILS:
+        row = conn.execute(
+            "SELECT name FROM users WHERE lower(email) = ?",
+            (email,)).fetchone()
+        admins.append({"email": email,
+                       "name": (row["name"] or "") if row else "",
+                       "has_user_row": bool(row)})
+    staff_rows = conn.execute(
+        "SELECT id, name, email, active FROM staff"
+        " ORDER BY name, email").fetchall()
+    staff_out = []
+    for r in staff_rows:
+        perms = [p[0] for p in conn.execute(
+            "SELECT perm FROM erp_staff_perms WHERE staff_id = ?"
+            " ORDER BY perm", (r["id"],)).fetchall()]
+        staff_out.append({"id": r["id"], "name": r["name"],
+                          "email": r["email"], "active": bool(r["active"]),
+                          "perms": perms})
+    conn.close()
+    return jsonify({
+        "integrations": health["integrations"],
+        "backup": backup,
+        "security_check": security_check,
+        "security_check_note": (
+            "The post-backup security check runs on the VM after each"
+            " nightly backup; the backup job records each run here. No"
+            " run recorded yet means no backup has posted a result since"
+            " this view shipped -- it is not a pass."),
+        "access_review": {"admins": admins, "staff": staff_out},
+    })
+
+
+@app.post("/api/erp/settings/security-check")
+def erp_settings_record_security_check():
+    """Record one post-backup security-check run. Called by the VM
+    backup job (acct_backup_job.py) with X-Cron-Secret after each
+    backup, once the backup itself is safely stored. Same cron-secret
+    pattern as the backup export: 503 when CRON_SECRET is not
+    configured, 403 on a wrong or missing secret. Best-effort by
+    design: the job never fails a good backup when this record fails.
+    Body: {run_at, manifest_id, ok, failures[], notes[]}."""
+    if not CRON_SECRET:
+        return jsonify(error="cron secret is not configured"), 503
+    if not hmac.compare_digest(
+            request.headers.get("X-Cron-Secret", ""), CRON_SECRET):
+        return jsonify(error="cron secret required"), 403
+    data = request.get_json(force=True, silent=True) or {}
+    failures = data.get("failures") or []
+    notes = data.get("notes") or []
+    if not isinstance(failures, list) or not isinstance(notes, list):
+        return jsonify(error="failures and notes must be lists"), 400
+    run_at = str(data.get("run_at") or "").strip()
+    if not run_at:
+        run_at = datetime.now(timezone.utc).isoformat()
+    manifest_id = str(data.get("manifest_id") or "")
+    conn = db()
+    cur = conn.execute(
+        "INSERT INTO erp_security_check_runs"
+        " (run_at, manifest_id, ok, failures_json, notes_json, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?)",
+        (run_at, manifest_id, 1 if data.get("ok") else 0,
+         json.dumps([str(f) for f in failures]),
+         json.dumps([str(n) for n in notes]),
+         datetime.now(timezone.utc).isoformat()))
+    conn.commit()
+    run_id = cur.lastrowid
+    conn.close()
+    return jsonify(ok=True, id=run_id), 201
 
 
 # ---------- Dept 10 Settings Wave B ----------
