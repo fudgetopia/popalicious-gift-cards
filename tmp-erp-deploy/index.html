@@ -1595,13 +1595,13 @@ function renderRoute() {
 // preview: Dashboard has none; the rest list their sections below.
 var ERP_SIDEBAR_SECTIONS = {
   inventory: ["Items", "Lots & expiry", "Shrinkage", "Replenishment"],
-  purchasing: ["Vendors", "Purchase orders"],
+  purchasing: ["Vendors", "Purchase orders", "Vendor scorecards"],
   production: ["Recipes", "Batches"],
   "staff-perms": ["Staff", "Add staff member"],
-  hr: ["Employee records", "Overtime alerts", "Add employee"],
-  quality: ["Recall plan", "Trace a lot", "Recall drills", "Supplier COAs", "HACCP plan", "Complaint trending", "SOP Library"],
-  legal: ["Trademark + IP register", "Contracts + insurance", "Licenses & permits", "Compliance calendar"],
-  stores: ["All stores", "Add store", "Transfers"]
+  hr: ["Employee records", "Overtime alerts", "Add employee", "Training records"],
+  quality: ["Recall plan", "Trace a lot", "Recall drills", "Supplier COAs", "HACCP plan", "Complaint trending", "Equipment calibration", "Internal audits", "SOP Library"],
+  legal: ["Trademark + IP register", "Contracts + insurance", "Licenses & permits", "Compliance calendar", "Risk register"],
+  stores: ["All stores", "Add store", "Transfers", "Fleet register"]
 };
 // Tabs with a real sub-tab row. The subs lists below are the same lists
 // the rows build (same keys, same labels, same order) and are only used
@@ -1621,7 +1621,7 @@ var ERP_SIDEBAR_SUBTABS = {
     subs: [["documents", "Documents"], ["partners", "Partners"]] },
   reports: { view: "reportsView", render: function () { renderErpReportsDetail(); },
     reset: function () { erpState.reportData = null; },
-    subs: [["sales", "Sales"], ["valuation", "Inventory valuation"], ["margin", "Production margin"], ["wholesale", "Wholesale performance"], ["spend", "Spend by vendor"], ["customers", "Customers"], ["profitability", "Channel profitability"], ["programs", "Programs"], ["forecast", "Forecast"], ["summaries", "Sales summaries"]] },
+    subs: [["sales", "Sales"], ["valuation", "Inventory valuation"], ["margin", "Production margin"], ["wholesale", "Wholesale performance"], ["spend", "Spend by vendor"], ["customers", "Customers"], ["profitability", "Channel profitability"], ["programs", "Programs"], ["forecast", "Forecast"], ["summaries", "Sales summaries"], ["esg", "ESG metrics"]] },
   marketing: { view: "mktView", render: function () { renderErpMarketingDetail(); },
     reset: function () { erpState.mktSelectedTicketId = null; erpState.mktTicketDetail = null; erpState.mktCustomerDetail = null; erpState.mktCalDetail = null; erpState.mktPromos = null; erpState.mktInbox = null; erpState.mktAutomation = null; erpState.mktWinback = null; erpState.mktReviews = null; },
     subs: [["instagram", "Instagram"], ["newsletter", "Newsletter"], ["support", "Support inbox"], ["customers", "Customers"], ["calendar", "Content calendar"], ["promos", "Promo calendar"], ["inbox", "Social inbox"], ["automation", "Automation"], ["reviews", "Reviews"]] },
@@ -1630,7 +1630,7 @@ var ERP_SIDEBAR_SUBTABS = {
     subs: [["find", "Find member"], ["signup", "Sign up new member"], ["profile", "My profile"]] },
   settings: { view: "settingsView", render: function () { renderErpSettingsDetail(); },
     reset: function () { erpState.showCompanyEdit = false; },
-    subs: [["company", "Company profile"], ["integrations", "Integrations"], ["quickbooks", "QuickBooks"], ["notifications", "Notifications"], ["audit", "Audit log"], ["data", "Data export & import"]] }
+    subs: [["company", "Company profile"], ["integrations", "Integrations"], ["systems", "Systems"], ["quickbooks", "QuickBooks"], ["notifications", "Notifications"], ["audit", "Audit log"], ["data", "Data export & import"]] }
 };
 var erpSidebarSublistEl = null;
 var erpSidebarLastSig = "";
@@ -1892,6 +1892,7 @@ async function renderHome() {
     await renderDashAttention(body, dashData);
     renderDashRecentOrders(body, dashData);
     await renderDashTrend(body);
+    await renderDashBI(body);
   }
   if (!erpIsAdmin() && (erpSession().perms || []).length === 0) {
     note = "No functions assigned yet \u2014 ask Matt or DJ to assign your permissions.";
@@ -2081,6 +2082,140 @@ async function renderDashTrend(body) {
   });
   await load("day");
 }
+/* ---------------- Dashboard: executive BI trends (Module I) ---------------- */
+// Read-only KPI trends for the last 12 months, from data the ERP
+// already stores. Admin-only, like the sales-trend chart above: the
+// fetch 403s for staff, and the panel says so instead of showing
+// numbers. A KPI with no data in the window says "No data" -- trends
+// are never fabricated. Months run oldest to newest; change is vs the
+// previous month, blank when the previous month was zero.
+async function renderDashBI(body) {
+  dashSectionTitle(body, "Executive trends");
+  var wrap = document.createElement("div");
+  wrap.className = "dash-panel";
+  body.appendChild(wrap);
+  var data = null;
+  try {
+    var resp = await authFetch("/api/erp/dashboard/bi");
+    data = await resp.json().catch(function () { return {}; });
+    if (!resp.ok) throw new Error("unavailable");
+  } catch (e) {
+    var note = document.createElement("p");
+    note.textContent = "Executive trends are admin-only.";
+    wrap.appendChild(note);
+    return;
+  }
+  function moneyCell(cents) {
+    return (cents === null || cents === undefined) ? "—" : money(cents / 100);
+  }
+  function changeCell(pct) {
+    if (pct === null || pct === undefined) return "—";
+    return (pct > 0 ? "+" : "") + pct + "%";
+  }
+  function kpiTable(headers, rows) {
+    var table = document.createElement("table");
+    table.className = "admin-orders-table";
+    var thead = document.createElement("thead");
+    var hr = document.createElement("tr");
+    headers.forEach(function (c) {
+      var th = document.createElement("th");
+      th.textContent = c;
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    rows.forEach(function (r) {
+      var tr = document.createElement("tr");
+      r.forEach(function (cell) {
+        var td = document.createElement("td");
+        td.textContent = cell;
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    return table;
+  }
+  function kpiNote(text) {
+    var p = document.createElement("p");
+    p.className = "dash-chart-note";
+    p.textContent = text;
+    wrap.appendChild(p);
+  }
+  function kpiHeading(text) {
+    var h = document.createElement("h4");
+    h.textContent = text;
+    wrap.appendChild(h);
+  }
+  // Sales + orders.
+  kpiHeading("Sales — last 12 months");
+  if (!data.sales_has_data) {
+    var noSales = document.createElement("p");
+    noSales.textContent = "No data — no sales in the last 12 months.";
+    wrap.appendChild(noSales);
+  } else {
+    wrap.appendChild(kpiTable(["Month", "Revenue", "Orders", "Change vs prior month"],
+      (data.sales || []).map(function (s) {
+        return [s.month, moneyCell(s.revenue_cents), String(s.order_count), changeCell(s.change_pct)];
+      })));
+  }
+  kpiNote(data.sales_note || "");
+  // Inventory value.
+  kpiHeading("Inventory value — last 12 months");
+  var inv = data.inventory_value || {};
+  if (!inv.monthly || !inv.monthly.length || inv.current_total_cents === null || inv.current_total_cents === undefined) {
+    var noInv = document.createElement("p");
+    noInv.textContent = "No data — no inventory movements recorded.";
+    wrap.appendChild(noInv);
+  } else {
+    wrap.appendChild(kpiTable(["Month", "Value (month-end)"],
+      inv.monthly.map(function (m) { return [m.month, moneyCell(m.value_cents)]; })));
+    var cur = document.createElement("p");
+    cur.textContent = "Current inventory value: " + moneyCell(inv.current_total_cents) + ".";
+    wrap.appendChild(cur);
+  }
+  kpiNote(inv.note || "");
+  // Payroll.
+  kpiHeading("Payroll — last 12 months");
+  if (!data.payroll_has_data) {
+    var noPay = document.createElement("p");
+    noPay.textContent = "No data — no approved or paid pay runs in the last 12 months.";
+    wrap.appendChild(noPay);
+  } else {
+    wrap.appendChild(kpiTable(["Month", "Gross", "Total cost", "Runs"],
+      (data.payroll || []).map(function (p) {
+        return [p.month, moneyCell(p.gross_cents), moneyCell(p.total_cost_cents), String(p.run_count)];
+      })));
+  }
+  kpiNote(data.payroll_note || "");
+  // Wholesale AR.
+  kpiHeading("Wholesale accounts receivable — last 12 months");
+  var ar = data.wholesale_ar || {};
+  var arCur = document.createElement("p");
+  arCur.textContent = "Open wholesale balance now: " + moneyCell(ar.current_open_cents) + " across " + (ar.open_invoice_count || 0) + " open invoice" + ((ar.open_invoice_count || 0) === 1 ? "" : "s") + ".";
+  wrap.appendChild(arCur);
+  if (!(ar.billed_monthly || []).some(function (m) { return m.billed_cents || m.invoice_count; })) {
+    var noAr = document.createElement("p");
+    noAr.textContent = "No data — no wholesale invoices in the last 12 months.";
+    wrap.appendChild(noAr);
+  } else {
+    wrap.appendChild(kpiTable(["Month", "Billed", "Invoices"],
+      ar.billed_monthly.map(function (m) {
+        return [m.month, moneyCell(m.billed_cents), String(m.invoice_count)];
+      })));
+    if ((ar.by_invoice_month || []).length) {
+      var byH = document.createElement("h4");
+      byH.textContent = "Open balance by invoice month (current snapshot)";
+      wrap.appendChild(byH);
+      wrap.appendChild(kpiTable(["Invoice month", "Still open", "Invoices"],
+        ar.by_invoice_month.map(function (m) {
+          return [m.month, moneyCell(m.open_cents), String(m.invoice_count)];
+        })));
+    }
+  }
+  kpiNote(ar.note || "");
+}
 window.addEventListener("hashchange", renderRoute);
 
 /* ---------- init ---------- */
@@ -2143,6 +2278,9 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           showLots: false, showShrinkage: false, showReplenishment: false,
           selectedItemId: null, selectedPOId: null,
           overduePOs: [], perfVendorId: null, perfData: null,
+          scorecards: [],
+          fleet: [], fleetVehicleId: null, fleetDetail: null,
+          showAddVehicle: false,
           priceVendorId: null, priceData: null, editPOId: null,
           stockSearch: "", showAddItem: false, showAddVendor: false, editVendorId: null, showNewPO: false, acctAccounts: [], acctJournal: [], acctTrial: null, acctView: "accounts", showAddAcct: false, showNewEntry: false, acctInvoices: [], acctBills: [], acctAging: null, acctWholesale: [], acctVendors: [], showNewInvoice: false, showNewBill: false, payInvoiceId: null, editInvoiceId: null, payBillId: null, acctBankAccounts: [], acctBankTxns: null, acctRecon: null, showAddBankAcct: false, selectedBankAccountId: null, matchTxnId: null, bankSyncMsg: "", acctReportKind: "profit-loss", acctReport: null, acctReportStart: "", acctReportEnd: "", acctReportAsOf: "", acctReportCompare: true, acctReportError: "", acctTaxRates: [], acctTaxLiability: null, acctTaxFilings: [], showAddTaxRate: false, showNewTaxFiling: false, remitTaxFilingId: null, acctTaxError: "", acctPayrollEmployees: [], acctPayrollRuns: [], acctPayrollFilings: [], showAddPayrollEmployee: false, editPayrollEmployeeId: null, showNewPayrollRun: false, selectedPayrollRunId: null, acctPayrollError: "", acctAudit: [], acctAuditFilters: {action: "", actor: "", from: "", to: ""}, acctAuditOffset: 0, acctAuditLoaded: false, acctBackup: null, acctBackupLoaded: false, acctSales: null, acctSalesLoaded: false, acctSalesMsg: "", acctSnapshot: null, acctSnapshotLoaded: false, acctStmtCustomers: [], acctStmtCustomersLoaded: false, acctStatement: null, acctStatementLoaded: false, acctStmtKey: "", acctStmtStart: "", acctStmtEnd: "", acctStmtError: "",
           acctMatch: null, acctMatchLoaded: false, creditNoteInvoiceId: null,
@@ -2150,6 +2288,8 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           acctQbDiff: null, acctQbDiffLoaded: false,
           acctDraws: [], acctDrawsLoaded: false, showNewDraw: false,
           acctBillPayRequests: [], acctBillPayRequestsLoaded: false,
+          acctBudgets: [], acctBudgetPeriod: "", acctVariance: null, acctVarianceLoaded: false, showNewBudget: false,
+          acctTreasury: null, acctTreasuryLoaded: false, acctTreasuryAsOf: "",
           acctTaxChecklists: {}, acctTaxChecklistsLoaded: false,
           acctTaxReminders: [], acctTaxRemindersLoaded: false,
           acctTaxRemindMsg: "",
@@ -4739,11 +4879,13 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               erpGet("/api/erp/purchase-orders"),
               erpGet("/api/erp/items"),
               erpGet("/api/erp/locations"),
-              erpGet("/api/erp/purchase-orders/overdue")
+              erpGet("/api/erp/purchase-orders/overdue"),
+              erpGet("/api/erp/vendors/scorecards").catch(function () { return { scorecards: [] }; })
             ]);
             erpState.vendors = results[0].vendors || [];
             erpState.pos = results[1].purchase_orders || [];
             erpState.overduePOs = results[4].overdue || [];
+            erpState.scorecards = results[5].scorecards || [];
             erpState.items = results[2].items || [];
             erpState.locations = results[3].locations || [];
             renderErpPurchasingDetail();
@@ -4795,6 +4937,8 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           els.body.appendChild(poToolbar);
           if (erpState.showNewPO && erpCan("purchasing.write")) els.body.appendChild(erpNewPOForm());
           els.body.appendChild(erpPOTable());
+          els.body.appendChild(erpSectionTitle("Vendor scorecards"));
+          els.body.appendChild(erpVendorScorecardPanel());
         }
         /* ---------------- Accounting: ledger + chart of accounts ---------------- */
         function erpAcctCanWrite() { return erpCan("accounting.write"); }
@@ -4881,6 +5025,8 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           if (erpAcctCanRead()) acctTabs.push(["matching", "Matching"]);
           if (erpAcctCanRead()) acctTabs.push(["diff", "QB diff"]);
           if (erpAcctCanRead()) acctTabs.push(["draws", "Owner draws"]);
+          if (erpIsAdmin()) acctTabs.push(["budgets", "Budgets"]);
+          if (erpIsAdmin()) acctTabs.push(["treasury", "Treasury"]);
           if (erpTaxCanRead()) acctTabs.push(["tax", "Sales Tax"]);
           if (erpPayrollCanRead()) acctTabs.push(["payroll", "Payroll"]);
           acctTabs.forEach(function (t) {
@@ -5106,6 +5252,24 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
               noAccess.textContent = "Admin access required.";
               els.body.appendChild(noAccess);
             }
+          } else if (erpState.acctView === "budgets") {
+            if (erpIsAdmin()) {
+              if (!erpState.acctVarianceLoaded) erpAcctLoadBudgets();
+              els.body.appendChild(erpAcctBudgetsSection());
+            } else {
+              var noAccess = document.createElement("p");
+              noAccess.textContent = "Admin access required.";
+              els.body.appendChild(noAccess);
+            }
+          } else if (erpState.acctView === "treasury") {
+            if (erpIsAdmin()) {
+              if (!erpState.acctTreasuryLoaded) erpAcctLoadTreasury();
+              els.body.appendChild(erpAcctTreasurySection());
+            } else {
+              var noAccess = document.createElement("p");
+              noAccess.textContent = "Admin access required.";
+              els.body.appendChild(noAccess);
+            }
           } else {
             var aToolbar = document.createElement("div");
             aToolbar.className = "erp-toolbar";
@@ -5126,7 +5290,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             els.body.appendChild(erpAcctAccountsTable());
           }
         }
-        var ERP_ACCT_AUDIT_ACTIONS = ["account.create", "account.deactivate", "journal.post", "journal.reverse", "invoice.create", "invoice.pay", "invoice.void", "bill.create", "bill.pay", "bill.void", "bank.create", "bank.sync", "bank.auto_match", "bank.match", "bank.unmatch", "bank.close", "tax.rate.add", "tax.filing.create", "tax.remit", "tax.file", "payroll.employee.create", "payroll.employee.update", "payroll.employee.deactivate", "payroll.run.create", "payroll.run.approve", "payroll.run.pay", "payroll.tax.file", "migration.import", "period.lock", "period.unlock", "backup.export", "backup.restore", "sale.post", "sale.backfill", "sale.post_failed", "credit_note.create", "bill_po.link", "draw.request", "draw.approve", "draw.reject", "draw.cancel", "billpay.request", "billpay.approve", "billpay.reject", "billpay.cancel", "tax.checklist", "tax.remind"];
+        var ERP_ACCT_AUDIT_ACTIONS = ["account.create", "account.deactivate", "journal.post", "journal.reverse", "invoice.create", "invoice.pay", "invoice.void", "bill.create", "bill.pay", "bill.void", "bank.create", "bank.sync", "bank.auto_match", "bank.match", "bank.unmatch", "bank.close", "tax.rate.add", "tax.filing.create", "tax.remit", "tax.file", "payroll.employee.create", "payroll.employee.update", "payroll.employee.deactivate", "payroll.run.create", "payroll.run.approve", "payroll.run.pay", "payroll.tax.file", "migration.import", "period.lock", "period.unlock", "backup.export", "backup.restore", "sale.post", "sale.backfill", "sale.post_failed", "credit_note.create", "bill_po.link", "draw.request", "draw.approve", "draw.reject", "draw.cancel", "billpay.request", "billpay.approve", "billpay.reject", "billpay.cancel", "tax.checklist", "tax.remind", "budget.create", "budget.update", "budget.delete"];
         async function erpAcctLoadAudit() {
           var f = erpState.acctAuditFilters;
           var q = "/api/erp/accounting/audit?limit=100&offset=" + erpState.acctAuditOffset;
@@ -5284,7 +5448,7 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           title.textContent = "Backup status";
           wrap.appendChild(title);
           var note = document.createElement("p");
-          note.textContent = "Nightly accounting backup: a snapshot of the 24 accounting tables, stored on this VM and in Google Drive, verified weekly. Backup files are not downloadable from the ERP.";
+          note.textContent = "Nightly accounting backup: a snapshot of the 28 accounting tables, stored on this VM and in Google Drive, verified weekly. Backup files are not downloadable from the ERP.";
           wrap.appendChild(note);
           if (!erpState.acctBackupLoaded) {
             var loading = document.createElement("p");
@@ -5452,6 +5616,263 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             var p = document.createElement("p");
             p.textContent = text;
             wrap.appendChild(p);
+          });
+          return wrap;
+        }
+        // ---- Big-company package, modules B + K: budgets vs actual and
+        // treasury cash view. Both tabs are admin-only (see the tab list
+        // and the render branches above); the endpoints enforce it too.
+        function erpAcctBudgetMonth() {
+          return erpState.acctBudgetPeriod || new Date().toISOString().slice(0, 7);
+        }
+        async function erpAcctLoadBudgets() {
+          try {
+            var period = erpAcctBudgetMonth();
+            var data = await erpGet("/api/erp/accounting/budgets?period=" + encodeURIComponent(period));
+            erpState.acctBudgets = (data && data.budgets) ? data.budgets : [];
+            var v = await erpGet("/api/erp/accounting/budgets/variance?period=" + encodeURIComponent(period));
+            erpState.acctVariance = (v && typeof v === "object") ? v : {error: true};
+          } catch (error) {
+            erpState.acctBudgets = [];
+            erpState.acctVariance = {error: true};
+          }
+          erpState.acctVarianceLoaded = true;
+          renderErpAccountingDetail();
+        }
+        function erpAcctBudgetsSection() {
+          var wrap = document.createElement("div");
+          var title = document.createElement("h3");
+          title.textContent = "Budgets vs actual";
+          wrap.appendChild(title);
+          var note = document.createElement("p");
+          note.textContent = "Monthly budgets by account. Budgets are planning figures: they never post to the ledger and never change the trial balance. Actuals come from the same ledger the P&L uses. An account with activity but no budget is listed as unbudgeted, never as zero-spent. For income, a positive variance means more than planned; for expenses, it means over budget.";
+          wrap.appendChild(note);
+          var periodRow = document.createElement("p");
+          periodRow.textContent = "Month: ";
+          var periodInput = document.createElement("input");
+          periodInput.type = "month";
+          periodInput.value = erpAcctBudgetMonth();
+          periodInput.addEventListener("change", function () {
+            if (!periodInput.value) return;
+            erpState.acctBudgetPeriod = periodInput.value;
+            erpState.acctVarianceLoaded = false;
+            erpAcctLoadBudgets();
+          });
+          periodRow.appendChild(periodInput);
+          wrap.appendChild(periodRow);
+          var formBtn = document.createElement("button");
+          formBtn.type = "button";
+          formBtn.textContent = erpState.showNewBudget ? "Cancel" : "Set a budget";
+          formBtn.addEventListener("click", function () {
+            erpState.showNewBudget = !erpState.showNewBudget;
+            renderErpAccountingDetail();
+          });
+          wrap.appendChild(formBtn);
+          if (erpState.showNewBudget) wrap.appendChild(erpAcctNewBudgetForm());
+          if (!erpState.acctVarianceLoaded) {
+            var loading = document.createElement("p");
+            loading.textContent = "Loading budgets\u2026";
+            wrap.appendChild(loading);
+            return wrap;
+          }
+          var v = erpState.acctVariance;
+          if (!v || v.error) {
+            var err = document.createElement("p");
+            err.textContent = "Budgets could not be loaded.";
+            wrap.appendChild(err);
+            return wrap;
+          }
+          var t = v.totals || {};
+          var totLine = document.createElement("p");
+          totLine.textContent = "Month " + (v.label || "") + " \u2014 Budget " + erpMoney(t.budget_cents || 0) + " \u2014 Actual " + erpMoney(t.actual_cents || 0) + " \u2014 Variance " + erpMoney(t.variance_cents || 0) + (t.variance_pct === null || t.variance_pct === undefined ? "" : " (" + t.variance_pct + "%)") + " \u2014 " + (t.budgeted_account_count || 0) + " budgeted accounts.";
+          wrap.appendChild(totLine);
+          if (!(v.rows || []).length && !(v.unbudgeted || []).length) {
+            var none = document.createElement("p");
+            none.textContent = "No budgets and no activity this month yet. Set a budget above to start planning.";
+            wrap.appendChild(none);
+            return wrap;
+          }
+          (v.rows || []).forEach(function (row) {
+            var line = document.createElement("p");
+            line.textContent = row.code + " " + row.name + " \u2014 Budget " + erpMoney(row.budget_cents) + " \u2014 Actual " + erpMoney(row.actual_cents) + " \u2014 Variance " + erpMoney(row.variance_cents) + (row.variance_pct === null || row.variance_pct === undefined ? " (no %: zero budget)" : " (" + row.variance_pct + "%)");
+            wrap.appendChild(line);
+            var budget = null;
+            (erpState.acctBudgets || []).forEach(function (b) {
+              if (String(b.account_id) === String(row.account_id)) budget = b;
+            });
+            if (budget) {
+              var delBtn = document.createElement("button");
+              delBtn.type = "button";
+              delBtn.textContent = "Delete budget";
+              delBtn.addEventListener("click", function () {
+                if (delBtn.textContent !== "Click again to delete") {
+                  delBtn.textContent = "Click again to delete";
+                  return;
+                }
+                delBtn.disabled = true;
+                erpDelete("/api/erp/accounting/budgets/" + encodeURIComponent(String(budget.id))).then(function () {
+                  erpState.acctVarianceLoaded = false;
+                  return erpAcctLoadBudgets();
+                }).catch(function (error) {
+                  delBtn.disabled = false;
+                  delBtn.textContent = "Delete budget";
+                  setAdminDetailStatus(error.message, true);
+                });
+              });
+              wrap.appendChild(delBtn);
+            }
+          });
+          if ((v.unbudgeted || []).length) {
+            var unHead = document.createElement("p");
+            unHead.textContent = "Unbudgeted this month (activity with no budget set):";
+            wrap.appendChild(unHead);
+            v.unbudgeted.forEach(function (row) {
+              var line = document.createElement("p");
+              line.textContent = row.code + " " + row.name + " \u2014 Actual " + erpMoney(row.actual_cents) + " \u2014 no budget set";
+              wrap.appendChild(line);
+            });
+          }
+          return wrap;
+        }
+        function erpAcctNewBudgetForm() {
+          var wrap = document.createElement("div");
+          var acctLabel = document.createElement("label");
+          acctLabel.textContent = "Account ";
+          var acctSel = document.createElement("select");
+          (erpState.acctAccounts || []).forEach(function (a) {
+            if (!a.active || (a.type !== "income" && a.type !== "expense")) return;
+            var opt = document.createElement("option");
+            opt.value = String(a.id);
+            opt.textContent = a.code + " " + a.name;
+            acctSel.appendChild(opt);
+          });
+          acctLabel.appendChild(acctSel);
+          wrap.appendChild(acctLabel);
+          var amtLabel = document.createElement("label");
+          amtLabel.textContent = " Budget ($) ";
+          var amtInput = document.createElement("input");
+          amtInput.type = "number";
+          amtInput.step = "0.01";
+          amtInput.min = "0";
+          amtInput.placeholder = "0.00";
+          amtLabel.appendChild(amtInput);
+          wrap.appendChild(amtLabel);
+          var submit = document.createElement("button");
+          submit.type = "button";
+          submit.textContent = "Save budget";
+          submit.addEventListener("click", function () {
+            var cents = erpDollarsToCents(amtInput.value || "0");
+            if (cents === null || cents < 0) {
+              setAdminDetailStatus("Budget must be $0 or more.", true);
+              return;
+            }
+            if (!acctSel.value) {
+              setAdminDetailStatus("Pick an income or expense account.", true);
+              return;
+            }
+            submit.disabled = true;
+            erpPost("/api/erp/accounting/budgets", {account_id: Number(acctSel.value), period: erpAcctBudgetMonth(), amount_cents: cents}).then(function () {
+              erpState.showNewBudget = false;
+              erpState.acctVarianceLoaded = false;
+              return erpAcctLoadBudgets();
+            }).catch(function (error) {
+              submit.disabled = false;
+              setAdminDetailStatus(error.message, true);
+            });
+          });
+          wrap.appendChild(submit);
+          return wrap;
+        }
+        async function erpAcctLoadTreasury() {
+          try {
+            var asOf = erpState.acctTreasuryAsOf || new Date().toISOString().slice(0, 10);
+            var data = await erpGet("/api/erp/accounting/treasury?as_of=" + encodeURIComponent(asOf));
+            erpState.acctTreasury = (data && typeof data === "object") ? data : {error: true};
+          } catch (error) {
+            erpState.acctTreasury = {error: true};
+          }
+          erpState.acctTreasuryLoaded = true;
+          renderErpAccountingDetail();
+        }
+        function erpAcctTreasurySection() {
+          var wrap = document.createElement("div");
+          var title = document.createElement("h3");
+          title.textContent = "Treasury \u2014 cash position";
+          wrap.appendChild(title);
+          var note = document.createElement("p");
+          note.textContent = "Read-only. Cash is the live GL balance of the cash accounts (1010 Checking, 1020 Petty Cash, plus any bank-linked cash account). The forecast is only the open invoices and bills already in the ERP, scheduled by due date.";
+          wrap.appendChild(note);
+          var asOfRow = document.createElement("p");
+          asOfRow.textContent = "As of: ";
+          var asOfInput = document.createElement("input");
+          asOfInput.type = "date";
+          asOfInput.value = erpState.acctTreasuryAsOf || new Date().toISOString().slice(0, 10);
+          asOfInput.addEventListener("change", function () {
+            if (!asOfInput.value) return;
+            erpState.acctTreasuryAsOf = asOfInput.value;
+            erpState.acctTreasuryLoaded = false;
+            erpAcctLoadTreasury();
+          });
+          asOfRow.appendChild(asOfInput);
+          wrap.appendChild(asOfRow);
+          if (!erpState.acctTreasuryLoaded) {
+            var loading = document.createElement("p");
+            loading.textContent = "Loading treasury\u2026";
+            wrap.appendChild(loading);
+            return wrap;
+          }
+          var s = erpState.acctTreasury;
+          if (!s || s.error) {
+            var err = document.createElement("p");
+            err.textContent = "Treasury could not be loaded.";
+            wrap.appendChild(err);
+            return wrap;
+          }
+          if (s.empty) {
+            var none = document.createElement("p");
+            none.textContent = "No cash activity yet: no journal entries and no open invoices or bills.";
+            wrap.appendChild(none);
+            return wrap;
+          }
+          var cash = s.cash || {};
+          var cashLine = document.createElement("p");
+          cashLine.textContent = "Cash as of " + (s.as_of || "") + ": " + erpMoney(cash.total_cents || 0) + " across " + ((cash.accounts || []).length) + " cash accounts.";
+          wrap.appendChild(cashLine);
+          (cash.accounts || []).forEach(function (a) {
+            var line = document.createElement("p");
+            line.textContent = a.code + " " + a.name + ": " + erpMoney(a.balance_cents);
+            wrap.appendChild(line);
+          });
+          var tot = s.totals || {};
+          var inLine = document.createElement("p");
+          inLine.textContent = "Expected in: " + erpMoney(tot.expected_in_cents || 0) + " (" + (tot.open_invoice_count || 0) + " open invoices)" + (tot.overdue_in_cents ? " \u2014 of which overdue: " + erpMoney(tot.overdue_in_cents) : "");
+          wrap.appendChild(inLine);
+          var outLine = document.createElement("p");
+          outLine.textContent = "Expected out: " + erpMoney(tot.expected_out_cents || 0) + " (" + (tot.open_bill_count || 0) + " open bills)" + (tot.overdue_out_cents ? " \u2014 of which overdue: " + erpMoney(tot.overdue_out_cents) : "");
+          wrap.appendChild(outLine);
+          var projLine = document.createElement("p");
+          projLine.textContent = "Projected balance: " + erpMoney(tot.projected_balance_cents || 0);
+          wrap.appendChild(projLine);
+          var schedHead = document.createElement("p");
+          schedHead.textContent = "Forecast schedule (by due date):";
+          wrap.appendChild(schedHead);
+          if (!(s.schedule || []).length) {
+            var noSched = document.createElement("p");
+            noSched.textContent = "No open invoices or bills \u2014 nothing scheduled.";
+            wrap.appendChild(noSched);
+          }
+          (s.schedule || []).forEach(function (row) {
+            var line = document.createElement("p");
+            line.textContent = row.date + " \u2014 " + (row.kind === "in" ? "In" : "Out") + " \u2014 " + row.ref + " \u2014 " + row.name + " \u2014 " + erpMoney(row.amount_cents) + " \u2014 running balance " + erpMoney(row.running_balance_cents) + (row.overdue ? " (overdue)" : "");
+            wrap.appendChild(line);
+          });
+          var asmHead = document.createElement("p");
+          asmHead.textContent = "Assumptions:";
+          wrap.appendChild(asmHead);
+          (s.assumptions || []).forEach(function (a) {
+            var line = document.createElement("p");
+            line.textContent = a;
+            wrap.appendChild(line);
           });
           return wrap;
         }
@@ -9692,10 +10113,37 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
           var sum = document.createElement("p");
           sum.textContent = p.po_count + " purchase orders (" + p.open_count + " open, " +
             p.completed_count + " completed) · On-time " +
-            (p.on_time_pct === null ? "—" : p.on_time_pct + "% (" + p.on_time_count + " of " + p.on_time_denominator + ")") +
-            " · Fill rate " + (p.fill_rate_pct === null ? "—" : p.fill_rate_pct + "%") +
+            (p.on_time_pct === null ? "No data" : p.on_time_pct + "% (" + p.on_time_count + " of " + p.on_time_denominator + ")") +
+            " · Fill rate " + (p.fill_rate_pct === null ? "No data" : p.fill_rate_pct + "%") +
+            " · In-full " + (p.in_full_pct === null ? "No data" : p.in_full_pct + "% (" + p.in_full_count + " of " + p.in_full_denominator + ")") +
+            " · OTIF " + (p.otif_pct === null ? "No data" : p.otif_pct + "% (" + p.otif_count + " of " + p.otif_denominator + ")") +
             " · Avg lead time " + (p.avg_lead_days === null ? "—" : p.avg_lead_days + " days");
           wrap.appendChild(sum);
+          var otifNote = document.createElement("p");
+          otifNote.className = "admin-orders-empty";
+          otifNote.textContent = "OTIF = the share of completed POs that were both on time (last receipt on or before the expected date) and in full (received at least as much as ordered). Only completed POs are scored; a vendor with no completed POs shows no data, never 0%.";
+          wrap.appendChild(otifNote);
+          var poRows = p.pos || [];
+          if (poRows.length) {
+            var poTable = document.createElement("table");
+            poTable.className = "admin-orders-table";
+            poTable.innerHTML = "<thead><tr><th>PO</th><th>Expected</th><th>Last receipt</th><th>Ordered</th><th>Received</th><th>On time</th><th>In full</th><th>OTIF</th></tr></thead>";
+            var poTb = document.createElement("tbody");
+            poRows.forEach(function (po) {
+              var tr = document.createElement("tr");
+              tr.appendChild(erpCell("PO", po.po_number));
+              tr.appendChild(erpCell("Expected", po.expected_date || "—"));
+              tr.appendChild(erpCell("Last receipt", po.last_receipt_date || "—"));
+              tr.appendChild(erpCell("Ordered", erpQty(po.qty_ordered)));
+              tr.appendChild(erpCell("Received", erpQty(po.qty_received)));
+              tr.appendChild(erpCell("On time", po.on_time === null || po.on_time === undefined ? "—" : (po.on_time ? "Yes" : "No")));
+              tr.appendChild(erpCell("In full", po.in_full === null || po.in_full === undefined ? "—" : (po.in_full ? "Yes" : "No")));
+              tr.appendChild(erpCell("OTIF", po.otif === null || po.otif === undefined ? "—" : (po.otif ? "Yes" : "No")));
+              poTb.appendChild(tr);
+            });
+            poTable.appendChild(poTb);
+            wrap.appendChild(poTable);
+          }
           if ((p.overdue || []).length) {
             var od = document.createElement("p");
             od.textContent = "Overdue: " + p.overdue.map(function (o) {
@@ -9708,6 +10156,39 @@ document.getElementById("logoutBtn").addEventListener("click", function () { doL
             none.textContent = "No overdue purchase orders for this vendor.";
             wrap.appendChild(none);
           }
+          return wrap;
+        }
+        /* ---------------- Module C: all-vendor OTIF scorecard ---------------- */
+        function erpVendorScorecardPanel() {
+          var wrap = document.createElement("div");
+          var note = document.createElement("p");
+          note.className = "admin-orders-empty";
+          note.textContent = "One row per vendor, computed from purchase orders and receipts. OTIF = on time and in full. A vendor with no completed POs shows No data, never 0%.";
+          wrap.appendChild(note);
+          var rows = erpState.scorecards || [];
+          if (!rows.length) {
+            var none = document.createElement("p");
+            none.className = "admin-orders-empty";
+            none.textContent = "No vendors yet.";
+            wrap.appendChild(none);
+            return wrap;
+          }
+          var table = document.createElement("table");
+          table.className = "admin-orders-table";
+          table.innerHTML = "<thead><tr><th>Vendor</th><th>POs</th><th>On-time</th><th>In-full</th><th>OTIF</th><th>Fill rate</th></tr></thead>";
+          var tb = document.createElement("tbody");
+          rows.forEach(function (s) {
+            var tr = document.createElement("tr");
+            tr.appendChild(erpCell("Vendor", s.vendor_name + (s.active ? "" : " (inactive)")));
+            tr.appendChild(erpCell("POs", String(s.po_count) + " (" + s.completed_count + " completed)"));
+            tr.appendChild(erpCell("On-time", s.on_time_pct === null ? "No data" : s.on_time_pct + "% (" + s.on_time_count + " of " + s.on_time_denominator + ")"));
+            tr.appendChild(erpCell("In-full", s.in_full_pct === null ? "No data" : s.in_full_pct + "% (" + s.in_full_count + " of " + s.in_full_denominator + ")"));
+            tr.appendChild(erpCell("OTIF", s.otif_pct === null ? "No data" : s.otif_pct + "% (" + s.otif_count + " of " + s.otif_denominator + ")"));
+            tr.appendChild(erpCell("Fill rate", s.fill_rate_pct === null ? "No data" : s.fill_rate_pct + "%"));
+            tb.appendChild(tr);
+          });
+          table.appendChild(tb);
+          wrap.appendChild(table);
           return wrap;
         }
         function erpVendorPricePanel(res) {
@@ -17991,7 +18472,8 @@ function renderErpReportsDetail() {
    ["spend", "Spend by vendor"], ["customers", "Customers"],
    ["profitability", "Channel profitability"], ["programs", "Programs"],
    ["forecast", "Forecast"],
-   ["summaries", "Sales summaries"]].forEach(function (t) {
+   ["summaries", "Sales summaries"],
+   ["esg", "ESG metrics"]].forEach(function (t) {
     var b = document.createElement("button");
     b.type = "button";
     b.textContent = t[1];
@@ -18014,7 +18496,275 @@ function renderErpReportsDetail() {
   else if (v === "profitability") renderErpProfitabilityReport(els.body);
   else if (v === "programs") renderErpProgramsReport(els.body);
   else if (v === "forecast") renderErpForecastReport(els.body);
+  else if (v === "esg") renderErpEsgReport(els.body);
   else renderErpSummariesView(els.body);
+}
+
+function renderErpEsgReport(body) {
+  // ESG metrics (Dept 7, Module H). Monthly, admin-entered values
+  // over the trailing 12 months. Staff with reports.read see the
+  // tables read-only; the entry forms render for admins only.
+  // A month with no entered value shows as —, never as zero.
+  var isAdmin = erpIsAdmin();
+  var note = document.createElement("p");
+  note.style.color = "var(--muted)";
+  note.textContent = "Admin-entered sustainability metrics by month — energy use, waste, packaging, or anything else you define. No baselines, no benchmarks: a month with no entered value shows as —, never as zero. Change compares against the previous month with an entered value; change % is blank when there is no previous value or it was zero.";
+  body.appendChild(note);
+  var adminWrap = document.createElement("div");
+  body.appendChild(adminWrap);
+  var out = document.createElement("div");
+  out.textContent = "Loading…";
+  body.appendChild(out);
+  function esgFmt(v) {
+    if (v === null || v === undefined) return null;
+    var n = Number(v);
+    if (!isFinite(n)) return String(v);
+    return String(Math.round(n * 100) / 100);
+  }
+  function esgSigned(v) {
+    if (v === null || v === undefined) return null;
+    var n = Number(v);
+    if (!isFinite(n)) return String(v);
+    var s = String(Math.round(n * 100) / 100);
+    return n > 0 ? "+" + s : s;
+  }
+  function esgPct(v) {
+    if (v === null || v === undefined) return null;
+    var n = Number(v);
+    if (!isFinite(n)) return String(v);
+    var s = String(n);
+    return n > 0 ? "+" + s + "%" : s + "%";
+  }
+  erpGet("/api/erp/reports/esg").then(function (res) {
+    var metrics = res.metrics || [];
+    out.replaceChildren();
+    if (isAdmin) {
+      // --- Add a metric definition. ---
+      var mCard = document.createElement("div");
+      mCard.className = "erp-form";
+      var mTitle = document.createElement("h3");
+      mTitle.style.flex = "1 1 100%";
+      mTitle.textContent = "Add a metric";
+      mCard.appendChild(mTitle);
+      var mName = document.createElement("input");
+      mName.type = "text";
+      mName.placeholder = "Metric name, e.g. Electricity use";
+      mCard.appendChild(erpField("Metric name", mName));
+      var mUnit = document.createElement("input");
+      mUnit.type = "text";
+      mUnit.placeholder = "Unit, e.g. kWh";
+      mCard.appendChild(erpField("Unit", mUnit));
+      var mStatus = document.createElement("p");
+      mStatus.style.color = "var(--muted)";
+      mStatus.style.flex = "1 1 100%";
+      mCard.appendChild(mStatus);
+      var mBtn = document.createElement("button");
+      mBtn.type = "button";
+      mBtn.textContent = "Add metric";
+      mBtn.addEventListener("click", function () {
+        if (!mName.value.trim()) { mStatus.textContent = "Enter a metric name first."; return; }
+        mBtn.disabled = true;
+        mStatus.textContent = "Adding…";
+        erpPost("/api/erp/reports/esg/metrics", {
+          name: mName.value, unit: mUnit.value
+        }).then(function () {
+          renderErpReportsDetail();
+        }).catch(function (error) {
+          mStatus.textContent = error.message;
+          mBtn.disabled = false;
+        });
+      });
+      mCard.appendChild(mBtn);
+      adminWrap.appendChild(mCard);
+      // --- Record a monthly value. ---
+      if (metrics.length) {
+        var vCard = document.createElement("div");
+        vCard.className = "erp-form";
+        var vTitle = document.createElement("h3");
+        vTitle.style.flex = "1 1 100%";
+        vTitle.textContent = "Record a monthly value";
+        vCard.appendChild(vTitle);
+        var vMetric = document.createElement("select");
+        metrics.forEach(function (m) {
+          var opt = document.createElement("option");
+          opt.value = m.metric.id;
+          opt.textContent = m.metric.name + (m.metric.unit ? (" (" + m.metric.unit + ")") : "");
+          vMetric.appendChild(opt);
+        });
+        vMetric.value = String(metrics[0].metric.id);
+        vCard.appendChild(erpField("Metric", vMetric));
+        var vPeriod = document.createElement("input");
+        vPeriod.type = "text";
+        vPeriod.placeholder = "YYYY-MM";
+        vCard.appendChild(erpField("Month", vPeriod));
+        var vValue = document.createElement("input");
+        vValue.type = "text";
+        vValue.placeholder = "Value, e.g. 1240";
+        vCard.appendChild(erpField("Value", vValue));
+        var vNote = document.createElement("input");
+        vNote.type = "text";
+        vNote.placeholder = "Note (optional)";
+        vCard.appendChild(erpField("Note", vNote));
+        var vStatus = document.createElement("p");
+        vStatus.style.color = "var(--muted)";
+        vStatus.style.flex = "1 1 100%";
+        vCard.appendChild(vStatus);
+        var vBtn = document.createElement("button");
+        vBtn.type = "button";
+        vBtn.textContent = "Record value";
+        vBtn.addEventListener("click", function () {
+          if (!vPeriod.value.trim()) { vStatus.textContent = "Enter a month (YYYY-MM) first."; return; }
+          if (!vValue.value.trim()) { vStatus.textContent = "Enter a value first."; return; }
+          vBtn.disabled = true;
+          vStatus.textContent = "Recording…";
+          erpPost("/api/erp/reports/esg/values", {
+            metric_id: Number(vMetric.value), period: vPeriod.value,
+            value: vValue.value, note: vNote.value
+          }).then(function () {
+            renderErpReportsDetail();
+          }).catch(function (error) {
+            vStatus.textContent = error.message;
+            vBtn.disabled = false;
+          });
+        });
+        vCard.appendChild(vBtn);
+        var vHint = document.createElement("p");
+        vHint.className = "admin-orders-empty";
+        vHint.style.flex = "1 1 100%";
+        vHint.textContent = "Saving a value for a month that already has one replaces it.";
+        vCard.appendChild(vHint);
+        adminWrap.appendChild(vCard);
+      }
+    }
+    if (!metrics.length) {
+      var empty = document.createElement("p");
+      empty.className = "admin-orders-empty";
+      empty.textContent = "No ESG metrics defined yet. Add the first metric above.";
+      out.appendChild(empty);
+      return;
+    }
+    metrics.forEach(function (entry) {
+      var m = entry.metric;
+      var h3 = document.createElement("h3");
+      h3.textContent = m.name + (m.unit ? (" (" + m.unit + ")") : "");
+      out.appendChild(h3);
+      if (!entry.has_data) {
+        var none = document.createElement("p");
+        none.className = "admin-orders-empty";
+        none.textContent = "No values recorded yet for this metric.";
+        out.appendChild(none);
+      }
+      out.appendChild(erpReportTable(
+        ["Month", "Value" + (m.unit ? (" (" + m.unit + ")") : ""), "Change", "Change %"],
+        (entry.series || []).map(function (s) {
+          return [s.period, esgFmt(s.value), esgSigned(s.change), esgPct(s.change_pct)];
+        })));
+      if (isAdmin) {
+        var row = document.createElement("div");
+        row.className = "erp-toolbar";
+        var editBtn = document.createElement("button");
+        editBtn.type = "button";
+        editBtn.textContent = "Edit metric";
+        editBtn.addEventListener("click", function () {
+          renderErpEsgMetricEditForm(out, m, function () { renderErpReportsDetail(); });
+        });
+        row.appendChild(editBtn);
+        var delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.textContent = "Delete metric";
+        delBtn.addEventListener("click", function () {
+          delBtn.disabled = true;
+          erpDelete("/api/erp/reports/esg/metrics/" + m.id).then(function () {
+            renderErpReportsDetail();
+          }).catch(function (error) {
+            var e = document.createElement("p");
+            e.style.color = "var(--muted)";
+            e.textContent = error.message;
+            out.appendChild(e);
+            delBtn.disabled = false;
+          });
+        });
+        row.appendChild(delBtn);
+        out.appendChild(row);
+      }
+    });
+    // --- Recorded values, with per-value delete (admin). ---
+    erpGet("/api/erp/reports/esg/values").then(function (vals) {
+      var values = vals.values || [];
+      var vh = document.createElement("h3");
+      vh.textContent = "Recorded values";
+      out.appendChild(vh);
+      if (!values.length) {
+        var vn = document.createElement("p");
+        vn.className = "admin-orders-empty";
+        vn.textContent = "No values recorded yet.";
+        out.appendChild(vn);
+        return;
+      }
+      values.forEach(function (val) {
+        var line = document.createElement("p");
+        line.textContent = val.period + " — " + val.metric_name + ": " + esgFmt(val.value) + (val.metric_unit ? (" " + val.metric_unit) : "") + (val.note ? (" — " + val.note) : "");
+        out.appendChild(line);
+        if (isAdmin) {
+          var del = document.createElement("button");
+          del.type = "button";
+          del.textContent = "Delete value";
+          del.addEventListener("click", function () {
+            del.disabled = true;
+            erpDelete("/api/erp/reports/esg/values/" + val.id).then(function () {
+              renderErpReportsDetail();
+            }).catch(function (error) {
+              var e = document.createElement("p");
+              e.style.color = "var(--muted)";
+              e.textContent = error.message;
+              out.appendChild(e);
+              del.disabled = false;
+            });
+          });
+          out.appendChild(del);
+        }
+      });
+    }).catch(function (error) { out.textContent = error.message; });
+  }).catch(function (error) { out.textContent = error.message; });
+}
+function renderErpEsgMetricEditForm(out, rec, reload) {
+  // Inline edit for one metric definition: swaps the whole ESG view
+  // body for the edit form (Cancel reloads the view).
+  out.replaceChildren();
+  var title = document.createElement("h3");
+  title.textContent = "Edit metric";
+  out.appendChild(title);
+  var nameInput = document.createElement("input");
+  nameInput.type = "text";
+  nameInput.value = rec.name || "";
+  out.appendChild(erpField("Metric name", nameInput));
+  var unitInput = document.createElement("input");
+  unitInput.type = "text";
+  unitInput.value = rec.unit || "";
+  out.appendChild(erpField("Unit", unitInput));
+  var status = document.createElement("p");
+  status.style.color = "var(--muted)";
+  out.appendChild(status);
+  var saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.textContent = "Save changes";
+  saveBtn.addEventListener("click", function () {
+    saveBtn.disabled = true;
+    erpPost("/api/erp/reports/esg/metrics/" + rec.id + "/update", {
+      name: nameInput.value, unit: unitInput.value
+    }).then(function () {
+      reload();
+    }).catch(function (error) {
+      status.textContent = error.message;
+      saveBtn.disabled = false;
+    });
+  });
+  out.appendChild(saveBtn);
+  var cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", function () { reload(); });
+  out.appendChild(cancelBtn);
 }
 
 function renderErpSalesReport(body) {
@@ -20973,6 +21723,7 @@ function renderErpHrDetail(data, staffList, events, timeTotals, overtimeAlerts, 
   els.body.appendChild(renderErpHrDocumentsExpiringSection());
   els.body.appendChild(renderErpHrHiringSection(loadErpHrDetail));
   els.body.appendChild(renderErpHrHeadcountSection(loadErpHrDetail));
+  els.body.appendChild(renderErpHrTrainingSection(loadErpHrDetail));
 }
 function renderErpHrCard(e) {
   var card = document.createElement("div");
@@ -22880,6 +23631,306 @@ function renderErpHrHeadcountSection(reload) {
     renderPeriods();
     renderUnassigned(results[3].employees || []);
     loadForecast();
+  });
+  return wrap;
+}
+function renderErpHrTrainingSection(reload) {
+  // Training records (Dept 12, Module D): admin-defined courses +
+  // per-employee completion records. Self-fetching like the hiring
+  // section. This is the real training record: the onboarding
+  // checklist's "Training done" tick stays a manual checklist step
+  // (SOP 12.3) and is not a record. Nobody is ever auto-marked
+  // trained; expiry is computed from the course's re-training period
+  // (completed date + months) unless a date is typed.
+  var wrap = document.createElement("div");
+  var title = document.createElement("h3");
+  title.textContent = "Training records";
+  wrap.appendChild(title);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Admin-only. Courses are defined here and completions are the real training record — the onboarding checklist's “Training done” tick is only a checklist step, not a record. Nobody is auto-marked trained. Expiry is computed from the course's re-training period (completed date + months) unless a date is typed; expired and due-soon completions are listed below.";
+  wrap.appendChild(note);
+  var status = document.createElement("p");
+  status.style.color = "var(--muted)";
+  status.style.flex = "1 1 100%";
+  wrap.appendChild(status);
+  var coursesWrap = document.createElement("div");
+  wrap.appendChild(coursesWrap);
+  var overdueWrap = document.createElement("div");
+  wrap.appendChild(overdueWrap);
+  var complWrap = document.createElement("div");
+  wrap.appendChild(complWrap);
+  function expiryText(course) {
+    if (course.expiry_months === null || course.expiry_months === undefined) return "no expiry";
+    return "re-training every " + course.expiry_months + " month" + (course.expiry_months === 1 ? "" : "s");
+  }
+  function statusLabel(s) {
+    if (s === "expired") return "EXPIRED";
+    if (s === "due_soon") return "due soon";
+    if (s === "none") return "no expiry";
+    return "current";
+  }
+  function renderCourses(courses) {
+    coursesWrap.replaceChildren();
+    var h = document.createElement("h4");
+    h.textContent = "Courses";
+    coursesWrap.appendChild(h);
+    if (!courses.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No training courses yet. Add the first one below — courses are admin-defined, never pre-filled.";
+      coursesWrap.appendChild(none);
+    }
+    courses.forEach(function (course) {
+      var card = document.createElement("div");
+      card.className = "erp-form";
+      var h4 = document.createElement("h4");
+      h4.textContent = course.title + " (" + (course.active ? "Active" : "Inactive") + ") · " + expiryText(course)
+        + " · " + course.completion_count + " completion" + (course.completion_count === 1 ? "" : "s");
+      card.appendChild(h4);
+      if (course.description) {
+        var desc = document.createElement("p");
+        desc.textContent = course.description;
+        card.appendChild(desc);
+      }
+      var toggleBtn = document.createElement("button");
+      toggleBtn.type = "button";
+      toggleBtn.textContent = course.active ? "Deactivate" : "Activate";
+      toggleBtn.addEventListener("click", function () {
+        toggleBtn.disabled = true;
+        status.textContent = course.active ? "Deactivating course…" : "Activating course…";
+        erpPost("/api/erp/hr/training/courses/" + encodeURIComponent(String(course.id)) + "/update", { active: !course.active }).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          toggleBtn.disabled = false;
+        });
+      });
+      card.appendChild(toggleBtn);
+      var delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", function () {
+        delBtn.disabled = true;
+        status.textContent = "Deleting course…";
+        erpDelete("/api/erp/hr/training/courses/" + encodeURIComponent(String(course.id))).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          delBtn.disabled = false;
+        });
+      });
+      card.appendChild(delBtn);
+      var editBtn = document.createElement("button");
+      editBtn.type = "button";
+      editBtn.textContent = "Edit";
+      card.appendChild(editBtn);
+      var editForm = null;
+      editBtn.addEventListener("click", function () {
+        if (editForm) { editForm.remove(); editForm = null; return; }
+        editForm = document.createElement("div");
+        editForm.className = "erp-form";
+        var tInput = document.createElement("input");
+        tInput.type = "text";
+        tInput.value = course.title;
+        editForm.appendChild(erpField("Title", tInput));
+        var dInput = document.createElement("textarea");
+        dInput.value = course.description || "";
+        editForm.appendChild(erpField("Description", dInput));
+        var mInput = document.createElement("input");
+        mInput.type = "number";
+        mInput.min = "1";
+        mInput.max = "120";
+        mInput.value = (course.expiry_months === null || course.expiry_months === undefined) ? "" : String(course.expiry_months);
+        editForm.appendChild(erpField("Re-training period (months, blank = no expiry)", mInput));
+        var saveBtn = document.createElement("button");
+        saveBtn.type = "button";
+        saveBtn.textContent = "Save";
+        saveBtn.addEventListener("click", function () {
+          saveBtn.disabled = true;
+          status.textContent = "Saving course…";
+          erpPost("/api/erp/hr/training/courses/" + encodeURIComponent(String(course.id)) + "/update", {
+            title: tInput.value, description: dInput.value,
+            expiry_months: mInput.value === "" ? null : Number(mInput.value)
+          }).then(function () {
+            if (typeof reload === "function") reload();
+          }).catch(function (error) {
+            status.textContent = error.message;
+            saveBtn.disabled = false;
+          });
+        });
+        editForm.appendChild(saveBtn);
+        card.appendChild(editForm);
+      });
+      coursesWrap.appendChild(card);
+    });
+    var form = document.createElement("div");
+    form.className = "erp-form";
+    var formTitle = document.createElement("h4");
+    formTitle.textContent = "Add course";
+    form.appendChild(formTitle);
+    var titleInput = document.createElement("input");
+    titleInput.type = "text";
+    titleInput.placeholder = "Title";
+    form.appendChild(erpField("Title", titleInput));
+    var descInput = document.createElement("textarea");
+    descInput.placeholder = "Description (optional)";
+    form.appendChild(erpField("Description", descInput));
+    var monthsInput = document.createElement("input");
+    monthsInput.type = "number";
+    monthsInput.min = "1";
+    monthsInput.max = "120";
+    monthsInput.placeholder = "Blank = never expires";
+    form.appendChild(erpField("Re-training period (months)", monthsInput));
+    var addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.textContent = "Add course";
+    addBtn.addEventListener("click", function () {
+      addBtn.disabled = true;
+      status.textContent = "Adding course…";
+      erpPost("/api/erp/hr/training/courses", {
+        title: titleInput.value, description: descInput.value,
+        expiry_months: monthsInput.value === "" ? null : Number(monthsInput.value)
+      }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        addBtn.disabled = false;
+      });
+    });
+    form.appendChild(addBtn);
+    coursesWrap.appendChild(form);
+  }
+  function renderOverdue(overdue) {
+    overdueWrap.replaceChildren();
+    var h = document.createElement("h4");
+    h.textContent = "Expiry / overdue";
+    overdueWrap.appendChild(h);
+    var expired = overdue.expired || [];
+    var dueSoon = overdue.due_soon || [];
+    if (!expired.length && !dueSoon.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "Nothing expired and nothing due within 30 days.";
+      overdueWrap.appendChild(none);
+      return;
+    }
+    expired.forEach(function (c) {
+      var p = document.createElement("p");
+      p.textContent = "EXPIRED: " + c.employee_name + " — " + c.course_title + " (completed " + c.completed_date + ", expired " + c.expiry_date + ")";
+      overdueWrap.appendChild(p);
+    });
+    dueSoon.forEach(function (c) {
+      var p = document.createElement("p");
+      p.textContent = "Due soon: " + c.employee_name + " — " + c.course_title + " (expires " + c.expiry_date + ")";
+      overdueWrap.appendChild(p);
+    });
+  }
+  function renderCompletions(completions, employees, courses) {
+    complWrap.replaceChildren();
+    var h = document.createElement("h4");
+    h.textContent = "Completions";
+    complWrap.appendChild(h);
+    if (!completions.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No completions recorded yet. Nobody is marked trained until a completion is recorded here.";
+      complWrap.appendChild(none);
+    }
+    completions.forEach(function (c) {
+      var card = document.createElement("div");
+      card.className = "erp-form";
+      var line = document.createElement("p");
+      line.textContent = c.employee_name + " — " + c.course_title + " · completed " + c.completed_date
+        + (c.expiry_date ? " · expires " + c.expiry_date + " (" + statusLabel(c.expiry_status) + ")" : " · no expiry")
+        + (c.certificate ? " · cert: " + c.certificate : "")
+        + (c.notes ? " — " + c.notes : "");
+      card.appendChild(line);
+      var delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", function () {
+        delBtn.disabled = true;
+        status.textContent = "Deleting completion…";
+        erpDelete("/api/erp/hr/training/completions/" + encodeURIComponent(String(c.id))).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          delBtn.disabled = false;
+        });
+      });
+      card.appendChild(delBtn);
+      complWrap.appendChild(card);
+    });
+    var form = document.createElement("div");
+    form.className = "erp-form";
+    var formTitle = document.createElement("h4");
+    formTitle.textContent = "Record a completion";
+    form.appendChild(formTitle);
+    var empSelect = document.createElement("select");
+    (employees || []).forEach(function (e) {
+      var opt = document.createElement("option");
+      opt.value = String(e.id);
+      opt.textContent = e.name + (e.active ? "" : " (inactive)");
+      empSelect.appendChild(opt);
+    });
+    form.appendChild(erpField("Employee", empSelect));
+    var courseSelect = document.createElement("select");
+    (courses || []).filter(function (c) { return c.active; }).forEach(function (c) {
+      var opt = document.createElement("option");
+      opt.value = String(c.id);
+      opt.textContent = c.title;
+      courseSelect.appendChild(opt);
+    });
+    form.appendChild(erpField("Course (active only)", courseSelect));
+    var dateInput = document.createElement("input");
+    dateInput.type = "date";
+    form.appendChild(erpField("Completed date", dateInput));
+    var expiryInput = document.createElement("input");
+    expiryInput.type = "date";
+    form.appendChild(erpField("Expiry date (blank = from course period)", expiryInput));
+    var certInput = document.createElement("input");
+    certInput.type = "text";
+    certInput.placeholder = "Certificate reference (optional)";
+    form.appendChild(erpField("Certificate", certInput));
+    var addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.textContent = "Record completion";
+    addBtn.addEventListener("click", function () {
+      addBtn.disabled = true;
+      status.textContent = "Recording completion…";
+      erpPost("/api/erp/hr/training/completions", {
+        employee_id: Number(empSelect.value), course_id: Number(courseSelect.value),
+        completed_date: dateInput.value, expiry_date: expiryInput.value || "",
+        certificate: certInput.value
+      }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        addBtn.disabled = false;
+      });
+    });
+    form.appendChild(addBtn);
+    if (!(employees || []).length || !(courses || []).filter(function (c) { return c.active; }).length) {
+      addBtn.disabled = true;
+      var hint = document.createElement("p");
+      hint.className = "admin-orders-empty";
+      hint.textContent = !(employees || []).length ? "Add an employee first (SOP 12.1)." : "Add an active course first.";
+      form.appendChild(hint);
+    }
+    complWrap.appendChild(form);
+  }
+  Promise.all([
+    erpGet("/api/erp/hr/training/courses").catch(function () { return { courses: [] }; }),
+    erpGet("/api/erp/hr/training/completions").catch(function () { return { completions: [] }; }),
+    erpGet("/api/erp/hr/training/overdue").catch(function () { return { expired: [], due_soon: [] }; }),
+    erpGet("/api/erp/hr/employees").catch(function () { return { employees: [] }; })
+  ]).then(function (results) {
+    renderCourses(results[0].courses || []);
+    renderOverdue(results[2]);
+    renderCompletions(results[1].completions || [], results[3].employees || [], results[0].courses || []);
+  }).catch(function (error) {
+    status.textContent = error.message;
   });
   return wrap;
 }
@@ -24816,6 +25867,13 @@ function renderErpQualityDetail(data) {
   renderErpQualityChecklistsSection(chkWrap, data.templates || [], data.checklists || [], data.tempLog || [], data.stores || [], loadErpQualityDetail);
   els.body.appendChild(chkWrap);
 
+  var calWrap = document.createElement("div");
+  renderErpQualityCalibrationSection(calWrap, loadErpQualityDetail);
+  els.body.appendChild(calWrap);
+  var auditWrap = document.createElement("div");
+  renderErpQualityAuditSection(auditWrap, loadErpQualityDetail);
+  els.body.appendChild(auditWrap);
+
   // --- SOP Library (read copy of the SOP files). ---
   var sopCard = qCard("SOP Library");
   sopCard.appendChild(qNote("Read-only copy of the SOP files — every SOP, by department. SOPs are edited in the SOP files and re-imported (hidden_files/sop_import.py); this library never edits them."));
@@ -25296,6 +26354,546 @@ function renderErpQualityHaccpEditForm(card, rec, status, reload) {
   card.appendChild(cancelBtn);
 }
 
+function renderErpQualityCalibrationSection(wrap, reload) {
+  // Equipment calibration (Dept 13, Module E): the equipment register
+  // + dated calibration records. Self-fetching. Nothing is
+  // pre-registered. A record's due date drives the due/overdue list
+  // (computed from stored dates vs today, never stored). Deleting
+  // equipment with records is refused; deleting a record is allowed.
+  var title = document.createElement("h3");
+  title.textContent = "Equipment calibration";
+  wrap.appendChild(title);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Admin-only. Register scales, thermometers, and other equipment here, then record each calibration with its due date. Due and overdue are computed from the stored due dates — the latest calibration per item is what counts. Deleting equipment with calibration records is refused; deleting a single calibration record is allowed.";
+  wrap.appendChild(note);
+  var status = document.createElement("p");
+  status.style.color = "var(--muted)";
+  status.style.flex = "1 1 100%";
+  wrap.appendChild(status);
+  var dueWrap = document.createElement("div");
+  wrap.appendChild(dueWrap);
+  var listWrap = document.createElement("div");
+  wrap.appendChild(listWrap);
+  function dueLabel(s) {
+    if (s === "overdue") return "OVERDUE";
+    if (s === "due_soon") return "due soon";
+    if (s === "none") return "no calibrations yet";
+    return "current";
+  }
+  function renderDue(due) {
+    dueWrap.replaceChildren();
+    var h = document.createElement("h4");
+    h.textContent = "Due / overdue";
+    dueWrap.appendChild(h);
+    var overdue = due.overdue || [];
+    var dueSoon = due.due_soon || [];
+    if (!overdue.length && !dueSoon.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "Nothing overdue and nothing due within 30 days.";
+      dueWrap.appendChild(none);
+      return;
+    }
+    overdue.forEach(function (c) {
+      var p = document.createElement("p");
+      p.textContent = "OVERDUE: " + c.equipment_name + " — due " + c.due_date + " (calibrated " + c.calibration_date + ", " + c.result + ", by " + c.performed_by + ")";
+      dueWrap.appendChild(p);
+    });
+    dueSoon.forEach(function (c) {
+      var p = document.createElement("p");
+      p.textContent = "Due soon: " + c.equipment_name + " — due " + c.due_date + " (calibrated " + c.calibration_date + ", " + c.result + ", by " + c.performed_by + ")";
+      dueWrap.appendChild(p);
+    });
+  }
+  function renderEquipment(items) {
+    listWrap.replaceChildren();
+    var h = document.createElement("h4");
+    h.textContent = "Equipment register";
+    listWrap.appendChild(h);
+    if (!items.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No equipment registered yet. Add the first item below — nothing is pre-registered.";
+      listWrap.appendChild(none);
+    }
+    items.forEach(function (eq) {
+      var card = document.createElement("div");
+      card.className = "erp-form";
+      var h4 = document.createElement("h4");
+      h4.textContent = eq.name + " (" + (eq.active ? "Active" : "Inactive") + ")"
+        + (eq.type ? " · " + eq.type : "")
+        + (eq.location ? " · " + eq.location : "")
+        + (eq.serial ? " · SN " + eq.serial : "")
+        + " · " + eq.calibration_count + " calibration" + (eq.calibration_count === 1 ? "" : "s")
+        + " · " + dueLabel(eq.due_status)
+        + (eq.due_date ? " (due " + eq.due_date + ")" : "");
+      card.appendChild(h4);
+      var calList = document.createElement("div");
+      card.appendChild(calList);
+      var calToggle = document.createElement("button");
+      calToggle.type = "button";
+      calToggle.textContent = "Calibrations";
+      var calShown = false;
+      calToggle.addEventListener("click", function () {
+        calShown = !calShown;
+        if (!calShown) { calList.replaceChildren(); return; }
+        erpGet("/api/erp/quality/equipment/" + encodeURIComponent(String(eq.id)) + "/calibrations").then(function (data) {
+          calList.replaceChildren();
+          var cals = data.calibrations || [];
+          if (!cals.length) {
+            var n = document.createElement("p");
+            n.className = "admin-orders-empty";
+            n.textContent = "No calibration records yet.";
+            calList.appendChild(n);
+          }
+          cals.forEach(function (c) {
+            var row = document.createElement("p");
+            row.textContent = "Calibrated " + c.calibration_date + " · due " + c.due_date + " (" + dueLabel(c.due_status) + ") · " + c.result + " · by " + c.performed_by + (c.notes ? " — " + c.notes : "");
+            calList.appendChild(row);
+            var delBtn = document.createElement("button");
+            delBtn.type = "button";
+            delBtn.textContent = "Delete record";
+            delBtn.addEventListener("click", function () {
+              delBtn.disabled = true;
+              status.textContent = "Deleting calibration record…";
+              erpDelete("/api/erp/quality/calibrations/" + encodeURIComponent(String(c.id))).then(function () {
+                if (typeof reload === "function") reload();
+              }).catch(function (error) {
+                status.textContent = error.message;
+                delBtn.disabled = false;
+              });
+            });
+            calList.appendChild(delBtn);
+          });
+        }).catch(function (error) { status.textContent = error.message; });
+      });
+      card.appendChild(calToggle);
+      var addCalBtn = document.createElement("button");
+      addCalBtn.type = "button";
+      addCalBtn.textContent = "Record calibration";
+      card.appendChild(addCalBtn);
+      var calForm = null;
+      addCalBtn.addEventListener("click", function () {
+        if (calForm) { calForm.remove(); calForm = null; return; }
+        calForm = document.createElement("div");
+        calForm.className = "erp-form";
+        var dateInput = document.createElement("input");
+        dateInput.type = "date";
+        calForm.appendChild(erpField("Calibration date", dateInput));
+        var dueInput = document.createElement("input");
+        dueInput.type = "date";
+        calForm.appendChild(erpField("Due date", dueInput));
+        var resultSelect = document.createElement("select");
+        [["pass", "Pass"], ["fail", "Fail"], ["adjusted", "Adjusted"]].forEach(function (o) {
+          var opt = document.createElement("option");
+          opt.value = o[0];
+          opt.textContent = o[1];
+          resultSelect.appendChild(opt);
+        });
+        calForm.appendChild(erpField("Result", resultSelect));
+        var byInput = document.createElement("input");
+        byInput.type = "text";
+        byInput.placeholder = "Who calibrated it";
+        calForm.appendChild(erpField("Performed by", byInput));
+        var notesInput = document.createElement("textarea");
+        notesInput.placeholder = "Notes (optional)";
+        calForm.appendChild(erpField("Notes", notesInput));
+        var saveBtn = document.createElement("button");
+        saveBtn.type = "button";
+        saveBtn.textContent = "Save calibration";
+        saveBtn.addEventListener("click", function () {
+          saveBtn.disabled = true;
+          status.textContent = "Saving calibration…";
+          erpPost("/api/erp/quality/equipment/" + encodeURIComponent(String(eq.id)) + "/calibrations", {
+            calibration_date: dateInput.value, due_date: dueInput.value,
+            result: resultSelect.value, performed_by: byInput.value, notes: notesInput.value
+          }).then(function () {
+            if (typeof reload === "function") reload();
+          }).catch(function (error) {
+            status.textContent = error.message;
+            saveBtn.disabled = false;
+          });
+        });
+        calForm.appendChild(saveBtn);
+        card.appendChild(calForm);
+      });
+      var toggleBtn = document.createElement("button");
+      toggleBtn.type = "button";
+      toggleBtn.textContent = eq.active ? "Deactivate" : "Activate";
+      toggleBtn.addEventListener("click", function () {
+        toggleBtn.disabled = true;
+        status.textContent = eq.active ? "Deactivating equipment…" : "Activating equipment…";
+        erpPost("/api/erp/quality/equipment/" + encodeURIComponent(String(eq.id)) + "/update", { active: !eq.active }).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          toggleBtn.disabled = false;
+        });
+      });
+      card.appendChild(toggleBtn);
+      var delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", function () {
+        delBtn.disabled = true;
+        status.textContent = "Deleting equipment…";
+        erpDelete("/api/erp/quality/equipment/" + encodeURIComponent(String(eq.id))).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          delBtn.disabled = false;
+        });
+      });
+      card.appendChild(delBtn);
+      listWrap.appendChild(card);
+    });
+    var form = document.createElement("div");
+    form.className = "erp-form";
+    var formTitle = document.createElement("h4");
+    formTitle.textContent = "Add equipment";
+    form.appendChild(formTitle);
+    var nameInput = document.createElement("input");
+    nameInput.type = "text";
+    nameInput.placeholder = "Name";
+    form.appendChild(erpField("Name", nameInput));
+    var typeInput = document.createElement("input");
+    typeInput.type = "text";
+    typeInput.placeholder = "e.g. scale, thermometer";
+    form.appendChild(erpField("Type", typeInput));
+    var locInput = document.createElement("input");
+    locInput.type = "text";
+    locInput.placeholder = "Location";
+    form.appendChild(erpField("Location", locInput));
+    var serialInput = document.createElement("input");
+    serialInput.type = "text";
+    serialInput.placeholder = "Serial (optional)";
+    form.appendChild(erpField("Serial", serialInput));
+    var addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.textContent = "Add equipment";
+    addBtn.addEventListener("click", function () {
+      addBtn.disabled = true;
+      status.textContent = "Adding equipment…";
+      erpPost("/api/erp/quality/equipment", {
+        name: nameInput.value, type: typeInput.value,
+        location: locInput.value, serial: serialInput.value
+      }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        addBtn.disabled = false;
+      });
+    });
+    form.appendChild(addBtn);
+    listWrap.appendChild(form);
+  }
+  Promise.all([
+    erpGet("/api/erp/quality/equipment").catch(function () { return { equipment: [] }; }),
+    erpGet("/api/erp/quality/calibrations/due").catch(function () { return { overdue: [], due_soon: [] }; })
+  ]).then(function (results) {
+    renderDue(results[1]);
+    renderEquipment(results[0].equipment || []);
+  }).catch(function (error) {
+    status.textContent = error.message;
+  });
+}
+function renderErpQualityAuditSection(wrap, reload) {
+  // Internal audit program (Dept 13, Module F): scheduled audits with
+  // an SOP scope, a checklist per audit, findings, and corrective
+  // actions with owners and due dates. Self-fetching. This is NOT the
+  // accounting audit log and NOT the staff audit log -- those stay
+  // as-is. Auditor and action owners are free-text names (an auditor
+  // may be an external consultant with no ERP login); no auditor is
+  // ever invented. Scope is SOP numbers from the SOP Library.
+  var title = document.createElement("h3");
+  title.textContent = "Internal audits";
+  wrap.appendChild(title);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Admin-only. The quality audit program — not the accounting audit log, which stays as-is. Schedule an audit with the SOPs it covers and the auditor (a free-text name — an auditor may be an external consultant with no ERP login), run its checklist, log findings, and track each corrective action to done. Deleting an audit with checklist items or findings is refused; deleting a finding with actions is refused; deleting a single action or checklist item is allowed.";
+  wrap.appendChild(note);
+  var status = document.createElement("p");
+  status.style.color = "var(--muted)";
+  status.style.flex = "1 1 100%";
+  wrap.appendChild(status);
+  var listWrap = document.createElement("div");
+  wrap.appendChild(listWrap);
+  function renderAudits(audits, sopNumbers) {
+    listWrap.replaceChildren();
+    var h = document.createElement("h4");
+    h.textContent = "Audit program";
+    listWrap.appendChild(h);
+    if (!audits.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = "No internal audits scheduled yet. Add the first one below — the program starts empty.";
+      listWrap.appendChild(none);
+    }
+    audits.forEach(function (a) {
+      var card = document.createElement("div");
+      card.className = "erp-form";
+      var h4 = document.createElement("h4");
+      h4.textContent = a.audit_date + " · SOPs " + a.scope + " · " + a.auditor + " · " + a.status
+        + " · " + a.finding_count + " finding" + (a.finding_count === 1 ? "" : "s")
+        + " (" + a.open_findings + " open) · " + a.open_actions + " open action" + (a.open_actions === 1 ? "" : "s");
+      card.appendChild(h4);
+      if (a.notes) {
+        var n = document.createElement("p");
+        n.textContent = a.notes;
+        card.appendChild(n);
+      }
+      var detailWrap = document.createElement("div");
+      card.appendChild(detailWrap);
+      var openBtn = document.createElement("button");
+      openBtn.type = "button";
+      openBtn.textContent = "Open audit";
+      var detailShown = false;
+      openBtn.addEventListener("click", function () {
+        detailShown = !detailShown;
+        if (!detailShown) { detailWrap.replaceChildren(); return; }
+        erpGet("/api/erp/quality/audits/" + encodeURIComponent(String(a.id))).then(function (data) {
+          renderAuditDetail(detailWrap, data.audit);
+        }).catch(function (error) { status.textContent = error.message; });
+      });
+      card.appendChild(openBtn);
+      var statusSelect = document.createElement("select");
+      [["planned", "Planned"], ["in_progress", "In progress"], ["completed", "Completed"]].forEach(function (o) {
+        var opt = document.createElement("option");
+        opt.value = o[0];
+        opt.textContent = o[1];
+        if (a.status === o[0]) opt.selected = true;
+        statusSelect.appendChild(opt);
+      });
+      statusSelect.addEventListener("change", function () {
+        status.textContent = "Updating audit…";
+        erpPost("/api/erp/quality/audits/" + encodeURIComponent(String(a.id)) + "/update", { status: statusSelect.value }).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) { status.textContent = error.message; });
+      });
+      card.appendChild(erpField("Status", statusSelect));
+      var delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.textContent = "Delete";
+      delBtn.addEventListener("click", function () {
+        delBtn.disabled = true;
+        status.textContent = "Deleting audit…";
+        erpDelete("/api/erp/quality/audits/" + encodeURIComponent(String(a.id))).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          delBtn.disabled = false;
+        });
+      });
+      card.appendChild(delBtn);
+      listWrap.appendChild(card);
+    });
+    var form = document.createElement("div");
+    form.className = "erp-form";
+    var formTitle = document.createElement("h4");
+    formTitle.textContent = "Schedule an audit";
+    form.appendChild(formTitle);
+    var dateInput = document.createElement("input");
+    dateInput.type = "date";
+    form.appendChild(erpField("Audit date", dateInput));
+    var scopeInput = document.createElement("input");
+    scopeInput.type = "text";
+    scopeInput.placeholder = "e.g. 13.1, 13.6";
+    form.appendChild(erpField("Scope (SOP numbers, comma-separated)", scopeInput));
+    if (sopNumbers.length) {
+      var hint = document.createElement("p");
+      hint.className = "admin-orders-empty";
+      hint.textContent = "SOPs in the Library: " + sopNumbers.join(", ");
+      form.appendChild(hint);
+    }
+    var auditorInput = document.createElement("input");
+    auditorInput.type = "text";
+    auditorInput.placeholder = "Auditor name";
+    form.appendChild(erpField("Auditor", auditorInput));
+    var notesInput = document.createElement("textarea");
+    notesInput.placeholder = "Notes (optional)";
+    form.appendChild(erpField("Notes", notesInput));
+    var addBtn = document.createElement("button");
+    addBtn.type = "button";
+    addBtn.textContent = "Schedule audit";
+    addBtn.addEventListener("click", function () {
+      addBtn.disabled = true;
+      status.textContent = "Scheduling audit…";
+      erpPost("/api/erp/quality/audits", {
+        audit_date: dateInput.value, scope: scopeInput.value,
+        auditor: auditorInput.value, notes: notesInput.value
+      }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        addBtn.disabled = false;
+      });
+    });
+    form.appendChild(addBtn);
+    listWrap.appendChild(form);
+  }
+  function renderAuditDetail(detailWrap, audit) {
+    detailWrap.replaceChildren();
+    var chkTitle = document.createElement("h4");
+    chkTitle.textContent = "Checklist (" + audit.checklist_done + "/" + audit.checklist_total + " done)";
+    detailWrap.appendChild(chkTitle);
+    (audit.checklist || []).forEach(function (item) {
+      var row = document.createElement("label");
+      row.style.display = "block";
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = !!item.done;
+      box.addEventListener("change", function () {
+        erpPost("/api/erp/quality/audit-checklist/" + encodeURIComponent(String(item.id)) + "/update", { done: box.checked }).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) { status.textContent = error.message; });
+      });
+      row.appendChild(box);
+      row.appendChild(document.createTextNode(" " + item.item + (item.notes ? " — " + item.notes : "")));
+      detailWrap.appendChild(row);
+      var delItemBtn = document.createElement("button");
+      delItemBtn.type = "button";
+      delItemBtn.textContent = "Delete item";
+      delItemBtn.addEventListener("click", function () {
+        erpDelete("/api/erp/quality/audit-checklist/" + encodeURIComponent(String(item.id))).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) { status.textContent = error.message; });
+      });
+      detailWrap.appendChild(delItemBtn);
+    });
+    var itemInput = document.createElement("input");
+    itemInput.type = "text";
+    itemInput.placeholder = "New checklist item";
+    detailWrap.appendChild(erpField("Add checklist item", itemInput));
+    var addItemBtn = document.createElement("button");
+    addItemBtn.type = "button";
+    addItemBtn.textContent = "Add item";
+    addItemBtn.addEventListener("click", function () {
+      addItemBtn.disabled = true;
+      erpPost("/api/erp/quality/audits/" + encodeURIComponent(String(audit.id)) + "/checklist", { item: itemInput.value }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        addItemBtn.disabled = false;
+      });
+    });
+    detailWrap.appendChild(addItemBtn);
+    var fTitle = document.createElement("h4");
+    fTitle.textContent = "Findings (" + audit.finding_count + ", " + audit.open_findings + " open)";
+    detailWrap.appendChild(fTitle);
+    (audit.findings || []).forEach(function (f) {
+      var fCard = document.createElement("div");
+      fCard.className = "erp-form";
+      var fp = document.createElement("p");
+      fp.textContent = "[" + f.severity + "] " + f.description + " · " + f.status + " · " + f.open_actions + " open action" + (f.open_actions === 1 ? "" : "s");
+      fCard.appendChild(fp);
+      (f.actions || []).forEach(function (act) {
+        var ap = document.createElement("p");
+        ap.textContent = act.description + " · owner " + act.owner + " · due " + act.due_date + " · " + act.status;
+        fCard.appendChild(ap);
+        var doneBtn = document.createElement("button");
+        doneBtn.type = "button";
+        doneBtn.textContent = act.status === "done" ? "Reopen action" : "Mark action done";
+        doneBtn.addEventListener("click", function () {
+          erpPost("/api/erp/quality/audit-actions/" + encodeURIComponent(String(act.id)) + "/update", { status: act.status === "done" ? "open" : "done" }).then(function () {
+            if (typeof reload === "function") reload();
+          }).catch(function (error) { status.textContent = error.message; });
+        });
+        fCard.appendChild(doneBtn);
+        var delActBtn = document.createElement("button");
+        delActBtn.type = "button";
+        delActBtn.textContent = "Delete action";
+        delActBtn.addEventListener("click", function () {
+          erpDelete("/api/erp/quality/audit-actions/" + encodeURIComponent(String(act.id))).then(function () {
+            if (typeof reload === "function") reload();
+          }).catch(function (error) { status.textContent = error.message; });
+        });
+        fCard.appendChild(delActBtn);
+      });
+      var actDesc = document.createElement("input");
+      actDesc.type = "text";
+      actDesc.placeholder = "Corrective action";
+      fCard.appendChild(erpField("Add corrective action", actDesc));
+      var actOwner = document.createElement("input");
+      actOwner.type = "text";
+      actOwner.placeholder = "Owner name";
+      fCard.appendChild(erpField("Owner", actOwner));
+      var actDue = document.createElement("input");
+      actDue.type = "date";
+      fCard.appendChild(erpField("Due date", actDue));
+      var addActBtn = document.createElement("button");
+      addActBtn.type = "button";
+      addActBtn.textContent = "Add action";
+      addActBtn.addEventListener("click", function () {
+        addActBtn.disabled = true;
+        erpPost("/api/erp/quality/audit-findings/" + encodeURIComponent(String(f.id)) + "/actions", {
+          description: actDesc.value, owner: actOwner.value, due_date: actDue.value
+        }).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          status.textContent = error.message;
+          addActBtn.disabled = false;
+        });
+      });
+      fCard.appendChild(addActBtn);
+      var fDoneBtn = document.createElement("button");
+      fDoneBtn.type = "button";
+      fDoneBtn.textContent = f.status === "done" ? "Reopen finding" : "Mark finding done";
+      fDoneBtn.addEventListener("click", function () {
+        erpPost("/api/erp/quality/audit-findings/" + encodeURIComponent(String(f.id)) + "/update", { status: f.status === "done" ? "open" : "done" }).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) { status.textContent = error.message; });
+      });
+      fCard.appendChild(fDoneBtn);
+      var fDelBtn = document.createElement("button");
+      fDelBtn.type = "button";
+      fDelBtn.textContent = "Delete finding";
+      fDelBtn.addEventListener("click", function () {
+        erpDelete("/api/erp/quality/audit-findings/" + encodeURIComponent(String(f.id))).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) { status.textContent = error.message; });
+      });
+      fCard.appendChild(fDelBtn);
+      detailWrap.appendChild(fCard);
+    });
+    var fDesc = document.createElement("textarea");
+    fDesc.placeholder = "Finding description";
+    detailWrap.appendChild(erpField("Add finding", fDesc));
+    var sevSelect = document.createElement("select");
+    [["minor", "Minor"], ["major", "Major"], ["critical", "Critical"]].forEach(function (o) {
+      var opt = document.createElement("option");
+      opt.value = o[0];
+      opt.textContent = o[1];
+      sevSelect.appendChild(opt);
+    });
+    detailWrap.appendChild(erpField("Severity", sevSelect));
+    var addFBtn = document.createElement("button");
+    addFBtn.type = "button";
+    addFBtn.textContent = "Add finding";
+    addFBtn.addEventListener("click", function () {
+      addFBtn.disabled = true;
+      erpPost("/api/erp/quality/audits/" + encodeURIComponent(String(audit.id)) + "/findings", {
+        description: fDesc.value, severity: sevSelect.value
+      }).then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        addFBtn.disabled = false;
+      });
+    });
+    detailWrap.appendChild(addFBtn);
+  }
+  Promise.all([
+    erpGet("/api/erp/quality/audits").catch(function () { return { audits: [] }; }),
+    erpGet("/api/erp/quality/sops").catch(function () { return { sops: [] }; })
+  ]).then(function (results) {
+    var sopNumbers = (results[1].sops || []).map(function (s) { return s.number; }).filter(function (n) { return !!n; });
+    renderAudits(results[0].audits || [], sopNumbers);
+  }).catch(function (error) {
+    status.textContent = error.message;
+  });
+}
+
 /* ---------------- Legal & Compliance (Dept 14 Wave B) ---------------- */
 // Admin-only. Trademark/IP register, contracts + insurance register,
 // licenses & permits register, and compliance calendar. The IP register starts seeded with the
@@ -25310,8 +26908,9 @@ async function loadErpLegalDetail() {
     var licenses = await erpGet("/api/erp/legal/licenses").catch(function () { return { licenses: [] }; });
     var compliance = await erpGet("/api/erp/legal/compliance").catch(function () { return { items: [] }; });
     var leases = await erpGet("/api/erp/legal/leases").catch(function () { return { leases: [] }; });
-    renderErpLegalDetail({ ip: ip.ip || [], agreements: agreements.agreements || [], licenses: licenses.licenses || [], items: compliance.items || [], leases: leases.leases || [] });
-    setAdminDetailStatus((ip.ip || []).length + " IP record" + ((ip.ip || []).length === 1 ? "" : "s") + " · " + (agreements.agreements || []).length + " agreement" + ((agreements.agreements || []).length === 1 ? "" : "s") + " · " + (licenses.licenses || []).length + " license" + ((licenses.licenses || []).length === 1 ? "" : "s") + " · " + (compliance.items || []).length + " compliance obligation" + ((compliance.items || []).length === 1 ? "" : "s") + ".");
+    var risks = await erpGet("/api/erp/legal/risks").catch(function () { return { risks: [] }; });
+    renderErpLegalDetail({ ip: ip.ip || [], agreements: agreements.agreements || [], licenses: licenses.licenses || [], items: compliance.items || [], leases: leases.leases || [], risks: risks.risks || [] });
+    setAdminDetailStatus((ip.ip || []).length + " IP record" + ((ip.ip || []).length === 1 ? "" : "s") + " · " + (agreements.agreements || []).length + " agreement" + ((agreements.agreements || []).length === 1 ? "" : "s") + " · " + (licenses.licenses || []).length + " license" + ((licenses.licenses || []).length === 1 ? "" : "s") + " · " + (compliance.items || []).length + " compliance obligation" + ((compliance.items || []).length === 1 ? "" : "s") + " · " + (risks.risks || []).length + " risk" + ((risks.risks || []).length === 1 ? "" : "s") + ".");
   } catch (error) {
     setAdminDetailStatus(error instanceof TypeError ?
       "We couldn't connect to load Legal & Compliance." : error.message, true);
@@ -25325,7 +26924,7 @@ function renderErpLegalDetail(data) {
   els.body.appendChild(h2);
   var note = document.createElement("p");
   note.className = "admin-orders-empty";
-  note.textContent = "Admin-only. The trademark register and the compliance calendar start seeded with the known facts — the Pop-A-Licious wordmark (unfiled) and the two FDA obligations; agreements and licenses start empty. Overdue and expiring-soon flags are computed from the dates — they are never stored.";
+  note.textContent = "Admin-only. The trademark register and the compliance calendar start seeded with the known facts — the Pop-A-Licious wordmark (unfiled) and the two FDA obligations; agreements, licenses and the risk register start empty. Overdue and expiring-soon flags are computed from the dates — they are never stored.";
   els.body.appendChild(note);
   function lInput(placeholder, type) {
     var input = document.createElement("input");
@@ -25771,6 +27370,82 @@ function renderErpLegalDetail(data) {
   var leaseWrap = document.createElement("div");
   renderErpLegalLeaseSection(leaseWrap, data.leases || [], data.agreements || [], loadErpLegalDetail);
   els.body.appendChild(leaseWrap);
+  // --- Risk register (Module G). ---
+  var riskCard = lCard("Risk register");
+  riskCard.appendChild(lNote("One row per risk — title, description, likelihood × impact on the low / medium / high scale, mitigation, owner, and a review date. The register starts empty — no risk is ever invented. Risk score is likelihood × impact (1–9) and the review flag is computed from the review date — they are never stored. Risks due for review are listed first."));
+  var riskTitle = lInput("Risk title, e.g. Single supplier for kernels");
+  riskCard.appendChild(erpField("Title", riskTitle));
+  var riskDesc = lArea("What could happen, and what it would cost us", 2);
+  riskCard.appendChild(lAreaField("Description", riskDesc));
+  var riskLikelihood = lSelect([["low", "Low"], ["medium", "Medium"], ["high", "High"]], "medium");
+  riskCard.appendChild(erpField("Likelihood", riskLikelihood));
+  var riskImpact = lSelect([["low", "Low"], ["medium", "Medium"], ["high", "High"]], "medium");
+  riskCard.appendChild(erpField("Impact", riskImpact));
+  var riskMitigation = lArea("What we do about it", 2);
+  riskCard.appendChild(lAreaField("Mitigation", riskMitigation));
+  var riskOwner = lInput("Owner (may be an external adviser)");
+  riskCard.appendChild(erpField("Owner", riskOwner));
+  var riskReview = lInput("YYYY-MM-DD");
+  riskCard.appendChild(erpField("Review date", riskReview));
+  var riskAddStatus = lStatus();
+  riskCard.appendChild(riskAddStatus);
+  var riskBtn = lButton("Add risk");
+  riskBtn.addEventListener("click", function () {
+    if (!riskTitle.value.trim()) { riskAddStatus.textContent = "Enter a risk title first."; return; }
+    riskBtn.disabled = true;
+    riskAddStatus.textContent = "Adding…";
+    erpPost("/api/erp/legal/risks", {
+      title: riskTitle.value, description: riskDesc.value,
+      likelihood: riskLikelihood.value, impact: riskImpact.value,
+      mitigation: riskMitigation.value, owner: riskOwner.value,
+      review_date: riskReview.value
+    }).then(function () {
+      loadErpLegalDetail();
+    }).catch(function (error) {
+      riskAddStatus.textContent = error.message;
+      riskBtn.disabled = false;
+    });
+  });
+  riskCard.appendChild(riskBtn);
+  var risks = data.risks || [];
+  var riskOverdue = risks.filter(function (r) { return r.review_status === "overdue"; });
+  var riskDueSoon = risks.filter(function (r) { return r.review_status === "due soon"; });
+  if (riskOverdue.length || riskDueSoon.length) {
+    riskCard.appendChild(lRow("Reviews due:"));
+    riskOverdue.forEach(function (r) {
+      riskCard.appendChild(lRow("OVERDUE review " + (r.review_date || "") + " — " + r.title));
+    });
+    riskDueSoon.forEach(function (r) {
+      riskCard.appendChild(lRow("Due soon " + (r.review_date || "") + " — " + r.title));
+    });
+  }
+  if (!risks.length) {
+    riskCard.appendChild(lNote("No risks recorded yet."));
+  }
+  risks.forEach(function (rec) {
+    var rowCard = document.createElement("div");
+    rowCard.className = "erp-form";
+    rowCard.style.flex = "1 1 100%";
+    rowCard.appendChild(lRow(rec.title + " · " + rec.likelihood + " × " + rec.impact + " — score " + rec.risk_score + (rec.review_date ? (" · review " + rec.review_date) : " · no review date") + " · " + rec.review_status + (rec.owner ? (" · owner " + rec.owner) : "") + (rec.description ? (" — " + rec.description) : "") + (rec.mitigation ? (" — mitigation: " + rec.mitigation) : "")));
+    var riskEditBtn = lButton("Edit");
+    riskEditBtn.addEventListener("click", function () {
+      renderErpLegalRiskEditForm(rowCard, rec, riskAddStatus, loadErpLegalDetail);
+    });
+    rowCard.appendChild(riskEditBtn);
+    var riskDelBtn = lButton("Delete");
+    riskDelBtn.addEventListener("click", function () {
+      riskDelBtn.disabled = true;
+      erpPost("/api/erp/legal/risks/" + rec.id + "/delete", {}).then(function () {
+        loadErpLegalDetail();
+      }).catch(function (error) {
+        riskAddStatus.textContent = error.message;
+        riskDelBtn.disabled = false;
+      });
+    });
+    rowCard.appendChild(riskDelBtn);
+    riskCard.appendChild(rowCard);
+  });
+  els.body.appendChild(riskCard);
 }
 function renderErpLegalLeaseSection(wrap, leases, agreements, reload) {
   // Lease accounting (ASC 842), Additions Wave C. Schedules are
@@ -26295,6 +27970,80 @@ function renderErpLegalComplianceEditForm(card, rec, status, reload) {
   cancelBtn.addEventListener("click", function () { reload(); });
   card.appendChild(cancelBtn);
 }
+function renderErpLegalRiskEditForm(card, rec, status, reload) {
+  card.replaceChildren();
+  var title = document.createElement("h3");
+  title.textContent = "Edit risk";
+  card.appendChild(title);
+  function eInput(value, placeholder) {
+    var input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = placeholder || "";
+    input.value = value || "";
+    return input;
+  }
+  function eArea(value, placeholder, rows) {
+    var area = document.createElement("textarea");
+    area.placeholder = placeholder || "";
+    area.rows = rows || 2;
+    area.style.width = "100%";
+    area.value = value || "";
+    return area;
+  }
+  function eSelect(pairs, selected) {
+    var sel = document.createElement("select");
+    pairs.forEach(function (p) {
+      var opt = document.createElement("option");
+      opt.value = p[0];
+      opt.textContent = p[1];
+      if (p[0] === selected) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.value = selected || (pairs.length ? pairs[0][0] : "");
+    return sel;
+  }
+  var titleInput = eInput(rec.title, "Title");
+  card.appendChild(erpField("Title", titleInput));
+  var descInput = eArea(rec.description, "Description", 2);
+  var descField = erpField("Description", descInput);
+  descField.style.flex = "1 1 100%";
+  card.appendChild(descField);
+  var likelihoodInput = eSelect([["low", "Low"], ["medium", "Medium"], ["high", "High"]], rec.likelihood);
+  card.appendChild(erpField("Likelihood", likelihoodInput));
+  var impactInput = eSelect([["low", "Low"], ["medium", "Medium"], ["high", "High"]], rec.impact);
+  card.appendChild(erpField("Impact", impactInput));
+  var mitigationInput = eArea(rec.mitigation, "Mitigation", 2);
+  var mitigationField = erpField("Mitigation", mitigationInput);
+  mitigationField.style.flex = "1 1 100%";
+  card.appendChild(mitigationField);
+  var ownerInput = eInput(rec.owner, "Owner");
+  card.appendChild(erpField("Owner", ownerInput));
+  var reviewInput = eInput(rec.review_date, "Review date (YYYY-MM-DD)");
+  card.appendChild(erpField("Review date", reviewInput));
+  var saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.textContent = "Save changes";
+  saveBtn.addEventListener("click", function () {
+    saveBtn.disabled = true;
+    erpPost("/api/erp/legal/risks/" + rec.id + "/update", {
+      title: titleInput.value, description: descInput.value,
+      likelihood: likelihoodInput.value, impact: impactInput.value,
+      mitigation: mitigationInput.value, owner: ownerInput.value,
+      review_date: reviewInput.value
+    }).then(function () {
+      reload();
+    }).catch(function (error) {
+      status.textContent = error.message;
+      saveBtn.disabled = false;
+    });
+  });
+  card.appendChild(saveBtn);
+  var cancelBtn = document.createElement("button");
+  cancelBtn.type = "button";
+  cancelBtn.textContent = "Cancel";
+  cancelBtn.addEventListener("click", function () { reload(); });
+  card.appendChild(cancelBtn);
+}
 
 /* ---------------- Stores (Dept 14 Wave A) ---------------- */
 // Core stores: store locations, the request/approve/receive transfer
@@ -26309,14 +28058,16 @@ async function loadErpStoresDetail() {
     var locations = await erpGet("/api/erp/locations").catch(function () { return { locations: [] }; });
     var transfers = await erpGet("/api/erp/stores/transfers").catch(function () { return { transfers: [] }; });
     var items = await erpGet("/api/erp/items").catch(function () { return { items: [] }; });
-    renderErpStoresDetail(stores, locations.locations || [], transfers.transfers || [], items.items || []);
+    var fleet = await erpGet("/api/erp/fleet/vehicles").catch(function () { return { vehicles: [] }; });
+    erpState.fleet = fleet.vehicles || [];
+    renderErpStoresDetail(stores, locations.locations || [], transfers.transfers || [], items.items || [], erpState.fleet);
     setAdminDetailStatus((stores.stores || []).length + " store" + ((stores.stores || []).length === 1 ? "" : "s") + " · " + (transfers.transfers || []).length + " transfer" + ((transfers.transfers || []).length === 1 ? "" : "s") + ".");
   } catch (error) {
     setAdminDetailStatus(error instanceof TypeError ?
       "We couldn't connect to load Stores." : error.message, true);
   }
 }
-function renderErpStoresDetail(data, locations, transfers, items) {
+function renderErpStoresDetail(data, locations, transfers, items, fleet) {
   var els = adminDetailEls();
   els.body.replaceChildren();
   var h2 = document.createElement("h2");
@@ -26520,6 +28271,256 @@ function renderErpStoresDetail(data, locations, transfers, items) {
     trCard.appendChild(row);
   });
   els.body.appendChild(trCard);
+  // --- Fleet register (Module J). ---
+  var fleetList = fleet || erpState.fleet || [];
+  var fleetCard = stCard("Fleet register");
+  var fleetNote = document.createElement("p");
+  fleetNote.className = "admin-orders-empty";
+  fleetNote.textContent = "Vehicles that serve the stores, with maintenance and fuel logs. Starts empty — add the first vehicle below. A vehicle with logs attached cannot be deleted; delete its logs first. The register survives a data wipe.";
+  fleetCard.appendChild(fleetNote);
+  var fleetStatus = stStatus();
+  function fleetReloadDetail() {
+    if (!erpState.fleetVehicleId) { loadErpStoresDetail(); return; }
+    erpGet("/api/erp/fleet/vehicles/" + erpState.fleetVehicleId).then(function (res) {
+      erpState.fleetDetail = res;
+      loadErpStoresDetail();
+    }).catch(function () { loadErpStoresDetail(); });
+  }
+  var flName = stInput("Vehicle name");
+  fleetCard.appendChild(erpField("Name", flName));
+  var flMake = stInput("Make");
+  fleetCard.appendChild(erpField("Make", flMake));
+  var flModel = stInput("Model");
+  fleetCard.appendChild(erpField("Model", flModel));
+  var flYear = stInput("Year");
+  fleetCard.appendChild(erpField("Year", flYear));
+  var flPlate = stInput("License plate");
+  fleetCard.appendChild(erpField("Plate", flPlate));
+  var storePairs = [["", "No store linked"]].concat(((data && data.stores) || []).map(function (s) {
+    return [String(s.id), s.name];
+  }));
+  var flStore = stSelect(storePairs, "");
+  fleetCard.appendChild(erpField("Store", flStore));
+  var flNotes = stInput("Notes");
+  fleetCard.appendChild(erpField("Notes", flNotes));
+  var flAddBtn = stButton("Add vehicle");
+  flAddBtn.addEventListener("click", function () {
+    flAddBtn.disabled = true;
+    fleetStatus.textContent = "";
+    var year = flYear.value.trim();
+    erpPost("/api/erp/fleet/vehicles", {
+      name: flName.value, make: flMake.value, model: flModel.value,
+      year: year === "" ? null : Number(year), plate: flPlate.value,
+      store_id: flStore.value === "" ? null : Number(flStore.value),
+      notes: flNotes.value
+    }).then(function () { loadErpStoresDetail(); }).catch(function (error) {
+      fleetStatus.textContent = error.message;
+      flAddBtn.disabled = false;
+    });
+  });
+  fleetCard.appendChild(flAddBtn);
+  fleetCard.appendChild(fleetStatus);
+  if (!fleetList.length) {
+    var flNone = document.createElement("p");
+    flNone.className = "admin-orders-empty";
+    flNone.textContent = "No vehicles yet.";
+    fleetCard.appendChild(flNone);
+  }
+  fleetList.forEach(function (v) {
+    var row = document.createElement("div");
+    var meta = document.createElement("p");
+    var desc = [v.make, v.model, v.year].filter(function (x) { return x; }).join(" ");
+    meta.textContent = v.name
+      + (desc ? " · " + desc : "")
+      + (v.plate ? " · " + v.plate : "")
+      + (v.store_name ? " · " + v.store_name : "")
+      + " · " + v.status
+      + " · " + v.maintenance_count + " maintenance · " + v.fuel_count + " fuel"
+      + " · maintenance " + erpMoney(v.maintenance_total_cents)
+      + " · fuel " + erpMoney(v.fuel_total_cents);
+    row.appendChild(meta);
+    var viewBtn = stButton(erpState.fleetVehicleId === v.id ? "Hide logs" : "View logs");
+    viewBtn.addEventListener("click", function () {
+      if (erpState.fleetVehicleId === v.id) {
+        erpState.fleetVehicleId = null;
+        erpState.fleetDetail = null;
+        renderErpStoresDetail(data, locations, transfers, items, fleetList);
+        return;
+      }
+      erpGet("/api/erp/fleet/vehicles/" + v.id).then(function (res) {
+        erpState.fleetVehicleId = v.id;
+        erpState.fleetDetail = res;
+        renderErpStoresDetail(data, locations, transfers, items, fleetList);
+      }).catch(function (error) { fleetStatus.textContent = error.message; });
+    });
+    row.appendChild(viewBtn);
+    fleetCard.appendChild(row);
+  });
+  if (erpState.fleetVehicleId && erpState.fleetDetail) {
+    var fd = erpState.fleetDetail;
+    var fv = fd.vehicle || {};
+    var detTitle = document.createElement("h3");
+    detTitle.textContent = "Fleet logs — " + (fv.name || "");
+    fleetCard.appendChild(detTitle);
+    var mTitle = document.createElement("h3");
+    mTitle.textContent = "Maintenance";
+    fleetCard.appendChild(mTitle);
+    var mLogs = fd.maintenance || [];
+    if (!mLogs.length) {
+      var mNone = document.createElement("p");
+      mNone.className = "admin-orders-empty";
+      mNone.textContent = "No maintenance logs yet.";
+      fleetCard.appendChild(mNone);
+    }
+    mLogs.forEach(function (m) {
+      var mRow = document.createElement("div");
+      var mMeta = document.createElement("p");
+      mMeta.textContent = m.service_date + " · " + m.description + " · " + erpMoney(m.cost_cents)
+        + (m.odometer !== null && m.odometer !== undefined ? " · " + m.odometer + " mi" : "");
+      mRow.appendChild(mMeta);
+      var mDel = stButton("Delete log");
+      mDel.addEventListener("click", function () {
+        mDel.disabled = true;
+        erpDelete("/api/erp/fleet/maintenance/" + m.id).then(function () {
+          fleetReloadDetail();
+        }).catch(function (error) { fleetStatus.textContent = error.message; mDel.disabled = false; });
+      });
+      mRow.appendChild(mDel);
+      fleetCard.appendChild(mRow);
+    });
+    var mDate = stInput("YYYY-MM-DD");
+    fleetCard.appendChild(erpField("Service date", mDate));
+    var mDesc = stInput("Description");
+    fleetCard.appendChild(erpField("Description", mDesc));
+    var mCost = stInput("Cost ($)");
+    fleetCard.appendChild(erpField("Cost ($)", mCost));
+    var mOdo = stInput("Odometer");
+    fleetCard.appendChild(erpField("Odometer", mOdo));
+    var mAddBtn = stButton("Add maintenance");
+    mAddBtn.addEventListener("click", function () {
+      mAddBtn.disabled = true;
+      fleetStatus.textContent = "";
+      erpPost("/api/erp/fleet/vehicles/" + erpState.fleetVehicleId + "/maintenance", {
+        service_date: mDate.value, description: mDesc.value,
+        cost_cents: mCost.value.trim() === "" ? 0 : Math.round(Number(mCost.value) * 100),
+        odometer: mOdo.value.trim() === "" ? null : Number(mOdo.value)
+      }).then(function () { fleetReloadDetail(); }).catch(function (error) {
+        fleetStatus.textContent = error.message;
+        mAddBtn.disabled = false;
+      });
+    });
+    fleetCard.appendChild(mAddBtn);
+    var fTitle = document.createElement("h3");
+    fTitle.textContent = "Fuel";
+    fleetCard.appendChild(fTitle);
+    var fLogs = fd.fuel || [];
+    if (!fLogs.length) {
+      var fNone = document.createElement("p");
+      fNone.className = "admin-orders-empty";
+      fNone.textContent = "No fuel logs yet.";
+      fleetCard.appendChild(fNone);
+    }
+    fLogs.forEach(function (f) {
+      var fRow = document.createElement("div");
+      var fMeta = document.createElement("p");
+      fMeta.textContent = f.fuel_date + " · " + f.gallons + " gal · " + erpMoney(f.cost_cents)
+        + (f.odometer !== null && f.odometer !== undefined ? " · " + f.odometer + " mi" : "");
+      fRow.appendChild(fMeta);
+      var fDel = stButton("Delete log");
+      fDel.addEventListener("click", function () {
+        fDel.disabled = true;
+        erpDelete("/api/erp/fleet/fuel/" + f.id).then(function () {
+          fleetReloadDetail();
+        }).catch(function (error) { fleetStatus.textContent = error.message; fDel.disabled = false; });
+      });
+      fRow.appendChild(fDel);
+      fleetCard.appendChild(fRow);
+    });
+    var fDate = stInput("YYYY-MM-DD");
+    fleetCard.appendChild(erpField("Fuel date", fDate));
+    var fGal = stInput("Gallons");
+    fleetCard.appendChild(erpField("Gallons", fGal));
+    var fCost = stInput("Cost ($)");
+    fleetCard.appendChild(erpField("Cost ($)", fCost));
+    var fOdo = stInput("Odometer");
+    fleetCard.appendChild(erpField("Odometer", fOdo));
+    var fAddBtn = stButton("Add fuel fill");
+    fAddBtn.addEventListener("click", function () {
+      fAddBtn.disabled = true;
+      fleetStatus.textContent = "";
+      erpPost("/api/erp/fleet/vehicles/" + erpState.fleetVehicleId + "/fuel", {
+        fuel_date: fDate.value, gallons: Number(fGal.value),
+        cost_cents: fCost.value.trim() === "" ? 0 : Math.round(Number(fCost.value) * 100),
+        odometer: fOdo.value.trim() === "" ? null : Number(fOdo.value)
+      }).then(function () { fleetReloadDetail(); }).catch(function (error) {
+        fleetStatus.textContent = error.message;
+        fAddBtn.disabled = false;
+      });
+    });
+    fleetCard.appendChild(fAddBtn);
+    var eTitle = document.createElement("h3");
+    eTitle.textContent = "Edit vehicle";
+    fleetCard.appendChild(eTitle);
+    var eName = stInput("Vehicle name");
+    eName.value = fv.name || "";
+    fleetCard.appendChild(erpField("Name", eName));
+    var eMake = stInput("Make");
+    eMake.value = fv.make || "";
+    fleetCard.appendChild(erpField("Make", eMake));
+    var eModel = stInput("Model");
+    eModel.value = fv.model || "";
+    fleetCard.appendChild(erpField("Model", eModel));
+    var eYear = stInput("Year");
+    eYear.value = (fv.year === null || fv.year === undefined) ? "" : String(fv.year);
+    fleetCard.appendChild(erpField("Year", eYear));
+    var ePlate = stInput("License plate");
+    ePlate.value = fv.plate || "";
+    fleetCard.appendChild(erpField("Plate", ePlate));
+    var eStore = stSelect(storePairs, (fv.store_id === null || fv.store_id === undefined) ? "" : String(fv.store_id));
+    fleetCard.appendChild(erpField("Store", eStore));
+    var eStatus = stSelect([["active", "Active"], ["retired", "Retired"]], fv.status || "active");
+    fleetCard.appendChild(erpField("Status", eStatus));
+    var eNotes = stInput("Notes");
+    eNotes.value = fv.notes || "";
+    fleetCard.appendChild(erpField("Notes", eNotes));
+    var eSaveBtn = stButton("Save vehicle");
+    eSaveBtn.addEventListener("click", function () {
+      eSaveBtn.disabled = true;
+      fleetStatus.textContent = "";
+      var year = eYear.value.trim();
+      erpPost("/api/erp/fleet/vehicles/" + erpState.fleetVehicleId + "/update", {
+        name: eName.value, make: eMake.value, model: eModel.value,
+        year: year === "" ? null : Number(year), plate: ePlate.value,
+        store_id: eStore.value === "" ? null : Number(eStore.value),
+        status: eStatus.value, notes: eNotes.value
+      }).then(function () { fleetReloadDetail(); }).catch(function (error) {
+        fleetStatus.textContent = error.message;
+        eSaveBtn.disabled = false;
+      });
+    });
+    fleetCard.appendChild(eSaveBtn);
+    var delVehBtn = stButton("Delete vehicle");
+    delVehBtn.addEventListener("click", function () {
+      if (delVehBtn.getAttribute("data-confirm") === "1") {
+        delVehBtn.disabled = true;
+        erpDelete("/api/erp/fleet/vehicles/" + erpState.fleetVehicleId).then(function () {
+          erpState.fleetVehicleId = null;
+          erpState.fleetDetail = null;
+          loadErpStoresDetail();
+        }).catch(function (error) {
+          fleetStatus.textContent = error.message;
+          delVehBtn.disabled = false;
+          delVehBtn.setAttribute("data-confirm", "");
+          delVehBtn.textContent = "Delete vehicle";
+        });
+        return;
+      }
+      delVehBtn.setAttribute("data-confirm", "1");
+      delVehBtn.textContent = "Tap again to confirm delete";
+    });
+    fleetCard.appendChild(delVehBtn);
+  }
+  els.body.appendChild(fleetCard);
 }
 function renderErpStoresCard(st, locations, reload) {
   var card = document.createElement("div");
@@ -29704,7 +31705,8 @@ async function loadErpSettingsDetail() {
     erpGet("/api/erp/settings/company-profile").catch(function () { return null; }),
     erpGet("/api/erp/settings/integrations").catch(function () { return null; }),
     erpGet("/api/erp/settings/notification-preferences").catch(function () { return null; }),
-    erpGet("/api/erp/settings/audit?limit=100").catch(function () { return null; })
+    erpGet("/api/erp/settings/audit?limit=100").catch(function () { return null; }),
+    erpGet("/api/erp/settings/systems").catch(function () { return null; })
   ]);
   erpState.qbStatus = results[0];
   erpState.companyProfile = (results[1] && results[1].profile) || erpState.companyProfile;
@@ -29712,6 +31714,7 @@ async function loadErpSettingsDetail() {
   erpState.notificationPrefs = (results[3] && results[3].preferences) || erpState.notificationPrefs;
   erpState.settingsAudit = (results[4] && results[4].audit) || null;
   erpState.settingsAuditLoaded = !!results[4];
+  erpState.systemsOverview = results[5] || null;
   if (!results[0] && !results[1] && !results[2]) {
     setAdminDetailStatus("Could not load Settings.", true);
   } else {
@@ -29868,6 +31871,144 @@ function erpSettingsIntegrationsCard() {
     box.appendChild(err);
     card.appendChild(box);
   });
+  return card;
+}
+
+/* ---------------- Settings: Systems / IT status view (Module A) ---------------- */
+// Read-only consolidation of what already exists elsewhere: integration
+// health (same data as the Integrations tab), backup status (same data
+// as the Accounting backup card), the last post-backup security-check
+// run, and an access review (who holds admin + each staff member's
+// grants). Nothing on this card writes anything; every section links
+// out to the screen that owns it.
+function erpSettingsSystemsCard() {
+  var card = document.createElement("div");
+  card.className = "admin-orders-wrap";
+  var h3 = document.createElement("h3");
+  h3.textContent = "Systems";
+  card.appendChild(h3);
+  var note = document.createElement("p");
+  note.style.color = "var(--muted)";
+  note.textContent = "Read-only status: integration health, backups, the post-backup security check, and who can do what. Nothing here changes anything — use the linked screens to change it.";
+  card.appendChild(note);
+  var data = erpState.systemsOverview;
+  if (!data) {
+    var none = document.createElement("p");
+    none.textContent = "Could not load the Systems overview.";
+    card.appendChild(none);
+    return card;
+  }
+  function section(title) {
+    var h4 = document.createElement("h4");
+    h4.textContent = title;
+    card.appendChild(h4);
+    return h4;
+  }
+  function line(text) {
+    var p = document.createElement("p");
+    p.textContent = text;
+    card.appendChild(p);
+    return p;
+  }
+  function linkBtn(text, onClick) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = text;
+    b.addEventListener("click", onClick);
+    card.appendChild(b);
+    return b;
+  }
+  function linkA(text, href) {
+    var p = document.createElement("p");
+    var a = document.createElement("a");
+    a.href = href;
+    a.textContent = text;
+    p.appendChild(a);
+    card.appendChild(p);
+    return p;
+  }
+  // 1. Integration health (summary; detail lives on the Integrations tab).
+  section("Integration health");
+  var ints = data.integrations || [];
+  var counts = {};
+  ints.forEach(function (it) { counts[it.status] = (counts[it.status] || 0) + 1; });
+  line("Six integrations: " + ints.map(function (it) { return it.name + " — " + it.status; }).join("; ") + ".");
+  if (counts.error) {
+    var errLine = document.createElement("p");
+    errLine.style.color = "#c92e29";
+    errLine.textContent = counts.error + " integration" + (counts.error === 1 ? "" : "s") + " reporting an error — open Integrations for the stored error.";
+    card.appendChild(errLine);
+  }
+  linkBtn("Open Integrations", function () {
+    erpState.settingsView = "integrations";
+    renderErpSettingsDetail();
+  });
+  // 2. Backup status (detail lives on Accounting → Backup status).
+  section("Backup status");
+  var b = data.backup || {};
+  if (!b.has_backup) {
+    line("No backup yet — the nightly job has not run.");
+  } else {
+    line("Last backup (UTC): " + (b.last_backup_utc || "—") + (b.manifest_id ? " · Manifest: " + b.manifest_id : ""));
+    line("Total backups: " + (b.total_backups || 0) + (b.rows_backed_up !== null && b.rows_backed_up !== undefined ? " · Rows in last backup: " + b.rows_backed_up : "") + (b.latest_restore_utc ? " · Last restore: " + b.latest_restore_utc : " · Never restored"));
+  }
+  linkA("Accounting → Backup status", "#/accounting");
+  // 3. Post-backup security check.
+  section("Post-backup security check");
+  var sec = data.security_check;
+  if (!sec) {
+    line("No security-check run recorded yet — the next nightly backup records one. This is not a pass.");
+    var secNote = document.createElement("p");
+    secNote.style.color = "var(--muted)";
+    secNote.textContent = data.security_check_note || "";
+    card.appendChild(secNote);
+  } else {
+    var verdict = document.createElement("p");
+    verdict.textContent = "Last run: " + (sec.run_at || "—") + " · " + (sec.ok ? "Passed" : "FAILED") + (sec.manifest_id ? " · Backup manifest: " + sec.manifest_id : "");
+    if (!sec.ok) verdict.style.color = "#c92e29";
+    card.appendChild(verdict);
+    (sec.failures || []).forEach(function (f) {
+      var fp = document.createElement("p");
+      fp.style.color = "#c92e29";
+      fp.textContent = "Failure: " + f;
+      card.appendChild(fp);
+    });
+    (sec.notes || []).forEach(function (n) { line("Check: " + n); });
+  }
+  // 4. Access review.
+  section("Access review");
+  var ar = data.access_review || {};
+  var admins = ar.admins || [];
+  line("Admins (" + admins.length + "): " + (admins.length ? admins.map(function (a) { return (a.name ? a.name + " " : "") + "<" + a.email + ">" + (a.has_user_row ? "" : " (no ERP user row)"); }).join("; ") : "none"));
+  var staff = ar.staff || [];
+  if (!staff.length) {
+    line("No staff members.");
+  } else {
+    var table = document.createElement("table");
+    table.className = "admin-orders-table";
+    var thead = document.createElement("thead");
+    var hr = document.createElement("tr");
+    ["Name", "Email", "Active", "Permissions"].forEach(function (c) {
+      var th = document.createElement("th");
+      th.textContent = c;
+      hr.appendChild(th);
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    staff.forEach(function (s) {
+      var tr = document.createElement("tr");
+      [[s.name || ""], [s.email || ""], [s.active ? "Yes" : "No"], [(s.perms || []).length ? (s.perms || []).join(", ") : "None"]].forEach(function (cell) {
+        var td = document.createElement("td");
+        td.textContent = cell[0];
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    card.appendChild(table);
+  }
+  linkA("Staff & permissions — change who can do what", "#/staff-perms");
   return card;
 }
 
@@ -30187,7 +32328,7 @@ function renderErpSettingsDetail() {
   var tabs = document.createElement("div");
   tabs.className = "erp-toolbar";
   tabs.setAttribute("data-erp-subtabs", "settings");
-  [["company", "Company profile"], ["integrations", "Integrations"], ["quickbooks", "QuickBooks"], ["notifications", "Notifications"], ["audit", "Audit log"], ["data", "Data export & import"]].forEach(function (t) {
+  [["company", "Company profile"], ["integrations", "Integrations"], ["systems", "Systems"], ["quickbooks", "QuickBooks"], ["notifications", "Notifications"], ["audit", "Audit log"], ["data", "Data export & import"]].forEach(function (t) {
     var b = document.createElement("button");
     b.type = "button";
     b.textContent = t[1];
@@ -30204,6 +32345,8 @@ function renderErpSettingsDetail() {
     els.body.appendChild(erpSettingsCompanyCard());
   } else if (erpState.settingsView === "integrations") {
     els.body.appendChild(erpSettingsIntegrationsCard());
+  } else if (erpState.settingsView === "systems") {
+    els.body.appendChild(erpSettingsSystemsCard());
   } else if (erpState.settingsView === "notifications") {
     els.body.appendChild(erpSettingsNotificationsCard());
   } else if (erpState.settingsView === "audit") {
