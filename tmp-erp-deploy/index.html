@@ -1650,14 +1650,14 @@ var ERP_SIDEBAR_SECTIONS = {
   purchasing: ["Vendors", "Purchase orders", "Vendor scorecards"],
   production: [["Batches", "batches.read"], ["Equipment", "batches.read"], ["Kits & bundles", "batches.read"], ["Work orders", "batches.read"], "Yield & waste trend", "Finished-goods stock vs targets", "Demand forecast & MRP", "Production calendar", ["Recipes", "recipes.read"], ["Website flavors staged for preview", "recipes.read"]],
   "staff-perms": ["Staff", "Add staff member", "Staff audit log"],
-  hr: ["Employee records", "Overtime alerts", "Add employee", "Onboarding templates — by role", "Events — scheduling & roster", "Time tracking — per-person totals", "Time off (PTO)", "Performance reviews", "Feed to payrun — event staff (opt-in only)", "Recurring schedules", "Documents expiring soon", "Hiring pipeline", "Job roles", "Headcount planning", "Positions & org chart", "Succession planning", "Career paths", "Training records", "Benefits administration", "Compensation", "Bonus plans", "Commissions", "Pay grades", "E-learning", "HR Help Desk", "Bulletins", "Projects"],
+  hr: ["Employee records", "Overtime alerts", "Add employee", "Onboarding templates — by role", "Events — scheduling & roster", "Time tracking — per-person totals", "Time off (PTO)", "Performance reviews", "Feed to payrun — event staff (opt-in only)", "Recurring schedules", "Documents expiring soon", "Hiring pipeline", "Job roles", "Headcount planning", "Positions & org chart", "Succession planning", "Career paths", "Training records", "Benefits administration", "Compensation", "Bonus plans", "Commissions", "Pay grades", "E-learning", "HR Help Desk", "Bulletins", "Policies & handbooks", "Projects"],
   quality: ["Recall plan", "Trace a lot", "Recall drills", "Supplier COAs", "HACCP plan", "Complaint trending", "Digital quality checklists", "Equipment calibration", "Internal audits", "CAPA", "Supplier audits", "FSMA 204 traceability", "SQF / BRC audit prep", "Allergen management", "Statistical process control", "SOP Library"],
   legal: ["Trademark + IP register", "Contracts + insurance", "Licenses & permits", "Compliance calendar", "Risk register", "Lease accounting — ASC 842"],
   stores: ["All stores", "Add store", "Closed stores", "Transfers", "Fleet register"]
 };
 // Staff see a different HR page ("My HR" self-service), so they get
 // its own sidebar list instead of the admin one.
-var ERP_SIDEBAR_SECTIONS_HR_STAFF = ["Your profile", "Time off (PTO)", "Performance reviews", "Recurring schedule", "Events you're assigned to", "Your time + cash", "Your documents", "Ask HR", "Bulletins", "My tasks", "Expense claims"];
+var ERP_SIDEBAR_SECTIONS_HR_STAFF = ["Your profile", "Time off (PTO)", "Performance reviews", "Recurring schedule", "Events you're assigned to", "Your time + cash", "Your documents", "Ask HR", "Bulletins", "Policies & handbooks", "My tasks", "Expense claims"];
 // Tabs with a real sub-tab row. The subs lists below are the same lists
 // the rows build (same keys, same labels, same order) and are only used
 // as a fallback when the row is not in the DOM — in a detail view, where
@@ -37352,6 +37352,7 @@ function renderErpHrDetail(data, staffList, events, timeTotals, overtimeAlerts, 
   els.body.appendChild(renderErpHrElearningSection(loadErpHrDetail));
   els.body.appendChild(renderErpHrHelpDeskSection(loadErpHrDetail, staffList));
   els.body.appendChild(renderErpHrBulletinsSection(loadErpHrDetail));
+  els.body.appendChild(renderErpHrPoliciesSection(loadErpHrDetail));
   els.body.appendChild(renderErpHrProjectsSection(loadErpHrDetail));
 }
 function renderErpHrCard(e) {
@@ -44577,6 +44578,352 @@ function renderErpHrBulletinsSection(reload) {
   });
   return wrap;
 }
+function renderErpHrPoliciesSection(reload) {
+  // Policies & handbooks (SOP 12.38): the employee handbook and
+  // standing policies, one document per row, versioned, with
+  // per-version acknowledgement. A policy is created as a draft
+  // with its first draft version (v1); publishing a draft
+  // supersedes the live version and resets everyone's
+  // acknowledgement, so staff must re-acknowledge each new
+  // version. The body is plain text (max 20000 characters) --
+  // rich text is not used here, because its markup would eat the
+  // cap and truncate real handbook content. Drafts and archived
+  // policies are admin-only; staff see published policies only
+  // in My HR. The register starts empty -- the handbook text is
+  // the user's to write, never pre-filled.
+  var wrap = document.createElement("div");
+  var title = document.createElement("h2");
+  title.textContent = "Policies & handbooks";
+  wrap.appendChild(title);
+  var note = document.createElement("p");
+  note.className = "admin-orders-empty";
+  note.textContent = "Admin-only. One document per policy: the employee handbook, a standing policy, a safety rule, or a conduct rule. Each version is published, then every member of staff acknowledges that version in My HR. A new version resets acknowledgement — staff must acknowledge it again. Drafts are never visible to staff, and archived policies stay in the register with their versions and acknowledgements. The audience is all active employees.";
+  wrap.appendChild(note);
+  var status = document.createElement("p");
+  status.style.color = "var(--muted)";
+  status.style.flex = "1 1 100%";
+  wrap.appendChild(status);
+  function polInput(placeholder) {
+    var input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = placeholder || "";
+    return input;
+  }
+  function polButton(label) {
+    var b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    return b;
+  }
+  function polCategoryLabel(c) {
+    if (c === "handbook") return "Handbook";
+    if (c === "policy") return "Policy";
+    if (c === "safety") return "Safety";
+    if (c === "conduct") return "Conduct";
+    return "Other";
+  }
+  function polStatusLabel(s) {
+    if (s === "published") return "Published";
+    if (s === "archived") return "Archived";
+    if (s === "superseded") return "Superseded";
+    return "Draft";
+  }
+  function polCategorySelect(current) {
+    var sel = document.createElement("select");
+    [["handbook", "Handbook"], ["policy", "Policy"], ["safety", "Safety"], ["conduct", "Conduct"], ["other", "Other"]].forEach(function (p) {
+      var opt = document.createElement("option");
+      opt.value = p[0];
+      opt.textContent = p[1];
+      if ((current || "other") === p[0]) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    return sel;
+  }
+  function polCountsLine(p) {
+    var audience = p.audience_count || 0;
+    if (!audience) return " · no staff yet — nobody to acknowledge";
+    return " · " + (p.acknowledged_count || 0) + " of " + audience + " acknowledged";
+  }
+  function polHeadText(p) {
+    var s = p.title + " — " + polCategoryLabel(p.category);
+    if (p.status === "published") {
+      s += " · v" + (p.current_version || 0) + " · Published" + polCountsLine(p);
+    } else if (p.status === "archived") {
+      s += " · v" + (p.current_version || 0) + " · Archived" + polCountsLine(p);
+    } else {
+      s += " · Draft v" + (p.body_version || 1) + " — not published yet";
+    }
+    return s;
+  }
+  // Two-tap action: the first tap arms the button and says what
+  // will happen; the second tap runs. No window.confirm — it
+  // auto-dismisses in the browser, which would read as a cancel.
+  function armPolAction(btn, what, run, doneLabel) {
+    var originalLabel = btn.textContent;
+    btn.addEventListener("click", function () {
+      if (!btn.dataset.armed) {
+        btn.dataset.armed = "1";
+        btn.textContent = "Confirm " + doneLabel;
+        status.textContent = what + " Tap Confirm " + doneLabel + " to confirm.";
+        return;
+      }
+      btn.disabled = true;
+      status.textContent = doneLabel + "…";
+      run().then(function () {
+        if (typeof reload === "function") reload();
+      }).catch(function (error) {
+        status.textContent = error.message;
+        btn.disabled = false;
+        delete btn.dataset.armed;
+        btn.textContent = originalLabel;
+      });
+    });
+  }
+  // --- Add form ---
+  var addCard = document.createElement("div");
+  addCard.className = "erp-form";
+  var addTitle = document.createElement("h3");
+  addTitle.textContent = "Add a policy";
+  addCard.appendChild(addTitle);
+  var addNote = document.createElement("p");
+  addNote.className = "admin-orders-empty";
+  addNote.textContent = "Created as you — the author is your login, and the created date is today. The policy starts as a draft with its first version (v1); publish it from the expanded row when the text is ready. The body is plain text, up to 20000 characters — split a long handbook into one policy per topic.";
+  addCard.appendChild(addNote);
+  var titleInput = polInput("Title (e.g. Employee handbook)");
+  addCard.appendChild(erpField("Title", titleInput));
+  var catSel = polCategorySelect("handbook");
+  addCard.appendChild(erpField("Category", catSel));
+  var effInput = polInput("Effective date (YYYY-MM-DD, optional)");
+  addCard.appendChild(erpField("Effective date", effInput));
+  var bodyInput = document.createElement("textarea");
+  bodyInput.placeholder = "The policy text — plain text, up to 20000 characters";
+  addCard.appendChild(erpField("Body", bodyInput));
+  var addStatus = document.createElement("p");
+  addStatus.style.color = "var(--muted)";
+  addStatus.style.flex = "1 1 100%";
+  addCard.appendChild(addStatus);
+  var addBtn = polButton("Add policy");
+  addBtn.addEventListener("click", function () {
+    if (!titleInput.value.trim() || !bodyInput.value.trim()) { addStatus.textContent = "Title and body are required."; return; }
+    addBtn.disabled = true;
+    addStatus.textContent = "Adding…";
+    erpPost("/api/erp/hr/policies", {
+      title: titleInput.value,
+      category: catSel.value,
+      effective_date: effInput.value,
+      body: bodyInput.value
+    }).then(function () {
+      if (typeof reload === "function") reload();
+    }).catch(function (error) {
+      addStatus.textContent = error.message;
+      addBtn.disabled = false;
+    });
+  });
+  addCard.appendChild(addBtn);
+  wrap.appendChild(addCard);
+  // --- Category + status filters + search + list ---
+  var filterSel = document.createElement("select");
+  [["", "All categories"], ["handbook", "Handbook"], ["policy", "Policy"], ["safety", "Safety"], ["conduct", "Conduct"], ["other", "Other"]].forEach(function (p) {
+    var opt = document.createElement("option");
+    opt.value = p[0];
+    opt.textContent = p[1];
+    filterSel.appendChild(opt);
+  });
+  wrap.appendChild(erpField("Category", filterSel));
+  var statusSel = document.createElement("select");
+  [["", "All statuses"], ["draft", "Draft"], ["published", "Published"], ["archived", "Archived"]].forEach(function (p) {
+    var opt = document.createElement("option");
+    opt.value = p[0];
+    opt.textContent = p[1];
+    statusSel.appendChild(opt);
+  });
+  wrap.appendChild(erpField("Status", statusSel));
+  var listWrap = document.createElement("div");
+  wrap.appendChild(erpCompactSearchBox("Search policies…", function (q) { erpCompactFilter(listWrap, q); }));
+  wrap.appendChild(listWrap);
+  var allPolicies = [];
+  function renderList() {
+    listWrap.replaceChildren();
+    var wantedCat = filterSel.value || "";
+    var wantedStatus = statusSel.value || "";
+    var shown = allPolicies.filter(function (p) {
+      return (!wantedCat || p.category === wantedCat)
+        && (!wantedStatus || p.status === wantedStatus);
+    });
+    if (!shown.length) {
+      var none = document.createElement("p");
+      none.className = "admin-orders-empty";
+      none.textContent = allPolicies.length ? "No policies match these filters." : "No policies yet. Add the first one when there is a handbook or a standing policy every member of staff needs to follow.";
+      listWrap.appendChild(none);
+      return;
+    }
+    shown.forEach(function (p) { listWrap.appendChild(renderPolicyRow(p)); });
+    erpCompactSection(listWrap);
+  }
+  filterSel.addEventListener("change", renderList);
+  statusSel.addEventListener("change", renderList);
+  function renderPolicyRow(p) {
+    var card = document.createElement("div");
+    card.className = "erp-form erp-compact-item";
+    var headBtn = document.createElement("button");
+    headBtn.type = "button";
+    headBtn.className = "erp-compact-title";
+    headBtn.textContent = polHeadText(p);
+    headBtn.setAttribute("aria-expanded", "false");
+    card.appendChild(headBtn);
+    var detail = document.createElement("div");
+    detail.className = "erp-compact-detail";
+    detail.hidden = true;
+    card.appendChild(detail);
+    var body = document.createElement("p");
+    body.textContent = p.body || "—";
+    detail.appendChild(body);
+    var meta = document.createElement("p");
+    meta.textContent = "Created by " + (p.created_by || "—") + (p.created_at ? " on " + p.created_at : "") + (p.effective_date ? " · Effective " + p.effective_date : " · No effective date");
+    detail.appendChild(meta);
+    var versionsWrap = document.createElement("div");
+    var versionsNote = document.createElement("p");
+    versionsNote.className = "admin-orders-empty";
+    versionsNote.textContent = "Versions and acknowledgement load when this policy is opened.";
+    versionsWrap.appendChild(versionsNote);
+    detail.appendChild(versionsWrap);
+    // The new-version form and the Archive / Delete buttons live
+    // on the row so an admin can act without opening the detail
+    // fetch; the draft check uses the list payload's has_draft.
+    if (!p.has_draft) {
+      var verCard = document.createElement("div");
+      verCard.className = "erp-form";
+      var verTitle = document.createElement("h3");
+      verTitle.textContent = "New version";
+      verCard.appendChild(verTitle);
+      var verNote = document.createElement("p");
+      verNote.className = "admin-orders-empty";
+      verNote.textContent = "A new draft version carrying the revised text. The live version stays up until the new draft is published.";
+      verCard.appendChild(verNote);
+      var verBody = document.createElement("textarea");
+      verBody.placeholder = "The revised policy text — plain text, up to 20000 characters";
+      verCard.appendChild(erpField("Body", verBody));
+      var verStatus = document.createElement("p");
+      verStatus.style.color = "var(--muted)";
+      verStatus.style.flex = "1 1 100%";
+      verCard.appendChild(verStatus);
+      var verBtn = polButton("Save new version");
+      verBtn.addEventListener("click", function () {
+        if (!verBody.value.trim()) { verStatus.textContent = "Body is required."; return; }
+        verBtn.disabled = true;
+        verStatus.textContent = "Saving…";
+        erpPost("/api/erp/hr/policies/" + p.id + "/versions", { body: verBody.value }).then(function () {
+          if (typeof reload === "function") reload();
+        }).catch(function (error) {
+          verStatus.textContent = error.message;
+          verBtn.disabled = false;
+        });
+      });
+      verCard.appendChild(verBtn);
+      detail.appendChild(verCard);
+    }
+    if (p.status !== "archived") {
+      var archBtn = polButton("Archive");
+      armPolAction(archBtn, "Archive policy \"" + p.title + "\"? Staff will no longer see it.", function () {
+        return erpPost("/api/erp/hr/policies/" + p.id + "/archive", {});
+      }, "Archive");
+      detail.appendChild(archBtn);
+    }
+    if (p.status === "draft" && !(p.current_version || 0)) {
+      var delBtn = polButton("Delete");
+      armPolAction(delBtn, "Delete draft policy \"" + p.title + "\" permanently?", function () {
+        return erpDelete("/api/erp/hr/policies/" + p.id);
+      }, "Delete");
+      detail.appendChild(delBtn);
+    }
+    // Versions and acknowledgement come from the detail endpoint,
+    // fetched once per card when it is first opened. A missing
+    // policy shows a not-found state and is never re-fetched.
+    var detailLoaded = false;
+    var detailLoading = false;
+    function loadDetail() {
+      if (detailLoaded || detailLoading) return;
+      detailLoading = true;
+      versionsNote.textContent = "Loading versions…";
+      erpGet("/api/erp/hr/policies/" + p.id).then(function (d) {
+        detailLoaded = true;
+        detailLoading = false;
+        versionsWrap.replaceChildren();
+        var versions = d.versions || [];
+        var verH = document.createElement("p");
+        verH.textContent = "Versions (" + versions.length + "):";
+        versionsWrap.appendChild(verH);
+        if (!versions.length) {
+          var noVer = document.createElement("p");
+          noVer.className = "admin-orders-empty";
+          noVer.textContent = "No versions yet.";
+          versionsWrap.appendChild(noVer);
+        } else {
+          versions.forEach(function (v) {
+            var vline = document.createElement("p");
+            vline.textContent = "v" + v.version + " · " + polStatusLabel(v.status) + " — created by " + (v.created_by || "—") + (v.created_at ? " on " + v.created_at : "") + (v.published_by ? " · published by " + v.published_by + (v.published_at ? " on " + v.published_at : "") : "");
+            versionsWrap.appendChild(vline);
+            if (v.status === "draft") {
+              var pubBtn = polButton("Publish v" + v.version);
+              armPolAction(pubBtn, "Publish v" + v.version + " of \"" + p.title + "\"? It supersedes the live version and every member of staff must acknowledge it again.", function () {
+                return erpPost("/api/erp/hr/policies/" + p.id + "/versions/" + v.id + "/publish", {});
+              }, "Publish");
+              versionsWrap.appendChild(pubBtn);
+            }
+          });
+        }
+        var ackH = document.createElement("p");
+        ackH.textContent = "Acknowledged (" + (d.acknowledged || []).length + "):";
+        versionsWrap.appendChild(ackH);
+        if (!(d.acknowledged || []).length) {
+          var noAck = document.createElement("p");
+          noAck.className = "admin-orders-empty";
+          noAck.textContent = (d.current_version || 0) ? "Nobody has acknowledged v" + d.current_version + " yet." : "Nothing published yet — nobody can acknowledge a draft.";
+          versionsWrap.appendChild(noAck);
+        } else {
+          (d.acknowledged || []).forEach(function (a) {
+            var line = document.createElement("p");
+            line.textContent = (a.employee_name || ("Employee #" + a.employee_id)) + " — acknowledged " + (a.acknowledged_at || "");
+            versionsWrap.appendChild(line);
+          });
+        }
+        var unackH = document.createElement("p");
+        unackH.textContent = "Not acknowledged yet (" + (d.unacknowledged || []).length + "):";
+        versionsWrap.appendChild(unackH);
+        if (!(d.unacknowledged || []).length) {
+          var noUnack = document.createElement("p");
+          noUnack.className = "admin-orders-empty";
+          noUnack.textContent = (d.audience_count || 0) ? "Everyone has acknowledged it." : "No staff yet — the audience is empty.";
+          versionsWrap.appendChild(noUnack);
+        } else {
+          (d.unacknowledged || []).forEach(function (u) {
+            var line = document.createElement("p");
+            line.textContent = (u.employee_name || ("Employee #" + u.employee_id));
+            versionsWrap.appendChild(line);
+          });
+        }
+      }).catch(function () {
+        detailLoaded = true;
+        detailLoading = false;
+        versionsNote.textContent = "Policy no longer available.";
+      });
+    }
+    headBtn.addEventListener("click", function () {
+      var open = detail.hidden;
+      detail.hidden = !open;
+      headBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) loadDetail();
+    });
+    return card;
+  }
+  erpGet("/api/erp/hr/policies").catch(function () { return { policies: [] }; }).then(function (data) {
+    allPolicies = data.policies || [];
+    renderList();
+  }).catch(function (error) {
+    status.textContent = error.message;
+  });
+  return wrap;
+}
 function renderErpHrCommissionsSection(reload) {
   // Sales commissions (SOP 12.37): a REGISTER only -- one record per
   // commission agreed with a real rep. The amount is typed in from
@@ -46417,6 +46764,90 @@ function renderErpHrSelfService(me) {
     }
   }
   els.body.appendChild(bul);
+  // Policies & handbooks (SOP 12.38): published policies only,
+  // each with ONLY the caller's own acknowledgement state for the
+  // current version. Opening one records nothing -- only the
+  // explicit Acknowledge tap records an acknowledgement, and a new
+  // version needs acknowledging again.
+  function polMeCategoryLabel(c) {
+    if (c === "handbook") return "Handbook";
+    if (c === "policy") return "Policy";
+    if (c === "safety") return "Safety";
+    if (c === "conduct") return "Conduct";
+    return "Other";
+  }
+  function polMeStateText(p) {
+    return p.acknowledged_at ? "Acknowledged" : "Not acknowledged";
+  }
+  function polMeHeadText(p) {
+    return (p.title || ("Policy #" + p.id)) + " — " + polMeCategoryLabel(p.category) + " · v" + (p.current_version || 0) + " · " + polMeStateText(p);
+  }
+  var pol = hrMeSection("Policies & handbooks");
+  if (!me.policies_available) {
+    hrMeNote(pol, "Policies & handbooks aren't set up yet — ask an admin when it is available.");
+  } else {
+    hrMeNote(pol, "The policies you need to follow — the employee handbook and standing policies. Tap Acknowledge when you have read and understood the current version. When a new version is published you will need to acknowledge it again.");
+    var polStatus = document.createElement("p");
+    polStatus.className = "admin-orders-empty";
+    pol.appendChild(polStatus);
+    if (!(me.policies || []).length) {
+      hrMeNote(pol, "No policies published yet.");
+    } else {
+      (me.policies || []).forEach(function (p) {
+        var prow = document.createElement("div");
+        var phead = document.createElement("button");
+        phead.type = "button";
+        phead.className = "erp-compact-title";
+        phead.textContent = polMeHeadText(p);
+        phead.setAttribute("aria-expanded", "false");
+        prow.appendChild(phead);
+        var pdetail = document.createElement("div");
+        pdetail.className = "erp-compact-detail";
+        pdetail.hidden = true;
+        prow.appendChild(pdetail);
+        var pbody = document.createElement("p");
+        pbody.textContent = p.body || "—";
+        pdetail.appendChild(pbody);
+        var pmeta = document.createElement("p");
+        pmeta.textContent = (p.effective_date ? "Effective " + p.effective_date : "No effective date");
+        pdetail.appendChild(pmeta);
+        var ackBtn = null;
+        if (!p.acknowledged_at) {
+          ackBtn = document.createElement("button");
+          ackBtn.type = "button";
+          ackBtn.textContent = "Acknowledge";
+          ackBtn.addEventListener("click", function () {
+            ackBtn.disabled = true;
+            polStatus.textContent = "Acknowledging…";
+            erpPost("/api/erp/hr/policies/mine/" + p.id + "/acknowledge", {}).then(function (d) {
+              if (d) {
+                if (d.acknowledged_at) p.acknowledged_at = d.acknowledged_at;
+              }
+              phead.textContent = polMeHeadText(p);
+              ackBtn.textContent = "Acknowledged";
+              polStatus.textContent = "";
+            }).catch(function (error) {
+              polStatus.textContent = error.message;
+              ackBtn.disabled = false;
+            });
+          });
+          pdetail.appendChild(ackBtn);
+        } else {
+          var ackNote = document.createElement("p");
+          ackNote.className = "admin-orders-empty";
+          ackNote.textContent = "Acknowledged " + p.acknowledged_at + ".";
+          pdetail.appendChild(ackNote);
+        }
+        phead.addEventListener("click", function () {
+          var open = pdetail.hidden;
+          pdetail.hidden = !open;
+          phead.setAttribute("aria-expanded", open ? "true" : "false");
+        });
+        pol.appendChild(prow);
+      });
+    }
+  }
+  els.body.appendChild(pol);
   // My tasks (SOP 1.10): the caller's own project work -- tasks
   // assigned to them across projects, plus the projects they own
   // (each with all its tasks). A task in someone else's project
