@@ -3331,6 +3331,68 @@ def init_db():
             ON erp_hr_bulletin_reads (bulletin_id);
         CREATE INDEX IF NOT EXISTS idx_erp_hr_bulletin_reads_employee
             ON erp_hr_bulletin_reads (employee_id);
+        -- HR Policies & Handbooks (SOP 12.38): the employee handbook
+        -- and standing policies, versioned, with per-version
+        -- acknowledgement. erp_hr_policies is one row per document:
+        -- title, category from a small fixed set (handbook / policy
+        -- / safety / conduct / other), status draft / published /
+        -- archived, current_version (the published version number,
+        -- 0 while never published), effective_date (YYYY-MM-DD or
+        -- ''), the admin who created it and when.
+        -- erp_hr_policy_versions is append-only: one row per
+        -- version -- body is plain text (max 20000 characters, the
+        -- same cap as the knowledge base; rich text is NOT used
+        -- here because its markup would eat the cap and truncate
+        -- real handbook content, and the 20000-cap decision for
+        -- wired rich-text fields is still open), status draft /
+        -- published / superseded, created and published by/at.
+        -- erp_hr_policy_acknowledgements is one row per (policy,
+        -- version, employee): acknowledged_at, the time that
+        -- employee tapped Acknowledge on that version. UNIQUE on
+        -- (policy_id, version, employee_id) -- acknowledgements
+        -- are per-version, so publishing a new version resets
+        -- everyone to unacknowledged for it. Like bulletins these
+        -- are people records, NOT in _ERP_RESET_TABLES. All
+        -- registers start empty; nothing is seeded -- the handbook
+        -- text is the user's to write.
+        CREATE TABLE IF NOT EXISTS erp_hr_policies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            category TEXT NOT NULL DEFAULT 'other',
+            status TEXT NOT NULL DEFAULT 'draft',
+            current_version INTEGER NOT NULL DEFAULT 0,
+            effective_date TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_hr_policy_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            policy_id INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            body TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'draft',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            published_by TEXT NOT NULL DEFAULT '',
+            published_at TEXT NOT NULL DEFAULT '',
+            UNIQUE (policy_id, version)
+        );
+        CREATE TABLE IF NOT EXISTS erp_hr_policy_acknowledgements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            policy_id INTEGER NOT NULL,
+            version INTEGER NOT NULL,
+            employee_id INTEGER NOT NULL,
+            acknowledged_at TEXT NOT NULL,
+            UNIQUE (policy_id, version, employee_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_policy_versions_policy
+            ON erp_hr_policy_versions (policy_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_policy_acks_policy
+            ON erp_hr_policy_acknowledgements (policy_id, version);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_policy_acks_employee
+            ON erp_hr_policy_acknowledgements (employee_id);
         -- Sales commissions (Wave 4 item 26, SOP 12.37): a REGISTER
         -- only -- the design's §4 entry ("commission 0 hits. No reps,
         -- founders sell. Add if a rep or commission plan ever
@@ -33496,6 +33558,15 @@ def hr_me():
         for r in conn.execute(
             "SELECT * FROM erp_hr_bulletins"
             " ORDER BY id DESC").fetchall()]
+    # HR Policies & Handbooks (SOP 12.38): published policies only,
+    # each with ONLY this employee's own acknowledgement state for
+    # the current version -- never another employee's. Drafts and
+    # archived policies are admin-only and never appear here.
+    policies = [
+        _hr_policy_staff_payload(conn, r, emp_id)
+        for r in conn.execute(
+            "SELECT * FROM erp_hr_policies WHERE status = 'published'"
+            " ORDER BY title, id").fetchall()]
     # Projects & tasks (Wave 4 item 18, SOP 1.10): the caller's own
     # tasks across projects, and the projects they own (each with
     # all its tasks). Never another employee's work -- a task in
@@ -33534,6 +33605,8 @@ def hr_me():
         "help_cases": help_cases,
         "bulletins_available": True,
         "bulletins": bulletins,
+        "policies_available": True,
+        "policies": policies,
         "projects_available": True,
         "my_tasks": my_tasks,
         "my_projects": my_projects,
@@ -38324,6 +38397,607 @@ def hr_delete_bulletin(bulletin_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---- HR Policies & Handbooks (SOP 12.38) ----
+# One document per policy row, versioned, with per-version
+# acknowledgement. A policy is created as a draft with its first
+# draft version (v1). Publishing a draft version supersedes the
+# currently published version (if any) and resets everyone's
+# acknowledgement for the new version -- acknowledgements are
+# per-version, so staff must re-acknowledge each new version.
+# Editing a published policy never edits the published version in
+# place: a new draft version is created and published. Drafts and
+# archived policies are admin-only; staff see published policies
+# only, each with only their own acknowledgement state. The body
+# is plain text (max 20000 characters, the knowledge-base cap):
+# rich text is NOT used here -- its markup would eat the cap and
+# truncate real handbook content, and the 20000-cap decision for
+# wired rich-text fields is still open. Split a long handbook
+# into one policy per topic instead of one giant document. No
+# file uploads -- body text only, no bytes stored. Registers
+# start empty; nothing is seeded.
+HR_POLICY_CATEGORIES = ("handbook", "policy", "safety", "conduct",
+                        "other")
+_HR_POLICY_BODY_MAX = 20000
+
+
+def _hr_get_policy(conn, policy_id):
+    try:
+        policy_id = int(policy_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_hr_policies WHERE id = ?",
+                        (policy_id,)).fetchone()
+
+
+def _hr_policy_versions(conn, policy_id):
+    return conn.execute(
+        "SELECT * FROM erp_hr_policy_versions WHERE policy_id = ?"
+        " ORDER BY version",
+        (policy_id,)).fetchall()
+
+
+def _hr_policy_live_body(conn, row):
+    """(body, version) a reader sees: the published version's body,
+    else the latest draft's body, else ('', 0)."""
+    versions = _hr_policy_versions(conn, row["id"])
+    published = [v for v in versions if v["status"] == "published"]
+    if published:
+        return published[-1]["body"] or "", published[-1]["version"]
+    if versions:
+        return versions[-1]["body"] or "", versions[-1]["version"]
+    return "", 0
+
+
+def _hr_policy_counts(conn, policy_id, current_version):
+    """(acknowledged, unacknowledged, audience) for the CURRENT
+    version. Before any version is published nobody can have
+    acknowledged anything, so both counts are 0 -- a draft never
+    reads '0 of N acknowledged'."""
+    audience = _hr_bulletin_audience(conn)
+    if not current_version:
+        return 0, 0, len(audience)
+    acks = conn.execute(
+        "SELECT employee_id FROM erp_hr_policy_acknowledgements"
+        " WHERE policy_id = ? AND version = ?",
+        (policy_id, current_version)).fetchall()
+    ack_ids = {r["employee_id"] for r in acks}
+    unack = sum(1 for e in audience if e["id"] not in ack_ids)
+    return len(ack_ids), unack, len(audience)
+
+
+def _hr_policy_payload(conn, row, with_detail=False):
+    body, body_version = _hr_policy_live_body(conn, row)
+    versions = _hr_policy_versions(conn, row["id"])
+    has_draft = any(v["status"] == "draft" for v in versions)
+    ack_count, unack_count, audience_count = _hr_policy_counts(
+        conn, row["id"], row["current_version"] or 0)
+    out = {
+        "id": row["id"], "title": row["title"],
+        "category": row["category"] or "other",
+        "status": row["status"] or "draft",
+        "current_version": row["current_version"] or 0,
+        "effective_date": row["effective_date"] or "",
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+        "body": body, "body_version": body_version,
+        "has_draft": has_draft,
+        "acknowledged_count": ack_count,
+        "unacknowledged_count": unack_count,
+        "audience_count": audience_count,
+    }
+    if with_detail:
+        out["versions"] = [{
+            "id": v["id"], "version": v["version"],
+            "body": v["body"] or "", "status": v["status"],
+            "created_by": v["created_by"] or "",
+            "created_at": v["created_at"],
+            "published_by": v["published_by"] or "",
+            "published_at": v["published_at"] or "",
+        } for v in versions]
+        acks = conn.execute(
+            "SELECT * FROM erp_hr_policy_acknowledgements"
+            " WHERE policy_id = ? AND version = ?",
+            (row["id"], row["current_version"] or 0)).fetchall()
+        ack_list = []
+        for a in acks:
+            emp = _hr_get_employee(conn, a["employee_id"])
+            ack_list.append({
+                "employee_id": a["employee_id"],
+                "employee_name": (emp["name"] if emp else ""),
+                "employee_email": (emp["email"] if emp else ""),
+                "acknowledged_at": a["acknowledged_at"] or "",
+            })
+        ack_list.sort(key=lambda d: d["acknowledged_at"] or "")
+        ack_ids = {a["employee_id"] for a in acks}
+        out["acknowledged"] = ack_list
+        out["unacknowledged"] = [{
+            "employee_id": emp["id"],
+            "employee_name": emp["name"] or "",
+            "employee_email": emp["email"] or "",
+        } for emp in _hr_bulletin_audience(conn)
+            if emp["id"] not in ack_ids]
+    return out
+
+
+def _hr_policy_staff_payload(conn, row, employee_id):
+    """One published policy as a staff member sees it: the current
+    version's body plus ONLY their own acknowledgement state for
+    that version -- never anyone else's."""
+    body, _ = _hr_policy_live_body(conn, row)
+    a = conn.execute(
+        "SELECT * FROM erp_hr_policy_acknowledgements"
+        " WHERE policy_id = ? AND version = ? AND employee_id = ?",
+        (row["id"], row["current_version"] or 0,
+         employee_id)).fetchone()
+    return {
+        "id": row["id"], "title": row["title"],
+        "category": row["category"] or "other",
+        "current_version": row["current_version"] or 0,
+        "effective_date": row["effective_date"] or "",
+        "body": body,
+        "acknowledged_at": (a["acknowledged_at"] if a else "") or "",
+    }
+
+
+def _hr_policy_validate_date(value):
+    """'' or a YYYY-MM-DD date, else an error string."""
+    if not value:
+        return None
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return "effective_date must be YYYY-MM-DD"
+    return None
+
+
+def _hr_policy_fields(data, partial=False):
+    """Validate policy metadata (title / category / effective_date).
+    Returns (values, error)."""
+    fields = {}
+    if not partial or "title" in data:
+        title = (data.get("title") or "").strip()
+        if not title:
+            return None, "title is required"
+        if len(title) > 200:
+            return None, "title must be 200 characters or fewer"
+        fields["title"] = title
+    if "category" in data:
+        category = (data.get("category") or "other").strip().lower()
+        if category not in HR_POLICY_CATEGORIES:
+            return None, ("category must be one of: "
+                          "handbook, policy, safety, conduct, other")
+        fields["category"] = category
+    elif not partial:
+        fields["category"] = "other"
+    if "effective_date" in data:
+        eff = (data.get("effective_date") or "").strip()
+        err = _hr_policy_validate_date(eff)
+        if err:
+            return None, err
+        fields["effective_date"] = eff
+    return fields, None
+
+
+def _hr_policy_body(data):
+    """Validate a version body. Returns (body, error)."""
+    body = data.get("body")
+    if not isinstance(body, str) or not body.strip():
+        return None, "body is required"
+    if len(body.strip()) > _HR_POLICY_BODY_MAX:
+        return None, "body is too long (max 20000 characters)"
+    return body.strip(), None
+
+
+@app.get("/api/erp/hr/policies")
+def hr_list_policies():
+    """Admin list: every policy, newest first, optionally filtered
+    by category, status, and/or a search string over the title,
+    the body and the creator's login. Each row carries live
+    acknowledgement counts for its current version."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    category = (request.args.get("category") or "").strip().lower()
+    status = (request.args.get("status") or "").strip().lower()
+    q = (request.args.get("q") or "").strip().lower()
+    if category and category not in HR_POLICY_CATEGORIES:
+        return jsonify(error="unknown category"), 400
+    if status and status not in ("draft", "published", "archived"):
+        return jsonify(error="unknown status"), 400
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_policies ORDER BY id DESC").fetchall()
+    out = []
+    for r in rows:
+        if category and (r["category"] or "other") != category:
+            continue
+        if status and (r["status"] or "draft") != status:
+            continue
+        d = _hr_policy_payload(conn, r)
+        if q and q not in d["title"].lower() \
+                and q not in d["body"].lower() \
+                and q not in d["created_by"].lower():
+            continue
+        out.append(d)
+    conn.close()
+    return jsonify(policies=out)
+
+
+@app.post("/api/erp/hr/policies")
+def hr_create_policy():
+    """Create a policy (201, admin only) as a draft with its first
+    draft version (v1). The author is the admin who created it,
+    from the login -- never typed in, never invented."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields, error = _hr_policy_fields(data)
+    if error:
+        return jsonify(error=error), 400
+    body, error = _hr_policy_body(data)
+    if error:
+        return jsonify(error=error), 400
+    conn = db()
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_policies (title, category, status,"
+        " current_version, effective_date, created_by, created_at,"
+        " updated_by, updated_at)"
+        " VALUES (?, ?, 'draft', 0, ?, ?, ?, ?, ?)",
+        (fields["title"], fields["category"],
+         fields.get("effective_date", ""), actor, now, actor, now))
+    policy_id = cur.lastrowid
+    conn.execute(
+        "INSERT INTO erp_hr_policy_versions (policy_id, version,"
+        " body, status, created_by, created_at)"
+        " VALUES (?, 1, ?, 'draft', ?, ?)",
+        (policy_id, body, actor, now))
+    _erp_staff_audit(conn, actor, "hr.policy_created",
+                     "hr_policy", policy_id,
+                     "policy #%d created (draft v1): %r"
+                     % (policy_id, fields["title"]))
+    conn.commit()
+    out = _hr_policy_payload(conn, _hr_get_policy(conn, policy_id))
+    conn.close()
+    return jsonify(out), 201
+
+
+@app.get("/api/erp/hr/policies/<int:policy_id>")
+def hr_get_policy_route(policy_id):
+    """One policy for an admin, with every version and the
+    acknowledgement list for the current version (who acknowledged
+    it and when, and who has not yet)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_policy(conn, policy_id)
+    if not row:
+        conn.close()
+        return jsonify(error="policy not found"), 404
+    out = _hr_policy_payload(conn, row, with_detail=True)
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/policies/<int:policy_id>")
+def hr_update_policy(policy_id):
+    """Update a policy's metadata (title / category / effective
+    date, admin only). The body is never edited here -- a
+    published version is never edited in place; a new draft
+    version carries the new text (see /versions)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    fields, error = _hr_policy_fields(data, partial=True)
+    if error:
+        return jsonify(error=error), 400
+    if not fields:
+        return jsonify(error="nothing to update"), 400
+    conn = db()
+    row = _hr_get_policy(conn, policy_id)
+    if not row:
+        conn.close()
+        return jsonify(error="policy not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    sets = []
+    vals = []
+    for key in ("title", "category", "effective_date"):
+        if key in fields:
+            sets.append("%s = ?" % key)
+            vals.append(fields[key])
+    sets.append("updated_by = ?")
+    vals.append(actor)
+    sets.append("updated_at = ?")
+    vals.append(now)
+    vals.append(policy_id)
+    conn.execute("UPDATE erp_hr_policies SET %s WHERE id = ?"
+                 % ", ".join(sets), vals)
+    _erp_staff_audit(conn, actor, "hr.policy_updated",
+                     "hr_policy", policy_id,
+                     "policy #%d updated: %s"
+                     % (policy_id, ", ".join(sorted(fields))))
+    conn.commit()
+    out = _hr_policy_payload(conn, _hr_get_policy(conn, policy_id))
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/policies/<int:policy_id>/versions")
+def hr_create_policy_version(policy_id):
+    """Create a new draft version (201, admin only) carrying new
+    text. Refused 409 while a draft version is already open --
+    finish or publish the open draft first. Editing a published
+    policy goes through here: the published version stays live
+    until the new draft is published."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    body, error = _hr_policy_body(data)
+    if error:
+        return jsonify(error=error), 400
+    conn = db()
+    row = _hr_get_policy(conn, policy_id)
+    if not row:
+        conn.close()
+        return jsonify(error="policy not found"), 404
+    versions = _hr_policy_versions(conn, policy_id)
+    if any(v["status"] == "draft" for v in versions):
+        conn.close()
+        return jsonify(error="a draft version is already open;"
+                       " publish it or delete the policy first"), 409
+    nxt = (max([v["version"] for v in versions], default=0) + 1)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_policy_versions (policy_id, version,"
+        " body, status, created_by, created_at)"
+        " VALUES (?, ?, ?, 'draft', ?, ?)",
+        (policy_id, nxt, body, actor, now))
+    vid = cur.lastrowid
+    conn.execute(
+        "UPDATE erp_hr_policies SET updated_by = ?, updated_at = ?"
+        " WHERE id = ?", (actor, now, policy_id))
+    _erp_staff_audit(conn, actor, "hr.policy_version_created",
+                     "hr_policy", policy_id,
+                     "policy #%d draft v%d created"
+                     % (policy_id, nxt))
+    conn.commit()
+    out = _hr_policy_payload(conn, _hr_get_policy(conn, policy_id),
+                             with_detail=True)
+    conn.close()
+    return jsonify(out), 201
+
+
+@app.post("/api/erp/hr/policies/<int:policy_id>/versions/<int:version_id>/publish")
+def hr_publish_policy_version(policy_id, version_id):
+    """Publish a draft version (admin only). The currently
+    published version, if any, is superseded -- never edited in
+    place. The policy becomes published with current_version set
+    to the new version, and everyone's acknowledgement resets:
+    staff must acknowledge the new version. Publishing an
+    archived policy re-activates it (the archive was a shelving,
+    not a deletion)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_policy(conn, policy_id)
+    if not row:
+        conn.close()
+        return jsonify(error="policy not found"), 404
+    ver = conn.execute(
+        "SELECT * FROM erp_hr_policy_versions"
+        " WHERE id = ? AND policy_id = ?",
+        (version_id, policy_id)).fetchone()
+    if not ver:
+        conn.close()
+        return jsonify(error="policy version not found"), 404
+    if ver["status"] != "draft":
+        conn.close()
+        return jsonify(error="only a draft version can be published"
+                       " (status: %s)" % ver["status"]), 409
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_policy_versions SET status = 'superseded'"
+        " WHERE policy_id = ? AND status = 'published'",
+        (policy_id,))
+    conn.execute(
+        "UPDATE erp_hr_policy_versions"
+        " SET status = 'published', published_by = ?,"
+        " published_at = ? WHERE id = ?",
+        (actor, now, version_id))
+    conn.execute(
+        "UPDATE erp_hr_policies SET status = 'published',"
+        " current_version = ?, updated_by = ?, updated_at = ?"
+        " WHERE id = ?", (ver["version"], actor, now, policy_id))
+    _erp_staff_audit(conn, actor, "hr.policy_published",
+                     "hr_policy", policy_id,
+                     "policy #%d v%d published"
+                     % (policy_id, ver["version"]))
+    conn.commit()
+    out = _hr_policy_payload(conn, _hr_get_policy(conn, policy_id),
+                             with_detail=True)
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/policies/<int:policy_id>/archive")
+def hr_archive_policy(policy_id):
+    """Archive a policy (admin only). Archived policies are hidden
+    from staff but stay in the admin register with their versions
+    and acknowledgements. Publishing a new draft version of an
+    archived policy re-activates it."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_policy(conn, policy_id)
+    if not row:
+        conn.close()
+        return jsonify(error="policy not found"), 404
+    if (row["status"] or "") == "archived":
+        conn.close()
+        return jsonify(error="policy is already archived"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_policies SET status = 'archived',"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (actor, now, policy_id))
+    _erp_staff_audit(conn, actor, "hr.policy_archived",
+                     "hr_policy", policy_id,
+                     "policy #%d archived" % policy_id)
+    conn.commit()
+    out = _hr_policy_payload(conn, _hr_get_policy(conn, policy_id))
+    conn.close()
+    return jsonify(out)
+
+
+@app.delete("/api/erp/hr/policies/<int:policy_id>")
+def hr_delete_policy(policy_id):
+    """Delete a policy, permanently (admin only) -- draft-only. A
+    policy with any published history (published or superseded
+    versions) is refused 409: published policies are history, and
+    the correction is a new version or an archive, never a
+    delete. A deleted draft leaves no versions or acknowledgements
+    behind. Two-tap confirm on the frontend; no window.confirm."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_policy(conn, policy_id)
+    if not row:
+        conn.close()
+        return jsonify(error="policy not found"), 404
+    versions = _hr_policy_versions(conn, policy_id)
+    if (row["status"] or "") != "draft" or (row["current_version"] or 0):
+        conn.close()
+        return jsonify(error="only a draft policy with no published"
+                       " history can be deleted"), 409
+    if any(v["status"] in ("published", "superseded")
+           for v in versions):
+        conn.close()
+        return jsonify(error="only a draft policy with no published"
+                       " history can be deleted"), 409
+    conn.execute("DELETE FROM erp_hr_policy_acknowledgements"
+                 " WHERE policy_id = ?", (policy_id,))
+    conn.execute("DELETE FROM erp_hr_policy_versions"
+                 " WHERE policy_id = ?", (policy_id,))
+    conn.execute("DELETE FROM erp_hr_policies WHERE id = ?",
+                 (policy_id,))
+    _erp_staff_audit(conn, actor, "hr.policy_deleted",
+                     "hr_policy", policy_id,
+                     "deleted draft policy %r" % row["title"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/hr/policies/mine")
+def hr_my_policies():
+    """Every published policy for the caller, each with ONLY their
+    own acknowledgement state for the current version. Drafts and
+    archived policies are admin-only and never appear here. A
+    caller with no HR record linked gets 404, never another
+    employee's acknowledgement state."""
+    _, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    mine = _hr_resolve_caller_employee(conn)
+    if not mine:
+        conn.close()
+        return jsonify(error="no HR record is linked to your login;"
+                       " ask an admin to link one"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_policies WHERE status = 'published'"
+        " ORDER BY title, id").fetchall()
+    out = [_hr_policy_staff_payload(conn, r, mine["id"])
+           for r in rows]
+    conn.close()
+    return jsonify(policies=out)
+
+
+@app.get("/api/erp/hr/policies/mine/<int:policy_id>")
+def hr_my_policy(policy_id):
+    """One published policy for the caller, with their own
+    acknowledgement state. Opening it records nothing -- only the
+    explicit Acknowledge tap records an acknowledgement."""
+    _, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    mine = _hr_resolve_caller_employee(conn)
+    if not mine:
+        conn.close()
+        return jsonify(error="no HR record is linked to your login;"
+                       " ask an admin to link one"), 404
+    row = _hr_get_policy(conn, policy_id)
+    if not row or (row["status"] or "") != "published":
+        conn.close()
+        return jsonify(error="policy not found"), 404
+    out = _hr_policy_staff_payload(conn, row, mine["id"])
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/policies/mine/<int:policy_id>/acknowledge")
+def hr_acknowledge_policy(policy_id):
+    """Acknowledge the current version of a published policy, for
+    the caller only. Explicit and timestamped; the first
+    acknowledgement time is kept, and re-acknowledging changes
+    nothing. Acknowledging a version the caller already
+    acknowledged is a no-op, not an error."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    mine = _hr_resolve_caller_employee(conn)
+    if not mine:
+        conn.close()
+        return jsonify(error="no HR record is linked to your login;"
+                       " ask an admin to link one"), 404
+    row = _hr_get_policy(conn, policy_id)
+    if not row or (row["status"] or "") != "published":
+        conn.close()
+        return jsonify(error="policy not found"), 404
+    now = datetime.now(timezone.utc).isoformat()
+    existing = conn.execute(
+        "SELECT * FROM erp_hr_policy_acknowledgements"
+        " WHERE policy_id = ? AND version = ? AND employee_id = ?",
+        (policy_id, row["current_version"] or 0,
+         mine["id"])).fetchone()
+    if existing and existing["acknowledged_at"]:
+        out = _hr_policy_staff_payload(conn, row, mine["id"])
+        conn.close()
+        return jsonify(out)
+    if existing:
+        conn.execute(
+            "UPDATE erp_hr_policy_acknowledgements"
+            " SET acknowledged_at = ? WHERE id = ?",
+            (now, existing["id"]))
+    else:
+        conn.execute(
+            "INSERT INTO erp_hr_policy_acknowledgements (policy_id,"
+            " version, employee_id, acknowledged_at)"
+            " VALUES (?, ?, ?, ?)",
+            (policy_id, row["current_version"] or 0,
+             mine["id"], now))
+    _erp_staff_audit(conn, actor, "hr.policy_acknowledged",
+                     "hr_policy", policy_id,
+                     "policy #%d v%d acknowledged by employee #%d"
+                     % (policy_id, row["current_version"] or 0,
+                        mine["id"]))
+    conn.commit()
+    out = _hr_policy_staff_payload(conn, row, mine["id"])
+    conn.close()
+    return jsonify(out)
 
 
 # ---- Sales commissions (Wave 4 item 26, SOP 12.37) ----
