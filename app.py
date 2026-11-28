@@ -39,7 +39,7 @@ import base64
 import csv
 import html
 import io
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 from contextlib import contextmanager
 from decimal import Decimal, ROUND_HALF_UP
@@ -1250,6 +1250,23 @@ def init_db():
         if "ssn" not in _pe_cols:
             conn.execute("ALTER TABLE erp_acct_employees"
                          " ADD COLUMN ssn TEXT NOT NULL DEFAULT ''")
+    # Migration (S1, SOP 9.42): payment method + bank details on
+    # payroll employees. Blank means not set; full numbers are
+    # stored but never returned (only last 4, like the SSN).
+    # Never invented, never backfilled.
+    if _pe_exists:
+        _pe_cols = [r["name"] for r in conn.execute(
+            "PRAGMA table_info(erp_acct_employees)").fetchall()]
+        for _pd_col in (
+                "payment_method TEXT NOT NULL DEFAULT ''",
+                "bank_name TEXT NOT NULL DEFAULT ''",
+                "bank_account_type TEXT NOT NULL DEFAULT ''",
+                "bank_account TEXT NOT NULL DEFAULT ''",
+                "bank_routing TEXT NOT NULL DEFAULT ''"):
+            if _pd_col.split(" ")[0] not in _pe_cols:
+                conn.execute("ALTER TABLE erp_acct_employees"
+                             " ADD COLUMN " + _pd_col)
+                _pe_cols.append(_pd_col.split(" ")[0])
     # Migration: emailed_at on purchase orders (Purchasing 5-pack, Nov 2026).
     poexists = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='erp_purchase_orders'"
@@ -2488,10 +2505,31 @@ def init_db():
         -- people record, NOT in _ERP_RESET_TABLES -- a wipe must
         -- never erase it. Applicants link via erp_hr_applicants.role_id
         -- (added by the guarded ALTER after this script).
+        -- Job-description fields (Nov 27, 2026): position is the
+        -- actual job title; base_salary_range is free text shown to
+        -- applicants on the public careers listing; shift and
+        -- job_category are closed enums; reports_to is the free-text
+        -- title of the supervisor (NO link to another role); the
+        -- three section texts plus description are the four boxes of
+        -- the printable job description (Description, What's in it
+        -- for you, What you bring to the table, Job duties and
+        -- functions). Status is the `active` column (1 = Active,
+        -- 0 = Inactive) -- deactivation is real since Nov 27, 2026,
+        -- reversing the Nov 23 "roles are never deactivated" rule.
+        -- There is deliberately NO location column: location is added
+        -- at the job posting / hiring stage, not on the role.
         CREATE TABLE IF NOT EXISTS erp_hr_roles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
+            position TEXT NOT NULL DEFAULT '',
+            base_salary_range TEXT NOT NULL DEFAULT '',
+            shift TEXT NOT NULL DEFAULT '',
+            job_category TEXT NOT NULL DEFAULT '',
+            reports_to TEXT NOT NULL DEFAULT '',
+            whats_in_it_for_you TEXT NOT NULL DEFAULT '',
+            what_you_bring TEXT NOT NULL DEFAULT '',
+            job_duties TEXT NOT NULL DEFAULT '',
             active INTEGER NOT NULL DEFAULT 1,
             created_by TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
@@ -2919,6 +2957,50 @@ def init_db():
             ON erp_hr_documents (employee_id);
         CREATE INDEX IF NOT EXISTS idx_erp_hr_documents_expiry
             ON erp_hr_documents (expiry_date);
+        -- General file store (S3, SOP 10.16, Nov 2026): the ONE place
+        -- non-HR entity files live -- COA files, store-document files,
+        -- allergen-statement files, certification evidence files and
+        -- expense receipts. One row per file, base64 blob in data_b64,
+        -- following the erp_hr_documents pattern exactly (same 5 MB
+        -- cap on decoded bytes, same ~7 MB base64-text cap) so the
+        -- single-SQLite backup story does not change: no filesystem
+        -- dependency, no new service, and the nightly backup covers
+        -- the bytes. erp_hr_documents stays employee-HR-ONLY and is
+        -- untouched by this table -- the two stores never mix, and no
+        -- HR document can be filed here (kind "hr" does not exist).
+        -- kind fixes the owning table (coa -> erp_quality_coas,
+        -- store_document -> erp_store_documents, allergen_statement
+        -- -> erp_quality_supplier_allergen_statements,
+        -- cert_evidence -> erp_quality_certifications,
+        -- expense_receipt -> erp_acct_expense_claims); owner_type is
+        -- stored redundantly so a row is self-describing, and the
+        -- upload endpoint refuses an owner_type that does not match
+        -- the kind. The owning record must exist at upload time (404
+        -- otherwise); deleting the owning record does NOT cascade --
+        -- its files stay, listed under the (now missing) owner, so a
+        -- deleted COA never silently destroys its evidence file.
+        -- Like the HR and quality records this table is NOT in
+        -- _ERP_RESET_TABLES: a wipe must never erase filed evidence.
+        -- Nothing is seeded; the register starts empty.
+        CREATE TABLE IF NOT EXISTS erp_file_store (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            owner_type TEXT NOT NULL,
+            owner_id INTEGER NOT NULL,
+            filename TEXT NOT NULL,
+            mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            data_b64 TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            uploaded_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_file_store_owner
+            ON erp_file_store (kind, owner_type, owner_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_file_store_kind
+            ON erp_file_store (kind);
         -- HR Additions 4: recurring schedules. erp_hr_recurring_events
         -- is a template for events that repeat (weekly / biweekly /
         -- monthly); erp_hr_recurring_instances is the idempotency link
@@ -3340,12 +3422,13 @@ def init_db():
         -- 0 while never published), effective_date (YYYY-MM-DD or
         -- ''), the admin who created it and when.
         -- erp_hr_policy_versions is append-only: one row per
-        -- version -- body is plain text (max 20000 characters, the
-        -- same cap as the knowledge base; rich text is NOT used
-        -- here because its markup would eat the cap and truncate
-        -- real handbook content, and the 20000-cap decision for
-        -- wired rich-text fields is still open), status draft /
-        -- published / superseded, created and published by/at.
+        -- version -- body is plain text (max 50000 characters, raised
+        -- from 20000 so a full employee handbook fits in one policy;
+        -- rich text is NOT used here because its markup would eat
+        -- the cap and truncate real handbook content, and the
+        -- 20000-cap decision for wired rich-text fields is still
+        -- open), status draft / published / superseded, created and
+        -- published by/at.
         -- erp_hr_policy_acknowledgements is one row per (policy,
         -- version, employee): acknowledged_at, the time that
         -- employee tapped Acknowledge on that version. UNIQUE on
@@ -3393,6 +3476,106 @@ def init_db():
             ON erp_hr_policy_acknowledgements (policy_id, version);
         CREATE INDEX IF NOT EXISTS idx_erp_hr_policy_acks_employee
             ON erp_hr_policy_acknowledgements (employee_id);
+        -- Policy audiences (SOP 12.38 scoping): one row per audience
+        -- a policy is scoped to, kind 'site' (key = store /
+        -- corporate / warehouse slug) or 'role' (key = the role id
+        -- as decimal text). No rows = all staff (the default that
+        -- keeps every existing policy visible to everyone). A people
+        -- record like the policies it scopes: NOT in
+        -- _ERP_RESET_TABLES -- a wipe must never silently widen a
+        -- scoped policy back to all-staff by deleting its rows.
+        CREATE TABLE IF NOT EXISTS erp_hr_policy_audiences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            policy_id INTEGER NOT NULL,
+            audience_kind TEXT NOT NULL,
+            audience_key TEXT NOT NULL,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            UNIQUE (policy_id, audience_kind, audience_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_policy_audiences_policy
+            ON erp_hr_policy_audiences (policy_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_policy_audiences_kind
+            ON erp_hr_policy_audiences (audience_kind, audience_key);
+
+        -- Digital HR Forms (SOPs 12.40-12.46): erp_hr_form_defs is
+        -- the 11 fill-in forms (HR-02..HR-12), seeded from the
+        -- packet text. erp_hr_form_submissions is one row per filled
+        -- form, with the current data frozen per version.
+        -- erp_hr_form_submission_versions holds append-only
+        -- snapshots of the data (version 1 at submit, +1 per
+        -- correction). erp_hr_form_signatures holds attestation /
+        -- token / paper signatures (superseded_by_version marks the
+        -- ones a correction replaced). erp_hr_form_token_requests
+        -- holds the HR-02 candidate email links. These tables are
+        -- deliberately NOT in _ERP_RESET_TABLES: HR records survive
+        -- a wipe (a wipe must never destroy them).
+        CREATE TABLE IF NOT EXISTS erp_hr_form_defs (
+            code TEXT PRIMARY KEY, title TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            starter TEXT NOT NULL DEFAULT 'admin',
+            instructions TEXT NOT NULL DEFAULT '',
+            fields_json TEXT NOT NULL DEFAULT '[]',
+            terminal_json TEXT NOT NULL DEFAULT '[]');
+        CREATE TABLE IF NOT EXISTS erp_hr_form_submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            form_code TEXT NOT NULL, form_version INTEGER NOT NULL,
+            employee_id INTEGER, subject_name TEXT NOT NULL DEFAULT '',
+            subject_email TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'draft',
+            decision TEXT, decision_notes TEXT, decided_by TEXT,
+            decided_at TEXT, payroll_received_by TEXT,
+            payroll_date_received TEXT, payroll_first_deposit_date TEXT,
+            linked_safety_incident_id INTEGER,
+            data_json TEXT NOT NULL DEFAULT '{}',
+            current_version INTEGER NOT NULL DEFAULT 0,
+            submitted_at TEXT, ever_submitted INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_form_subs_form
+            ON erp_hr_form_submissions (form_code);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_form_subs_employee
+            ON erp_hr_form_submissions (employee_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_form_subs_status
+            ON erp_hr_form_submissions (status);
+        CREATE TABLE IF NOT EXISTS erp_hr_form_submission_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            submission_id INTEGER NOT NULL, version INTEGER NOT NULL,
+            data_json TEXT NOT NULL DEFAULT '{}',
+            note TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL
+            DEFAULT '', created_at TEXT NOT NULL,
+            UNIQUE (submission_id, version));
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_form_versions_sub
+            ON erp_hr_form_submission_versions (submission_id);
+        CREATE TABLE IF NOT EXISTS erp_hr_form_signatures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            submission_id INTEGER NOT NULL, role TEXT NOT NULL,
+            signer_type TEXT NOT NULL DEFAULT 'staff',
+            signer_name TEXT NOT NULL DEFAULT '',
+            typed_name TEXT NOT NULL DEFAULT '',
+            signed_at TEXT NOT NULL, method TEXT NOT NULL DEFAULT
+            'attestation', note TEXT NOT NULL DEFAULT '',
+            superseded_by_version INTEGER);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_form_sigs_sub
+            ON erp_hr_form_signatures (submission_id);
+        CREATE TABLE IF NOT EXISTS erp_hr_form_token_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            submission_id INTEGER NOT NULL,
+            signer_name TEXT NOT NULL DEFAULT '',
+            signer_email TEXT NOT NULL DEFAULT '',
+            form_version INTEGER NOT NULL DEFAULT 1,
+            status TEXT NOT NULL DEFAULT 'sent',
+            token_hash TEXT NOT NULL, expires_at TEXT NOT NULL,
+            sent_at TEXT, viewed_at TEXT, signed_at TEXT,
+            signed_name TEXT, signed_copy_json TEXT,
+            declined_at TEXT, decline_reason TEXT,
+            signer_ip TEXT, signer_user_agent TEXT,
+            email_sent_at TEXT, created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, updated_at TEXT);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_form_tokens_hash
+            ON erp_hr_form_token_requests (token_hash);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_form_tokens_sub
+            ON erp_hr_form_token_requests (submission_id);
         -- Sales commissions (Wave 4 item 26, SOP 12.37): a REGISTER
         -- only -- the design's §4 entry ("commission 0 hits. No reps,
         -- founders sell. Add if a rep or commission plan ever
@@ -3463,6 +3646,47 @@ def init_db():
             ON erp_hr_commissions (employee_id);
         CREATE INDEX IF NOT EXISTS idx_erp_hr_commissions_status
             ON erp_hr_commissions (status);
+        -- Background checks (S7, SOP 12.39): a register of screening
+        -- results as reported by the screening company, tied to the
+        -- onboarding record/employee. erp_hr_onboarding links to an
+        -- employee through its employee_id column (one checklist row
+        -- per employee), so a check carries employee_id (required)
+        -- plus onboarding_id (optional: the specific checklist row
+        -- the check satisfies, which must belong to that employee).
+        -- There is NO integration with any screening vendor: the
+        -- ERP never runs a check, never contacts a vendor, and never
+        -- fills in a result. vendor is the screening company's name
+        -- typed by the admin from the vendor's report; status is
+        -- requested / in_progress / complete / cancelled; result is
+        -- pending / clear / review / adverse, recorded only from
+        -- what the vendor reported. requested_date is the date the
+        -- check was requested; completed_date is the date on the
+        -- vendor's report and is only set when the check completes.
+        -- report_reference is the vendor's report/case number from
+        -- the report; notes hold only the admin's record-keeping
+        -- note (never a copy of the vendor's detailed findings).
+        -- The register starts EMPTY. Like the rest of HR, this table
+        -- is NOT in _ERP_RESET_TABLES.
+        CREATE TABLE IF NOT EXISTS erp_hr_background_checks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            onboarding_id INTEGER,
+            vendor TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'requested',
+            result TEXT NOT NULL DEFAULT 'pending',
+            requested_date TEXT NOT NULL,
+            completed_date TEXT NOT NULL DEFAULT '',
+            report_reference TEXT NOT NULL DEFAULT '',
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_bgchecks_employee
+            ON erp_hr_background_checks (employee_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_hr_bgchecks_status
+            ON erp_hr_background_checks (status);
         -- Projects & tasks (Wave 4 item 18, SOP 1.10): cross-department
         -- project management -- the design's §3.17 gap. A project is
         -- one multi-week effort with more than two owners (a store
@@ -4429,6 +4653,134 @@ def init_db():
         CREATE UNIQUE INDEX IF NOT EXISTS idx_erp_quality_spc_limits_pair
             ON erp_quality_spc_limits (characteristic,
                                        COALESCE(recipe_id, 0));
+        -- Workplace safety incident register (SOP 13.22): FACILITY-
+        -- scoped, not store-scoped -- the workplace is the production
+        -- facility at 6290 McLeod Dr, Suite 120, Las Vegas, NV, and
+        -- stores may not exist yet, so there is deliberately no
+        -- store_id here (unlike erp_store_incidents, which covers
+        -- theft / customer complaints at a store). location defaults
+        -- to the facility address and is typed over only when the
+        -- incident happened somewhere else. severity is one of four
+        -- admin-recorded levels and osha_recordable is an
+        -- admin-entered flag: the ERP defines NO thresholds for
+        -- either and does NOT determine OSHA reportability -- that
+        -- is the manager's call (SOP 13.22). lost_time_days counts
+        -- whole days lost as recorded (0 = none recorded);
+        -- medical_treatment is whether treatment was given, with
+        -- the detail in medical_treatment_detail; workers_comp_claim
+        -- is whether a claim exists, with the claim number and an
+        -- admin-entered status. The register starts EMPTY -- no
+        -- incident is ever seeded or auto-created. Quality records
+        -- -- NOT in _ERP_RESET_TABLES: a wipe must never erase them.
+        CREATE TABLE IF NOT EXISTS erp_quality_safety_incidents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            incident_date TEXT NOT NULL,
+            incident_type TEXT NOT NULL,
+            location TEXT NOT NULL DEFAULT
+                'Production facility — 6290 McLeod Dr, Suite 120, Las Vegas, NV',
+            description TEXT NOT NULL DEFAULT '',
+            person_involved TEXT NOT NULL DEFAULT '',
+            severity TEXT NOT NULL DEFAULT 'minor',
+            lost_time_days INTEGER NOT NULL DEFAULT 0,
+            medical_treatment INTEGER NOT NULL DEFAULT 0,
+            medical_treatment_detail TEXT NOT NULL DEFAULT '',
+            workers_comp_claim INTEGER NOT NULL DEFAULT 0,
+            workers_comp_claim_number TEXT NOT NULL DEFAULT '',
+            workers_comp_status TEXT NOT NULL DEFAULT 'none',
+            osha_recordable INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'open',
+            reported_by TEXT NOT NULL DEFAULT '',
+            follow_up_note TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_safety_date
+            ON erp_quality_safety_incidents (incident_date);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_safety_status
+            ON erp_quality_safety_incidents (status);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_safety_severity
+            ON erp_quality_safety_incidents (severity);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_safety_osha
+            ON erp_quality_safety_incidents (osha_recordable);
+        -- Sanitation / pest-control register (SOP 13.23): one
+        -- register covering BOTH sanitation checks and pest-control
+        -- visits, distinguished by entry_type ('sanitation' vs
+        -- 'pest_control'). Three tables: schedules (the recurring
+        -- plan -- what gets checked/treated, how often, where, by
+        -- whom, next due), logs (one row per completed check or
+        -- visit -- date, area, who did it, pest-control vendor when
+        -- there is one, pass/fail result, notes), and findings (one
+        -- row per thing found wrong on a log -- a log can carry
+        -- several; each finding has its own severity and status and
+        -- may link ONE existing CAPA by id -- a finding never
+        -- auto-creates a CAPA and a CAPA is never opened from here).
+        -- No vendor is ever seeded: the vendor name on a pest-control
+        -- log is typed in by the admin, and a blank vendor means the
+        -- visit was done in-house (or the vendor was not recorded).
+        -- 'overdue' is computed from next_due_date vs today and is
+        -- never stored. All three registers start EMPTY -- nothing is
+        -- ever seeded or auto-created. Quality records -- NOT in
+        -- _ERP_RESET_TABLES: a wipe must never erase them.
+        CREATE TABLE IF NOT EXISTS erp_quality_sanitation_schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_type TEXT NOT NULL,
+            name TEXT NOT NULL,
+            area TEXT NOT NULL DEFAULT '',
+            frequency TEXT NOT NULL DEFAULT 'weekly',
+            description TEXT NOT NULL DEFAULT '',
+            assigned_to TEXT NOT NULL DEFAULT '',
+            next_due_date TEXT NOT NULL DEFAULT '',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_sanitation_sched_type
+            ON erp_quality_sanitation_schedules (entry_type, active);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_sanitation_sched_due
+            ON erp_quality_sanitation_schedules (next_due_date);
+        CREATE TABLE IF NOT EXISTS erp_quality_sanitation_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entry_type TEXT NOT NULL,
+            log_date TEXT NOT NULL,
+            schedule_id INTEGER,
+            area TEXT NOT NULL DEFAULT '',
+            performed_by TEXT NOT NULL DEFAULT '',
+            vendor TEXT NOT NULL DEFAULT '',
+            result TEXT NOT NULL DEFAULT 'pass',
+            notes TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_sanitation_log_date
+            ON erp_quality_sanitation_logs (entry_type, log_date);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_sanitation_log_sched
+            ON erp_quality_sanitation_logs (schedule_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_sanitation_log_result
+            ON erp_quality_sanitation_logs (result);
+        CREATE TABLE IF NOT EXISTS erp_quality_sanitation_findings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            log_id INTEGER NOT NULL,
+            description TEXT NOT NULL,
+            severity TEXT NOT NULL DEFAULT 'minor',
+            status TEXT NOT NULL DEFAULT 'open',
+            capa_id INTEGER,
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_sanitation_finding_log
+            ON erp_quality_sanitation_findings (log_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_sanitation_finding_status
+            ON erp_quality_sanitation_findings (status);
+        CREATE INDEX IF NOT EXISTS idx_erp_quality_sanitation_finding_capa
+            ON erp_quality_sanitation_findings (capa_id);
         -- Wave 3 B6 (SOP Dept 7, unnumbered "Schedule a report by
         -- email"): scheduled report email delivery. One row is one
         -- pushed report: report_key picks which Dept 7 report (or the
@@ -4640,8 +4992,13 @@ def init_db():
         -- secret is never stored, so it cannot be the signing key.
         -- Scopes are read-only in v1 (orders.read, inventory.read,
         -- invoices.read); any *.write scope is refused at creation.
-        -- Revocation is permanent (revoked = 1, never un-revoked,
-        -- never deleted) so it stays auditable. Delivery payloads
+        -- Revocation is permanent (revoked = 1, never un-revoked).
+        -- A revoked key may be deleted by an admin (SOP 10.15):
+        -- deletion is a hard row delete, and the staff audit row
+        -- (settings.api_key_deleted, with name + prefix + scopes)
+        -- is the permanent record, so the revocation stays
+        -- auditable. An active key can never be deleted directly:
+        -- revoke it first. Delivery payloads
         -- are TEXT, never a BLOB: the full Settings export dumps
         -- every erp_* table into JSON, and a BLOB would break the
         -- export -- and the export is what mints the wipe token.
@@ -5130,6 +5487,69 @@ def init_db():
             ON erp_store_timeclock (shift_id);
         CREATE INDEX IF NOT EXISTS idx_erp_store_timeclock_employee
             ON erp_store_timeclock (employee_id);
+        -- Dept 15 (Stores) S4: dated shift instances (rota). Unlike
+        -- erp_store_shifts (weekly templates), erp_store_rota_shifts
+        -- is one row per specific date: shift_date YYYY-MM-DD, times
+        -- HH:MM, role free text, scope free text (where in the store
+        -- the shift covers, e.g. register / floor / production --
+        -- never invented, empty unless an admin types one).
+        -- employee_id is NULLABLE on purpose: an unassigned published
+        -- shift is a real state the coverage check warns about, not
+        -- an error at creation. status is draft / published /
+        -- cancelled; template_id links back to the weekly template
+        -- the instance was generated from, NULL for hand-made ones.
+        -- erp_store_rota_requests is the swap / drop queue: one row
+        -- per staff request on a published shift, pending / approved
+        -- / denied / cancelled. A swap names its target employee;
+        -- a drop has no target -- approving it unassigns the shift
+        -- (it stays published so coverage flags the gap) instead of
+        -- deleting it. Both tables start EMPTY -- no shifts, no
+        -- requests are seeded -- and both are in _ERP_RESET_TABLES
+        -- with the other store tables. Nothing here posts to the
+        -- ledger or payroll: a rota shift is a plan, not hours
+        -- worked; hours still come from the timeclock.
+        CREATE TABLE IF NOT EXISTS erp_store_rota_shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            store_id INTEGER NOT NULL,
+            employee_id INTEGER,
+            template_id INTEGER,
+            shift_date TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT '',
+            scope TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'draft',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_rota_shifts_store_date
+            ON erp_store_rota_shifts (store_id, shift_date);
+        CREATE INDEX IF NOT EXISTS idx_erp_store_rota_shifts_employee
+            ON erp_store_rota_shifts (employee_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_store_rota_shifts_template
+            ON erp_store_rota_shifts (template_id);
+        CREATE TABLE IF NOT EXISTS erp_store_rota_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rota_shift_id INTEGER NOT NULL,
+            employee_id INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'swap',
+            target_employee_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reason TEXT NOT NULL DEFAULT '',
+            decided_by TEXT NOT NULL DEFAULT '',
+            decided_at TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_store_rota_requests_shift
+            ON erp_store_rota_requests (rota_shift_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_store_rota_requests_employee
+            ON erp_store_rota_requests (employee_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_store_rota_requests_status
+            ON erp_store_rota_requests (status);
         -- Dept 14 (Stores) Wave C: facilities & maintenance, loss
         -- prevention (register voids + cash audits), and planograms.
         -- All four tables start EMPTY -- no equipment catalog, no
@@ -6256,6 +6676,19 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_erp_prod_lines ON erp_order_production_lines (order_id);
         """
     )
+    # Digital HR Forms (SOPs 12.40-12.46): seed the form definitions
+    # (idempotent). The instructions are the verbatim packet text,
+    # so the seed can never drift from the packet. A definition is
+    # only inserted when its code is absent; a later version bump is
+    # a code change, not a seed change.
+    for _d in HR_FORM_DEFS:
+        conn.execute(
+            "INSERT OR IGNORE INTO erp_hr_form_defs (code, title,"
+            " version, starter, instructions, fields_json,"
+            " terminal_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (_d["code"], _d["title"], _d["version"], _d["starter"],
+             _d["instructions"], json.dumps(_d["fields"]),
+             json.dumps(_d["terminal"])))
     # Learning paths + catalog (SOP 12.28): category + content link
     # on courses (guarded ALTERs, same pattern as the employee
     # scope columns). Existing courses get category_id NULL (shown
@@ -6298,6 +6731,25 @@ def init_db():
     if "requisition_id" not in _arcols2:
         conn.execute(
             "ALTER TABLE erp_hr_applicants ADD COLUMN requisition_id INTEGER")
+    # Job-description fields on erp_hr_roles (Nov 27, 2026): same
+    # guarded-ALTER pattern -- the CREATE TABLE above now includes
+    # them, but databases created before this build get them here.
+    # No backfill: existing roles keep blank fields until an admin
+    # fills them in. No location column, ever, by the user's call.
+    _hrrole_cols = [r["name"] for r in conn.execute(
+        "PRAGMA table_info(erp_hr_roles)").fetchall()]
+    for _hrrole_col, _hrrole_ddl in (
+            ("position", "TEXT NOT NULL DEFAULT ''"),
+            ("base_salary_range", "TEXT NOT NULL DEFAULT ''"),
+            ("shift", "TEXT NOT NULL DEFAULT ''"),
+            ("job_category", "TEXT NOT NULL DEFAULT ''"),
+            ("reports_to", "TEXT NOT NULL DEFAULT ''"),
+            ("whats_in_it_for_you", "TEXT NOT NULL DEFAULT ''"),
+            ("what_you_bring", "TEXT NOT NULL DEFAULT ''"),
+            ("job_duties", "TEXT NOT NULL DEFAULT ''")):
+        if _hrrole_col not in _hrrole_cols:
+            conn.execute("ALTER TABLE erp_hr_roles ADD COLUMN %s %s"
+                         % (_hrrole_col, _hrrole_ddl))
     # Benefits administration (SOP 12.23): link a tracked benefit
     # row to the plan it was enrolled through and the window it was
     # enrolled in (NULL = tracked outside a plan / not via a window,
@@ -6333,7 +6785,16 @@ def init_db():
             ("scope_type", "TEXT"),
             ("scope_store_id", "INTEGER"),
             ("role_id", "INTEGER"),
-            ("position_id", "INTEGER")):
+            ("position_id", "INTEGER"),
+            # Policy-audience scoping (SOP 12.38): work_site is the
+            # site whose handbook this person reads (store /
+            # corporate / warehouse). NULL = unassigned: no handbook
+            # until an admin picks one (fail-closed). No default and
+            # no backfill -- it is independent of scope_type (which
+            # has no warehouse value and is a headcount concept, not
+            # a workplace), of role_id, and of position_id; changing
+            # any of those never changes work_site.
+            ("work_site", "TEXT")):
         if _hc_col not in _hecols:
             conn.execute("ALTER TABLE erp_hr_employees ADD COLUMN %s %s"
                          % (_hc_col, _hc_ddl))
@@ -6343,6 +6804,8 @@ def init_db():
                  " ON erp_hr_employees (role_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_erp_hr_employees_position"
                  " ON erp_hr_employees (position_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_erp_hr_employees_work_site"
+                 " ON erp_hr_employees (work_site)")
     # Dept 10 Settings Wave A (item 1): seed the company profile once.
     # INSERT OR IGNORE so an admin-edited row is never overwritten.
     # Known values only: legal name FUDGETOPIA LLC; facility address is the
@@ -7017,6 +7480,11 @@ def init_db():
             exempt INTEGER NOT NULL DEFAULT 0,
             active INTEGER NOT NULL DEFAULT 1,
             ssn TEXT NOT NULL DEFAULT '',
+            payment_method TEXT NOT NULL DEFAULT '',
+            bank_name TEXT NOT NULL DEFAULT '',
+            bank_account_type TEXT NOT NULL DEFAULT '',
+            bank_account TEXT NOT NULL DEFAULT '',
+            bank_routing TEXT NOT NULL DEFAULT '',
             qb_id TEXT,
             created_at TEXT NOT NULL
         );
@@ -7185,6 +7653,84 @@ def init_db():
             ON erp_acct_payroll_garnishments (employee_id);
         CREATE INDEX IF NOT EXISTS idx_erp_acct_garnishments_status
             ON erp_acct_payroll_garnishments (status);
+        -- S1 (SOP 9.42): payroll disbursement register. One row per
+        -- pay run, recording HOW that run was paid -- it prepares /
+        -- records the payout, it never transfers funds. method is
+        -- direct_deposit / check / cash / mixed (the overall method
+        -- for the run; per-line methods live in lines_json).
+        -- reference is the admin-typed payout reference (bank batch
+        -- reference for ACH, check batch reference for checks);
+        -- disbursed_date is the admin-typed date the payout was
+        -- made / the file was prepared. check_start_number is the
+        -- first check number used, only when the run pays by check
+        -- (or mixed with check lines). lines_json is a JSON list of
+        -- per-line snapshots {employee_id, employee_name,
+        -- net_cents, method, account_last4, routing_last4,
+        -- check_number} -- masked last-4 only, NEVER full account
+        -- or routing numbers. total_net_cents / line_count are the
+        -- stored totals at preparation time. prepared_by /
+        -- prepared_at record who prepared it. A disbursement never
+        -- changes the run status and never posts a journal entry:
+        -- the ledger posting is the separate /pay step (SOP 9.17).
+        -- There is no edit or delete endpoint: a wrong live record
+        -- stands as history (correct it by noting it in a new
+        -- record's reference only if a genuinely new payout is
+        -- made, never by editing the old one). No bank / ACH
+        -- integration exists: the NACHA file this record drives is
+        -- a preparation draft, not a submitted transfer.
+        CREATE TABLE IF NOT EXISTS erp_acct_payroll_disbursements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payrun_id INTEGER NOT NULL UNIQUE,
+            method TEXT NOT NULL,
+            reference TEXT NOT NULL,
+            disbursed_date TEXT NOT NULL,
+            check_start_number INTEGER,
+            lines_json TEXT NOT NULL DEFAULT '[]',
+            total_net_cents INTEGER NOT NULL DEFAULT 0,
+            line_count INTEGER NOT NULL DEFAULT 0,
+            notes TEXT NOT NULL DEFAULT '',
+            prepared_by TEXT NOT NULL DEFAULT '',
+            prepared_at TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_acct_disbursements_payrun
+            ON erp_acct_payroll_disbursements (payrun_id);
+        """
+    )
+    # S5 (SOP 9.43): vendor W-9 register. One row per vendor, admin-entered
+    # only, never seeded: the register starts EMPTY and the admin records
+    # each contractor's W-9 by hand. is_contractor flags the vendors whose
+    # payments count toward 1099-NEC reporting; a flagged contractor with
+    # no W-9 on file still counts in the year-end summary -- the missing
+    # W-9 is flagged, never silently dropped. The TIN (SSN or EIN, 9
+    # digits) is stored in full but NEVER returned by any endpoint: only
+    # whether one is on file and its last 4 digits, the same rule as the
+    # payroll SSN (SOP 9.38) and the bank details (SOP 9.42). legal_name
+    # is the name as it appears on the W-9 (it may differ from the vendor
+    # record's display name). w9_received_date is the date the paper /
+    # electronic W-9 was received, '' when no W-9 is on file. There is no
+    # edit history on this row: a correction overwrites the fields and
+    # writes an audit row naming the fields changed, never the values.
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS erp_acct_vendor_w9 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            vendor_id INTEGER NOT NULL UNIQUE,
+            is_contractor INTEGER NOT NULL DEFAULT 0,
+            legal_name TEXT NOT NULL DEFAULT '',
+            entity_type TEXT NOT NULL DEFAULT '',
+            tin_type TEXT NOT NULL DEFAULT '',
+            tin TEXT NOT NULL DEFAULT '',
+            address TEXT NOT NULL DEFAULT '',
+            city TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT '',
+            zip TEXT NOT NULL DEFAULT '',
+            w9_received_date TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_acct_vendor_w9_vendor
+            ON erp_acct_vendor_w9 (vendor_id);
         """
     )
     # Dept 9 big-company package, module B: monthly budgets. One row per
@@ -7604,9 +8150,10 @@ def init_db():
         -- never sends anything by itself -- it groups and tracks. The email
         -- channel links ONE newsletter issue, the instagram channel links
         -- ONE Instagram post (created/published through the existing
-        -- Instagram flow); the sms channel is a placeholder only -- SMS is
-        -- NOT adopted, so its status is always 'not_configured' and it
-        -- never sends. campaign_key reuses the existing campaign_key
+        -- Instagram flow); the sms channel takes no linked issue or
+        -- post -- an SMS send is recorded against the campaign when an
+        -- order SMS is sent with that campaign (SOP 8.40, item S6).
+        -- campaign_key reuses the existing campaign_key
         -- convention: it is the attribution join -- the same key stamped
         -- on orders at checkout (§3.11 attribution, later item) -- so it
         -- must be unique. Deleting a campaign deletes only the grouping
@@ -7640,6 +8187,63 @@ def init_db():
         );
         CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_mkt_campaign_channels_one
             ON erp_mkt_campaign_channels (campaign_id, channel);
+        -- SMS sending via Twilio (Dept 8, SOP 8.40, item S6, Nov 27,
+        -- 2026): provider config (one row, id = 1), admin-written
+        -- message templates, and the send log. Registers start EMPTY:
+        -- no config row is seeded (no config = sending disabled), no
+        -- template is seeded, no message is seeded. The auth token is
+        -- NEVER stored in plain text: erp_sms_config.auth_token_enc
+        -- holds the encrypted token (see _sms_encrypt_token); only
+        -- token_last4 is ever returned by the API. NOT in
+        -- _ERP_RESET_TABLES: like the other erp_mkt_* tables, a wipe
+        -- must never erase admin-entered config, templates, or the
+        -- send log (the log is the audit trail for money spent on
+        -- messages).
+        CREATE TABLE IF NOT EXISTS erp_sms_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            provider TEXT NOT NULL DEFAULT 'twilio',
+            account_sid TEXT NOT NULL DEFAULT '',
+            from_number TEXT NOT NULL DEFAULT '',
+            auth_token_enc TEXT NOT NULL DEFAULT '',
+            token_last4 TEXT NOT NULL DEFAULT '',
+            auto_ready INTEGER NOT NULL DEFAULT 0,
+            auto_shipped INTEGER NOT NULL DEFAULT 0,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS erp_sms_templates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'custom',
+            body TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_by TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS uidx_erp_sms_templates_name
+            ON erp_sms_templates (name COLLATE NOCASE);
+        CREATE TABLE IF NOT EXISTS erp_sms_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            template_id INTEGER,
+            order_source TEXT NOT NULL DEFAULT '',
+            order_id INTEGER NOT NULL DEFAULT 0,
+            campaign_id INTEGER,
+            event TEXT NOT NULL DEFAULT '',
+            to_number TEXT NOT NULL DEFAULT '',
+            from_number TEXT NOT NULL DEFAULT '',
+            body TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'failed',
+            provider_sid TEXT NOT NULL DEFAULT '',
+            provider_status TEXT NOT NULL DEFAULT '',
+            error TEXT NOT NULL DEFAULT '',
+            created_by TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_erp_sms_messages_order
+            ON erp_sms_messages (order_source, order_id);
+        CREATE INDEX IF NOT EXISTS idx_erp_sms_messages_status
+            ON erp_sms_messages (status);
         -- Campaign cost tracking (Dept 8, SOP 8.35, Wave 3 section 4.2
         -- item 16, Nov 25, 2026): marketing spend per campaign, so ROI %
         -- can be computed against the attributed revenue SOP 8.30 already
@@ -8618,6 +9222,114 @@ def init_db():
         _erp_migrate_barcode_pool(conn)
     conn.commit()
     conn.close()
+
+# HR Forms definitions (SOPs 12.40-12.46). Generated from
+# hidden_files/hr-form-HR-XX.txt (verbatim packet text) and
+# the design field specs (design §3). HR-01 is excluded by
+# the user's direction. Instructions are the packet text
+# verbatim; field labels come from the packet too.
+HR_FORM_DEFS = [
+    {
+        "code": "HR-02",
+        "title": "Offer Letter",
+        "version": 1,
+        "starter": "admin",
+        "terminal": ["countersigned", "declined"],
+        "instructions": 'Form HR-02\nOffer Letter\n\nComplete one per hire. The signed copy goes in the personnel file; the employee keeps a copy.\n\nDate: ______\nCandidate name: ______\nCandidate address: ______\nDear ______________________________,\n\nPop-A-Licious is pleased to offer you the position below. We are glad to have you join the team.\n\nPosition / job title: ______\nDepartment: ______\nStart date: ______\nWork location: ______\nPay rate ($ per hour): ______\nSchedule / expected hours: ______\nReports to: ______\nClassification: full-time / part-time: ______\nTerms\n\nEmployment with Pop-A-Licious is at-will: either you or the company may end the employment relationship at any time, with or without cause or notice. This letter is not a contract for any set period of employment.\n\nThis offer depends on completion of Form I-9 (with acceptable documents) within the federal deadlines, and - for any role handling food - a current Clark County food handler card.\n\nPay, schedules, paid time off, and all other terms follow the Employee Handbook, which you will receive and acknowledge on or before your first day.\n\nCompany recipes, formulas, and business information are trade secrets. You will sign the Confidentiality Agreement (Form HR-06) as a condition of employment.\n\nPlease sign below to accept this offer and return the signed letter by the date shown.\n\nAcceptance deadline: ______\nEmployee signature: ______\nDate: ______\nPrint name: ______\nFor Pop-A-Licious - signature and title: ______\nDate: ______\n',
+        "fields": [{'key': 'date', 'label': 'Date', 'type': 'date', 'required': True}, {'key': 'candidate_name', 'label': 'Candidate name', 'type': 'text', 'required': True}, {'key': 'candidate_address', 'label': 'Candidate address', 'type': 'longtext', 'required': True}, {'key': 'position', 'label': 'Position / job title', 'type': 'text', 'required': True}, {'key': 'department', 'label': 'Department', 'type': 'text', 'required': True}, {'key': 'start_date', 'label': 'Start date', 'type': 'date', 'required': True}, {'key': 'work_location', 'label': 'Work location', 'type': 'text', 'required': True}, {'key': 'pay_rate_cents', 'label': 'Pay rate ($ per hour)', 'type': 'money', 'required': True}, {'key': 'schedule', 'label': 'Schedule / expected hours', 'type': 'text', 'required': True}, {'key': 'reports_to', 'label': 'Reports to', 'type': 'text', 'required': True}, {'key': 'classification', 'label': 'Classification', 'type': 'select', 'required': True, 'options': ['full-time', 'part-time']}, {'key': 'acceptance_deadline', 'label': 'Acceptance deadline', 'type': 'date', 'required': True}, {'key': 'candidate_email', 'label': 'Candidate email', 'type': 'text', 'required': True}, {'key': 'employee_signature', 'label': 'Employee signature', 'type': 'signature', 'required': False, 'stage': 'signing'}, {'key': 'employee_print_name', 'label': 'Print name', 'type': 'text', 'required': False, 'stage': 'signing'}, {'key': 'company_signature', 'label': 'Company signature', 'type': 'signature', 'required': False, 'stage': 'countersign'}, {'key': 'company_title', 'label': 'Title', 'type': 'text', 'required': False, 'stage': 'countersign'}],
+    },
+    {
+        "code": "HR-03",
+        "title": "Federal Forms: I-9 and W-4",
+        "version": 1,
+        "starter": "admin",
+        "terminal": ["complete"],
+        "instructions": "Form HR-03\nFederal Forms: I-9 and W-4\n\nForm I-9 (USCIS) and Form W-4 (IRS) are official federal forms. Always complete the current version of each, printed from uscis.gov and irs.gov or supplied from the office stock of current forms. Do not photocopy an old version from a prior packet - editions change, and an outdated I-9 can be rejected in an audit. This page is the instruction and tracking sheet that goes in front of the completed federal forms in the personnel file.\n\nForm I-9 - Employment Eligibility Verification\n\nSection 1 is completed and signed by the employee on or before the first day of work.\n\nSection 2 is completed by the employer within 3 business days of the start date, after examining the employee's original, unexpired documents in the employee's physical presence. Photocopies of documents are not acceptable for Section 2 examination.\n\nThe employee chooses which acceptable document(s) to present from the Lists of Acceptable Documents printed with the form. Never ask for a specific document.\n\nKeep I-9 forms in the separate I-9 binder, not in the general personnel file, so they can be produced quickly if requested.\n\nForm W-4 - Employee's Withholding Certificate\n\nCompleted and signed by the employee before the first paycheck. If an employee does not submit a W-4, withhold as the IRS directs for a missing form.\n\nNevada has no state income tax, so there is no Nevada withholding form to complete.\n\nA new W-4 is required when an employee's withholding situation changes and they ask to update it; file the new form in place of the old one for payroll.\n\nTracking - completed by the manager\n\nEmployee name: ______\nStart date: ______\nI-9 Section 1 signed | Date completed: ______ | Completed / verified by: ______\nI-9 Section 2 - documents examined | Date completed: ______ | Completed / verified by: ______\nW-4 signed and given to payroll | Date completed: ______ | Completed / verified by: ______\nDeadline check: Section 2 must be finished within 3 business days of the start date above. If that date has passed and Section 2 is not complete, finish it the same day this page is reviewed and note the reason for the delay in the personnel file.\n",
+        "fields": [{'key': 'employee_name', 'label': 'Employee name', 'type': 'text', 'required': True}, {'key': 'start_date', 'label': 'Start date', 'type': 'date', 'required': True}, {'key': 'i9_section1', 'label': 'I-9 Section 1 signed', 'type': 'checkitem', 'required': True, 'detail_label': 'Date completed', 'detail_type': 'date'}, {'key': 'i9_section2', 'label': 'I-9 Section 2 - documents examined', 'type': 'checkitem', 'required': True, 'detail_label': 'Date completed', 'detail_type': 'date'}, {'key': 'w4_signed', 'label': 'W-4 signed and given to payroll', 'type': 'checkitem', 'required': True, 'detail_label': 'Date completed', 'detail_type': 'date'}, {'key': 'delay_note', 'label': 'Delay note', 'type': 'longtext', 'required': False}],
+    },
+    {
+        "code": "HR-04",
+        "title": "Employee Information Sheet",
+        "version": 1,
+        "starter": "either",
+        "terminal": ["signed"],
+        "instructions": 'Form HR-04\nEmployee Information Sheet\n\nCompleted at hire and updated whenever information changes. Kept in the personnel file.\n\nEmployee\n\nFull legal name: ______\nDate of birth: ______\nStreet address: ______\nCity / State / ZIP: ______\nPersonal phone: ______\nPersonal email: ______\nStart date: ______\nPosition: ______\nDepartment: ______\nFood handler card expiration: ______\nEmergency contacts\n\n______ | ______ | ______\n______ | ______ | ______\nSocial Security number is collected on Form W-4 and Form I-9 for payroll and eligibility reporting. It is not recorded on this sheet.\n\nAcknowledgment\n\nI confirm the information above is correct. I will notify the office promptly if my address, phone number, or emergency contacts change.\n\nEmployee signature: ______\nDate: ______\nUpdate log\n\n______ | ______ | ______\n______ | ______ | ______\n',
+        "fields": [{'key': 'full_legal_name', 'label': 'Full legal name', 'type': 'text', 'required': True}, {'key': 'date_of_birth', 'label': 'Date of birth', 'type': 'date', 'required': True}, {'key': 'street_address', 'label': 'Street address', 'type': 'text', 'required': True}, {'key': 'city_state_zip', 'label': 'City / State / ZIP', 'type': 'text', 'required': True}, {'key': 'personal_phone', 'label': 'Personal phone', 'type': 'text', 'required': True}, {'key': 'personal_email', 'label': 'Personal email', 'type': 'text', 'required': True}, {'key': 'start_date', 'label': 'Start date', 'type': 'date', 'required': True}, {'key': 'position', 'label': 'Position', 'type': 'text', 'required': True}, {'key': 'department', 'label': 'Department', 'type': 'text', 'required': True}, {'key': 'handles_food', 'label': 'Does this role handle food?', 'type': 'checkbox', 'required': False}, {'key': 'food_handler_card_expiration', 'label': 'Food handler card expiration', 'type': 'date', 'required': False}, {'key': 'emergency_contact_1_name', 'label': 'Emergency contact 1 — name', 'type': 'text', 'required': False}, {'key': 'emergency_contact_1_relationship', 'label': 'Emergency contact 1 — relationship', 'type': 'text', 'required': False}, {'key': 'emergency_contact_1_phone', 'label': 'Emergency contact 1 — phone', 'type': 'text', 'required': False}, {'key': 'emergency_contact_2_name', 'label': 'Emergency contact 2 — name', 'type': 'text', 'required': False}, {'key': 'emergency_contact_2_relationship', 'label': 'Emergency contact 2 — relationship', 'type': 'text', 'required': False}, {'key': 'emergency_contact_2_phone', 'label': 'Emergency contact 2 — phone', 'type': 'text', 'required': False}, {'key': 'employee_signature', 'label': 'Employee signature', 'type': 'signature', 'required': False}],
+    },
+    {
+        "code": "HR-05",
+        "title": "Direct Deposit Authorization",
+        "version": 1,
+        "starter": "staff",
+        "terminal": ["verified"],
+        "instructions": "Form HR-05\nDirect Deposit Authorization\n\nI authorize Pop-A-Licious to deposit my pay electronically to the account below, and to correct any deposit made in error by reversing it to the extent permitted by law and my bank's rules. This authorization stays in effect until I revoke it in writing or submit a new authorization.\n\nEmployee name (print): ______\nLast 4 of SSN (for payroll matching): ______\nBank name: ______\nRouting number (9 digits): ______\nAccount number: ______\nAccount type: checking / savings: ______\nAttach a voided check (write VOID across a blank check for this account) or a bank direct-deposit letter showing the routing and account numbers. Handwritten numbers alone are the most common cause of a failed first deposit.\n\n☐ Deposit my full net pay to the account above.\n\n☐ Split my pay: $ ____________ or ______ % to the account above, and the remainder to a second account (attach a second copy of this form for the second account).\n\nDirect deposit normally begins with the first full pay period after payroll receives this form and the voided check. Until it is active, pay is issued by check.\n\nEmployee signature: ______\nDate: ______\nFor payroll use\n\nReceived by: ______\nDate received: ______\nFirst deposit pay date: ______\n",
+        "fields": [{'key': 'employee_name', 'label': 'Employee name (print)', 'type': 'text', 'required': True}, {'key': 'ssn_last4', 'label': 'Last 4 of SSN (for payroll matching)', 'type': 'text', 'required': True}, {'key': 'bank_name', 'label': 'Bank name', 'type': 'text', 'required': True}, {'key': 'routing_number', 'label': 'Routing number (9 digits)', 'type': 'text', 'required': True}, {'key': 'account_number', 'label': 'Account number', 'type': 'text', 'required': True}, {'key': 'account_type', 'label': 'Account type', 'type': 'select', 'required': True, 'options': ['checking', 'savings']}, {'key': 'deposit_full_net_pay', 'label': 'Deposit my full net pay to the account above', 'type': 'checkbox', 'required': False}, {'key': 'split_amount_cents', 'label': 'Split: $ amount to the account above', 'type': 'money', 'required': False}, {'key': 'split_percent', 'label': 'Split: % to the account above', 'type': 'number', 'required': False}, {'key': 'employee_signature', 'label': 'Employee signature', 'type': 'signature', 'required': False}, {'key': 'payroll_received_by', 'label': 'Received by', 'type': 'text', 'required': False, 'stage': 'payroll'}, {'key': 'payroll_date_received', 'label': 'Date received', 'type': 'date', 'required': False, 'stage': 'payroll'}, {'key': 'payroll_first_deposit_date', 'label': 'First deposit pay date', 'type': 'date', 'required': False, 'stage': 'payroll'}],
+    },
+    {
+        "code": "HR-06",
+        "title": "Confidentiality Agreement",
+        "version": 1,
+        "starter": "staff",
+        "terminal": ["signed"],
+        "instructions": 'Form HR-06\nConfidentiality Agreement\n\nPop-A-Licious recipes, formulas, flavor development, supplier and pricing information, customer and wholesale account information, and business plans are confidential and, in the case of recipes and formulas, trade secrets. This agreement backs up the confidentiality rule in the Employee Handbook.\n\nIn signing below, I agree that:\n\nI will not copy, photograph, remove, share, or disclose any recipe, formula, batch record, or flavor-development material, during or after my employment, except as my job requires inside Pop-A-Licious.\n\nI will not disclose confidential business information - including wholesale pricing, customer lists, supplier terms, sales figures, and planned products - to anyone outside the company.\n\nI will return all company documents, records, keys, and devices when my employment ends, and I will not keep copies in any form, including photos or personal cloud storage.\n\nI understand that breaking this agreement may result in discipline up to and including termination, and that trade secret misuse may also carry legal consequences.\n\nThis agreement does not stop me from reporting a legal or food safety concern to a government agency, or from discussing wages and working conditions as protected by law.\n\nEmployee name (print): ______\nPosition: ______\nEmployee signature: ______\nDate: ______\nFor Pop-A-Licious - signature and title: ______\nDate: ______\n',
+        "fields": [{'key': 'employee_name', 'label': 'Employee name (print)', 'type': 'text', 'required': True}, {'key': 'position', 'label': 'Position', 'type': 'text', 'required': True}, {'key': 'employee_signature', 'label': 'Employee signature', 'type': 'signature', 'required': False}, {'key': 'company_signature', 'label': 'Company signature', 'type': 'signature', 'required': False, 'stage': 'countersign'}, {'key': 'company_title', 'label': 'Title', 'type': 'text', 'required': False, 'stage': 'countersign'}],
+    },
+    {
+        "code": "HR-07",
+        "title": "Driving Authorization and Vehicle Use",
+        "version": 1,
+        "starter": "staff",
+        "terminal": ["verified"],
+        "instructions": "Form HR-07\nDriving Authorization and Vehicle Use\n\nCompleted by every employee who drives for Pop-A-Licious - deliveries, events, store runs, or any company errand - in a company or personal vehicle. A copy of the driver's license and current insurance must be on file before the first driving assignment.\n\nDriver information\n\nEmployee name (print): ______\nPosition: ______\nDriver's license number: ______\nState / expiration: ______\nLicense copy attached? Y / N: ______\nInsurance carrier: ______\nPolicy number: ______\nPolicy expiration: ______\nDriving rules I agree to follow\n\nHold a valid driver's license for the vehicle I drive, and tell my manager the same day if my license is suspended, revoked, or restricted, or if my insurance lapses.\n\nObey all traffic laws, wear a seat belt, and never use a handheld phone while driving.\n\nNever drive for the company while impaired by alcohol, drugs, medication, or fatigue.\n\nReport any accident, ticket, or vehicle damage to my manager immediately - from the scene when it is safe to do so - and complete an Incident Report (Form HR-10) the same day.\n\nKeep personal insurance in force on any personal vehicle I use for company business, and understand my own policy is primary for that vehicle.\n\nCarry no passengers who are not on company business, and use the vehicle only for the assigned trip.\n\nI authorize Pop-A-Licious to verify my driving record when I am hired for a driving role and periodically while I hold one.\n\nEmployee signature: ______\nDate: ______\nManager signature - license and insurance verified: ______\nDate: ______\n",
+        "fields": [{'key': 'employee_name', 'label': 'Employee name (print)', 'type': 'text', 'required': True}, {'key': 'position', 'label': 'Position', 'type': 'text', 'required': True}, {'key': 'license_number', 'label': "Driver's license number", 'type': 'text', 'required': True}, {'key': 'license_state', 'label': 'State', 'type': 'text', 'required': True}, {'key': 'license_expiration', 'label': 'License expiration', 'type': 'date', 'required': True}, {'key': 'license_copy_attached', 'label': 'License copy attached?', 'type': 'select', 'required': True, 'options': ['Y', 'N']}, {'key': 'insurance_carrier', 'label': 'Insurance carrier', 'type': 'text', 'required': True}, {'key': 'policy_number', 'label': 'Policy number', 'type': 'text', 'required': True}, {'key': 'policy_expiration', 'label': 'Policy expiration', 'type': 'date', 'required': True}, {'key': 'employee_signature', 'label': 'Employee signature', 'type': 'signature', 'required': False}, {'key': 'manager_signature', 'label': 'Manager signature', 'type': 'signature', 'required': False, 'stage': 'verification'}],
+    },
+    {
+        "code": "HR-08",
+        "title": "New-Hire Filing Checklist",
+        "version": 1,
+        "starter": "admin",
+        "terminal": ["complete"],
+        "instructions": 'Form HR-08 - Employer use\nNew-Hire Filing Checklist\n\nEmployee name: ______\nStart date: ______\nPosition: ______\n☐ HR-01 Employment Application - signed | Date done: ______ | Initials: ______\n☐ HR-02 Offer Letter - signed by employee and company | Date done: ______ | Initials: ______\n☐ Form I-9 - Section 1 by day 1, Section 2 within 3 business days (HR-03 tracking page attached) | Date done: ______ | Initials: ______\n☐ Form W-4 - signed and sent to payroll | Date done: ______ | Initials: ______\n☐ Nevada new-hire report filed (within 20 days of hire date) | Date done: ______ | Initials: ______\n☐ HR-04 Employee Information Sheet - completed | Date done: ______ | Initials: ______\n☐ HR-05 Direct Deposit Authorization + voided check (or check issued) | Date done: ______ | Initials: ______\n☐ HR-06 Confidentiality Agreement - signed | Date done: ______ | Initials: ______\n☐ Handbook issued; signed acknowledgment received / ERP Policies acknowledgment recorded | Date done: ______ | Initials: ______\n☐ Food handler card - copy on file, expiration noted (all food-handling roles) | Date done: ______ | Initials: ______\n☐ HR-07 Driving Authorization + license and insurance copies (driving roles only) | Date done: ______ | Initials: ______\n☐ ERP account created; onboarding checklist started; training paths assigned | Date done: ______ | Initials: ______\nFile complete - manager signature: ______\nDate: ______\n',
+        "fields": [{'key': 'employee_name', 'label': 'Employee name', 'type': 'text', 'required': True}, {'key': 'start_date', 'label': 'Start date', 'type': 'date', 'required': True}, {'key': 'position', 'label': 'Position', 'type': 'text', 'required': True}, {'key': 'item_01_application_signed', 'label': 'HR-01 Employment Application - signed', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_02_offer_letter_signed', 'label': 'HR-02 Offer Letter - signed by employee and company', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_03_i9', 'label': 'Form I-9 - Section 1 by day 1, Section 2 within 3 business days (HR-03 tracking page attached)', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_04_w4', 'label': 'Form W-4 - signed and sent to payroll', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_05_nv_new_hire_report', 'label': 'Nevada new-hire report filed (within 20 days of hire date)', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_06_info_sheet', 'label': 'HR-04 Employee Information Sheet - completed', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_07_direct_deposit', 'label': 'HR-05 Direct Deposit Authorization + voided check (or check issued)', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_08_confidentiality', 'label': 'HR-06 Confidentiality Agreement - signed', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_09_handbook_issued', 'label': 'Handbook issued; signed acknowledgment received / ERP Policies acknowledgment recorded', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_10_food_handler_card', 'label': 'Food handler card - copy on file, expiration noted (all food-handling roles)', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_11_driving', 'label': 'HR-07 Driving Authorization + license and insurance copies (driving roles only)', 'type': 'checkitem', 'required': False, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'item_12_erp_account', 'label': 'ERP account created; onboarding checklist started; training paths assigned', 'type': 'checkitem', 'required': True, 'detail_label': 'Date done', 'detail_type': 'date'}, {'key': 'manager_signature', 'label': 'File complete - manager signature', 'type': 'signature', 'required': False}],
+    },
+    {
+        "code": "HR-09",
+        "title": "Time-Off Request",
+        "version": 1,
+        "starter": "staff",
+        "terminal": ["approved", "approved_with_changes", "denied"],
+        "instructions": 'Form HR-09\nTime-Off Request\n\nSubmit as early as possible - at least two weeks ahead for planned time off when you can. Your balance is tracked in the ERP; this form is the signed paper trail. Approval is not final until your manager signs.\n\nEmployee name: ______\nDepartment: ______\nFirst day off: ______\nLast day off: ______\nReturn date: ______\nTotal days / hours requested: ______\nType: PTO / sick / unpaid / other: ______\nReason (optional for PTO; required for unpaid leave): ______\n______\nEmployee signature: ______\nDate submitted: ______\nManager decision\n\n☐ Approved ☐ Approved with changes (note below) ☐ Denied (reason below)\n\nNotes: ______\nBalance after this request (from ERP): ______\nManager signature: ______\nDate: ______\nAfter approval, the manager enters the time off in the ERP and files this form in the personnel file.\n',
+        "fields": [{'key': 'employee_name', 'label': 'Employee name', 'type': 'text', 'required': True}, {'key': 'department', 'label': 'Department', 'type': 'text', 'required': True}, {'key': 'first_day_off', 'label': 'First day off', 'type': 'date', 'required': True}, {'key': 'last_day_off', 'label': 'Last day off', 'type': 'date', 'required': True}, {'key': 'return_date', 'label': 'Return date', 'type': 'date', 'required': True}, {'key': 'total_days_hours', 'label': 'Total days / hours requested', 'type': 'text', 'required': True}, {'key': 'type', 'label': 'Type', 'type': 'select', 'required': True, 'options': ['PTO', 'sick', 'unpaid', 'other']}, {'key': 'reason', 'label': 'Reason', 'type': 'longtext', 'required': False}, {'key': 'employee_signature', 'label': 'Employee signature', 'type': 'signature', 'required': False}],
+    },
+    {
+        "code": "HR-10",
+        "title": "Incident and Injury Report",
+        "version": 1,
+        "starter": "either",
+        "terminal": ["reviewed"],
+        "instructions": "Form HR-10\nIncident and Injury Report\n\nComplete the same day as the incident - injuries, near misses, vehicle accidents, property damage, and food safety incidents. Get medical care first; paperwork second. This report feeds the workers' compensation claim when someone is hurt.\n\nDate of incident: ______\nTime: ______\nLocation: ______\nEmployee involved: ______\nPosition: ______\nSupervisor on duty: ______\nType: ☐ Injury ☐ Near miss ☐ Vehicle ☐ Property damage ☐ Food safety ☐ Other\n\nWhat happened\n\n______\n______\n______\nIf someone was injured\n\nBody part / nature of injury: ______\nFirst aid given: ______\nSent for medical care? Where: ______\nMissed work? How much: ______\nWitnesses\n\n______ | ______ | ______\n______ | ______ | ______\nEmployee signature: ______\nSupervisor signature: ______\nDate: ______\nSupervisor: notify the owner the same day for any injury needing medical care, any vehicle accident, or any food safety incident. File in the personnel file and log in the ERP.\n",
+        "fields": [{'key': 'date_of_incident', 'label': 'Date of incident', 'type': 'date', 'required': True}, {'key': 'time_of_incident', 'label': 'Time', 'type': 'time', 'required': True}, {'key': 'location', 'label': 'Location', 'type': 'text', 'required': True}, {'key': 'employee_involved', 'label': 'Employee involved', 'type': 'text', 'required': True}, {'key': 'position', 'label': 'Position', 'type': 'text', 'required': True}, {'key': 'supervisor_on_duty', 'label': 'Supervisor on duty', 'type': 'text', 'required': True}, {'key': 'type', 'label': 'Type', 'type': 'checkbox_group', 'required': True, 'options': ['Injury', 'Near miss', 'Vehicle', 'Property damage', 'Food safety', 'Other']}, {'key': 'what_happened', 'label': 'What happened', 'type': 'longtext', 'required': True}, {'key': 'injury_body_part', 'label': 'Body part / nature of injury', 'type': 'text', 'required': False}, {'key': 'injury_first_aid', 'label': 'First aid given', 'type': 'text', 'required': False}, {'key': 'injury_medical_care', 'label': 'Sent for medical care? Where', 'type': 'text', 'required': False}, {'key': 'injury_missed_work', 'label': 'Missed work? How much', 'type': 'text', 'required': False}, {'key': 'witness_1_name', 'label': 'Witness 1 — name', 'type': 'text', 'required': False}, {'key': 'witness_1_phone', 'label': 'Witness 1 — phone', 'type': 'text', 'required': False}, {'key': 'witness_1_saw', 'label': 'Witness 1 — what they saw', 'type': 'text', 'required': False}, {'key': 'witness_2_name', 'label': 'Witness 2 — name', 'type': 'text', 'required': False}, {'key': 'witness_2_phone', 'label': 'Witness 2 — phone', 'type': 'text', 'required': False}, {'key': 'witness_2_saw', 'label': 'Witness 2 — what they saw', 'type': 'text', 'required': False}, {'key': 'employee_signature', 'label': 'Employee signature', 'type': 'signature', 'required': False}, {'key': 'supervisor_signature', 'label': 'Supervisor signature', 'type': 'signature', 'required': False, 'stage': 'review'}, {'key': 'linked_safety_incident_id', 'label': 'Linked safety register incident (optional)', 'type': 'number', 'required': False, 'stage': 'review'}],
+    },
+    {
+        "code": "HR-11",
+        "title": "Disciplinary / Corrective Action Form",
+        "version": 1,
+        "starter": "admin",
+        "terminal": ["complete"],
+        "instructions": "Form HR-11\nDisciplinary / Corrective Action Form\n\nDocuments the discipline steps in the Employee Handbook. Complete one form per incident, discuss it with the employee in private, and file the signed copy in the personnel file.\n\nEmployee name: ______\nPosition: ______\nDate: ______\nManager issuing this action: ______\nStep issued\n\n☐ Verbal warning (documented) ☐ Written warning ☐ Final written warning ☐ Suspension ☐ Termination\n\nWhat happened - facts, dates, and the rule or standard involved\n\n______\n______\n______\nPrior actions on this issue\n\n______\nWhat must change, and by when\n\n______\n______\nConsequence if the behavior continues: ______________________________________________\n\nEmployee response (employee may write here or attach a statement)\n\n______\n______\nThe employee's signature confirms this action was discussed with them. It does not by itself mean the employee agrees with it. If the employee declines to sign, the manager notes that below and has a witness initial.\n\nEmployee signature: ______\nManager signature: ______\nDate: ______\n☐ Employee declined to sign - witness initials: __________\n",
+        "fields": [{'key': 'employee_name', 'label': 'Employee name', 'type': 'text', 'required': True}, {'key': 'position', 'label': 'Position', 'type': 'text', 'required': True}, {'key': 'date', 'label': 'Date', 'type': 'date', 'required': True}, {'key': 'manager_issuing', 'label': 'Manager issuing this action', 'type': 'text', 'required': True}, {'key': 'step_issued', 'label': 'Step issued', 'type': 'select', 'required': True, 'options': ['Verbal warning (documented)', 'Written warning', 'Final written warning', 'Suspension', 'Termination']}, {'key': 'what_happened', 'label': 'What happened - facts, dates, and the rule or standard involved', 'type': 'longtext', 'required': True}, {'key': 'prior_actions', 'label': 'Prior actions on this issue', 'type': 'longtext', 'required': True}, {'key': 'what_must_change', 'label': 'What must change, and by when', 'type': 'longtext', 'required': True}, {'key': 'consequence', 'label': 'Consequence if the behavior continues', 'type': 'longtext', 'required': True}, {'key': 'employee_response', 'label': 'Employee response (employee may write here or attach a statement)', 'type': 'longtext', 'required': False}, {'key': 'employee_signature', 'label': 'Employee signature', 'type': 'signature', 'required': False}, {'key': 'manager_signature', 'label': 'Manager signature', 'type': 'signature', 'required': False}, {'key': 'declined_to_sign', 'label': 'Employee declined to sign', 'type': 'checkbox', 'required': False}, {'key': 'witness_initials', 'label': 'Witness initials', 'type': 'text', 'required': False}],
+    },
+    {
+        "code": "HR-12",
+        "title": "Separation Checklist",
+        "version": 1,
+        "starter": "admin",
+        "terminal": ["complete"],
+        "instructions": 'Form HR-12 - Employer use\nSeparation Checklist\n\nThe ERP offboarding checklist runs the workflow; this signed sheet is the paper record for final pay and property return.\n\nEmployee name: ______\nPosition: ______\nLast day worked: ______\nSeparation type: resignation / termination / layoff / other: ______\nRehire eligible? Y / N: ______\nReason for separation: ______\nFinal pay\n\n☐ Final hours confirmed from timecards in the ERP | Date / amount: ______ | Initials: ______\n☐ Final paycheck amount and date issued (follow Nevada final-pay timing for the separation type) | Date / amount: ______ | Initials: ______\n☐ Accrued PTO handled per the Employee Handbook and ERP balance | Date / amount: ______ | Initials: ______\n☐ Direct deposit authorization closed after final deposit | Date / amount: ______ | Initials: ______\nProperty returned\n\n☐ Keys and access cards / fobs | Returned / N/A: ______ | Initials: ______\n☐ Uniforms and name badge | Returned / N/A: ______ | Initials: ______\n☐ Company devices, tools, and documents (including any recipe material) | Returned / N/A: ______ | Initials: ______\n☐ ERP and system access removed; passwords changed where shared | Returned / N/A: ______ | Initials: ______\nEmployee signature - property returned and final pay received / arranged: ______\nDate: ______\nManager signature: ______\nDate: ______\n',
+        "fields": [{'key': 'employee_name', 'label': 'Employee name', 'type': 'text', 'required': True}, {'key': 'position', 'label': 'Position', 'type': 'text', 'required': True}, {'key': 'last_day_worked', 'label': 'Last day worked', 'type': 'date', 'required': True}, {'key': 'separation_type', 'label': 'Separation type', 'type': 'select', 'required': True, 'options': ['resignation', 'termination', 'layoff', 'other']}, {'key': 'rehire_eligible', 'label': 'Rehire eligible?', 'type': 'select', 'required': True, 'options': ['Y', 'N']}, {'key': 'reason_for_separation', 'label': 'Reason for separation', 'type': 'longtext', 'required': True}, {'key': 'pay_hours_confirmed', 'label': 'Final hours confirmed from timecards in the ERP', 'type': 'checkitem', 'required': True, 'detail_label': 'Date / amount', 'detail_type': 'text'}, {'key': 'pay_final_paycheck', 'label': 'Final paycheck amount and date issued (follow Nevada final-pay timing for the separation type)', 'type': 'checkitem', 'required': True, 'detail_label': 'Date / amount', 'detail_type': 'text'}, {'key': 'pay_pto_handled', 'label': 'Accrued PTO handled per the Employee Handbook and ERP balance', 'type': 'checkitem', 'required': True, 'detail_label': 'Date / amount', 'detail_type': 'text'}, {'key': 'pay_direct_deposit_closed', 'label': 'Direct deposit authorization closed after final deposit', 'type': 'checkitem', 'required': True, 'detail_label': 'Date / amount', 'detail_type': 'text'}, {'key': 'prop_keys', 'label': 'Keys and access cards / fobs', 'type': 'checkitem', 'required': True, 'detail_label': 'Returned / N/A', 'detail_type': 'text'}, {'key': 'prop_uniforms', 'label': 'Uniforms and name badge', 'type': 'checkitem', 'required': True, 'detail_label': 'Returned / N/A', 'detail_type': 'text'}, {'key': 'prop_devices', 'label': 'Company devices, tools, and documents (including any recipe material)', 'type': 'checkitem', 'required': True, 'detail_label': 'Returned / N/A', 'detail_type': 'text'}, {'key': 'prop_access_removed', 'label': 'ERP and system access removed; passwords changed where shared', 'type': 'checkitem', 'required': True, 'detail_label': 'Returned / N/A', 'detail_type': 'text'}, {'key': 'employee_signature', 'label': 'Employee signature', 'type': 'signature', 'required': False}, {'key': 'manager_signature', 'label': 'Manager signature', 'type': 'signature', 'required': False}],
+    },
+]
+
 
 # The database must live on persistent storage (e.g. a Railway Volume).
 # If it can't be opened, keep the app up but report it on /healthz instead
@@ -17654,7 +18366,8 @@ def mkt_segment_members(segment_id):
 
 # ---------- Multi-channel campaigns (Dept 8, SOP 8.22) ----------
 # ONE campaign object grouping channels: email (one newsletter issue),
-# instagram (one IG post), sms (placeholder only -- SMS is NOT adopted).
+# instagram (one IG post), sms (no linked issue/post -- sends are
+# recorded per SOP 8.40, item S6).
 # A campaign never sends anything by itself; it groups and tracks.
 # campaign_key is the attribution join: the same key stamped on orders
 # at checkout (§3.11 attribution, later item), so it must be unique.
@@ -17666,7 +18379,7 @@ _MKT_CAMPAIGN_CHANNELS = ("email", "instagram", "sms")
 _MKT_CAMPAIGN_CHANNEL_STATUSES = {
     "email": ("sent", "skipped"),
     "instagram": ("posted", "skipped"),
-    "sms": ("not_configured",),
+    "sms": ("not_configured", "sent", "failed"),
 }
 
 
@@ -17898,8 +18611,9 @@ def mkt_campaign_channel_add(campaign_id):
         conn.close()
         return jsonify(error="campaign not found"), 404
     if channel == "sms":
-        # SMS is NOT adopted: the channel is a placeholder only. It takes
-        # no linked post or issue and never sends.
+        # SMS sends are recorded per SOP 8.40 (item S6): the channel
+        # still takes no linked post or issue -- a send with a
+        # campaign_id flips this channel to 'sent' or 'failed'.
         if ref_id is not None:
             conn.close()
             return jsonify(error="sms channel has no linked issue or post"), 400
@@ -17967,8 +18681,6 @@ def mkt_campaign_channel_status(campaign_id, channel_id):
     allowed = _MKT_CAMPAIGN_CHANNEL_STATUSES[ch["channel"]]
     if status not in allowed:
         conn.close()
-        if ch["channel"] == "sms":
-            return jsonify(error="sms is not configured and never sends"), 400
         return jsonify(error="status must be %s for the %s channel"
                        % (" or ".join(allowed), ch["channel"])), 400
     now = datetime.now(timezone.utc).isoformat()
@@ -17981,6 +18693,707 @@ def mkt_campaign_channel_status(campaign_id, channel_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True, channel_id=channel_id, status=status)
+
+
+# ---------- SMS sending via Twilio (Dept 8, SOP 8.40, item S6) ----------
+# Provider-pluggable by design: one _sms_send_via_twilio indirection,
+# and Twilio is the only provider implemented today (any second
+# provider is a new _sms_send_via_<provider> plus a branch in
+# _sms_send_for_order -- no endpoint or table changes). Sending is
+# DISABLED until an admin configures it in Settings: no complete
+# config (account SID + from number + stored auth token) means every
+# send is refused 409 and recorded as 'not_configured' -- no provider
+# call is ever attempted without configuration, and no message is
+# ever recorded 'sent' unless the provider call returned success
+# (or the test double captured it). Recipients are NEVER typed in:
+# they come only from a real order record -- today that is the
+# wholesale account's phone on a wholesale order, because retail
+# checkout (orders / paypal_orders) collects no phone number, so a
+# retail order has no SMS recipient and its send is refused.
+# Templates are admin-written with {order_number}, {account_name}
+# and {customer_name} placeholders. Auto-send on order ready /
+# shipped needs BOTH the auto flag on AND an admin-written template
+# of that kind, and a provider failure is recorded 'failed' and never
+# blocks the order status change that triggered it.
+#
+# Credentials: the Twilio auth token is NEVER stored in plain text.
+# It is stored encrypted (erp_sms_config.auth_token_enc, "v1:" +
+# base64 nonce + ":" + base64 ciphertext) under a keystream derived
+# from the server AUTH_SECRET env var (HMAC-SHA256 counter mode --
+# stdlib only; no cryptography library is installed in the deploy
+# venv, so this is not a vetted AEAD -- rotating AUTH_SECRET
+# invalidates the stored token and it must be re-entered). The API
+# never returns the token, only its last 4 characters. The account
+# SID and from number are not secrets and are stored as entered.
+# Test hook: tests assign backend._SMS_TEST_DOUBLE to a list;
+# _sms_send_via_twilio appends to it instead of calling Twilio.
+_SMS_TEST_DOUBLE = None
+_SMS_TEMPLATE_KINDS = ("order_ready", "order_shipped", "custom")
+_SMS_EVENTS = ("order_ready", "order_shipped", "custom")
+_SMS_MAX_BODY = 1600
+
+
+def _sms_token_key():
+    """Key bytes for the SMS token cipher, or None when AUTH_SECRET
+    is unset (then no token can be stored or read)."""
+    if not AUTH_SECRET:
+        return None
+    return hashlib.sha256(("sms-token:" + AUTH_SECRET).encode()).digest()
+
+
+def _sms_encrypt_token(token):
+    """Encrypt a Twilio auth token for storage. Returns
+    (storage_string, None) or (None, error)."""
+    key = _sms_token_key()
+    if key is None:
+        return None, ("sms credential encryption is not configured"
+                      " (AUTH_SECRET is unset)")
+    nonce = os.urandom(16)
+    raw = token.encode()
+    stream = bytearray()
+    counter = 0
+    while len(stream) < len(raw):
+        stream.extend(hmac.new(
+            key, nonce + struct.pack(">I", counter),
+            hashlib.sha256).digest())
+        counter += 1
+    ct = bytes(b ^ k for b, k in zip(raw, stream))
+    return ("v1:%s:%s" % (base64.b64encode(nonce).decode(),
+                          base64.b64encode(ct).decode())), None
+
+
+def _sms_decrypt_token(stored):
+    """Decrypt a stored token. Returns (token, None) or (None, error)."""
+    key = _sms_token_key()
+    if key is None:
+        return None, ("sms credential encryption is not configured"
+                      " (AUTH_SECRET is unset)")
+    try:
+        ver, nonce_b64, ct_b64 = (stored or "").split(":")
+        if ver != "v1":
+            return None, "unsupported stored sms credential version"
+        nonce = base64.b64decode(nonce_b64)
+        ct = base64.b64decode(ct_b64)
+    except Exception:
+        return None, "stored sms credential is unreadable -- re-enter it in Settings"
+    stream = bytearray()
+    counter = 0
+    while len(stream) < len(ct):
+        stream.extend(hmac.new(
+            key, nonce + struct.pack(">I", counter),
+            hashlib.sha256).digest())
+        counter += 1
+    try:
+        return bytes(b ^ k for b, k in zip(ct, stream)).decode(), None
+    except (UnicodeDecodeError, ValueError):
+        # Wrong key (e.g. AUTH_SECRET was rotated) decrypts to garbage,
+        # not to a readable token: treat it exactly like an unreadable
+        # stored credential, never raise into the send path.
+        return None, "stored sms credential is unreadable -- re-enter it in Settings"
+
+
+def _sms_normalize_phone(raw):
+    """Normalize a stored phone to E.164 (+1...) or return None. US
+    numbers only: 10 digits get +1, 11 digits starting with 1 get +,
+    a leading + is kept only for a valid 11-digit US number. Anything
+    else is not a sendable number -- it is never guessed at."""
+    if not raw or not isinstance(raw, str):
+        return None
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return None
+
+
+def _sms_config_row(conn):
+    return conn.execute(
+        "SELECT * FROM erp_sms_config WHERE id = 1").fetchone()
+
+
+def _sms_config_public(conn):
+    """Config as the API returns it: never the token, only last 4."""
+    row = _sms_config_row(conn)
+    if not row:
+        return {"provider": "twilio", "configured": False,
+                "account_sid": "", "from_number": "", "token_last4": "",
+                "auto_ready": False, "auto_shipped": False}
+    return {"provider": row["provider"] or "twilio",
+            "configured": bool((row["account_sid"] or "")
+                               and (row["from_number"] or "")
+                               and (row["auth_token_enc"] or "")),
+            "account_sid": row["account_sid"] or "",
+            "from_number": row["from_number"] or "",
+            "token_last4": row["token_last4"] or "",
+            "auto_ready": bool(row["auto_ready"]),
+            "auto_shipped": bool(row["auto_shipped"])}
+
+
+def _sms_template_row(conn, template_id):
+    r = conn.execute(
+        "SELECT * FROM erp_sms_templates WHERE id = ?",
+        (template_id,)).fetchone()
+    return dict(r) if r else None
+
+
+def _sms_render_template(body, order_number, account_name, customer_name):
+    out = body or ""
+    for key, val in (("order_number", order_number),
+                     ("account_name", account_name),
+                     ("customer_name", customer_name)):
+        out = out.replace("{%s}" % key, val or "")
+    return out
+
+
+def _sms_order_recipient(conn, source, order_id):
+    """(to_number, order_number, account_name, error). The recipient
+    comes only from the order's own record: a wholesale order uses
+    its account's stored phone. Retail orders carry no phone (the
+    checkout collects none), so they have no recipient by design."""
+    brief = _erp_order_brief(conn, source, order_id)
+    if not brief:
+        return None, "", "", "order not found"
+    if source != "wholesale":
+        return None, brief.get("number") or "", \
+            brief.get("customer_name") or "", \
+            ("no phone number on file for this order -- retail"
+             " checkout does not collect a phone number")
+    acct = conn.execute(
+        "SELECT name, phone FROM erp_wholesale_accounts WHERE id = ?",
+        (brief.get("account_id"),)).fetchone()
+    if not acct:
+        return None, brief.get("number") or "", "", \
+            "wholesale account not found for this order"
+    to = _sms_normalize_phone(acct["phone"] or "")
+    if not to:
+        return None, brief.get("number") or "", acct["name"] or "", \
+            "no usable phone number on file for this wholesale account"
+    return to, brief.get("number") or "", acct["name"] or "", None
+
+
+def _sms_send_via_twilio(account_sid, auth_token, from_number, to_number,
+                         body):
+    """One Twilio Messages create. Returns (result, None) on success
+    or (None, error) on failure. The test double captures instead of
+    calling Twilio."""
+    if _SMS_TEST_DOUBLE is not None:
+        sid = "test-sms-%d" % (len(_SMS_TEST_DOUBLE) + 1)
+        _SMS_TEST_DOUBLE.append({"to": to_number, "from": from_number,
+                                 "body": body, "account_sid": account_sid})
+        return {"sid": sid, "status": "queued"}, None
+    try:
+        resp = requests.post(
+            "https://api.twilio.com/2010-04-01/Accounts/%s/Messages.json"
+            % account_sid,
+            auth=(account_sid, auth_token),
+            data={"From": from_number, "To": to_number, "Body": body},
+            timeout=15)
+    except Exception as e:
+        return None, "twilio request failed: %s" % (e,)
+    if resp.status_code not in (200, 201):
+        try:
+            detail = (resp.json() or {}).get("message") or resp.text
+        except (ValueError, TypeError):
+            detail = resp.text
+        return None, "twilio refused the message (HTTP %d): %s" % (
+            resp.status_code, (detail or "")[:200])
+    try:
+        data = resp.json()
+    except (ValueError, TypeError):
+        data = {}
+    return {"sid": data.get("sid") or "",
+            "status": data.get("status") or "queued"}, None
+
+
+def _sms_message_dict(conn, row):
+    m = dict(row)
+    tpl = None
+    if row["template_id"]:
+        tpl = conn.execute(
+            "SELECT name FROM erp_sms_templates WHERE id = ?",
+            (row["template_id"],)).fetchone()
+    m["template_name"] = tpl["name"] if tpl else None
+    return m
+
+
+def _sms_record_message(conn, actor, template_id, source, order_id,
+                        campaign_id, event, to_number, from_number, body,
+                        status, provider_sid="", provider_status="",
+                        error=""):
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_sms_messages (template_id, order_source, order_id,"
+        " campaign_id, event, to_number, from_number, body, status,"
+        " provider_sid, provider_status, error, created_by, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (template_id, source, order_id, campaign_id, event,
+         to_number or "", from_number or "", body or "", status,
+         provider_sid or "", provider_status or "", error or "",
+         actor or "", now))
+    return cur.lastrowid
+
+
+def _sms_mark_campaign_channel(conn, campaign_id, status, actor):
+    """Flip a campaign's sms channel to 'sent'/'failed' after a send
+    with that campaign. No-op when the campaign has no sms channel."""
+    if not campaign_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_mkt_campaign_channels SET status = ?,"
+        " updated_by = ?, updated_at = ?"
+        " WHERE campaign_id = ? AND channel = 'sms'",
+        (status, actor or "", now, campaign_id))
+
+
+def _sms_send_for_order(conn, actor, source, order_id, event,
+                        template_id=None, custom_body=None,
+                        campaign_id=None):
+    """Send one order SMS and record the real outcome. Returns
+    (message_dict, None) on success or (None, (http_status, error))
+    on refusal/failure. A refusal that happens after the config check
+    ('not_configured', decrypt failure, provider failure) is still
+    recorded as a message row with that real status -- never 'sent'.
+    Validation failures (unknown order/template/campaign, wrong order
+    state, no recipient) record nothing: there is no message to log.
+    The caller commits. No provider call happens unless the config
+    is complete."""
+    if event not in _SMS_EVENTS:
+        return None, (400, "event must be order_ready, order_shipped, or custom")
+    if campaign_id is not None and not conn.execute(
+            "SELECT id FROM erp_mkt_campaigns WHERE id = ?",
+            (campaign_id,)).fetchone():
+        return None, (404, "campaign not found")
+    to_number, order_number, account_name, err = _sms_order_recipient(
+        conn, source, order_id)
+    if err:
+        code = 404 if err == "order not found" else 400
+        return None, (code, err)
+    customer_name = account_name
+    if event in ("order_ready", "order_shipped"):
+        fulf = _erp_get_fulfillment(conn, source, order_id)
+        current = fulf["status"] if fulf else ""
+        if event == "order_ready" and current != "ready":
+            return None, (400, "order is %s -- only a ready order can"
+                          " receive an order-ready SMS"
+                          % (current or "not started"))
+        if event == "order_shipped" and current not in (
+                "shipped", "partially_shipped"):
+            return None, (400, "order is %s -- only a shipped order can"
+                          " receive an order-shipped SMS"
+                          % (current or "not started"))
+    body = None
+    if template_id is not None:
+        tpl = _sms_template_row(conn, template_id)
+        if not tpl:
+            return None, (404, "template not found")
+        body = _sms_render_template(tpl["body"], order_number,
+                                    account_name, customer_name)
+    elif custom_body is not None:
+        body = custom_body.strip()
+    if not body:
+        return None, (400, "template_id or body is required")
+    if len(body) > _SMS_MAX_BODY:
+        return None, (400, "message body is too long (max %d characters)"
+                      % _SMS_MAX_BODY)
+    cfg = _sms_config_row(conn)
+    public = _sms_config_public(conn)
+    if not public["configured"]:
+        mid = _sms_record_message(
+            conn, actor, template_id, source, order_id, campaign_id,
+            event, "", cfg["from_number"] if cfg else "", body,
+            "not_configured", error="sms is not configured -- set up"
+            " Twilio in Settings first")
+        _mkt_audit(conn, actor, "sms.send_blocked", "sms_message", mid,
+                   "order %s #%d (%s): sms not configured"
+                   % (source, order_id, event))
+        return None, (409, "sms is not configured -- set up Twilio in"
+                      " Settings first")
+    token, err = _sms_decrypt_token(cfg["auth_token_enc"])
+    if err:
+        mid = _sms_record_message(
+            conn, actor, template_id, source, order_id, campaign_id,
+            event, to_number, cfg["from_number"], body, "failed",
+            error=err)
+        _mkt_audit(conn, actor, "sms.send_failed", "sms_message", mid,
+                   "order %s #%d (%s): %s" % (source, order_id, event, err))
+        return None, (500, err)
+    result, err = _sms_send_via_twilio(
+        cfg["account_sid"], token, cfg["from_number"], to_number, body)
+    if err:
+        mid = _sms_record_message(
+            conn, actor, template_id, source, order_id, campaign_id,
+            event, to_number, cfg["from_number"], body, "failed",
+            error=err)
+        _mkt_audit(conn, actor, "sms.send_failed", "sms_message", mid,
+                   "order %s #%d (%s): %s" % (source, order_id, event, err))
+        _sms_mark_campaign_channel(conn, campaign_id, "failed", actor)
+        return None, (502, err)
+    mid = _sms_record_message(
+        conn, actor, template_id, source, order_id, campaign_id, event,
+        to_number, cfg["from_number"], body, "sent",
+        provider_sid=result.get("sid") or "",
+        provider_status=result.get("status") or "")
+    _mkt_audit(conn, actor, "sms.sent", "sms_message", mid,
+               "order %s #%d (%s) to %s"
+               % (source, order_id, event, to_number))
+    _sms_mark_campaign_channel(conn, campaign_id, "sent", actor)
+    row = conn.execute(
+        "SELECT * FROM erp_sms_messages WHERE id = ?", (mid,)).fetchone()
+    return _sms_message_dict(conn, row), None
+
+
+def _sms_maybe_auto_send(conn, source, order_id, event, actor):
+    """Best-effort auto-send after an order status change. Never raises
+    and never blocks the status change: no config, no auto flag, or no
+    admin-written template of the event's kind all mean 'do nothing'.
+    A provider failure is recorded as a 'failed' message row by
+    _sms_send_for_order. Called only after the status change committed."""
+    try:
+        cfg = _sms_config_row(conn)
+        if not cfg:
+            return
+        flag = cfg["auto_ready"] if event == "order_ready" \
+            else cfg["auto_shipped"]
+        if not flag:
+            return
+        tpl = conn.execute(
+            "SELECT * FROM erp_sms_templates WHERE kind = ?"
+            " ORDER BY id DESC LIMIT 1", (event,)).fetchone()
+        if not tpl:
+            return
+        _sms_send_for_order(conn, actor, source, order_id, event,
+                            template_id=tpl["id"])
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
+@app.get("/api/erp/settings/sms/config")
+def erp_settings_sms_config():
+    # Settings gate, admin-only: the config names the provider
+    # account and carries the token mask. Reuses _require_erp_admin;
+    # no new permission is invented.
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    out = _sms_config_public(conn)
+    conn.close()
+    return jsonify(config=out)
+
+
+@app.post("/api/erp/settings/sms/config")
+def erp_settings_sms_config_put():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _sms_config_row(conn)
+    provider = row["provider"] if row else "twilio"
+    account_sid = row["account_sid"] if row else ""
+    from_number = row["from_number"] if row else ""
+    auth_token_enc = row["auth_token_enc"] if row else ""
+    token_last4 = row["token_last4"] if row else ""
+    auto_ready = bool(row["auto_ready"]) if row else False
+    auto_shipped = bool(row["auto_shipped"]) if row else False
+    if "provider" in data:
+        provider = (data.get("provider") or "").strip()
+        if provider != "twilio":
+            conn.close()
+            return jsonify(error="provider must be twilio"), 400
+    if "account_sid" in data:
+        account_sid = (data.get("account_sid") or "").strip()
+        if account_sid:
+            if len(account_sid) != 34 or not account_sid.startswith("AC"):
+                conn.close()
+                return jsonify(error="account_sid must be a Twilio account"
+                               " SID (34 characters, starting with AC)"), 400
+    if "from_number" in data:
+        raw_from = (data.get("from_number") or "").strip()
+        if raw_from:
+            norm = _sms_normalize_phone(raw_from)
+            if not norm:
+                conn.close()
+                return jsonify(error="from_number must be a usable US phone"
+                               " number"), 400
+            from_number = norm
+        else:
+            from_number = ""
+    if "auth_token" in data:
+        token = data.get("auth_token") or ""
+        if token:
+            if not isinstance(token, str) or len(token) > 200:
+                conn.close()
+                return jsonify(error="auth_token is too long (max 200"
+                               " characters)"), 400
+            enc, enc_err = _sms_encrypt_token(token)
+            if enc_err:
+                conn.close()
+                return jsonify(error=enc_err), 503
+            auth_token_enc = enc
+            token_last4 = token[-4:]
+        else:
+            auth_token_enc = ""
+            token_last4 = ""
+    if "auto_ready" in data:
+        if not isinstance(data.get("auto_ready"), bool):
+            conn.close()
+            return jsonify(error="auto_ready must be true or false"), 400
+        auto_ready = data["auto_ready"]
+    if "auto_shipped" in data:
+        if not isinstance(data.get("auto_shipped"), bool):
+            conn.close()
+            return jsonify(error="auto_shipped must be true or false"), 400
+        auto_shipped = data["auto_shipped"]
+    complete = bool(account_sid and from_number and auth_token_enc)
+    if (auto_ready or auto_shipped) and not complete:
+        conn.close()
+        return jsonify(error="auto-send needs a complete Twilio"
+                       " configuration first (account SID, from number,"
+                       " and auth token)"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO erp_sms_config (id, provider, account_sid,"
+        " from_number, auth_token_enc, token_last4, auto_ready,"
+        " auto_shipped, updated_by, updated_at)"
+        " VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (provider, account_sid, from_number, auth_token_enc, token_last4,
+         1 if auto_ready else 0, 1 if auto_shipped else 0, actor, now))
+    _erp_settings_audit(conn, actor, "sms.config_saved", "sms_config", 1,
+                        "twilio %s, from %s, auto_ready=%s auto_shipped=%s"
+                        % (account_sid or "no SID", from_number or "no number",
+                           auto_ready, auto_shipped))
+    conn.commit()
+    out = _sms_config_public(conn)
+    conn.close()
+    return jsonify(ok=True, config=out)
+
+
+@app.get("/api/erp/marketing/sms/templates")
+def mkt_sms_templates_list():
+    actor, err = _mkt_check_any_read()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_sms_templates ORDER BY id").fetchall()
+    out = [dict(r) for r in rows]
+    conn.close()
+    return jsonify(templates=out, count=len(out))
+
+
+@app.post("/api/erp/marketing/sms/templates")
+def mkt_sms_template_create():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify(error="name is required"), 400
+    if len(name) > 100:
+        return jsonify(error="name is too long (max 100 characters)"), 400
+    kind = (data.get("kind") or "custom").strip()
+    if kind not in _SMS_TEMPLATE_KINDS:
+        return jsonify(error="kind must be order_ready, order_shipped,"
+                       " or custom"), 400
+    body = (data.get("body") or "").strip()
+    if not body:
+        return jsonify(error="body is required"), 400
+    if len(body) > _SMS_MAX_BODY:
+        return jsonify(error="body is too long (max %d characters)"
+                       % _SMS_MAX_BODY), 400
+    conn = db()
+    if conn.execute("SELECT id FROM erp_sms_templates WHERE lower(name) = ?",
+                    (name.lower(),)).fetchone():
+        conn.close()
+        return jsonify(error="a template with that name already exists"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_sms_templates (name, kind, body, created_by,"
+        " created_at, updated_by, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (name, kind, body, actor, now, actor, now))
+    tid = cur.lastrowid
+    _mkt_audit(conn, actor, "sms.template_created", "sms_template", tid,
+               "%s (%s)" % (name, kind))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, template_id=tid), 201
+
+
+@app.post("/api/erp/marketing/sms/templates/<int:template_id>/update")
+def mkt_sms_template_update(template_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_sms_templates WHERE id = ?",
+                       (template_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="template not found"), 404
+    name = row["name"]
+    kind = row["kind"]
+    body = row["body"]
+    if "name" in data:
+        name = (data.get("name") or "").strip()
+        if not name:
+            conn.close()
+            return jsonify(error="name is required"), 400
+        if len(name) > 100:
+            conn.close()
+            return jsonify(error="name is too long (max 100 characters)"), 400
+        if name.lower() != row["name"].lower() and conn.execute(
+                "SELECT id FROM erp_sms_templates WHERE lower(name) = ?",
+                (name.lower(),)).fetchone():
+            conn.close()
+            return jsonify(error="a template with that name already exists"), 409
+    if "kind" in data:
+        kind = (data.get("kind") or "").strip()
+        if kind not in _SMS_TEMPLATE_KINDS:
+            conn.close()
+            return jsonify(error="kind must be order_ready, order_shipped,"
+                           " or custom"), 400
+    if "body" in data:
+        body = (data.get("body") or "").strip()
+        if not body:
+            conn.close()
+            return jsonify(error="body is required"), 400
+        if len(body) > _SMS_MAX_BODY:
+            conn.close()
+            return jsonify(error="body is too long (max %d characters)"
+                           % _SMS_MAX_BODY), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute("UPDATE erp_sms_templates SET name = ?, kind = ?, body = ?,"
+                 " updated_by = ?, updated_at = ? WHERE id = ?",
+                 (name, kind, body, actor, now, template_id))
+    _mkt_audit(conn, actor, "sms.template_updated", "sms_template",
+               template_id, "%s (%s)" % (name, kind))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, template_id=template_id)
+
+
+@app.delete("/api/erp/marketing/sms/templates/<int:template_id>")
+def mkt_sms_template_delete(template_id):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute("SELECT * FROM erp_sms_templates WHERE id = ?",
+                       (template_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="template not found"), 404
+    # Deleting a template never deletes the messages sent from it:
+    # sent rows keep their rendered body and their template_id, and
+    # the log shows no template name for a deleted template.
+    conn.execute("DELETE FROM erp_sms_templates WHERE id = ?",
+                 (template_id,))
+    _mkt_audit(conn, actor, "sms.template_deleted", "sms_template",
+               template_id, "%s (%s)" % (row["name"], row["kind"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, deleted=template_id)
+
+
+@app.get("/api/erp/marketing/sms/messages")
+def mkt_sms_messages_list():
+    actor, err = _mkt_check_any_read()
+    if err:
+        return err
+    source = (request.args.get("order_source") or "").strip()
+    if source and source not in _ERP_ORDER_SOURCES:
+        return jsonify(error="order_source must be stripe, paypal, or"
+                       " wholesale"), 400
+    status = (request.args.get("status") or "").strip()
+    if status and status not in ("sent", "failed", "not_configured"):
+        return jsonify(error="status must be sent, failed, or"
+                       " not_configured"), 400
+    try:
+        order_id = int(request.args.get("order_id") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="order_id must be a number"), 400
+    try:
+        limit = int(request.args.get("limit") or 100)
+    except (TypeError, ValueError):
+        return jsonify(error="limit must be a number"), 400
+    limit = max(1, min(limit, 200))
+    conn = db()
+    where = []
+    args = []
+    if source:
+        where.append("order_source = ?")
+        args.append(source)
+    if order_id:
+        where.append("order_id = ?")
+        args.append(order_id)
+    if status:
+        where.append("status = ?")
+        args.append(status)
+    sql = "SELECT * FROM erp_sms_messages"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(limit)
+    rows = conn.execute(sql, args).fetchall()
+    out = [_sms_message_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(messages=out, count=len(out))
+
+
+@app.post("/api/erp/marketing/sms/send")
+def mkt_sms_send():
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    source = (data.get("order_source") or "").strip()
+    if source not in _ERP_ORDER_SOURCES:
+        return jsonify(error="order_source must be stripe, paypal, or"
+                       " wholesale"), 400
+    try:
+        order_id = int(data.get("order_id") or 0)
+    except (TypeError, ValueError):
+        return jsonify(error="order_id must be a number"), 400
+    if not order_id:
+        return jsonify(error="order_id is required"), 400
+    event = (data.get("event") or "").strip()
+    if event not in _SMS_EVENTS:
+        return jsonify(error="event must be order_ready, order_shipped,"
+                       " or custom"), 400
+    template_id = data.get("template_id")
+    if template_id is not None and (
+            isinstance(template_id, bool)
+            or not isinstance(template_id, int)):
+        return jsonify(error="template_id must be a template id"), 400
+    custom_body = data.get("body")
+    if custom_body is not None and not isinstance(custom_body, str):
+        return jsonify(error="body must be a string"), 400
+    if template_id is None and not (custom_body or "").strip():
+        return jsonify(error="template_id or body is required"), 400
+    campaign_id = data.get("campaign_id")
+    if campaign_id is not None and (
+            isinstance(campaign_id, bool)
+            or not isinstance(campaign_id, int)):
+        return jsonify(error="campaign_id must be a campaign id"), 400
+    conn = db()
+    row, err_resp = _sms_send_for_order(
+        conn, actor, source, order_id, event, template_id=template_id,
+        custom_body=custom_body, campaign_id=campaign_id)
+    conn.commit()
+    conn.close()
+    if err_resp:
+        status, msg = err_resp
+        return jsonify(error=msg), status
+    return jsonify(ok=True, message=row), 201
 
 
 # ---------- Campaign cost tracking (Dept 8, SOP 8.35) ----------
@@ -18353,6 +19766,197 @@ def mkt_customer_notes_save(key):
     conn.close()
     return jsonify(ok=True, customer_key=key, tags=clean, note=note,
                    updated_by=actor or "", updated_at=now)
+
+
+# ---------- Customer delete (Dept 8, SOP 8.39) ----------
+# The first Delete control for customers: until this endpoint the ERP had
+# deactivate/activate for loyalty accounts and no way to remove a customer
+# record at all. Admin-only (_require_erp_admin; no new permission).
+# The deletable record is the one real row behind the CRM key:
+#   email:<email> -> the loyalty account (users row) for that email, or,
+#                    when the email has no loyalty account, the wholesale
+#                    account (erp_wholesale_accounts row) sharing it;
+#   account:<id>  -> the wholesale account (erp_wholesale_accounts row).
+# A guest-checkout-only email has no row behind it, so there is nothing
+# to delete (409). Guards, each a 409 with the exact reason, checked in
+# this order:
+#   open orders   -- an uncaptured PayPal checkout for the email
+#                    (paypal_orders status != 'captured'; a Stripe orders
+#                    row is paid by construction, so it never blocks) or
+#                    a wholesale order still in _ERP_WHOLESALE_OPEN_STATUSES
+#                    for the linked wholesale account;
+#   open balance  -- a retail invoice with status 'open' and
+#                    balance_cents > 0 keyed by the customer's email or
+#                    name (retail invoices carry customer_name only,
+#                    customer_id is NULL -- see _acct_customer_statement),
+#                    or a wholesale invoice with status 'open' and
+#                    balance_cents > 0 on the linked account;
+#   unredeemed kernels -- a positive kernel balance (_kernel_balance,
+#                    the same math as the admin customers list) or an
+#                    unused loyalty reward code (loyalty_rewards used = 0);
+#   active subscription -- a subscriptions row with status 'active' for
+#                    the loyalty account (a deleted member must not keep
+#                    being billed; cancel it first).
+# A successful delete removes ONLY the customer record itself (the users
+# row plus its login tokens, or the wholesale account row) and the
+# staff-entered CRM tags/note row for the key. It never touches posted or
+# financial history: orders, PayPal orders, invoices, payments, credit
+# notes, kernel transactions, loyalty reward codes, gift cards, referrals,
+# subscriptions, tickets, and newsletter records all stay exactly as they
+# were. Every delete leaves an audit row (erp_mkt_audit, action
+# customer.delete). There is no undelete: re-creating the account starts
+# a fresh record with zero kernels and no history attached.
+
+
+def _mkt_customer_delete_guards(conn, email, user, ws_acct):
+    """Guard checks for a customer delete. Returns (error, code) or
+    (None, None) when every guard passes. user is the users row or None;
+    ws_acct is the linked wholesale account row or None."""
+    if ws_acct:
+        open_ws = conn.execute(
+            "SELECT COUNT(*) AS c FROM erp_wholesale_orders"
+            " WHERE account_id = ? AND status IN (%s)"
+            % ", ".join("?" * len(_ERP_WHOLESALE_OPEN_STATUSES)),
+            (ws_acct["id"],) + _ERP_WHOLESALE_OPEN_STATUSES).fetchone()["c"]
+        if open_ws:
+            return (jsonify(error="customer has %d open wholesale order(s)"
+                            % open_ws), 409)
+        ws_bal = conn.execute(
+            "SELECT COALESCE(SUM(balance_cents), 0) AS s"
+            " FROM erp_acct_invoices WHERE customer_type = 'wholesale'"
+            " AND customer_id = ? AND status = 'open' AND balance_cents > 0",
+            (ws_acct["id"],)).fetchone()["s"]
+        if ws_bal:
+            return (jsonify(error="customer has an open wholesale balance of"
+                            " $%d.%02d" % (ws_bal // 100, ws_bal % 100)), 409)
+    if user:
+        open_pp = conn.execute(
+            "SELECT COUNT(*) AS c FROM paypal_orders"
+            " WHERE lower(email) = lower(?) AND status != 'captured'",
+            (email,)).fetchone()["c"]
+        if open_pp:
+            return (jsonify(error="customer has %d open PayPal checkout(s)"
+                            " awaiting payment" % open_pp), 409)
+        name = (user["name"] or "").strip().lower()
+        bal = conn.execute(
+            "SELECT COALESCE(SUM(balance_cents), 0) AS s"
+            " FROM erp_acct_invoices WHERE customer_type = 'retail'"
+            " AND status = 'open' AND balance_cents > 0"
+            " AND (lower(customer_name) = lower(?)"
+            " OR lower(customer_name) = lower(?))",
+            (email, name)).fetchone()["s"]
+        if bal:
+            return (jsonify(error="customer has an open balance of"
+                            " $%d.%02d" % (bal // 100, bal % 100)), 409)
+        kernels = _kernel_balance(conn, user["id"])
+        if kernels > 0:
+            return (jsonify(error="customer has %d unredeemed Kernel(s)"
+                            % kernels), 409)
+        unused = conn.execute(
+            "SELECT COUNT(*) AS c FROM loyalty_rewards"
+            " WHERE user_id = ? AND used = 0",
+            (user["id"],)).fetchone()["c"]
+        if unused:
+            return (jsonify(error="customer has %d unused loyalty reward"
+                            " code(s)" % unused), 409)
+        subs = conn.execute(
+            "SELECT COUNT(*) AS c FROM subscriptions"
+            " WHERE user_id = ? AND status = 'active'",
+            (user["id"],)).fetchone()["c"]
+        if subs:
+            return (jsonify(error="customer has an active subscription —"
+                            " cancel it first"), 409)
+    return None, None
+
+
+@app.delete("/api/erp/marketing/customers/<path:key>")
+def mkt_customer_delete(key):
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    if not key or ":" not in key:
+        return jsonify(
+            error="customer key must be email:<email> or account:<id>"), 400
+    kind, rest = key.split(":", 1)
+    conn = db()
+    if kind == "email":
+        email = rest.strip().lower()
+        if not email:
+            conn.close()
+            return jsonify(
+                error="customer key must be email:<email> or account:<id>"), 400
+        user = conn.execute(
+            "SELECT * FROM users WHERE lower(email) = lower(?)",
+            (email,)).fetchone()
+        ws = conn.execute(
+            "SELECT * FROM erp_wholesale_accounts"
+            " WHERE lower(email) = lower(?)", (email,)).fetchone()
+        if not user and not ws:
+            conn.close()
+            return jsonify(error="no customer record to delete — this"
+                           " customer has no loyalty account or wholesale"
+                           " account (guest checkout only)"), 409
+        err, code = _mkt_customer_delete_guards(conn, email, user, ws)
+        if err:
+            conn.close()
+            return err, code
+        if user:
+            conn.execute("DELETE FROM verification_tokens WHERE user_id = ?",
+                         (user["id"],))
+            conn.execute("DELETE FROM password_reset_tokens WHERE user_id = ?",
+                         (user["id"],))
+            conn.execute("DELETE FROM users WHERE id = ?", (user["id"],))
+            conn.execute("DELETE FROM erp_mkt_customer_notes"
+                         " WHERE customer_key = ?", (key,))
+            _mkt_audit(conn, actor, "customer.delete", "customer",
+                       user["id"], "%s loyalty account %s <%s> deleted"
+                       % (key, user["name"] or "", email))
+            conn.commit()
+            conn.close()
+            return jsonify(ok=True, deleted="loyalty_account",
+                           user_id=user["id"], customer_key=key)
+        conn.execute("DELETE FROM erp_wholesale_accounts WHERE id = ?",
+                     (ws["id"],))
+        conn.execute("DELETE FROM erp_mkt_customer_notes"
+                     " WHERE customer_key = ?", (key,))
+        _mkt_audit(conn, actor, "customer.delete", "wholesale_account",
+                   ws["id"], "%s wholesale account %s deleted"
+                   % (key, ws["name"]))
+        conn.commit()
+        conn.close()
+        return jsonify(ok=True, deleted="wholesale_account",
+                       account_id=ws["id"], customer_key=key)
+    if kind == "account":
+        try:
+            aid = int(rest)
+        except ValueError:
+            conn.close()
+            return jsonify(
+                error="customer key must be email:<email> or account:<id>"), 400
+        acct = conn.execute(
+            "SELECT * FROM erp_wholesale_accounts WHERE id = ?",
+            (aid,)).fetchone()
+        if not acct:
+            conn.close()
+            return jsonify(error="wholesale account not found"), 404
+        err, code = _mkt_customer_delete_guards(conn, "", None, acct)
+        if err:
+            conn.close()
+            return err, code
+        conn.execute("DELETE FROM erp_wholesale_accounts WHERE id = ?",
+                     (aid,))
+        conn.execute("DELETE FROM erp_mkt_customer_notes"
+                     " WHERE customer_key = ?", (key,))
+        _mkt_audit(conn, actor, "customer.delete", "wholesale_account",
+                   aid, "%s wholesale account %s deleted"
+                   % (key, acct["name"]))
+        conn.commit()
+        conn.close()
+        return jsonify(ok=True, deleted="wholesale_account",
+                       account_id=aid, customer_key=key)
+    conn.close()
+    return jsonify(
+        error="customer key must be email:<email> or account:<id>"), 400
 
 
 # ---------- Subscriptions (Dept 8, W2-N5, SOP 8.19; read-only) ----------
@@ -25143,6 +26747,12 @@ def _hr_employee_payload(conn, row, with_items=False):
         if "scope_type" in row.keys() else None,
         "scope_store_id": row["scope_store_id"]
         if "scope_store_id" in row.keys() else None,
+        # Policy-audience scoping (SOP 12.38): work_site is the site
+        # whose handbook this person reads (store / corporate /
+        # warehouse); None = unassigned, no handbook yet. It is
+        # independent of scope_type, role_id, and position_id.
+        "work_site": row["work_site"]
+        if "work_site" in row.keys() else None,
         "scope_label": _hc_scope_label(
             conn,
             row["scope_type"] if "scope_type" in row.keys() else None,
@@ -25204,15 +26814,29 @@ def hr_onboarding_template():
 @app.get("/api/erp/hr/employees")
 def hr_list_employees():
     """Staff directory: every record, active and inactive (inactive stay
-    visible as inactive, never silently vanish), with onboarding progress."""
+    visible as inactive, never silently vanish), with onboarding progress.
+    ?work_site= filters by work site: all / store / corporate /
+    warehouse / unassigned (NULL work site)."""
     _, err = _require_erp_admin()
     if err:
         return err
+    work_site = (request.args.get("work_site") or "").strip().lower()
+    if work_site and work_site not in (
+            "all", "store", "corporate", "warehouse", "unassigned"):
+        return jsonify(error="unknown work_site filter"), 400
     conn = db()
     rows = conn.execute(
         "SELECT * FROM erp_hr_employees ORDER BY active DESC, name, email"
     ).fetchall()
-    out = [_hr_employee_payload(conn, r) for r in rows]
+    out = []
+    for r in rows:
+        _ws = r["work_site"] if "work_site" in r.keys() else None
+        if work_site == "unassigned" and _ws is not None:
+            continue
+        if work_site in ("store", "corporate", "warehouse") \
+                and _ws != work_site:
+            continue
+        out.append(_hr_employee_payload(conn, r))
     conn.close()
     return jsonify(employees=out)
 
@@ -25305,6 +26929,13 @@ def hr_create_employee():
     if _hc_serr:
         conn.close()
         return jsonify(error=_hc_serr), 400
+    # Policy-audience scoping (SOP 12.38): work_site is optional,
+    # NULL allowed -- hiring never blocks on it. It is never
+    # derived from scope_type.
+    _ws_val, _ws_err = _hr_validate_work_site(data.get("work_site"))
+    if _ws_err:
+        conn.close()
+        return jsonify(error=_ws_err), 400
     # Positions (SOP 12.27): optional position_id -- the seat this
     # person holds. Must be an existing position, and no other ACTIVE
     # employee may already hold it (one seat, one holder). An inactive
@@ -25362,13 +26993,13 @@ def hr_create_employee():
         "INSERT INTO erp_hr_employees (staff_id, name, email, role,"
         " department, phone, emergency_contact, emergency_phone, hire_date,"
         " hourly_rate_cents, scope_type, scope_store_id, role_id,"
-        " position_id,"
+        " position_id, work_site,"
         " active, created_by, created_at, updated_by, updated_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, '', '')",
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, '', '')",
         (staff_id, name, email, role, department, phone, emergency_contact,
          emergency_phone, hire_date, hourly_rate_cents, _hc_scope,
          _hc_store_id, _hc_role_row["id"] if _hc_role_row else None,
-         _pos_row["id"] if _pos_row else None,
+         _pos_row["id"] if _pos_row else None, _ws_val,
          actor, now))
     employee_id = cur.lastrowid
     _hr_seed_onboarding(conn, employee_id, now, _seed_labels or None)
@@ -25494,6 +27125,18 @@ def hr_update_employee(employee_id):
             return jsonify(error="position '%s' is already held by %s"
                            % (_pos_row["title"] or "",
                               _pos_clash["name"] or "")), 400
+    # Policy-audience scoping (SOP 12.38): work_site is editable
+    # here. NULL/blank clears it back to unassigned (no handbook).
+    # Never derived from scope_type. The change is audited via the
+    # changes list below, like scope changes.
+    _ws_provided = "work_site" in data
+    _ws_new = None
+    if _ws_provided:
+        _ws_new, _ws_err = _hr_validate_work_site(
+            data.get("work_site"))
+        if _ws_err:
+            conn.close()
+            return jsonify(error=_ws_err), 400
     changes = []
     sets = []
     args = []
@@ -25540,6 +27183,14 @@ def hr_update_employee(employee_id):
             args.append(_pos_new)
             changes.append("position_id: %s -> %s"
                            % (_pos_old, _pos_new))
+    if _ws_provided:
+        _ws_old = row["work_site"] \
+            if "work_site" in row.keys() else None
+        if _ws_new != _ws_old:
+            sets.append("work_site = ?")
+            args.append(_ws_new)
+            changes.append("work_site: %s -> %s"
+                           % (_ws_old or "", _ws_new or ""))
     if sets:
         now = datetime.now(timezone.utc).isoformat()
         sets.append("updated_by = ?")
@@ -27270,19 +28921,167 @@ def _hr_role_row(conn, role_id):
                         (role_id,)).fetchone()
 
 
+# Job-description fields (Nov 27, 2026): closed enums for shift and
+# job category; everything else is free text with a length cap.
+# Location is deliberately NOT a role field (user decision): it is
+# added at the job posting / hiring stage, not on the role.
+HR_ROLE_SHIFTS = ("Day", "Evening", "Night")
+HR_ROLE_CATEGORIES = ("Production", "Event", "Store", "Drivers",
+                      "Management")
+
+
+def _hr_role_col(row, name):
+    """One erp_hr_roles column as a string, "" when the column is
+    missing (rows read from a database created before the
+    job-description fields existed) or NULL."""
+    try:
+        return row[name] or ""
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def _hr_role_status_value(data, current_active=True):
+    """Parse a role status from a create/update body. Accepts
+    "status": "Active"/"Inactive" (case-insensitive) and, for
+    compat, "active": 0/1/true/false. When both are given they must
+    agree. Returns (active-int, error-or-None); untouched when
+    neither key is present."""
+    status_active = None
+    if "status" in data:
+        status = data.get("status")
+        if not isinstance(status, str):
+            return None, "status must be Active or Inactive"
+        status = status.strip()
+        if status.lower() == "active":
+            status_active = 1
+        elif status.lower() == "inactive":
+            status_active = 0
+        else:
+            return None, "status must be Active or Inactive"
+    if "active" in data:
+        active = data.get("active")
+        if isinstance(active, bool):
+            active_int = 1 if active else 0
+        elif active in (0, 1, "0", "1"):
+            active_int = int(active)
+        else:
+            return None, "active must be 0 or 1"
+        if status_active is not None and status_active != active_int:
+            return None, "status and active disagree"
+        status_active = active_int
+    if status_active is None:
+        return (1 if current_active else 0), None
+    return status_active, None
+
+
+def _hr_role_fields(data, current=None):
+    """Validate the job-description fields in a role create/update
+    body. `current` is the existing row for updates (None on
+    create). Returns (values-dict, error-or-None); values holds only
+    the fields present in the body (plus status, always, resolved
+    against the current row). Lengths: description and each section
+    <= 5000, position and reports_to <= 100, base_salary_range
+    <= 200. shift / job_category must be one of the closed enums
+    or blank."""
+    values = {}
+    for key, limit in (("description", 5000),
+                       ("whats_in_it_for_you", 5000),
+                       ("what_you_bring", 5000),
+                       ("job_duties", 5000),
+                       ("position", 100),
+                       ("reports_to", 100),
+                       ("base_salary_range", 200)):
+        if key in data:
+            value = (data.get(key) or "").strip() \
+                if isinstance(data.get(key), str) else data.get(key)
+            if not isinstance(value, str):
+                return None, "%s must be text" % key
+            if len(value) > limit:
+                return None, "%s must be %d characters or fewer" % (
+                    key, limit)
+            values[key] = value
+    if "shift" in data:
+        shift = (data.get("shift") or "").strip() \
+            if isinstance(data.get("shift"), str) else data.get("shift")
+        if not isinstance(shift, str):
+            return None, "shift must be Day, Evening, Night or blank"
+        if shift and shift not in HR_ROLE_SHIFTS:
+            return None, "shift must be Day, Evening, Night or blank"
+        values["shift"] = shift
+    if "job_category" in data:
+        category = (data.get("job_category") or "").strip() \
+            if isinstance(data.get("job_category"), str) \
+            else data.get("job_category")
+        if not isinstance(category, str):
+            return None, ("job_category must be Production, Event,"
+                          " Store, Drivers, Management or blank")
+        if category and category not in HR_ROLE_CATEGORIES:
+            return None, ("job_category must be Production, Event,"
+                          " Store, Drivers, Management or blank")
+        values["job_category"] = category
+    current_active = True
+    if current is not None:
+        try:
+            current_active = bool(current["active"])
+        except (KeyError, IndexError, TypeError):
+            current_active = True
+    active, err = _hr_role_status_value(data, current_active)
+    if err:
+        return None, err
+    values["active"] = active
+    return values, None
+
+
 def _hr_role_payload(conn, row):
     count = conn.execute(
         "SELECT COUNT(*) FROM erp_hr_applicants WHERE role_id = ?",
         (row["id"],)).fetchone()[0]
+    active = bool(row["active"])
     return {
         "id": row["id"], "title": row["title"],
-        "description": row["description"] or "",
-        "active": bool(row["active"]), "applicant_count": count,
+        "description": _hr_role_col(row, "description"),
+        "position": _hr_role_col(row, "position"),
+        "status": "Active" if active else "Inactive",
+        "base_salary_range": _hr_role_col(row, "base_salary_range"),
+        "shift": _hr_role_col(row, "shift"),
+        "job_category": _hr_role_col(row, "job_category"),
+        "reports_to": _hr_role_col(row, "reports_to"),
+        "whats_in_it_for_you": _hr_role_col(
+            row, "whats_in_it_for_you"),
+        "what_you_bring": _hr_role_col(row, "what_you_bring"),
+        "job_duties": _hr_role_col(row, "job_duties"),
+        "active": active, "applicant_count": count,
         "created_by": row["created_by"] or "",
         "created_at": row["created_at"],
         "updated_by": row["updated_by"] or "",
         "updated_at": row["updated_at"] or "",
     }
+
+
+def _hr_role_posting(conn, row):
+    """The role's public job posting: the fields the careers page
+    renders. Only public content -- there is no pay, salary or
+    applicant data on a role, and none is ever added here. Returns
+    empty strings when the role row is gone (a requisition outlives
+    its role: role delete is not refused while a requisition
+    references it, so the listing must degrade, not 500)."""
+    if row is None:
+        return {"role_title": "", "position": "",
+                "base_salary_range": "", "job_category": "",
+                "shift": "", "reports_to": "", "role_description": "",
+                "whats_in_it_for_you": "", "what_you_bring": "",
+                "job_duties": ""}
+    return {"role_title": row["title"] or "",
+            "position": _hr_role_col(row, "position"),
+            "base_salary_range": _hr_role_col(row, "base_salary_range"),
+            "job_category": _hr_role_col(row, "job_category"),
+            "shift": _hr_role_col(row, "shift"),
+            "reports_to": _hr_role_col(row, "reports_to"),
+            "role_description": _hr_role_col(row, "description"),
+            "whats_in_it_for_you": _hr_role_col(
+                row, "whats_in_it_for_you"),
+            "what_you_bring": _hr_role_col(row, "what_you_bring"),
+            "job_duties": _hr_role_col(row, "job_duties")}
 
 
 def _hr_position_row(conn, position_id):
@@ -29530,23 +31329,56 @@ def hr_enroll_employee(employee_id):
 @app.get("/api/public/careers")
 def public_list_careers():
     """Public, no auth: open requisitions only -- id, title,
-    description, scope label, openings. No applicant data, no
-    internal fields (no role id, no audit columns, no draft/closed
-    rows). The public career page on the website reads this."""
+    description, scope label, openings, plus the linked role's
+    public job posting (role_title, position, base_salary_range,
+    job_category, shift, reports_to, and the four description
+    sections). The salary range is public by the user's call, so the
+    listing carries it. No applicant data, no internal fields (no
+    role id, no audit columns, no draft/closed rows). The public
+    career page on the website reads this. A requisition whose role
+    was deleted still lists, with empty role fields."""
     conn = db()
     rows = conn.execute(
         "SELECT id, title, description, scope_type, scope_store_id,"
-        " openings FROM erp_hr_requisitions WHERE status = 'open'"
-        " ORDER BY id").fetchall()
-    out = [{
-        "id": r["id"], "title": r["title"] or "",
-        "description": r["description"] or "",
-        "scope_label": _hc_scope_label(conn, r["scope_type"],
-                                       r["scope_store_id"]),
-        "openings": r["openings"],
-    } for r in rows]
+        " openings, role_id FROM erp_hr_requisitions"
+        " WHERE status = 'open' ORDER BY id").fetchall()
+    out = []
+    for r in rows:
+        posting = _hr_role_posting(conn, _hr_role_row(conn, r["role_id"]))
+        out.append({
+            "id": r["id"], "title": r["title"] or "",
+            "description": r["description"] or "",
+            "scope_label": _hc_scope_label(conn, r["scope_type"],
+                                           r["scope_store_id"]),
+            "openings": r["openings"],
+            **posting,
+        })
     conn.close()
     return jsonify(requisitions=out)
+
+
+@app.get("/api/public/careers/<int:req_id>")
+def public_get_career(req_id):
+    """Public, no auth: one open requisition with its linked role's
+    public job posting, for the website to render a single posting.
+    Open rows only -- draft/closed/unknown is 404. Same public
+    fields as the list, no internal fields."""
+    conn = db()
+    row = _hr_requisition_row(conn, req_id)
+    if not row or row["status"] != "open":
+        conn.close()
+        return jsonify(error="requisition not found or not open"), 404
+    posting = _hr_role_posting(conn, _hr_role_row(conn, row["role_id"]))
+    out = {
+        "id": row["id"], "title": row["title"] or "",
+        "description": row["description"] or "",
+        "scope_label": _hc_scope_label(conn, row["scope_type"],
+                                       row["scope_store_id"]),
+        "openings": row["openings"],
+        **posting,
+    }
+    conn.close()
+    return jsonify(requisition=out)
 
 
 @app.post("/api/public/careers/<int:req_id>/apply")
@@ -29614,8 +31446,10 @@ def public_apply_careers(req_id):
 @app.get("/api/erp/hr/roles")
 def hr_list_roles():
     """List job roles, ordered by title; ?active=1 lists active only
-    (the picker). Roles are never deactivated (Nov 23, 2026) -- every
-    row is active, so ?active=0 lists nothing."""
+    (the picker). Status is real since Nov 27, 2026: ?active=0 lists
+    the inactive roles, which stay out of every picker and block new
+    assignments until reactivated. Existing references to a role that
+    goes inactive are untouched -- no cascade, no silent unlink."""
     _, err = _require_erp_admin()
     if err:
         return err
@@ -29645,18 +31479,24 @@ def hr_list_roles():
 def hr_create_role():
     """Create a job role (201). Title is required, 1-100 chars;
     description is optional, max 5000 chars. A duplicate title
-    (case-insensitive) is 400."""
+    (case-insensitive) is 400. Job-description fields are optional:
+    position (<=100), base_salary_range (<=200, free text, shown to
+    applicants), shift (Day/Evening/Night), job_category
+    (Production/Event/Store/Drivers/Management), reports_to (<=100,
+    free-text supervisor title -- no link to another role), and the
+    three sections whats_in_it_for_you / what_you_bring / job_duties
+    (<=5000 each). Status defaults to Active; "status" or "active"
+    may set it. No location field exists on a role by design."""
     actor, err = _require_erp_admin()
     if err:
         return err
     data = request.get_json(force=True) or {}
     title = (data.get("title") or "").strip()
-    description = (data.get("description") or "").strip()
     if not title or len(title) > 100:
         return jsonify(error="title must be 1-100 characters"), 400
-    if len(description) > 5000:
-        return jsonify(error="description must be 5000 characters"
-                       " or fewer"), 400
+    fields, ferr = _hr_role_fields(data)
+    if ferr:
+        return jsonify(error=ferr), 400
     conn = db()
     dup = conn.execute(
         "SELECT id FROM erp_hr_roles WHERE lower(title) = lower(?)",
@@ -29667,10 +31507,18 @@ def hr_create_role():
                        " exists"), 400
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
-        "INSERT INTO erp_hr_roles (title, description, active,"
+        "INSERT INTO erp_hr_roles (title, description, position,"
+        " base_salary_range, shift, job_category, reports_to,"
+        " whats_in_it_for_you, what_you_bring, job_duties, active,"
         " created_by, created_at, updated_by, updated_at)"
-        " VALUES (?, ?, 1, ?, ?, '', '')",
-        (title, description, actor, now))
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')",
+        (title, fields.get("description", ""),
+         fields.get("position", ""), fields.get("base_salary_range", ""),
+         fields.get("shift", ""), fields.get("job_category", ""),
+         fields.get("reports_to", ""),
+         fields.get("whats_in_it_for_you", ""),
+         fields.get("what_you_bring", ""), fields.get("job_duties", ""),
+         fields["active"], actor, now))
     role_id = cur.lastrowid
     _erp_staff_audit(conn, actor, "hr.role_created", "hr_role", role_id,
                      "created job role %s" % title)
@@ -29698,21 +31546,20 @@ def hr_get_role(role_id):
 @app.post("/api/erp/hr/roles/<int:role_id>/update")
 def hr_update_role(role_id):
     """Edit a job role -- only provided fields change. A title change
-    must not collide with another role (400). There is no deactivate:
-    roles are either present or deleted (Nov 23, 2026) -- an "active"
-    key in the body is refused with 400."""
+    must not collide with another role (400). Status is real since
+    Nov 27, 2026 (reversing the Nov 23 "roles are never deactivated"
+    rule): "status": "Active"/"Inactive" -- or "active": 0/1 for
+    compat -- deactivates / reactivates the role. Deactivating only
+    removes it from the ?active=1 picker and blocks NEW assignments
+    using it; existing applicants, employees, requisitions, paths,
+    grades, targets and audiences that reference it are untouched.
+    Status changes are audited like any other field change
+    (hr.role_updated). The job-description fields validate as on
+    create; reports_to stays free text, never a link."""
     actor, err = _require_erp_admin()
     if err:
         return err
     data = request.get_json(force=True) or {}
-    if "active" in data:
-        conn = db()
-        if not _hr_role_row(conn, role_id):
-            conn.close()
-            return jsonify(error="role not found"), 404
-        conn.close()
-        return jsonify(error="roles cannot be deactivated -- delete the"
-                       " role instead"), 400
     conn = db()
     row = _hr_role_row(conn, role_id)
     if not row:
@@ -29738,16 +31585,25 @@ def hr_update_role(role_id):
             sets.append("title = ?")
             args.append(title)
             changes.append("title: %s -> %s" % (row["title"] or "", title))
-    if "description" in data:
-        description = (data.get("description") or "").strip()
-        if len(description) > 5000:
-            conn.close()
-            return jsonify(error="description must be 5000 characters"
-                           " or fewer"), 400
-        if description != (row["description"] or ""):
-            sets.append("description = ?")
-            args.append(description)
-            changes.append("description updated")
+    fields, ferr = _hr_role_fields(data, current=row)
+    if ferr:
+        conn.close()
+        return jsonify(error=ferr), 400
+    for key in ("description", "position", "base_salary_range",
+                "shift", "job_category", "reports_to",
+                "whats_in_it_for_you", "what_you_bring", "job_duties"):
+        if key in fields:
+            current_val = _hr_role_col(row, key)
+            if fields[key] != current_val:
+                sets.append("%s = ?" % key)
+                args.append(fields[key])
+                changes.append("%s updated" % key)
+    if fields["active"] != (1 if row["active"] else 0):
+        sets.append("active = ?")
+        args.append(fields["active"])
+        changes.append("status: %s -> %s" % (
+            "Active" if row["active"] else "Inactive",
+            "Active" if fields["active"] else "Inactive"))
     if sets:
         now = datetime.now(timezone.utc).isoformat()
         sets.append("updated_by = ?")
@@ -29778,7 +31634,10 @@ def hr_delete_role(role_id):
     Refused (409) while any career path step references the role
     " (SOP 12.31): remove the step from the path first. Refused"
     " (409) while any pay grade references the role (SOP 12.35):"
-    " delete the grades first."""
+    " delete the grades first. Refused (409) while any policy"
+    " audience references the role (SOP 12.38): remove the audience"
+    " from the policy first -- a cascade would silently widen a"
+    " scoped policy to all-staff when its last row went."""
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -29810,6 +31669,24 @@ def hr_delete_role(role_id):
         return jsonify(error="cannot delete a role with pay grades"
                        " (%d grade(s) attached) -- delete the pay"
                        " grades first" % gcount), 409
+    # Policy audiences (SOP 12.38): refuse while any audience row
+    # references the role. Cascade-deleting the rows is the
+    # dangerous option: removing rows from an OR list narrows the
+    # audience, and when the last row goes the policy silently
+    # becomes all-staff -- exactly the failure scoping exists to
+    # prevent. The admin removes the audience deliberately first.
+    _aud_policies = conn.execute(
+        "SELECT DISTINCT p.id, p.title FROM erp_hr_policy_audiences a"
+        " JOIN erp_hr_policies p ON p.id = a.policy_id"
+        " WHERE a.audience_kind = 'role' AND a.audience_key = ?"
+        " ORDER BY p.title, p.id", (str(role_id),)).fetchall()
+    if _aud_policies:
+        _aud_names = ", ".join(
+            "'%s'" % (p["title"] or "") for p in _aud_policies)
+        conn.close()
+        return jsonify(error="cannot delete a role used in a policy"
+                       " audience (%s) -- remove it from the policy"
+                       " first" % _aud_names), 409
     conn.execute("DELETE FROM erp_hr_roles WHERE id = ?", (role_id,))
     _erp_staff_audit(conn, actor, "hr.role_deleted", "hr_role", role_id,
                      "deleted job role %s" % (row["title"] or ""))
@@ -33348,6 +35225,375 @@ def hr_expiring_documents():
     return jsonify(expiring=expiring, expired=expired)
 
 
+# ---------------- General file store (S3, SOP 10.16) ----------------
+# The general file store for the five reference-only entity types
+# (COA, store document, allergen statement, cert evidence, expense
+# receipt). Separate table and endpoint set from erp_hr_documents,
+# which stays employee-HR-only. Same storage pattern as the HR
+# documents (base64 blob in SQLite, 5 MB cap on decoded bytes), so
+# no new infrastructure and the backup story is unchanged. List and
+# metadata views NEVER return the blob -- only the download endpoint
+# does. The blob can NEVER be replaced: update edits notes only;
+# re-upload to replace a file. Deletion is permanent and audited.
+# MIME allowlist (PDF + images + plain text/CSV) is enforced on the
+# declared type AND on the file's magic bytes for PDF/images, so a
+# renamed executable or HTML page cannot slip in as a PDF. Every
+# write leaves an audit row: the staff audit log for the four
+# admin-only kinds, the accounting audit log (target expense_claim)
+# for receipts, matching the claim audit trail.
+_FILE_STORE_MAX_BYTES = 5242880
+_FILE_STORE_MAX_B64_CHARS = 7000000
+_FILE_STORE_ALLOWED_MIMES = (
+    "application/pdf", "image/jpeg", "image/png", "image/gif",
+    "image/webp", "text/plain", "text/csv",
+)
+# kind -> (owner_type, owning table). The owner must exist at upload.
+_FILE_STORE_KINDS = {
+    "coa": ("coa", "erp_quality_coas"),
+    "store_document": ("store_document", "erp_store_documents"),
+    "allergen_statement": ("allergen_statement",
+                           "erp_quality_supplier_allergen_statements"),
+    "cert_evidence": ("certification", "erp_quality_certifications"),
+    "expense_receipt": ("expense_claim", "erp_acct_expense_claims"),
+}
+
+
+def _file_store_meta(row):
+    """Metadata for one stored file -- NEVER includes the blob."""
+    return {"id": row["id"], "kind": row["kind"] or "",
+            "owner_type": row["owner_type"] or "",
+            "owner_id": row["owner_id"],
+            "filename": row["filename"] or "",
+            "mime_type": row["mime_type"] or "application/octet-stream",
+            "size_bytes": row["size_bytes"],
+            "notes": row["notes"] or "",
+            "uploaded_by": row["uploaded_by"] or "",
+            "created_at": row["created_at"],
+            "updated_by": row["updated_by"] or "",
+            "updated_at": row["updated_at"] or ""}
+
+
+def _file_store_magic_ok(mime_type, decoded):
+    """True when the decoded bytes match the declared type. PDF and
+    image types are checked against their magic bytes; text types
+    carry no magic and are accepted as declared."""
+    if mime_type == "application/pdf":
+        return decoded[:4] == b"%PDF"
+    if mime_type == "image/png":
+        return decoded[:8] == b"\x89PNG\r\n\x1a\n"
+    if mime_type == "image/jpeg":
+        return decoded[:3] == b"\xff\xd8\xff"
+    if mime_type == "image/gif":
+        return decoded[:6] in (b"GIF87a", b"GIF89a")
+    if mime_type == "image/webp":
+        return decoded[:4] == b"RIFF" and decoded[8:12] == b"WEBP"
+    return True
+
+
+def _file_store_get(conn, file_id):
+    try:
+        file_id = int(file_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM erp_file_store WHERE id = ?",
+                        (file_id,)).fetchone()
+
+
+def _file_store_owner_row(conn, kind, owner_id):
+    """The owning entity row for a kind + owner id, or None."""
+    _, table = _FILE_STORE_KINDS[kind]
+    try:
+        owner_id = int(owner_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM %s WHERE id = ?" % table,
+                        (owner_id,)).fetchone()
+
+
+def _file_store_write_gate(conn, kind, owner_row):
+    """Who may write (upload / update notes / delete) a file of this
+    kind. Admins always. An expense receipt may also be written by
+    the staff member who owns the claim, and only while the claim is
+    a draft or submitted -- the same ownership rule the claim
+    endpoints use. Returns (actor, None) or (None, (resp, code))."""
+    if _erp_role() == "admin":
+        return _require_erp_admin()
+    if kind != "expense_receipt":
+        # Not admin and not a receipt: the admin gate itself decides
+        # the status (401 anonymous, 403 member/staff/wholesale).
+        return _require_erp_admin()
+    actor, err = _require_erp()
+    if err:
+        return None, err
+    mine = _hr_resolve_caller_employee(conn)
+    if not mine or mine["id"] != owner_row["employee_id"]:
+        return None, (jsonify(
+            error="you can only attach a receipt to your own claim"), 403)
+    if owner_row["status"] not in ("draft", "submitted"):
+        return None, (jsonify(
+            error="receipts can only be attached while the claim is a"
+                  " draft or submitted"), 400)
+    return actor, None
+
+
+def _file_store_read_gate(conn, kind, owner_row):
+    """Who may read (list / metadata / download) files of this kind.
+    Admins always. An expense receipt may also be read by the staff
+    member who owns the claim. Returns (actor, None) or
+    (None, (resp, code))."""
+    if _erp_role() == "admin":
+        return _require_erp_admin()
+    if kind != "expense_receipt":
+        # Not admin and not a receipt: the admin gate itself decides
+        # the status (401 anonymous, 403 member/staff/wholesale).
+        return _require_erp_admin()
+    actor, err = _require_erp()
+    if err:
+        return None, err
+    mine = _hr_resolve_caller_employee(conn)
+    if not mine or mine["id"] != owner_row["employee_id"]:
+        return None, (jsonify(
+            error="you can only read receipts for your own claims"), 403)
+    return actor, None
+
+
+def _file_store_audit(conn, actor, action, kind, file_id, owner_id,
+                      filename):
+    """One audit row per write. Receipts go to the accounting audit
+    log (target expense_claim, matching the claim trail); the four
+    admin-only kinds go to the staff audit log."""
+    if kind == "expense_receipt":
+        _acct_audit(conn, actor, action, "expense_claim", owner_id,
+                    "%s -- %s" % (filename, action))
+    else:
+        _erp_staff_audit(conn, actor, action, "file_store", file_id,
+                         "%s (%s) for %s #%d" % (filename, kind,
+                                                 _FILE_STORE_KINDS[kind][0],
+                                                 owner_id))
+
+
+@app.post("/api/erp/file-store/upload")
+def file_store_upload():
+    """Upload one file for an owning record (201). The owner must
+    exist (404 otherwise). Rejects, before storing anything: an
+    unknown kind, an owner_type that does not match the kind, a
+    missing or blank filename, a filename with a path, a MIME type
+    outside the allowlist (415), bytes whose magic does not match
+    the declared type, invalid base64, an empty file, a base64
+    payload over ~7 MB of text, and a decoded file over 5 MB."""
+    data = request.get_json(force=True, silent=True) or {}
+    kind = (data.get("kind") or "").strip()
+    if kind not in _FILE_STORE_KINDS:
+        return jsonify(error="kind must be one of %s"
+                       % ", ".join(sorted(_FILE_STORE_KINDS))), 400
+    owner_type, _table = _FILE_STORE_KINDS[kind]
+    if (data.get("owner_type") or "").strip() != owner_type:
+        return jsonify(error="owner_type must be %s for kind %s"
+                       % (owner_type, kind)), 400
+    try:
+        owner_id = int(data.get("owner_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="owner_id must be a number"), 400
+    filename = (data.get("filename") or "").strip()
+    if not filename or len(filename) > 255:
+        return jsonify(error="filename must be 1-255 characters"), 400
+    if "/" in filename or "\\" in filename:
+        return jsonify(error="filename must not contain a path"), 400
+    mime_type = (data.get("mime_type") or "").strip() \
+        or "application/octet-stream"
+    if len(mime_type) > 200:
+        return jsonify(error="mime_type must be 200 characters or fewer"), 400
+    if mime_type not in _FILE_STORE_ALLOWED_MIMES:
+        return jsonify(error="file type not accepted: %s (PDF, JPG, PNG,"
+                       " GIF, WebP, TXT or CSV only)" % mime_type), 415
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    raw_b64 = data.get("data_b64")
+    if not isinstance(raw_b64, str) or not raw_b64.strip():
+        return jsonify(error="data_b64 is required"), 400
+    if len(raw_b64) > _FILE_STORE_MAX_B64_CHARS:
+        return jsonify(error="file is too large (5 MB maximum)"), 400
+    try:
+        decoded = base64.b64decode(raw_b64, validate=True)
+    except ValueError:
+        return jsonify(error="data_b64 is not valid base64"), 400
+    if not decoded:
+        return jsonify(error="file is empty"), 400
+    if len(decoded) > _FILE_STORE_MAX_BYTES:
+        return jsonify(error="file is too large (5 MB maximum)"), 400
+    if not _file_store_magic_ok(mime_type, decoded):
+        return jsonify(error="file contents do not match the declared"
+                       " type %s" % mime_type), 400
+    conn = db()
+    owner_row = _file_store_owner_row(conn, kind, owner_id)
+    if not owner_row:
+        conn.close()
+        return jsonify(error="owning record not found"), 404
+    actor, err = _file_store_write_gate(conn, kind, owner_row)
+    if err:
+        conn.close()
+        return err
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_file_store (kind, owner_type, owner_id,"
+        " filename, mime_type, size_bytes, data_b64, notes,"
+        " uploaded_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (kind, owner_type, owner_id, filename, mime_type, len(decoded),
+         base64.b64encode(decoded).decode("ascii"), notes, actor, now,
+         actor, now))
+    _file_store_audit(conn, actor, "file_store.uploaded", kind,
+                      cur.lastrowid, owner_id, filename)
+    conn.commit()
+    row = conn.execute("SELECT * FROM erp_file_store WHERE id = ?",
+                       (cur.lastrowid,)).fetchone()
+    conn.close()
+    return jsonify(file=_file_store_meta(row)), 201
+
+
+@app.get("/api/erp/file-store")
+def file_store_list():
+    """Metadata for one owning record's files, oldest first. The
+    blob is NEVER returned here. kind + owner_type + owner_id are
+    all required query parameters."""
+    kind = (request.args.get("kind") or "").strip()
+    owner_type = (request.args.get("owner_type") or "").strip()
+    if kind not in _FILE_STORE_KINDS:
+        return jsonify(error="kind must be one of %s"
+                       % ", ".join(sorted(_FILE_STORE_KINDS))), 400
+    if owner_type != _FILE_STORE_KINDS[kind][0]:
+        return jsonify(error="owner_type must be %s for kind %s"
+                       % (_FILE_STORE_KINDS[kind][0], kind)), 400
+    try:
+        owner_id = int(request.args.get("owner_id"))
+    except (TypeError, ValueError):
+        return jsonify(error="owner_id must be a number"), 400
+    conn = db()
+    owner_row = _file_store_owner_row(conn, kind, owner_id)
+    if not owner_row:
+        conn.close()
+        return jsonify(error="owning record not found"), 404
+    _, err = _file_store_read_gate(conn, kind, owner_row)
+    if err:
+        conn.close()
+        return err
+    rows = conn.execute(
+        "SELECT * FROM erp_file_store WHERE kind = ? AND owner_type = ?"
+        " AND owner_id = ? ORDER BY id",
+        (kind, owner_type, owner_id)).fetchall()
+    conn.close()
+    return jsonify(files=[_file_store_meta(r) for r in rows])
+
+
+@app.get("/api/erp/file-store/<int:file_id>")
+def file_store_get(file_id):
+    """One file's metadata -- WITHOUT the blob. Use the download
+    endpoint for the file bytes."""
+    conn = db()
+    row = _file_store_get(conn, file_id)
+    if not row:
+        conn.close()
+        return jsonify(error="file not found"), 404
+    owner_row = _file_store_owner_row(conn, row["kind"],
+                                      row["owner_id"])
+    if not owner_row:
+        conn.close()
+        return jsonify(error="owning record not found"), 404
+    _, err = _file_store_read_gate(conn, row["kind"], owner_row)
+    if err:
+        conn.close()
+        return err
+    conn.close()
+    return jsonify(file=_file_store_meta(row))
+
+
+@app.get("/api/erp/file-store/<int:file_id>/download")
+def file_store_download(file_id):
+    """Download one file: metadata + the base64 blob. This is the
+    ONLY endpoint that ever returns the blob."""
+    conn = db()
+    row = _file_store_get(conn, file_id)
+    if not row:
+        conn.close()
+        return jsonify(error="file not found"), 404
+    owner_row = _file_store_owner_row(conn, row["kind"],
+                                      row["owner_id"])
+    if not owner_row:
+        conn.close()
+        return jsonify(error="owning record not found"), 404
+    _, err = _file_store_read_gate(conn, row["kind"], owner_row)
+    if err:
+        conn.close()
+        return err
+    payload = _file_store_meta(row)
+    payload["data_b64"] = row["data_b64"] or ""
+    conn.close()
+    return jsonify(file=payload)
+
+
+@app.post("/api/erp/file-store/<int:file_id>/update")
+def file_store_update(file_id):
+    """Edit a file's notes only. The blob can NEVER be replaced here
+    -- data_b64 in the body is ignored entirely; re-upload to
+    replace a file."""
+    data = request.get_json(force=True, silent=True) or {}
+    notes = (data.get("notes") or "").strip()
+    if len(notes) > 5000:
+        return jsonify(error="notes must be 5000 characters or fewer"), 400
+    conn = db()
+    row = _file_store_get(conn, file_id)
+    if not row:
+        conn.close()
+        return jsonify(error="file not found"), 404
+    owner_row = _file_store_owner_row(conn, row["kind"],
+                                      row["owner_id"])
+    if not owner_row:
+        conn.close()
+        return jsonify(error="owning record not found"), 404
+    actor, err = _file_store_write_gate(conn, row["kind"], owner_row)
+    if err:
+        conn.close()
+        return err
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_file_store SET notes = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (notes, actor, now, file_id))
+    _file_store_audit(conn, actor, "file_store.updated", row["kind"],
+                      file_id, row["owner_id"], row["filename"])
+    conn.commit()
+    row = _file_store_get(conn, file_id)
+    conn.close()
+    return jsonify(file=_file_store_meta(row))
+
+
+@app.post("/api/erp/file-store/<int:file_id>/delete")
+def file_store_delete(file_id):
+    """Delete a file PERMANENTLY -- the file bytes go with it.
+    Audited. The owning record is NOT deleted with it."""
+    conn = db()
+    row = _file_store_get(conn, file_id)
+    if not row:
+        conn.close()
+        return jsonify(error="file not found"), 404
+    owner_row = _file_store_owner_row(conn, row["kind"],
+                                      row["owner_id"])
+    if not owner_row:
+        conn.close()
+        return jsonify(error="owning record not found"), 404
+    actor, err = _file_store_write_gate(conn, row["kind"], owner_row)
+    if err:
+        conn.close()
+        return err
+    conn.execute("DELETE FROM erp_file_store WHERE id = ?", (file_id,))
+    _file_store_audit(conn, actor, "file_store.deleted", row["kind"],
+                      file_id, row["owner_id"], row["filename"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
 # ---------------- HR Additions 5: employee self-service ----------------
 # GET /api/erp/hr/me only: an admin or staff member sees exactly ONE
 # record -- their own -- resolved server-side on every request. /me
@@ -33561,12 +35807,24 @@ def hr_me():
     # HR Policies & Handbooks (SOP 12.38): published policies only,
     # each with ONLY this employee's own acknowledgement state for
     # the current version -- never another employee's. Drafts and
-    # archived policies are admin-only and never appear here.
+    # archived policies are admin-only and never appear here. The
+    # list is filtered by the same audience rule as /mine: an
+    # out-of-audience policy never appears.
     policies = [
         _hr_policy_staff_payload(conn, r, emp_id)
         for r in conn.execute(
             "SELECT * FROM erp_hr_policies WHERE status = 'published'"
-            " ORDER BY title, id").fetchall()]
+            " ORDER BY title, id").fetchall()
+        if _hr_policy_visible_to_employee(conn, r["id"], emp)]
+    # Digital HR Forms (SOPs 12.40-12.46): the caller's own form
+    # submissions only, newest first -- never another employee's.
+    # List rows only (no data); the detail is fetched on demand
+    # from /api/erp/hr/forms/mine/<id>.
+    my_forms = [
+        _hr_form_list_payload(r) for r in conn.execute(
+            "SELECT * FROM erp_hr_form_submissions WHERE employee_id = ?"
+            " ORDER BY updated_at DESC, id DESC",
+            (emp_id,)).fetchall()]
     # Projects & tasks (Wave 4 item 18, SOP 1.10): the caller's own
     # tasks across projects, and the projects they own (each with
     # all its tasks). Never another employee's work -- a task in
@@ -33586,8 +35844,30 @@ def hr_me():
         _expense_claim_dict(conn, r) for r in conn.execute(
             "SELECT * FROM erp_acct_expense_claims WHERE employee_id = ?"
             " ORDER BY date DESC, id DESC", (emp_id,)).fetchall()]
+    # Dated shifts (Dept 15 S4): the employee's own rota shifts
+    # (any store) with PTO flags, their own swap/drop requests, and
+    # the active employees they may swap with (names only). Never
+    # another employee's shifts.
+    rota_shifts = [_rota_shift_dict(conn, r) for r in conn.execute(
+        "SELECT r.*, e.name AS employee_name, s.name AS store_name"
+        " FROM erp_store_rota_shifts r"
+        " LEFT JOIN erp_hr_employees e ON e.id = r.employee_id"
+        " LEFT JOIN erp_stores s ON s.id = r.store_id"
+        " WHERE r.employee_id = ?"
+        " ORDER BY r.shift_date DESC, r.start_time, r.id",
+        (emp_id,)).fetchall()]
+    rota_requests = [_rota_request_dict(conn, r) for r in conn.execute(
+        "SELECT * FROM erp_store_rota_requests WHERE employee_id = ?"
+        " ORDER BY id DESC", (emp_id,)).fetchall()]
+    rota_swap_candidates = [dict(c) for c in conn.execute(
+        "SELECT id, name, role FROM erp_hr_employees"
+        " WHERE active = 1 AND id != ? ORDER BY name, id",
+        (emp_id,)).fetchall()]
     out = {
         "employee": _hr_employee_payload(conn, emp),
+        "rota_shifts": rota_shifts,
+        "rota_requests": rota_requests,
+        "rota_swap_candidates": rota_swap_candidates,
         "pto_available": bool(pto_available or pto_req_available),
         "pto_balances": pto_balances,
         "pto_requests": pto_requests,
@@ -33607,6 +35887,8 @@ def hr_me():
         "bulletins": bulletins,
         "policies_available": True,
         "policies": policies,
+        "forms_available": True,
+        "forms": my_forms,
         "projects_available": True,
         "my_tasks": my_tasks,
         "my_projects": my_projects,
@@ -36443,6 +38725,8 @@ def _hr_pay_grade_fields(data, conn, partial=False):
         role = _hr_role_row(conn, role_id)
         if not role:
             return None, "role not found"
+        if not role["active"]:
+            return None, "role is inactive"
         values["role_id"] = role["id"]
     if not partial or "grade" in data:
         grade = (data.get("grade") or "").strip()
@@ -38410,16 +40694,40 @@ def hr_delete_bulletin(bulletin_id):
 # place: a new draft version is created and published. Drafts and
 # archived policies are admin-only; staff see published policies
 # only, each with only their own acknowledgement state. The body
-# is plain text (max 20000 characters, the knowledge-base cap):
+# is plain text (max 50000 characters, raised from 20000 so a full
+# employee handbook fits in one policy):
 # rich text is NOT used here -- its markup would eat the cap and
 # truncate real handbook content, and the 20000-cap decision for
-# wired rich-text fields is still open. Split a long handbook
-# into one policy per topic instead of one giant document. No
-# file uploads -- body text only, no bytes stored. Registers
-# start empty; nothing is seeded.
+# wired rich-text fields is still open. Splitting a long handbook
+# into one policy per topic is still fine when the document is
+# genuinely separate. No file uploads -- body text only, no bytes
+# stored. Registers start empty; nothing is seeded.
 HR_POLICY_CATEGORIES = ("handbook", "policy", "safety", "conduct",
                         "other")
-_HR_POLICY_BODY_MAX = 20000
+_HR_POLICY_BODY_MAX = 50000
+# Policy-audience scoping (SOP 12.38): the three work sites. These
+# slugs match the hosted handbook PDF filenames and the handbook
+# titles (store / corporate / warehouse). Fixed set -- never derived
+# from scope_type, which has no warehouse value.
+HR_WORK_SITES = ("store", "corporate", "warehouse")
+
+
+def _hr_validate_work_site(value):
+    """Normalize a work_site input. Returns (value, None): None for
+    NULL/blank (unassigned -- hiring never blocks on it), else one
+    of the three slugs. Anything else is (None, error-string)."""
+    if value is None:
+        return None, None
+    if not isinstance(value, str):
+        return None, ("work_site must be one of: store, corporate,"
+                      " warehouse")
+    value = value.strip().lower()
+    if not value:
+        return None, None
+    if value not in HR_WORK_SITES:
+        return None, ("work_site must be one of: store, corporate,"
+                      " warehouse")
+    return value, None
 
 
 def _hr_get_policy(conn, policy_id):
@@ -38450,29 +40758,214 @@ def _hr_policy_live_body(conn, row):
     return "", 0
 
 
-def _hr_policy_counts(conn, policy_id, current_version):
-    """(acknowledged, unacknowledged, audience) for the CURRENT
-    version. Before any version is published nobody can have
-    acknowledged anything, so both counts are 0 -- a draft never
-    reads '0 of N acknowledged'."""
+def _hr_policy_audience_rows(conn, policy_id):
+    """The raw audience rows for a policy, in creation order."""
+    return conn.execute(
+        "SELECT * FROM erp_hr_policy_audiences WHERE policy_id = ?"
+        " ORDER BY id", (policy_id,)).fetchall()
+
+
+def _hr_policy_audience(conn, policy_id):
+    """Active employees in a policy's audience. No audience rows
+    means all active employees. Inactive rows are ex-staff, never
+    the audience (same rule as bulletins)."""
+    rows = _hr_policy_audience_rows(conn, policy_id)
     audience = _hr_bulletin_audience(conn)
+    if not rows:
+        return audience
+    site_keys = {r["audience_key"] for r in rows
+                 if r["audience_kind"] == "site"}
+    role_ids = set()
+    for r in rows:
+        if r["audience_kind"] == "role":
+            try:
+                role_ids.add(int(r["audience_key"]))
+            except (TypeError, ValueError):
+                pass  # a key that does not parse never matches
+    out = []
+    for e in audience:
+        work_site = e["work_site"] if "work_site" in e.keys() else None
+        role_id = e["role_id"] if "role_id" in e.keys() else None
+        if (work_site and work_site in site_keys) \
+                or (role_id is not None and role_id in role_ids):
+            out.append(e)
+    return out
+
+
+def _hr_policy_visible_to_employee(conn, policy_id, employee_row):
+    """True if the employee may see this policy: no audience rows,
+    or ANY audience row matches them (OR semantics) -- a site row
+    whose key equals their work_site, or a role row whose key
+    equals their role_id. Role match uses employee.role_id ONLY:
+    no free-text title match, no position fallback. Site match
+    uses employee.work_site ONLY: never derived from scope_type.
+    Inactive employees see nothing (ex-staff). This is the ONLY
+    place audience logic lives; every staff surface calls it."""
+    if employee_row is None:
+        return False
+    if not (employee_row["active"]
+            if "active" in employee_row.keys() else 1):
+        return False
+    rows = _hr_policy_audience_rows(conn, policy_id)
+    if not rows:
+        return True
+    work_site = (employee_row["work_site"]
+                 if "work_site" in employee_row.keys() else None)
+    role_id = (employee_row["role_id"]
+               if "role_id" in employee_row.keys() else None)
+    for r in rows:
+        if r["audience_kind"] == "site" and work_site \
+                and r["audience_key"] == work_site:
+            return True
+        if r["audience_kind"] == "role" and role_id is not None:
+            try:
+                if int(r["audience_key"]) == role_id:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    return False
+
+
+def _hr_policy_audience_label(conn, rows):
+    """Badge text for an audience: 'All staff', 'Store',
+    'Store + 2 roles', '2 roles'. Sites are named; roles are
+    counted (their titles live on the role rows, not here)."""
+    if not rows:
+        return "All staff"
+    sites = sorted({r["audience_key"] for r in rows
+                    if r["audience_kind"] == "site"})
+    n_roles = sum(1 for r in rows if r["audience_kind"] == "role")
+    parts = [s.capitalize() for s in sites]
+    if n_roles == 1:
+        parts.append("1 role")
+    elif n_roles > 1:
+        parts.append("%d roles" % n_roles)
+    return " + ".join(parts)
+
+
+def _hr_policy_audience_payload(conn, rows):
+    """Audience rows as the admin payload carries them: [{kind,
+    key}] plus the role title for role rows ('' when the role is
+    gone -- the delete guard makes that unreachable, but a payload
+    must never raise on it)."""
+    out = []
+    for r in rows:
+        item = {"kind": r["audience_kind"], "key": r["audience_key"]}
+        if r["audience_kind"] == "role":
+            role = _hr_role_row(conn, r["audience_key"])
+            item["role_title"] = (role["title"] if role else "") or ""
+        out.append(item)
+    return out
+
+
+def _hr_policy_validate_audiences(conn, data):
+    """Validate a policy audience body (one helper, reused by
+    create and metadata update). Returns (cleaned, error): cleaned
+    is None when the caller sent neither 'audiences' nor
+    'audience_mode' (leave the audience untouched on update,
+    all-staff on create); otherwise a list of (kind, key) tuples,
+    possibly empty (= all-staff). 'audience_mode' is 'all' or
+    'specific': 'specific' with nothing picked is a 400 ('pick at
+    least one site or role'), and 'all' with rows attached is a
+    400. Site keys must be one of the three slugs; role keys must
+    reference an ACTIVE role; duplicates are a clean 400, never an
+    IntegrityError."""
+    if "audiences" not in data and "audience_mode" not in data:
+        return None, None
+    mode = data.get("audience_mode")
+    if mode is not None:
+        if not isinstance(mode, str):
+            return None, "audience_mode must be 'all' or 'specific'"
+        mode = mode.strip().lower()
+        if mode not in ("all", "specific"):
+            return None, "audience_mode must be 'all' or 'specific'"
+    audiences = data.get("audiences")
+    if audiences is None:
+        audiences = []
+    if not isinstance(audiences, list):
+        return None, ("audiences must be a list of {kind, key}"
+                      " objects")
+    if mode == "all" and audiences:
+        return None, ("audiences must be empty when audience_mode"
+                      " is 'all'")
+    if mode == "specific" and not audiences:
+        return None, "pick at least one site or role"
+    cleaned = []
+    seen = set()
+    for item in audiences:
+        if not isinstance(item, dict):
+            return None, ("each audience must be an object with"
+                          " kind and key")
+        kind = item.get("kind")
+        if not isinstance(kind, str):
+            return None, "audience kind must be 'site' or 'role'"
+        kind = kind.strip().lower()
+        if kind not in ("site", "role"):
+            return None, "audience kind must be 'site' or 'role'"
+        key = item.get("key")
+        if kind == "site":
+            if not isinstance(key, str):
+                return None, ("audience site must be one of: store,"
+                              " corporate, warehouse")
+            key = key.strip().lower()
+            if key not in HR_WORK_SITES:
+                return None, ("audience site must be one of: store,"
+                              " corporate, warehouse")
+        else:
+            role_row, role_err = _hr_resolve_active_role(conn, key)
+            if role_err:
+                return None, role_err
+            key = str(role_row["id"])
+        if (kind, key) in seen:
+            return None, "duplicate audience: %s %s" % (kind, key)
+        seen.add((kind, key))
+        cleaned.append((kind, key))
+    return cleaned, None
+
+
+def _hr_policy_counts(conn, policy_id, current_version):
+    """(acknowledged, unacknowledged, audience,
+    out_of_audience_acknowledgements) for the CURRENT version,
+    over the CURRENT audience only. Before any version is
+    published nobody can have acknowledged anything, so the first
+    three counts are 0 -- a draft never reads '0 of N
+    acknowledged'. Ack rows from people no longer in the audience
+    are kept as history: they count in the fourth number (the
+    detail footnote), never in the acknowledged count, and if the
+    person re-enters the audience their existing ack counts again
+    with no re-tap."""
+    audience = _hr_policy_audience(conn, policy_id)
     if not current_version:
-        return 0, 0, len(audience)
+        return 0, 0, len(audience), 0
     acks = conn.execute(
         "SELECT employee_id FROM erp_hr_policy_acknowledgements"
         " WHERE policy_id = ? AND version = ?",
         (policy_id, current_version)).fetchall()
     ack_ids = {r["employee_id"] for r in acks}
+    audience_ids = {e["id"] for e in audience}
+    acked = len(ack_ids & audience_ids)
     unack = sum(1 for e in audience if e["id"] not in ack_ids)
-    return len(ack_ids), unack, len(audience)
+    out_of_audience = len(ack_ids - audience_ids)
+    return acked, unack, len(audience), out_of_audience
 
 
 def _hr_policy_payload(conn, row, with_detail=False):
     body, body_version = _hr_policy_live_body(conn, row)
     versions = _hr_policy_versions(conn, row["id"])
     has_draft = any(v["status"] == "draft" for v in versions)
-    ack_count, unack_count, audience_count = _hr_policy_counts(
-        conn, row["id"], row["current_version"] or 0)
+    ack_count, unack_count, audience_count, out_ack_count = \
+        _hr_policy_counts(conn, row["id"], row["current_version"] or 0)
+    aud_rows = _hr_policy_audience_rows(conn, row["id"])
+    has_site_audience = any(r["audience_kind"] == "site"
+                            for r in aud_rows)
+    # Admins see the gap the policy does not reach: active
+    # employees with no work site yet. Only meaningful when the
+    # policy has site audiences; otherwise 0.
+    unassigned_count = 0
+    if has_site_audience:
+        unassigned_count = conn.execute(
+            "SELECT COUNT(*) FROM erp_hr_employees"
+            " WHERE active = 1 AND work_site IS NULL").fetchone()[0]
     out = {
         "id": row["id"], "title": row["title"],
         "category": row["category"] or "other",
@@ -38488,6 +40981,10 @@ def _hr_policy_payload(conn, row, with_detail=False):
         "acknowledged_count": ack_count,
         "unacknowledged_count": unack_count,
         "audience_count": audience_count,
+        "audiences": _hr_policy_audience_payload(conn, aud_rows),
+        "audience_label": _hr_policy_audience_label(conn, aud_rows),
+        "unassigned_count": unassigned_count,
+        "out_of_audience_ack_count": out_ack_count,
     }
     if with_detail:
         out["versions"] = [{
@@ -38502,8 +40999,15 @@ def _hr_policy_payload(conn, row, with_detail=False):
             "SELECT * FROM erp_hr_policy_acknowledgements"
             " WHERE policy_id = ? AND version = ?",
             (row["id"], row["current_version"] or 0)).fetchall()
+        # Both lists are scoped to the CURRENT audience; ack rows
+        # from people no longer in it stay as history and surface
+        # only as out_of_audience_ack_count above.
+        audience_ids = {e["id"] for e in _hr_policy_audience(
+            conn, row["id"])}
         ack_list = []
         for a in acks:
+            if a["employee_id"] not in audience_ids:
+                continue
             emp = _hr_get_employee(conn, a["employee_id"])
             ack_list.append({
                 "employee_id": a["employee_id"],
@@ -38518,7 +41022,7 @@ def _hr_policy_payload(conn, row, with_detail=False):
             "employee_id": emp["id"],
             "employee_name": emp["name"] or "",
             "employee_email": emp["email"] or "",
-        } for emp in _hr_bulletin_audience(conn)
+        } for emp in _hr_policy_audience(conn, row["id"])
             if emp["id"] not in ack_ids]
     return out
 
@@ -38588,26 +41092,54 @@ def _hr_policy_body(data):
     if not isinstance(body, str) or not body.strip():
         return None, "body is required"
     if len(body.strip()) > _HR_POLICY_BODY_MAX:
-        return None, "body is too long (max 20000 characters)"
+        return None, "body is too long (max 50000 characters)"
     return body.strip(), None
 
 
 @app.get("/api/erp/hr/policies")
 def hr_list_policies():
     """Admin list: every policy, newest first, optionally filtered
-    by category, status, and/or a search string over the title,
-    the body and the creator's login. Each row carries live
-    acknowledgement counts for its current version."""
+    by category, status, audience, and/or a search string over the
+    title, the body and the creator's login. The audience filter
+    is all (default, no filtering) / all-staff (no audience rows)
+    / site:<slug> (a site row for that slug) / role:<id> (a role
+    row for that role id). Each row carries live acknowledgement
+    counts for its current version."""
     _, err = _require_erp_admin()
     if err:
         return err
     category = (request.args.get("category") or "").strip().lower()
     status = (request.args.get("status") or "").strip().lower()
     q = (request.args.get("q") or "").strip().lower()
+    audience = (request.args.get("audience") or "").strip().lower()
     if category and category not in HR_POLICY_CATEGORIES:
         return jsonify(error="unknown category"), 400
     if status and status not in ("draft", "published", "archived"):
         return jsonify(error="unknown status"), 400
+    # Audience filter (SOP 12.38): malformed values are 400s, like
+    # the other filters. A numeric role id that names no role (or
+    # no policy) simply matches nothing -- it is a well-formed
+    # filter, not an error.
+    aud_kind = None
+    aud_key = None
+    if audience in ("", "all"):
+        pass
+    elif audience == "all-staff":
+        aud_kind = "all-staff"
+    elif audience.startswith("site:"):
+        slug = audience[5:].strip()
+        if slug not in HR_WORK_SITES:
+            return jsonify(error="unknown audience filter"), 400
+        aud_kind, aud_key = "site", slug
+    elif audience.startswith("role:"):
+        rid = audience[5:].strip()
+        try:
+            aud_key = str(int(rid))
+        except (TypeError, ValueError):
+            return jsonify(error="unknown audience filter"), 400
+        aud_kind = "role"
+    else:
+        return jsonify(error="unknown audience filter"), 400
     conn = db()
     rows = conn.execute(
         "SELECT * FROM erp_hr_policies ORDER BY id DESC").fetchall()
@@ -38618,6 +41150,16 @@ def hr_list_policies():
         if status and (r["status"] or "draft") != status:
             continue
         d = _hr_policy_payload(conn, r)
+        if aud_kind == "all-staff" and d["audiences"]:
+            continue
+        if aud_kind == "site" and not any(
+                a["kind"] == "site" and a["key"] == aud_key
+                for a in d["audiences"]):
+            continue
+        if aud_kind == "role" and not any(
+                a["kind"] == "role" and a["key"] == aud_key
+                for a in d["audiences"]):
+            continue
         if q and q not in d["title"].lower() \
                 and q not in d["body"].lower() \
                 and q not in d["created_by"].lower():
@@ -38643,6 +41185,10 @@ def hr_create_policy():
     if error:
         return jsonify(error=error), 400
     conn = db()
+    audiences, error = _hr_policy_validate_audiences(conn, data)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
     now = datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO erp_hr_policies (title, category, status,"
@@ -38657,10 +41203,24 @@ def hr_create_policy():
         " body, status, created_by, created_at)"
         " VALUES (?, 1, ?, 'draft', ?, ?)",
         (policy_id, body, actor, now))
+    # Audience rows (absent/empty = all staff, no rows stored).
+    # This is metadata, not a version: no version is created for it.
+    if audiences:
+        for kind, key in audiences:
+            conn.execute(
+                "INSERT INTO erp_hr_policy_audiences (policy_id,"
+                " audience_kind, audience_key, created_by, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (policy_id, kind, key, actor, now))
     _erp_staff_audit(conn, actor, "hr.policy_created",
                      "hr_policy", policy_id,
-                     "policy #%d created (draft v1): %r"
-                     % (policy_id, fields["title"]))
+                     "policy #%d created (draft v1): %r%s"
+                     % (policy_id, fields["title"],
+                        (" (audience: %s)"
+                         % _hr_policy_audience_label(
+                             conn,
+                             _hr_policy_audience_rows(conn, policy_id)))
+                        if audiences else ""))
     conn.commit()
     out = _hr_policy_payload(conn, _hr_get_policy(conn, policy_id))
     conn.close()
@@ -38690,7 +41250,12 @@ def hr_update_policy(policy_id):
     """Update a policy's metadata (title / category / effective
     date, admin only). The body is never edited here -- a
     published version is never edited in place; a new draft
-    version carries the new text (see /versions)."""
+    version carries the new text (see /versions). The audience
+    can be replaced here too ('audiences' array, replace-all;
+    omitting it leaves the audience untouched, an explicit empty
+    array clears it to all-staff; 'audience_mode' = 'specific'
+    with nothing picked is a 400). An audience change creates no
+    version and resets no acknowledgements."""
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -38698,13 +41263,22 @@ def hr_update_policy(policy_id):
     fields, error = _hr_policy_fields(data, partial=True)
     if error:
         return jsonify(error=error), 400
-    if not fields:
+    # Audience replace-all: omitting 'audiences' leaves the audience
+    # untouched; an explicit empty array clears it to all-staff.
+    # 'audience_mode' = 'specific' with nothing picked is a 400.
+    audience_present = ("audiences" in data
+                        or "audience_mode" in data)
+    if not fields and not audience_present:
         return jsonify(error="nothing to update"), 400
     conn = db()
     row = _hr_get_policy(conn, policy_id)
     if not row:
         conn.close()
         return jsonify(error="policy not found"), 404
+    audiences, error = _hr_policy_validate_audiences(conn, data)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
     now = datetime.now(timezone.utc).isoformat()
     sets = []
     vals = []
@@ -38719,10 +41293,33 @@ def hr_update_policy(policy_id):
     vals.append(policy_id)
     conn.execute("UPDATE erp_hr_policies SET %s WHERE id = ?"
                  % ", ".join(sets), vals)
-    _erp_staff_audit(conn, actor, "hr.policy_updated",
-                     "hr_policy", policy_id,
-                     "policy #%d updated: %s"
-                     % (policy_id, ", ".join(sorted(fields))))
+    if fields:
+        _erp_staff_audit(conn, actor, "hr.policy_updated",
+                         "hr_policy", policy_id,
+                         "policy #%d updated: %s"
+                         % (policy_id, ", ".join(sorted(fields))))
+    if audiences is not None:
+        # Replace-all in the same transaction as the metadata
+        # update. An audience change is metadata: it creates no
+        # version and resets no acknowledgements -- ack rows are
+        # history and count again if the person re-enters.
+        before_rows = _hr_policy_audience_rows(conn, policy_id)
+        before_label = _hr_policy_audience_label(conn, before_rows)
+        conn.execute("DELETE FROM erp_hr_policy_audiences"
+                     " WHERE policy_id = ?", (policy_id,))
+        for kind, key in audiences:
+            conn.execute(
+                "INSERT INTO erp_hr_policy_audiences (policy_id,"
+                " audience_kind, audience_key, created_by, created_at)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (policy_id, kind, key, actor, now))
+        after_label = _hr_policy_audience_label(
+            conn, _hr_policy_audience_rows(conn, policy_id))
+        if before_label != after_label:
+            _erp_staff_audit(conn, actor, "hr.policy_audience_changed",
+                             "hr_policy", policy_id,
+                             "policy #%d audience changed: %s -> %s"
+                             % (policy_id, before_label, after_label))
     conn.commit()
     out = _hr_policy_payload(conn, _hr_get_policy(conn, policy_id))
     conn.close()
@@ -38887,6 +41484,8 @@ def hr_delete_policy(policy_id):
                        " history can be deleted"), 409
     conn.execute("DELETE FROM erp_hr_policy_acknowledgements"
                  " WHERE policy_id = ?", (policy_id,))
+    conn.execute("DELETE FROM erp_hr_policy_audiences"
+                 " WHERE policy_id = ?", (policy_id,))
     conn.execute("DELETE FROM erp_hr_policy_versions"
                  " WHERE policy_id = ?", (policy_id,))
     conn.execute("DELETE FROM erp_hr_policies WHERE id = ?",
@@ -38919,7 +41518,8 @@ def hr_my_policies():
         "SELECT * FROM erp_hr_policies WHERE status = 'published'"
         " ORDER BY title, id").fetchall()
     out = [_hr_policy_staff_payload(conn, r, mine["id"])
-           for r in rows]
+           for r in rows
+           if _hr_policy_visible_to_employee(conn, r["id"], mine)]
     conn.close()
     return jsonify(policies=out)
 
@@ -38939,7 +41539,8 @@ def hr_my_policy(policy_id):
         return jsonify(error="no HR record is linked to your login;"
                        " ask an admin to link one"), 404
     row = _hr_get_policy(conn, policy_id)
-    if not row or (row["status"] or "") != "published":
+    if not row or (row["status"] or "") != "published" \
+            or not _hr_policy_visible_to_employee(conn, policy_id, mine):
         conn.close()
         return jsonify(error="policy not found"), 404
     out = _hr_policy_staff_payload(conn, row, mine["id"])
@@ -38953,7 +41554,11 @@ def hr_acknowledge_policy(policy_id):
     the caller only. Explicit and timestamped; the first
     acknowledgement time is kept, and re-acknowledging changes
     nothing. Acknowledging a version the caller already
-    acknowledged is a no-op, not an error."""
+    acknowledged is a no-op, not an error. Visibility is re-checked
+    here, not just on the list: a direct POST must never
+    acknowledge a policy the caller cannot see, and an
+    out-of-audience policy is indistinguishable from a nonexistent
+    one (same 'policy not found')."""
     actor, err = _require_erp()
     if err:
         return err
@@ -38964,7 +41569,8 @@ def hr_acknowledge_policy(policy_id):
         return jsonify(error="no HR record is linked to your login;"
                        " ask an admin to link one"), 404
     row = _hr_get_policy(conn, policy_id)
-    if not row or (row["status"] or "") != "published":
+    if not row or (row["status"] or "") != "published" \
+            or not _hr_policy_visible_to_employee(conn, policy_id, mine):
         conn.close()
         return jsonify(error="policy not found"), 404
     now = datetime.now(timezone.utc).isoformat()
@@ -38998,6 +41604,2517 @@ def hr_acknowledge_policy(policy_id):
     out = _hr_policy_staff_payload(conn, row, mine["id"])
     conn.close()
     return jsonify(out)
+
+
+
+# ---- Digital HR Forms (SOPs 12.40-12.46) ----
+# Fill-in forms for HR-02..HR-12 (HR-01 Employment Application is
+# excluded: hiring goes through a future careers website). Staff
+# fill their own forms in My HR -> Forms; admins work all of them
+# in HR -> Forms. A submission is a draft until submitted; the
+# submitted data is frozen as version 1, and any later correction
+# creates a new version and supersedes every signature, so the form
+# must be re-signed. Drafts are deletable; submitted records are
+# never deleted (the paper packet stays the printable fallback).
+# Signatures are three-tier: attestation (typed name, in the ERP),
+# Wave-4 token (HR-02 candidate, by email link, 7 days), and paper
+# (recorded by an admin from the paper form, never typed for
+# someone else). HR-03 is a tracking sheet only -- the federal
+# I-9/W-4 stay official paper, and no I-9 document details are
+# ever stored. HR-05 bank account numbers are stored encrypted
+# and shown in full only on the single-record admin detail view;
+# lists and staff views show last-4 only. HR-09 approval never
+# posts leave: the manager still enters leave in the ERP after
+# approving. No new permission: admin via _require_erp_admin,
+# staff via _require_erp. Tables are explicitly NOT in
+# _ERP_RESET_TABLES (HR records survive a wipe).
+# HR_FORM_DEFS lives just above the init_db() call at the
+# end of this file's setup section (it must be defined
+# before init_db() runs, so the seed can run at import).
+
+HR_FORM_TOKEN_TTL_DAYS = 7
+HR_FORM_STATUSES = ("draft", "submitted", "in_review", "sent",
+                    "candidate_signed", "approved",
+                    "approved_with_changes", "denied", "countersigned",
+                    "signed", "verified", "reviewed", "complete",
+                    "declined")
+# Forms a staff member may start themselves (admin may start any).
+HR_FORM_STAFF_STARTABLE = ("HR-04", "HR-05", "HR-06", "HR-07",
+                           "HR-09", "HR-10")
+# Form codes where the person filling it in is an employee of ours
+# (staff-only forms + HR-08/HR-11/HR-12 admin forms). HR-02 is the
+# only form whose subject is a candidate, not an employee.
+HR_FORM_EMPLOYEE_FORMS = ("HR-03", "HR-04", "HR-05", "HR-06", "HR-07",
+                          "HR-08", "HR-09", "HR-10", "HR-11", "HR-12")
+# Department values that mark a role as food-handling by default
+# (user decision 6): Production, Event, Store.
+HR_FORM_FOOD_HANDLING_DEPARTMENTS = ("production", "event", "store")
+# NOTE: _current_member() returns a sqlite3.Row (key access only,
+# no .get) -- every member name read in this block uses member["name"].
+# What "submit" moves a form to, before any signature lands.
+_HR_FORM_SUBMIT_NEXT = {
+    "HR-03": "complete", "HR-04": "signed", "HR-05": "in_review",
+    "HR-06": "in_review", "HR-07": "in_review", "HR-08": "complete",
+    "HR-09": "in_review", "HR-10": "in_review", "HR-11": "in_review",
+    "HR-12": "in_review",
+}
+# Roles that may sign a form at submit time, by form code.
+# ("employee" = the staff member the form is about; "manager" =
+# the admin submitting the form.)
+_HR_FORM_SUBMIT_SIGNERS = {
+    "HR-04": ("employee",), "HR-05": ("employee",),
+    "HR-06": ("employee",), "HR-07": ("employee",),
+    "HR-08": ("manager",), "HR-09": ("employee",),
+    "HR-10": ("employee",), "HR-11": ("manager",),
+    "HR-12": ("manager",),
+}
+# Roles the /sign endpoint accepts, by form code.
+_HR_FORM_SIGN_ROLES = {
+    "HR-02": ("company",), "HR-04": ("employee",),
+    "HR-05": ("employee",), "HR-06": ("employee", "company"),
+    "HR-07": ("employee", "manager"), "HR-09": ("employee",),
+    "HR-10": ("employee", "supervisor"),
+    "HR-11": ("employee", "manager"), "HR-12": ("employee", "manager"),
+}
+# Roles that may be recorded by paper-sign, by form code (the
+# person signed on paper; an admin records the fact). The
+# candidate may sign the offer on paper too; managers and
+# countersigners are in the ERP, so they always attest there.
+_HR_FORM_PAPER_SIGN_ROLES = {
+    "HR-02": ("candidate",), "HR-04": ("employee",),
+    "HR-05": ("employee",), "HR-06": ("employee",),
+    "HR-07": ("employee",), "HR-09": ("employee",),
+    "HR-10": ("employee",), "HR-11": ("employee",),
+    "HR-12": ("employee",),
+}
+# The full text of each signature. The typed name is the employee
+# or manager typing their own name; the admin never types a name
+# for someone else (except the paper-attestation record, which
+# carries the paper signer's name as written on the form).
+_HR_FORM_SIGNATURE_TEXTS = {
+    "HR-06": ("By signing, I acknowledge that I have read, understood,"
+              " and agree to follow the Confidentiality Agreement."
+              " I understand that my obligations under this agreement"
+              " continue after my employment ends."),
+    "HR-07": ("By signing, I authorize Pop-A-Licious to run my DMV"
+              " record as needed, and I agree to report any accident,"
+              " ticket, or change in license or insurance status"
+              " promptly."),
+    "HR-11": ("Employee signature means: I have discussed this"
+              " corrective action with my manager. It does not mean"
+              " I agree with the decision."),
+}
+_HR_FORM_DATA_MAX = 5000
+
+
+def _hr_form_def(code):
+    for d in HR_FORM_DEFS:
+        if d["code"] == code:
+            return d
+    return None
+
+
+def _hr_form_fields(code):
+    d = _hr_form_def(code)
+    return d["fields"] if d else []
+
+
+def _hr_form_secure_key():
+    """Key bytes for the HR-05 bank-account cipher, or None when
+    AUTH_SECRET is unset (then no HR-05 account can be stored).
+    Same HMAC-stream construction as _sms_encrypt_token, with its
+    own prefix; the SMS helper is untouched."""
+    if not AUTH_SECRET:
+        return None
+    return hashlib.sha256(
+        ("hr-form:" + AUTH_SECRET).encode("utf-8")).digest()
+
+
+def _hr_form_encrypt_value(value):
+    """Encrypt one short value for storage. Returns
+    (storage_string, None) or (None, error)."""
+    key = _hr_form_secure_key()
+    if key is None:
+        return None, "server key is not configured"
+    try:
+        nonce = secrets.token_bytes(12)
+        out = bytearray()
+        counter = 0
+        plain = value.encode("utf-8")
+        for off in range(0, len(plain), 32):
+            block = hashlib.sha256(
+                key + nonce + counter.to_bytes(4, "big")).digest()
+            chunk = plain[off:off + 32]
+            out.extend(b ^ block[i] for i, b in enumerate(chunk))
+            counter += 1
+        return ("hrf1:%s:%s" % (
+            base64.b64encode(nonce).decode("ascii"),
+            base64.b64encode(bytes(out)).decode("ascii"))), None
+    except Exception:
+        return None, "encryption failed"
+
+
+def _hr_form_decrypt_value(stored):
+    """Decrypt a value stored by _hr_form_encrypt_value. Returns
+    (plaintext, None) or (None, error)."""
+    try:
+        if not isinstance(stored, str) or not stored.startswith("hrf1:"):
+            return None, "not an encrypted value"
+        _tag, nonce_b64, ct_b64 = stored.split(":", 2)
+        key = _hr_form_secure_key()
+        if key is None:
+            return None, "server key is not configured"
+        nonce = base64.b64decode(nonce_b64)
+        ct = base64.b64decode(ct_b64)
+        out = bytearray()
+        counter = 0
+        for off in range(0, len(ct), 32):
+            block = hashlib.sha256(
+                key + nonce + counter.to_bytes(4, "big")).digest()
+            chunk = ct[off:off + 32]
+            out.extend(b ^ block[i] for i, b in enumerate(chunk))
+            counter += 1
+        return bytes(out).decode("utf-8"), None
+    except Exception:
+        return None, "decryption failed"
+
+
+def _hr_form_valid_date(s):
+    if not isinstance(s, str):
+        return None
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+def _hr_form_valid_time(s):
+    if not isinstance(s, str):
+        return None
+    try:
+        return datetime.strptime(s, "%H:%M").time()
+    except (ValueError, TypeError):
+        return None
+
+
+def _hr_form_add_business_days(start, n):
+    """Add n business days (Mon-Fri) to a date; weekends are
+    skipped, holidays are not (the handbook lists no holidays)."""
+    d = start
+    left = n
+    while left > 0:
+        d = d + timedelta(days=1)
+        if d.weekday() < 5:
+            left -= 1
+    return d
+
+
+def _hr_form_section2_due(start_date):
+    """Section 2 is due 3 business days after the start date
+    (design §3, HR-03)."""
+    if not start_date:
+        return None
+    return _hr_form_add_business_days(start_date, 3)
+
+
+def _hr_form_validate_aba(routing):
+    """ABA routing checksum: the 9 digits, weighted 3-7-1, must
+    sum to a multiple of 10."""
+    if not isinstance(routing, str) or len(routing) != 9:
+        return False
+    if not routing.isdigit():
+        return False
+    weights = (3, 7, 1)
+    total = sum(int(d) * weights[i % 3] for i, d in enumerate(routing))
+    return total % 10 == 0
+
+
+def _hr_form_validate_data(form_code, data, partial=False,
+                           existing=None):
+    """Validate form data against the field spec. Returns
+    (clean, None) or (None, error). clean is a dict of validated
+    values (signature-type and staged fields are refused here --
+    they are recorded by the sign / verify / decide endpoints, not
+    as data). partial=True checks types only (draft save); False
+    also enforces every required field. existing is the current
+    stored data (plaintext form, already decrypted) -- a draft save
+    merges the incoming fields over it first, so a partial update
+    cannot wipe fields it did not send. HR-05 account and routing
+    numbers are validated as plaintext here; the caller encrypts
+    them for storage with _hr_form_encrypt_stored."""
+    if not isinstance(data, dict):
+        return None, "data must be an object"
+    fields = _hr_form_fields(form_code)
+    if not fields:
+        return None, "unknown form"
+    spec = {f["key"]: f for f in fields}
+    unknown = sorted(set(data) - set(spec))
+    if unknown:
+        return None, "unknown field: %s" % unknown[0]
+    merged = dict(existing or {})
+    for key, value in data.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    clean = {}
+    for f in fields:
+        key = f["key"]
+        typ = f["type"]
+        value = merged.get(key)
+        if typ == "signature" or f.get("stage"):
+            if key in merged and merged[key] not in (None, "", False):
+                return None, ("%s is recorded by signing, not as"
+                               " form data" % f["label"])
+            continue
+        if value is None or value == "":
+            if f["required"] and not partial:
+                return None, "%s is required" % f["label"]
+            clean[key] = value if value is not None else None
+            continue
+        if typ == "text":
+            if not isinstance(value, str):
+                return None, "%s must be text" % f["label"]
+            if len(value) > 1000:
+                return None, "%s is too long" % f["label"]
+            clean[key] = value.strip()
+            if f["required"] and not partial and not clean[key]:
+                return None, "%s is required" % f["label"]
+        elif typ == "longtext":
+            if not isinstance(value, str):
+                return None, "%s must be text" % f["label"]
+            if len(value) > 10000:
+                return None, "%s is too long" % f["label"]
+            clean[key] = value.strip()
+            if f["required"] and not partial and not clean[key]:
+                return None, "%s is required" % f["label"]
+        elif typ == "date":
+            d = _hr_form_valid_date(value)
+            if d is None:
+                return None, "%s must be a date (YYYY-MM-DD)" % f["label"]
+            clean[key] = d.isoformat()
+        elif typ == "time":
+            t = _hr_form_valid_time(value)
+            if t is None:
+                return None, "%s must be a time (HH:MM)" % f["label"]
+            clean[key] = t.strftime("%H:%M")
+        elif typ == "number":
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None, "%s must be a whole number" % f["label"]
+            clean[key] = value
+        elif typ == "money":
+            if isinstance(value, bool) or not isinstance(value, int):
+                return None, "%s must be an integer number of cents" \
+                    % f["label"]
+            if value < 0:
+                return None, "%s cannot be negative" % f["label"]
+            clean[key] = value
+        elif typ == "select":
+            if not isinstance(value, str) or \
+                    value not in f.get("options", []):
+                return None, "%s is not a valid choice" % f["label"]
+            clean[key] = value
+        elif typ == "checkbox":
+            if not isinstance(value, bool):
+                return None, "%s must be true or false" % f["label"]
+            clean[key] = value
+        elif typ == "checkbox_group":
+            if not isinstance(value, list) or not all(
+                    isinstance(v, str) for v in value):
+                return None, "%s must be a list of choices" % f["label"]
+            bad = [v for v in value if v not in f.get("options", [])]
+            if bad:
+                return None, "%s has an invalid choice" % f["label"]
+            if f["required"] and not partial and not value:
+                return None, "%s is required" % f["label"]
+            clean[key] = list(value)
+        elif typ == "checkitem":
+            if not isinstance(value, dict):
+                return None, "%s must be an object" % f["label"]
+            checked = value.get("checked")
+            if not isinstance(checked, bool):
+                return None, "%s must say whether it is done" % f["label"]
+            detail = value.get("detail")
+            if detail is None:
+                detail = ""
+            if not isinstance(detail, str):
+                return None, "%s detail must be text" % f["label"]
+            detail = detail.strip()
+            if checked and not detail:
+                return None, ("%s needs a %s" %
+                              (f["label"], f.get("detail_label",
+                                                "detail")))
+            if checked and f.get("detail_type") == "date":
+                if _hr_form_valid_date(detail) is None:
+                    return None, ("%s detail must be a date"
+                                  % f["label"])
+            clean[key] = {"checked": checked, "detail": detail,
+                          "by": value.get("by") if isinstance(
+                              value.get("by"), str) else ""}
+        elif typ == "readonly":
+            clean[key] = value
+        else:
+            return None, "unknown field type for %s" % f["label"]
+    # Cross-field rules, per form (design §3).
+    if not partial:
+        err = _hr_form_cross_check(form_code, clean)
+        if err:
+            return None, err
+    return clean, None
+
+
+def _hr_form_cross_check(form_code, clean):
+    """Cross-field rules that only apply to a complete form (a
+    draft may be half-filled). Returns an error string or None."""
+    if form_code == "HR-02":
+        if clean.get("pay_rate_cents") is not None and \
+                clean["pay_rate_cents"] <= 0:
+            return "Pay rate must be greater than zero"
+        start = _hr_form_valid_date(clean.get("start_date") or "")
+        deadline = _hr_form_valid_date(
+            clean.get("acceptance_deadline") or "")
+        if start and deadline and deadline < start:
+            return ("Acceptance deadline cannot be before the start"
+                    " date")
+        email = clean.get("candidate_email") or ""
+        if email and not EMAIL_RE.match(email):
+            return "Candidate email is not a valid email address"
+    if form_code == "HR-03":
+        start = _hr_form_valid_date(clean.get("start_date") or "")
+        sec2 = (clean.get("i9_section2") or {})
+        if start and sec2.get("checked"):
+            due = _hr_form_section2_due(start)
+            done = _hr_form_valid_date(sec2.get("detail") or "")
+            if done and due and done > due and not (
+                    clean.get("delay_note") or "").strip():
+                return ("Section 2 was completed after the 3-business-day"
+                        " deadline; a delay note is required")
+    if form_code == "HR-04":
+        dob = _hr_form_valid_date(clean.get("date_of_birth") or "")
+        if dob and dob >= date.today():
+            return "Date of birth must be in the past"
+        if clean.get("handles_food"):
+            if not clean.get("food_handler_card_expiration"):
+                return ("Food handler card expiration is required when"
+                        " the role handles food")
+        for n in (1, 2):
+            name = clean.get("emergency_contact_%d_name" % n) or ""
+            rel = clean.get("emergency_contact_%d_relationship" % n) or ""
+            phone = clean.get("emergency_contact_%d_phone" % n) or ""
+            if name or rel or phone:
+                if not name:
+                    return ("Emergency contact %d needs a name" % n)
+                if not phone:
+                    return ("Emergency contact %d needs a phone"
+                            " number" % n)
+        email = clean.get("personal_email") or ""
+        if email and not EMAIL_RE.match(email):
+            return "Personal email is not a valid email address"
+    if form_code == "HR-05":
+        ssn = clean.get("ssn_last4") or ""
+        if not (isinstance(ssn, str) and len(ssn) == 4 and
+                ssn.isdigit()):
+            return "Last 4 of SSN must be exactly 4 digits"
+        routing = clean.get("routing_number") or ""
+        if not (isinstance(routing, str) and len(routing) == 9 and
+                routing.isdigit()):
+            return "Routing number must be exactly 9 digits"
+        if not _hr_form_validate_aba(routing):
+            return "Routing number failed the ABA checksum"
+        acct = clean.get("account_number") or ""
+        if not (isinstance(acct, str) and acct.isdigit() and
+                4 <= len(acct) <= 17):
+            return "Account number must be 4 to 17 digits"
+        full = bool(clean.get("deposit_full_net_pay"))
+        split_amt = clean.get("split_amount_cents")
+        split_pct = clean.get("split_percent")
+        has_split = (split_amt is not None and split_amt > 0) or \
+            (split_pct is not None and split_pct > 0)
+        if full and has_split:
+            return ("Choose full net pay or a split, not both")
+        if not full and not has_split:
+            return ("Choose full net pay or a split amount /"
+                    " percentage")
+        if split_amt is not None and split_pct is not None and \
+                split_amt > 0 and split_pct > 0:
+            return "Choose a split amount or a split percentage, not both"
+        if split_pct is not None and split_pct > 0 and not (
+                1 <= split_pct <= 100):
+            return "Split percentage must be between 1 and 100"
+    if form_code == "HR-07":
+        lic = clean.get("license_number") or ""
+        if lic and len(lic) > 50:
+            return "Driver's license number is too long"
+    if form_code == "HR-09":
+        first = _hr_form_valid_date(clean.get("first_day_off") or "")
+        last = _hr_form_valid_date(clean.get("last_day_off") or "")
+        ret = _hr_form_valid_date(clean.get("return_date") or "")
+        if first and last and last < first:
+            return "Last day off cannot be before the first day off"
+        if last and ret and ret <= last:
+            return "Return date must be after the last day off"
+        if clean.get("type") == "unpaid" and not (
+                clean.get("reason") or "").strip():
+            return "A reason is required for unpaid time off"
+    if form_code == "HR-10":
+        incident = _hr_form_valid_date(
+            clean.get("date_of_incident") or "")
+        if incident and incident > date.today():
+            return "Date of incident cannot be in the future"
+        types = clean.get("type") or []
+        if "Injury" in types:
+            for key in ("injury_body_part", "injury_first_aid",
+                        "injury_medical_care", "injury_missed_work"):
+                if not (clean.get(key) or "").strip():
+                    label = [f["label"] for f in
+                             _hr_form_fields("HR-10")
+                             if f["key"] == key][0]
+                    return ("%s is required for an injury report"
+                            % label)
+        for n in (1, 2):
+            name = clean.get("witness_%d_name" % n) or ""
+            phone = clean.get("witness_%d_phone" % n) or ""
+            saw = clean.get("witness_%d_saw" % n) or ""
+            if name or phone or saw:
+                if not name:
+                    return "Witness %d needs a name" % n
+                if not phone:
+                    return "Witness %d needs a phone number" % n
+                if not saw:
+                    return "Witness %d needs what they saw" % n
+    return None
+
+
+def _hr_form_stamp_checkitems(form_code, clean, actor):
+    """Fill in the 'by' on checkitems the caller just checked: the
+    record shows who marked each item done. An item already checked
+    keeps the name already on it; an unchecked item keeps a blank
+    'by'. The admin never types a name here -- it is the actor's
+    own login."""
+    for f in _hr_form_fields(form_code):
+        if f["type"] != "checkitem":
+            continue
+        item = clean.get(f["key"])
+        if isinstance(item, dict) and item.get("checked") and \
+                not (item.get("by") or "").strip():
+            item["by"] = actor or ""
+    return clean
+
+
+def _hr_form_encrypt_stored(form_code, clean):
+    """Encrypt the sensitive HR-05 values for storage. Returns
+    (stored, None) or (None, error). Stored data keeps the
+    plaintext last-4s (for masking) and replaces the full numbers
+    with ciphertext; every other form stores its data as-is."""
+    stored = dict(clean)
+    if form_code == "HR-05":
+        for key in ("account_number", "routing_number"):
+            value = stored.get(key)
+            if value:
+                stored["%s_last4" % key] = str(value)[-4:]
+                enc, err = _hr_form_encrypt_value(str(value))
+                if err:
+                    return None, err
+                stored[key] = enc
+    return stored, None
+
+
+def _hr_form_decrypt_stored(form_code, stored):
+    """Decrypt stored data back to plaintext (admin detail view
+    only). Returns (plain, None) or (None, error)."""
+    plain = dict(stored or {})
+    if form_code == "HR-05":
+        for key in ("account_number", "routing_number"):
+            value = plain.get(key)
+            if value:
+                dec, err = _hr_form_decrypt_value(value)
+                if err:
+                    return None, err
+                plain[key] = dec
+    return plain, None
+
+
+def _hr_form_mask_stored(form_code, stored):
+    """Mask stored data for staff views, lists and logs. HR-05
+    account and routing numbers show last-4 only; HR-07 licence
+    and policy numbers show last-4 characters; HR-04 dates of
+    birth are omitted. The full values never appear here."""
+    out = dict(stored or {})
+    if form_code == "HR-05":
+        for key in ("account_number", "routing_number"):
+            last4 = out.get("%s_last4" % key) or ""
+            if last4:
+                out[key] = "****" + last4
+            else:
+                out[key] = "****"
+    if form_code == "HR-07":
+        for key in ("license_number", "policy_number"):
+            value = str(out.get(key) or "")
+            if len(value) > 4:
+                out[key] = "****" + value[-4:]
+            elif value:
+                out[key] = "****"
+    if form_code == "HR-04":
+        out.pop("date_of_birth", None)
+    return out
+
+
+def _hr_form_data_for_view(conn, sub, viewer):
+    """The data block for a detail payload. viewer is "admin" or
+    "staff". Admin sees the full stored data (HR-05 decrypted);
+    staff sees it masked. Never raises: a decryption failure is
+    reported as an error field, not a 500."""
+    stored = _hr_form_json_loads(sub["data_json"])
+    if viewer == "admin":
+        plain, err = _hr_form_decrypt_stored(sub["form_code"], stored)
+        if err:
+            return {"error": "stored data could not be decrypted"}
+        return plain
+    return _hr_form_mask_stored(sub["form_code"], stored)
+
+
+def _hr_form_json_loads(raw):
+    try:
+        return json.loads(raw or "{}") or {}
+    except Exception:
+        return {}
+
+
+def _hr_form_json_dumps(obj):
+    return json.dumps(obj, sort_keys=True)
+
+
+def _hr_form_get_submission(conn, submission_id):
+    try:
+        submission_id = int(submission_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute(
+        "SELECT * FROM erp_hr_form_submissions WHERE id = ?",
+        (submission_id,)).fetchone()
+
+
+def _hr_form_prefill_create(conn, code, employee, incoming,
+                          actor_name=""):
+    """Prefill a new draft from the subject employee's record (design
+    §3: name, department and position prefill from the staff row; the
+    user may correct them). Only fills fields the form has and the
+    caller did not already supply; never overwrites typed values.
+    For HR-04, a Production, Event or Store department also ticks
+    'does this role handle food?' by default (user decision 6) --
+    the checkbox still drives the expiry requirement. Returns the
+    extended data dict."""
+    if not employee:
+        return incoming
+    d = _hr_form_def(code)
+    keys = {f["key"] for f in (d["fields"] if d else [])}
+    out = dict(incoming)
+    name = (employee["name"] or "").strip()
+    if name and "employee_name" in keys and "employee_name" not in out:
+        out["employee_name"] = name
+    if name and "full_legal_name" in keys and "full_legal_name" not in out:
+        out["full_legal_name"] = name
+    dept = (employee["department"] or "").strip()
+    if dept and "department" in keys and "department" not in out:
+        out["department"] = dept
+    pos = ""
+    try:
+        pid = employee["position_id"] if "position_id" in employee.keys() else None
+    except Exception:
+        pid = None
+    if pid:
+        prow = _hr_position_row(conn, pid)
+        if prow:
+            pos = (prow["title"] or "").strip()
+    if pos and "position" in keys and "position" not in out:
+        out["position"] = pos
+    if actor_name and "manager_issuing" in keys and "manager_issuing" not in out:
+        out["manager_issuing"] = actor_name
+    if (code == "HR-04" and "handles_food" in keys
+            and "handles_food" not in out
+            and dept.lower() in HR_FORM_FOOD_HANDLING_DEPARTMENTS):
+        out["handles_food"] = True
+    return out
+
+
+def _hr_form_hidden_from_admin(sub):
+    """True when an admin must not see this submission (design §1.4):
+    a draft created by someone who is not an admin, and never
+    submitted, is its creator's private work-in-progress. Once
+    submitted it is in the shared workflow (ever_submitted stays
+    set even if the form is later returned to draft), and
+    admin-created drafts are visible to admins."""
+    return (sub["status"] == "draft" and not sub["ever_submitted"]
+            and sub["created_by"] not in ADMIN_EMAILS)
+
+
+def _hr_form_hidden_from_staff(sub, actor):
+    """True when a staff member must not see this submission: a draft
+    they did not create and that was never submitted (e.g. an admin's
+    draft HR-11 about them, visible only once the admin submits it)."""
+    return (sub["status"] == "draft" and not sub["ever_submitted"]
+            and sub["created_by"] != actor)
+
+
+def _hr_form_next_action(sub):
+    """One-line next step for a list row, so an admin or staff
+    member can see at a glance what a form is waiting for."""
+    status = sub["status"]
+    code = sub["form_code"]
+    if status == "draft":
+        return "Draft — finish and submit"
+    if status == "submitted":
+        return "Submitted — waiting for review"
+    if status == "sent":
+        return "Awaiting candidate signature"
+    if status == "candidate_signed":
+        return "Needs company countersign"
+    if status == "in_review":
+        if code == "HR-09":
+            return "Needs decision"
+        if code == "HR-05":
+            return "Needs payroll verification"
+        if code == "HR-06":
+            return "Needs company countersign"
+        if code == "HR-07":
+            return "Needs manager verification"
+        if code == "HR-10":
+            return "Needs supervisor review"
+        if code in ("HR-11", "HR-12"):
+            return "Needs signatures"
+        return "Needs review"
+    if status in ("approved", "approved_with_changes", "denied",
+                  "countersigned", "signed", "verified", "reviewed",
+                  "complete"):
+        return status.replace("_", " ").capitalize()
+    if status == "declined":
+        return "Candidate declined"
+    return status
+
+
+def _hr_form_list_payload(sub):
+    d = _hr_form_def(sub["form_code"])
+    return {
+        "id": sub["id"],
+        "form_code": sub["form_code"],
+        "form_title": d["title"] if d else sub["form_code"],
+        "subject_name": sub["subject_name"],
+        "employee_id": sub["employee_id"],
+        "status": sub["status"],
+        "current_version": sub["current_version"],
+        "next_action": _hr_form_next_action(sub),
+        "submitted_at": sub["submitted_at"],
+        "created_at": sub["created_at"],
+        "updated_at": sub["updated_at"],
+    }
+
+
+def _hr_form_signatures(conn, submission_id):
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_form_signatures"
+        " WHERE submission_id = ? ORDER BY signed_at, id",
+        (submission_id,)).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "role": r["role"],
+            "signer_type": r["signer_type"],
+            "signer_name": r["signer_name"],
+            "typed_name": r["typed_name"],
+            "signed_at": r["signed_at"],
+            "method": r["method"], "note": r["note"],
+            "superseded_by_version": r["superseded_by_version"],
+        })
+    return out
+
+
+def _hr_form_versions(conn, submission_id):
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_form_submission_versions"
+        " WHERE submission_id = ? ORDER BY version",
+        (submission_id,)).fetchall()
+    out = []
+    for r in rows:
+        out.append({
+            "version": r["version"], "note": r["note"],
+            "created_by": r["created_by"],
+            "created_at": r["created_at"],
+        })
+    return out
+
+
+def _hr_form_detail_payload(conn, sub, viewer):
+    """Full detail payload. viewer is "admin" or "staff": staff
+    see masked HR-05 numbers and no date of birth; admins see the
+    full record. The data block is the current version's data."""
+    d = _hr_form_def(sub["form_code"])
+    out = _hr_form_list_payload(sub)
+    out["form_version"] = d["version"] if d else 1
+    out["data"] = _hr_form_data_for_view(conn, sub, viewer)
+    out["decision"] = sub["decision"]
+    out["decision_notes"] = sub["decision_notes"]
+    out["decided_by"] = sub["decided_by"]
+    out["decided_at"] = sub["decided_at"]
+    out["payroll_received_by"] = sub["payroll_received_by"]
+    out["payroll_date_received"] = sub["payroll_date_received"]
+    out["payroll_first_deposit_date"] = \
+        sub["payroll_first_deposit_date"]
+    out["linked_safety_incident_id"] = \
+        sub["linked_safety_incident_id"]
+    out["signatures"] = _hr_form_signatures(conn, sub["id"])
+    out["versions"] = _hr_form_versions(conn, sub["id"])
+    if sub["form_code"] == "HR-03":
+        plain = _hr_form_json_loads(sub["data_json"])
+        start = _hr_form_valid_date(plain.get("start_date") or "")
+        due = _hr_form_section2_due(start) if start else None
+        sec2 = plain.get("i9_section2") or {}
+        done = _hr_form_valid_date(sec2.get("detail") or "")
+        out["section2_due"] = due.isoformat() if due else None
+        out["section2_recorded"] = done.isoformat() if done else None
+        out["section2_late"] = bool(done and due and done > due)
+        out["section2_overdue"] = bool(
+            due and not sec2.get("checked") and
+            date.today() > due)
+    if sub["form_code"] == "HR-07":
+        stored = _hr_form_json_loads(sub["data_json"])
+        exp = _hr_form_valid_date(
+            stored.get("policy_expiration") or "")
+        out["policy_expired"] = bool(exp and exp < date.today())
+    if sub["form_code"] == "HR-09" and sub["employee_id"]:
+        try:
+            _hr_pto_seed_types(conn)
+            types = conn.execute(
+                "SELECT * FROM erp_hr_pto_types WHERE active = 1"
+                " ORDER BY name").fetchall()
+            out["pto_balances"] = [
+                _hr_pto_balance_for(conn, sub["employee_id"], t)
+                for t in types]
+        except Exception:
+            out["pto_balances"] = []
+    return out
+
+
+def _hr_form_has_signature(conn, submission_id, role):
+    row = conn.execute(
+        "SELECT id FROM erp_hr_form_signatures WHERE submission_id = ?"
+        " AND role = ? AND superseded_by_version IS NULL",
+        (submission_id, role)).fetchone()
+    return row is not None
+
+
+def _hr_form_record_signature(conn, submission_id, role, signer_type,
+                              signer_name, typed_name, method, note,
+                              signed_at=None, actor=None):
+    """Insert one signature row (server time unless the caller
+    passes a paper date) and audit it."""
+    now = signed_at or _now_iso()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_form_signatures (submission_id, role,"
+        " signer_type, signer_name, typed_name, signed_at, method,"
+        " note) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (submission_id, role, signer_type, signer_name, typed_name,
+         now, method, note or ""))
+    sig_id = cur.lastrowid
+    sub = _hr_form_get_submission(conn, submission_id)
+    _erp_staff_audit(conn, actor, "hr.form_signed",
+                     "hr_form_submission", submission_id,
+                     "%s %s signed by %s (%s)" % (
+                         sub["form_code"], role, signer_name, method))
+    return sig_id
+
+
+def _hr_form_maybe_complete(conn, sub, actor):
+    """After a signature lands, move the form to its terminal
+    state when the required set is complete. Returns the new
+    status (or the current one when nothing changed)."""
+    code = sub["form_code"]
+    status = sub["status"]
+    new_status = None
+    if code == "HR-06" and status == "in_review":
+        if _hr_form_has_signature(conn, sub["id"], "employee") and \
+                _hr_form_has_signature(conn, sub["id"], "company"):
+            new_status = "signed"
+    elif code == "HR-07" and status == "in_review":
+        if _hr_form_has_signature(conn, sub["id"], "manager"):
+            new_status = "verified"
+    elif code == "HR-10" and status == "in_review":
+        if _hr_form_has_signature(conn, sub["id"], "supervisor"):
+            new_status = "reviewed"
+    elif code == "HR-11" and status == "in_review":
+        if _hr_form_has_signature(conn, sub["id"], "manager") and \
+                (_hr_form_has_signature(conn, sub["id"], "employee")
+                 or _hr_form_has_signature(conn, sub["id"], "witness")):
+            new_status = "complete"
+    elif code == "HR-12" and status == "in_review":
+        if _hr_form_has_signature(conn, sub["id"], "employee") and \
+                _hr_form_has_signature(conn, sub["id"], "manager"):
+            new_status = "complete"
+    elif code == "HR-02" and status == "candidate_signed":
+        if _hr_form_has_signature(conn, sub["id"], "company"):
+            new_status = "countersigned"
+    if new_status:
+        conn.execute(
+            "UPDATE erp_hr_form_submissions SET status = ?,"
+            " updated_at = ? WHERE id = ?",
+            (new_status, _now_iso(), sub["id"]))
+        _erp_staff_audit(conn, actor, "hr.form_completed",
+                         "hr_form_submission", sub["id"],
+                         "%s completed (%s)" % (code, new_status))
+        return new_status
+    return status
+
+
+def _hr_form_create_version(conn, submission_id, data, note,
+                            created_by):
+    """Snapshot one version of a submission's data (append-only).
+    Returns the version number."""
+    row = conn.execute(
+        "SELECT MAX(version) AS m FROM erp_hr_form_submission_versions"
+        " WHERE submission_id = ?", (submission_id,)).fetchone()
+    version = (row["m"] or 0) + 1
+    conn.execute(
+        "INSERT INTO erp_hr_form_submission_versions"
+        " (submission_id, version, data_json, note, created_by,"
+        " created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (submission_id, version, _hr_form_json_dumps(data), note,
+         created_by, _now_iso()))
+    return version
+
+
+# ---- HR Forms endpoints (admin) ----
+
+@app.get("/api/erp/hr/forms/defs")
+def hr_forms_defs():
+    """The 11 fill-in form definitions (HR-02..HR-12): field specs
+    and the verbatim packet instructions. Admin only; staff get
+    the same list from /mine/defs."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    return jsonify(forms=HR_FORM_DEFS)
+
+
+@app.get("/api/erp/hr/forms")
+def hr_forms_list():
+    """Admin list of every submission (newest first), optionally
+    filtered by form, status, or a search over the subject name
+    and form code. List rows never carry form data -- the full
+    account number never appears in a list."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    form = (request.args.get("form") or "").strip()
+    status = (request.args.get("status") or "").strip()
+    q = (request.args.get("q") or "").strip().lower()
+    if form and not _hr_form_def(form):
+        return jsonify(error="unknown form"), 400
+    if status and status not in HR_FORM_STATUSES:
+        return jsonify(error="unknown status"), 400
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_form_submissions"
+        " ORDER BY updated_at DESC, id DESC").fetchall()
+    out = []
+    for r in rows:
+        if _hr_form_hidden_from_admin(r):
+            continue
+        if form and r["form_code"] != form:
+            continue
+        if status and r["status"] != status:
+            continue
+        if q and q not in (r["subject_name"] or "").lower() and \
+                q not in r["form_code"].lower():
+            continue
+        out.append(_hr_form_list_payload(r))
+    conn.close()
+    return jsonify(forms=out)
+
+
+@app.post("/api/erp/hr/forms")
+def hr_forms_create():
+    """Create a draft submission (201, admin only). The admin may
+    start any form; HR-02 is a candidate (employee_id stays NULL).
+    Data is validated as a draft (types only); the full check runs
+    at submit / send time."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    code = body.get("form_code")
+    d = _hr_form_def(code)
+    if not d:
+        return jsonify(error="unknown form"), 400
+    conn = db()
+    employee_id = body.get("employee_id")
+    employee = None
+    if employee_id is not None:
+        try:
+            employee_id = int(employee_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="employee_id must be a number"), 400
+        employee = _hr_get_employee(conn, employee_id)
+        if not employee:
+            conn.close()
+            return jsonify(error="employee not found"), 404
+    if code == "HR-02" and employee_id is not None:
+        conn.close()
+        return jsonify(
+            error="an offer letter is for a candidate, not an"
+                  " employee"), 400
+    incoming = body.get("data") or {}
+    if not isinstance(incoming, dict):
+        conn.close()
+        return jsonify(error="data must be an object"), 400
+    member = _current_member()
+    incoming = _hr_form_prefill_create(
+        conn, code, employee, incoming,
+        actor_name=(member["name"] or "") if member else "")
+    clean, verr = _hr_form_validate_data(code, incoming, partial=True)
+    if verr:
+        conn.close()
+        return jsonify(error=verr), 400
+    clean = _hr_form_stamp_checkitems(code, clean, actor)
+    stored, serr = _hr_form_encrypt_stored(code, clean)
+    if serr:
+        conn.close()
+        return jsonify(error=serr), 500
+    subject_name = (body.get("subject_name") or "").strip()
+    if not subject_name:
+        subject_name = (clean.get("employee_name") or
+                        clean.get("candidate_name") or "")
+    if not subject_name and employee:
+        subject_name = employee["name"]
+    subject_email = (body.get("subject_email") or "").strip()
+    if subject_email and not EMAIL_RE.match(subject_email):
+        conn.close()
+        return jsonify(error="subject_email is not a valid email"
+                             " address"), 400
+    now = _now_iso()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_form_submissions (form_code, form_version,"
+        " employee_id, subject_name, subject_email, status, data_json,"
+        " created_by, created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
+        (code, d["version"], employee_id, subject_name, subject_email,
+         _hr_form_json_dumps(stored), actor, now, now))
+    sub_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.form_created",
+                     "hr_form_submission", sub_id,
+                     "%s draft created for %s" % (code, subject_name))
+    conn.commit()
+    sub = _hr_form_get_submission(conn, sub_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out), 201
+
+
+@app.get("/api/erp/hr/forms/<int:submission_id>")
+def hr_forms_detail(submission_id):
+    """Admin detail: the full record, including the decrypted
+    HR-05 account number (single-record admin detail only)."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/erp/hr/forms/<int:submission_id>/versions")
+def hr_forms_versions(submission_id):
+    """Version history (admin). Each version carries its data
+    masked, the same as a list -- the full HR-05 account number
+    never appears here."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_form_submission_versions"
+        " WHERE submission_id = ? ORDER BY version",
+        (submission_id,)).fetchall()
+    out = []
+    for r in rows:
+        stored = _hr_form_json_loads(r["data_json"])
+        out.append({
+            "version": r["version"],
+            "data": _hr_form_mask_stored(sub["form_code"], stored),
+            "note": r["note"], "created_by": r["created_by"],
+            "created_at": r["created_at"],
+        })
+    conn.close()
+    return jsonify(versions=out)
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/save")
+def hr_forms_save(submission_id):
+    """Save draft data (admin). Draft only; the incoming fields
+    merge over the stored data, so a partial save cannot wipe
+    fields it did not send. No version is created and nothing is
+    audited -- a draft is still being written."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["status"] != "draft":
+        conn.close()
+        return jsonify(
+            error="only a draft can be edited; correct a submitted"
+                  " form as a new version"), 409
+    incoming = body.get("data")
+    if not isinstance(incoming, dict):
+        conn.close()
+        return jsonify(error="data must be an object"), 400
+    stored = _hr_form_json_loads(sub["data_json"])
+    plain, derr = _hr_form_decrypt_stored(sub["form_code"], stored)
+    if derr:
+        conn.close()
+        return jsonify(error="stored data could not be decrypted"), 500
+    clean, verr = _hr_form_validate_data(
+        sub["form_code"], incoming, partial=True, existing=plain)
+    if verr:
+        conn.close()
+        return jsonify(error=verr), 400
+    clean = _hr_form_stamp_checkitems(sub["form_code"], clean, actor)
+    stored2, serr = _hr_form_encrypt_stored(sub["form_code"], clean)
+    if serr:
+        conn.close()
+        return jsonify(error=serr), 500
+    now = _now_iso()
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET data_json = ?,"
+        " updated_at = ? WHERE id = ?",
+        (_hr_form_json_dumps(stored2), now, submission_id))
+    conn.commit()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out)
+
+
+def _hr_form_do_submit(conn, sub, actor, body, member,
+                       caller_employee, viewer):
+    """Shared submit logic for the admin and staff endpoints.
+    Returns (payload, None) or (None, (error, http_status)).
+    The data is merged over the draft, fully validated, frozen as
+    version 1, and the required signatures (typed by the signer
+    themselves, never by someone else) are recorded. HR-02 has no
+    submit -- the admin sends it by email link instead."""
+    code = sub["form_code"]
+    if code == "HR-02":
+        return None, ("an offer letter is sent by email link, not"
+                      " submitted", 400)
+    if sub["status"] != "draft":
+        return None, ("only a draft can be submitted", 409)
+    incoming = body.get("data") or {}
+    if not isinstance(incoming, dict):
+        return None, ("data must be an object", 400)
+    stored = _hr_form_json_loads(sub["data_json"])
+    plain, derr = _hr_form_decrypt_stored(code, stored)
+    if derr:
+        return None, ("stored data could not be decrypted", 500)
+    clean, verr = _hr_form_validate_data(code, incoming, partial=False,
+                                         existing=plain)
+    if verr:
+        return None, (verr, 400)
+    clean = _hr_form_stamp_checkitems(code, clean, actor)
+    sigs = body.get("signatures") or []
+    if not isinstance(sigs, list):
+        return None, ("signatures must be a list", 400)
+    expected = _HR_FORM_SUBMIT_SIGNERS.get(code, ())
+    provided = {}
+    for s in sigs:
+        if not isinstance(s, dict):
+            return None, ("each signature must be an object", 400)
+        role = s.get("role")
+        if role not in expected:
+            return None, ("role %s cannot sign at submit time" % role,
+                           400)
+        if role in provided:
+            return None, ("duplicate signature for %s" % role, 400)
+        provided[role] = s
+    for role in expected:
+        if role not in provided:
+            return None, ("%s signature is required to submit" % role,
+                           400)
+    for role, s in provided.items():
+        typed = (s.get("typed_name") or "").strip()
+        if not typed:
+            return None, ("typed name is required for %s" % role, 400)
+        if role == "employee":
+            if caller_employee is None or \
+                    caller_employee["id"] != sub["employee_id"]:
+                return None, ("the employee must sign their own"
+                              " form", 403)
+            if typed.lower() != \
+                    (caller_employee["name"] or "").strip().lower():
+                return None, ("typed name must match the employee"
+                              " name", 400)
+        else:
+            if member is None or typed.lower() != \
+                    (member["name"] or "").strip().lower():
+                return None, ("typed name must match your account"
+                              " name", 400)
+    stored2, serr = _hr_form_encrypt_stored(code, clean)
+    if serr:
+        return None, (serr, 500)
+    now = _now_iso()
+    version = _hr_form_create_version(conn, sub["id"], stored2,
+                                      "Submitted as version 1", actor)
+    next_status = _HR_FORM_SUBMIT_NEXT[code]
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET data_json = ?,"
+        " current_version = ?, status = ?, submitted_at = ?,"
+        " ever_submitted = 1, updated_at = ? WHERE id = ?",
+        (_hr_form_json_dumps(stored2), version, next_status, now, now,
+         sub["id"]))
+    for role, s in provided.items():
+        if role == "employee":
+            signer_name = caller_employee["name"]
+            signer_type = "staff"
+        else:
+            signer_name = member["name"]
+            signer_type = "admin"
+        _hr_form_record_signature(
+            conn, sub["id"], role, signer_type, signer_name,
+            (s.get("typed_name") or "").strip(), "attestation",
+            _HR_FORM_SIGNATURE_TEXTS.get(code, ""), actor=actor)
+    _erp_staff_audit(conn, actor, "hr.form_submitted",
+                     "hr_form_submission", sub["id"],
+                     "%s submitted (version %d)" % (code, version))
+    conn.commit()
+    sub = _hr_form_get_submission(conn, sub["id"])
+    return _hr_form_detail_payload(conn, sub, viewer), None
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/submit")
+def hr_forms_submit(submission_id):
+    """Submit a draft (admin). The required signatures must be in
+    the body, typed by the signer themselves."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    member = _current_member()
+    caller_employee = _hr_resolve_caller_employee(conn)
+    out, ferr = _hr_form_do_submit(conn, sub, actor, body, member,
+                                   caller_employee, "admin")
+    if ferr:
+        conn.close()
+        return jsonify(error=ferr[0]), ferr[1]
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/return-to-draft")
+def hr_forms_return_to_draft(submission_id):
+    """Send a submitted or in-review form back to draft (admin).
+    Refused once anyone has signed -- a signed form is corrected
+    as a new version instead, so the signature is never silently
+    dropped."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["status"] not in ("submitted", "in_review"):
+        conn.close()
+        return jsonify(
+            error="only a submitted or in-review form can go back"
+                  " to draft"), 409
+    signed = conn.execute(
+        "SELECT COUNT(*) AS n FROM erp_hr_form_signatures"
+        " WHERE submission_id = ? AND superseded_by_version IS NULL",
+        (submission_id,)).fetchone()["n"]
+    if signed:
+        conn.close()
+        return jsonify(
+            error="this form has signatures; correct it as a new"
+                  " version instead"), 409
+    now = _now_iso()
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET status = 'draft',"
+        " submitted_at = NULL, updated_at = ? WHERE id = ?",
+        (now, submission_id))
+    _erp_staff_audit(conn, actor, "hr.form_returned_to_draft",
+                     "hr_form_submission", submission_id,
+                     "%s returned to draft" % sub["form_code"])
+    conn.commit()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/correct")
+def hr_forms_correct(submission_id):
+    """Correct a submitted form (admin). The incoming fields merge
+    over the current data, the merged form must be fully valid,
+    and the correction is frozen as a new version. Every
+    signature on the old version is superseded, so the form must
+    be re-signed (status goes back to in_review, or to draft for
+    an HR-02 whose link is now stale). A note explaining the
+    correction is required."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["status"] == "draft":
+        conn.close()
+        return jsonify(error="edit the draft directly"), 409
+    if sub["status"] in ("declined", "denied"):
+        conn.close()
+        return jsonify(
+            error="a declined or denied form cannot be corrected;"
+                  " start a new one"), 409
+    note = (body.get("note") or "").strip()
+    if not note:
+        return jsonify(error="a note explaining the correction is"
+                             " required"), 400
+    incoming = body.get("data") or {}
+    if not isinstance(incoming, dict):
+        conn.close()
+        return jsonify(error="data must be an object"), 400
+    stored = _hr_form_json_loads(sub["data_json"])
+    plain, derr = _hr_form_decrypt_stored(sub["form_code"], stored)
+    if derr:
+        conn.close()
+        return jsonify(error="stored data could not be decrypted"), 500
+    clean, verr = _hr_form_validate_data(
+        sub["form_code"], incoming, partial=False, existing=plain)
+    if verr:
+        conn.close()
+        return jsonify(error=verr), 400
+    clean = _hr_form_stamp_checkitems(sub["form_code"], clean, actor)
+    stored2, serr = _hr_form_encrypt_stored(sub["form_code"], clean)
+    if serr:
+        conn.close()
+        return jsonify(error=serr), 500
+    now = _now_iso()
+    version = _hr_form_create_version(conn, submission_id, stored2,
+                                      note, actor)
+    superseded = conn.execute(
+        "SELECT COUNT(*) AS n FROM erp_hr_form_signatures"
+        " WHERE submission_id = ? AND superseded_by_version IS NULL",
+        (submission_id,)).fetchone()["n"]
+    if superseded:
+        conn.execute(
+            "UPDATE erp_hr_form_signatures SET"
+            " superseded_by_version = ? WHERE submission_id = ?"
+            " AND superseded_by_version IS NULL",
+            (version, submission_id))
+    new_status = sub["status"]
+    if superseded:
+        new_status = "in_review"
+    if sub["form_code"] == "HR-02" and sub["status"] in (
+            "sent", "candidate_signed"):
+        new_status = "draft"
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET data_json = ?,"
+        " current_version = ?, status = ?, updated_at = ?"
+        " WHERE id = ?",
+        (_hr_form_json_dumps(stored2), version, new_status, now,
+         submission_id))
+    _erp_staff_audit(conn, actor, "hr.form_corrected",
+                     "hr_form_submission", submission_id,
+                     "%s corrected as version %d: %s"
+                     % (sub["form_code"], version, note[:200]))
+    if superseded:
+        _erp_staff_audit(conn, actor, "hr.form_superseded",
+                         "hr_form_submission", submission_id,
+                         "%s: %d signature(s) superseded by version %d"
+                         % (sub["form_code"], superseded, version))
+    conn.commit()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out)
+
+
+def _hr_form_do_sign(conn, sub, actor, body, member,
+                     caller_employee, viewer):
+    """Shared signing logic for the admin and staff endpoints.
+    Returns (payload, None) or (None, (error, http_status)).
+    The typed name must match the signer's own account or employee
+    name; the admin never types a name for someone else. HR-09
+    manager and HR-05 payroll signatures go through the decide and
+    verify endpoints instead."""
+    code = sub["form_code"]
+    role = (body.get("role") or "").strip()
+    if role not in _HR_FORM_SIGN_ROLES.get(code, ()):
+        return None, ("role %s cannot sign %s" % (role, code), 400)
+    if role == "manager" and code == "HR-09":
+        return None, ("a time-off decision is made with the decide"
+                      " endpoint, not by signing", 400)
+    if role == "payroll":
+        return None, ("payroll verification goes through the verify"
+                      " endpoint", 400)
+    if sub["status"] not in ("submitted", "in_review",
+                             "candidate_signed"):
+        return None, ("this form cannot be signed in its current"
+                      " state (%s)" % sub["status"], 409)
+    if code == "HR-02" and role == "company" and \
+            sub["status"] != "candidate_signed":
+        return None, ("the company countersigns after the candidate"
+                      " signs", 409)
+    if _hr_form_has_signature(conn, sub["id"], role):
+        return None, ("%s has already signed this version" % role, 409)
+    typed = (body.get("typed_name") or "").strip()
+    if not typed:
+        return None, ("typed name is required", 400)
+    if len(typed) > 200:
+        return None, ("typed name must be 200 characters or fewer",
+                       400)
+    title = ""
+    if role == "employee":
+        if caller_employee is None or \
+                caller_employee["id"] != sub["employee_id"]:
+            return None, ("the employee must sign their own form", 403)
+        if typed.lower() != \
+                (caller_employee["name"] or "").strip().lower():
+            return None, ("typed name must match the employee name",
+                           400)
+        signer_name = caller_employee["name"]
+        signer_type = "staff"
+    else:
+        if member is None or not _is_admin(member):
+            return None, ("only an admin can sign as %s" % role, 403)
+        if typed.lower() != (member["name"] or "").strip().lower():
+            return None, ("typed name must match your account name",
+                           400)
+        signer_name = member["name"]
+        signer_type = "admin"
+        if role == "company":
+            title = (body.get("title") or "").strip()
+            if not title:
+                return None, ("a title is required for the company"
+                              " signature", 400)
+            if len(title) > 200:
+                return None, ("title must be 200 characters or fewer",
+                               400)
+    linked_id = None
+    if code == "HR-10" and role == "supervisor":
+        linked_id = body.get("linked_safety_incident_id")
+        if linked_id is not None:
+            try:
+                linked_id = int(linked_id)
+            except (TypeError, ValueError):
+                return None, ("linked_safety_incident_id must be a"
+                              " number", 400)
+            row = conn.execute(
+                "SELECT id FROM erp_quality_safety_incidents WHERE id = ?",
+                (linked_id,)).fetchone()
+            if not row:
+                return None, ("safety incident not found", 404)
+    resp = None
+    if code == "HR-11" and role == "employee" and \
+            body.get("employee_response") is not None:
+        resp = body.get("employee_response")
+        if not isinstance(resp, str):
+            return None, ("employee response must be text", 400)
+        if len(resp) > 10000:
+            return None, ("employee response is too long", 400)
+        resp = resp.strip()
+    note = _HR_FORM_SIGNATURE_TEXTS.get(code, "")
+    if title:
+        note = (note + " Title: %s" % title) if note else \
+            "Title: %s" % title
+    _hr_form_record_signature(conn, sub["id"], role, signer_type,
+                              signer_name, typed, "attestation", note,
+                              actor=actor)
+    if resp is not None:
+        # The response is the employee's own statement at signing, so
+        # it lands on the live form (and the print view) now; the
+        # frozen version snapshot taken at submit is never edited.
+        stored = _hr_form_json_loads(sub["data_json"])
+        stored["employee_response"] = resp
+        conn.execute(
+            "UPDATE erp_hr_form_submissions SET data_json = ?,"
+            " updated_at = ? WHERE id = ?",
+            (_hr_form_json_dumps(stored), _now_iso(), sub["id"]))
+    if linked_id is not None:
+        conn.execute(
+            "UPDATE erp_hr_form_submissions SET"
+            " linked_safety_incident_id = ? WHERE id = ?",
+            (linked_id, sub["id"]))
+    new_status = _hr_form_maybe_complete(conn, sub, actor)
+    conn.commit()
+    sub = _hr_form_get_submission(conn, sub["id"])
+    return _hr_form_detail_payload(conn, sub, viewer), None
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/sign")
+def hr_forms_sign(submission_id):
+    """Sign a form in the ERP (admin or the staff member it is
+    about). The typed name must be the signer's own name."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    member = _current_member()
+    caller_employee = _hr_resolve_caller_employee(conn)
+    viewer = "admin" if _is_admin(member) else "staff"
+    if viewer == "admin" and _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if viewer == "staff" and _hr_form_hidden_from_staff(sub, actor):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    out, ferr = _hr_form_do_sign(conn, sub, actor, body, member,
+                                 caller_employee, viewer)
+    if ferr:
+        conn.close()
+        return jsonify(error=ferr[0]), ferr[1]
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/paper-sign")
+def hr_forms_paper_sign(submission_id):
+    """Record a paper signature (admin). The employee signed on
+    paper; the admin records the name as written on the form, the
+    date on the form, and a note saying who filed it and when.
+    The admin never types a name into a signature box -- this is
+    the record of a signature that already exists on paper."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    code = sub["form_code"]
+    role = (body.get("role") or "").strip()
+    if role not in _HR_FORM_PAPER_SIGN_ROLES.get(code, ()):
+        conn.close()
+        return jsonify(error="role %s cannot be recorded by paper for"
+                             " %s" % (role, code)), 400
+    if sub["status"] not in ("submitted", "in_review",
+                             "candidate_signed"):
+        conn.close()
+        return jsonify(
+            error="this form cannot be signed in its current state"
+                  " (%s)" % sub["status"]), 409
+    if _hr_form_has_signature(conn, sub["id"], role):
+        conn.close()
+        return jsonify(
+            error="%s has already signed this version" % role), 409
+    signer_name = (body.get("signer_name") or "").strip()
+    if not signer_name:
+        conn.close()
+        return jsonify(error="signer_name is required"), 400
+    if len(signer_name) > 200:
+        conn.close()
+        return jsonify(
+            error="signer_name must be 200 characters or fewer"), 400
+    signed_date = _hr_form_valid_date(body.get("signed_date") or "")
+    if not signed_date:
+        conn.close()
+        return jsonify(error="signed_date must be a date"
+                             " (YYYY-MM-DD)"), 400
+    if signed_date > date.today():
+        conn.close()
+        return jsonify(error="signed_date cannot be in the"
+                             " future"), 400
+    note = (body.get("note") or "").strip()
+    if not note:
+        conn.close()
+        return jsonify(
+            error="a note saying who filed it and when is required"), 400
+    if body.get("confirmed") is not True:
+        conn.close()
+        return jsonify(
+            error="confirm that you have the signed paper copy in the"
+                  " personnel file"), 400
+    member = _current_member()
+    note = "%s (recorded by %s)" % (
+        note, member["name"] if member else actor)
+    _hr_form_record_signature(
+        conn, submission_id, role, "admin", signer_name, "",
+        "paper", note, signed_at=signed_date.isoformat(), actor=actor)
+    _hr_form_maybe_complete(conn, sub, actor)
+    conn.commit()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/decline-sign")
+def hr_forms_decline_sign(submission_id):
+    """Record that an employee declined to sign HR-11 (admin).
+    The witness initials are recorded; the refusal itself is the
+    record, and the form completes with the manager's signature
+    plus the witness."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["form_code"] != "HR-11":
+        conn.close()
+        return jsonify(
+            error="only a disciplinary form records a declined"
+                  " signature"), 400
+    if sub["status"] != "in_review":
+        conn.close()
+        return jsonify(
+            error="only an in-review form can record a declined"
+                  " signature"), 409
+    if _hr_form_has_signature(conn, submission_id, "employee"):
+        conn.close()
+        return jsonify(
+            error="the employee has already signed this version"), 409
+    if _hr_form_has_signature(conn, submission_id, "witness"):
+        conn.close()
+        return jsonify(
+            error="a witness has already been recorded for this"
+                  " version"), 409
+    initials = (body.get("witness_initials") or "").strip()
+    if not initials:
+        conn.close()
+        return jsonify(error="witness_initials is required"), 400
+    if len(initials) > 20:
+        conn.close()
+        return jsonify(
+            error="witness_initials must be 20 characters or fewer"), 400
+    _hr_form_record_signature(
+        conn, submission_id, "witness", "admin", initials, initials,
+        "attestation", "Employee declined to sign; initials recorded"
+                      " by the manager.", actor=actor)
+    _hr_form_maybe_complete(conn, sub, actor)
+    conn.commit()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/decide")
+def hr_forms_decide(submission_id):
+    """Decide a time-off request (admin, HR-09 only). The manager
+    signs the decision with their own typed name. Approval does
+    NOT post leave -- the manager still enters the leave in the
+    ERP after approving, exactly as the paper form says. The
+    balance shown at decision time is display only."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["form_code"] != "HR-09":
+        conn.close()
+        return jsonify(error="only a time-off request is decided"
+                             " here"), 400
+    if sub["status"] != "in_review":
+        conn.close()
+        return jsonify(
+            error="only an in-review request can be decided"), 409
+    decision = (body.get("decision") or "").strip()
+    if decision not in ("approved", "approved_with_changes",
+                        "denied"):
+        conn.close()
+        return jsonify(
+            error="decision must be approved, approved_with_changes"
+                  " or denied"), 400
+    notes = (body.get("notes") or "").strip()
+    if decision in ("approved_with_changes", "denied") and not notes:
+        conn.close()
+        return jsonify(
+            error="notes are required for %s" % decision), 400
+    if len(notes) > 5000:
+        conn.close()
+        return jsonify(error="notes must be 5000 characters or"
+                             " fewer"), 400
+    typed = (body.get("typed_name") or "").strip()
+    if not typed:
+        conn.close()
+        return jsonify(error="typed name is required"), 400
+    member = _current_member()
+    if not member or typed.lower() != \
+            (member["name"] or "").strip().lower():
+        conn.close()
+        return jsonify(
+            error="typed name must match your account name"), 400
+    now = _now_iso()
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET status = ?, decision = ?,"
+        " decision_notes = ?, decided_by = ?, decided_at = ?,"
+        " updated_at = ? WHERE id = ?",
+        (decision, decision, notes, actor, now, now, submission_id))
+    _hr_form_record_signature(conn, submission_id, "manager", "admin",
+                              member["name"], typed, "attestation",
+                              "Time-off decision: %s" % decision,
+                              actor=actor)
+    _erp_staff_audit(conn, actor, "hr.form_decided",
+                     "hr_form_submission", submission_id,
+                     "HR-09 decided: %s" % decision)
+    conn.commit()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/verify")
+def hr_forms_verify(submission_id):
+    """Verify a direct deposit authorization (admin, HR-05 only).
+    Payroll records who received it, when, and the first deposit
+    pay date; the form moves to verified. The full account number
+    is never written into the audit log."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["form_code"] != "HR-05":
+        conn.close()
+        return jsonify(
+            error="only a direct deposit authorization is verified"
+                  " here"), 400
+    if sub["status"] != "in_review":
+        conn.close()
+        return jsonify(
+            error="only an in-review authorization can be verified"), 409
+    received_by = (body.get("received_by") or "").strip()
+    if not received_by:
+        conn.close()
+        return jsonify(error="received_by is required"), 400
+    member = _current_member()
+    if not member or received_by.lower() != \
+            (member["name"] or "").strip().lower():
+        conn.close()
+        return jsonify(
+            error="received_by must match your account name"), 400
+    date_received = _hr_form_valid_date(
+        body.get("date_received") or "")
+    if not date_received:
+        conn.close()
+        return jsonify(
+            error="date_received must be a date (YYYY-MM-DD)"), 400
+    first_deposit = _hr_form_valid_date(
+        body.get("first_deposit_date") or "")
+    if not first_deposit:
+        conn.close()
+        return jsonify(
+            error="first_deposit_date must be a date (YYYY-MM-DD)"), 400
+    now = _now_iso()
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET status = 'verified',"
+        " payroll_received_by = ?, payroll_date_received = ?,"
+        " payroll_first_deposit_date = ?, updated_at = ? WHERE id = ?",
+        (received_by, date_received.isoformat(),
+         first_deposit.isoformat(), now, submission_id))
+    _hr_form_record_signature(conn, submission_id, "payroll", "admin",
+                              received_by, received_by, "attestation",
+                              "Payroll verified the direct deposit"
+                              " authorization.", actor=actor)
+    _erp_staff_audit(conn, actor, "hr.form_verified",
+                     "hr_form_submission", submission_id,
+                     "HR-05 verified by %s" % received_by)
+    conn.commit()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/send")
+def hr_forms_send(submission_id):
+    """Send an offer letter by email link (admin, HR-02 only).
+    The admin fills the offer in first -- the candidate receives
+    the COMPLETED offer to review and sign, never a blank form.
+    The link is valid for 7 days. The full offer data is frozen
+    as version 1 when it is sent."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["form_code"] != "HR-02":
+        conn.close()
+        return jsonify(
+            error="only an offer letter is sent by email link"), 400
+    if sub["status"] != "draft":
+        conn.close()
+        return jsonify(error="only a draft offer can be sent"), 409
+    incoming = body.get("data") or {}
+    if not isinstance(incoming, dict):
+        conn.close()
+        return jsonify(error="data must be an object"), 400
+    stored = _hr_form_json_loads(sub["data_json"])
+    plain, derr = _hr_form_decrypt_stored("HR-02", stored)
+    if derr:
+        conn.close()
+        return jsonify(error="stored data could not be decrypted"), 500
+    clean, verr = _hr_form_validate_data("HR-02", incoming,
+                                         partial=False, existing=plain)
+    if verr:
+        conn.close()
+        return jsonify(error=verr), 400
+    clean = _hr_form_stamp_checkitems("HR-02", clean, actor)
+    stored2, serr = _hr_form_encrypt_stored("HR-02", clean)
+    if serr:
+        conn.close()
+        return jsonify(error=serr), 500
+    candidate_email = clean.get("candidate_email")
+    candidate_name = clean.get("candidate_name")
+    raw = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires = (now + timedelta(days=HR_FORM_TOKEN_TTL_DAYS)).isoformat()
+    version = _hr_form_create_version(conn, submission_id, stored2,
+                                      "Offer sent as version 1", actor)
+    now_iso = _now_iso()
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET data_json = ?,"
+        " current_version = ?, status = 'sent', subject_name = ?,"
+        " subject_email = ?, submitted_at = ?, ever_submitted = 1,"
+        " updated_at = ? WHERE id = ?",
+        (_hr_form_json_dumps(stored2), version, candidate_name,
+         candidate_email, now_iso, now_iso, submission_id))
+    cur = conn.execute(
+        "INSERT INTO erp_hr_form_token_requests (submission_id,"
+        " signer_name, signer_email, form_version, status, token_hash,"
+        " expires_at, sent_at, created_by, created_at)"
+        " VALUES (?, ?, ?, ?, 'sent', ?, ?, ?, ?, ?)",
+        (submission_id, candidate_name, candidate_email, version,
+         _esignature_token_hash(raw), expires, now_iso, actor,
+         now_iso))
+    token_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.form_sent",
+                     "hr_form_submission", submission_id,
+                     "HR-02 sent to %s (version %d, expires %s)"
+                     % (candidate_name, version, expires[:10]))
+    conn.commit()
+    signing_url = "/sign/hr-form/" + raw
+    email_sent = False
+    email_error = ""
+    base_url = (os.environ.get("ERP_FRONTEND_URL")
+                or "https://erp.pop-a-licious.com")
+    link = base_url.rstrip("/") + signing_url
+    body_html = (
+        "<p>Hi %s,</p>"
+        "<p>Pop-A-Licious would like you to review and sign this"
+        " offer letter: <strong>Offer Letter — %s</strong>.</p>"
+        "<p><a href='%s'>Open the offer letter and sign it</a></p>"
+        "<p>This link is only for you and it expires on %s. If it"
+        " has expired, ask Pop-A-Licious for a new link.</p>"
+        "<p>This is the ERP's own signing link -- it is not a"
+        " DocuSign link.</p>"
+        % (html.escape(candidate_name), html.escape(
+            clean.get("position") or ""), link, expires[:10]))
+    try:
+        send_email(candidate_email,
+                   "Please sign: Offer Letter — Pop-A-Licious",
+                   body_html)
+        email_sent = True
+    except Exception as exc:  # noqa: BLE001 -- a failed send is reported, never claimed
+        email_error = str(exc)[:200]
+    if email_sent:
+        conn = db()
+        conn.execute(
+            "UPDATE erp_hr_form_token_requests SET email_sent_at = ?"
+            " WHERE id = ?", (now_iso, token_id))
+        conn.commit()
+        conn.close()
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    out["signing_url"] = signing_url
+    out["signing_token"] = raw
+    out["email_sent"] = email_sent
+    if email_error:
+        out["email_error"] = email_error
+    conn.close()
+    return jsonify(out), 201
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/cancel-send")
+def hr_forms_cancel_send(submission_id):
+    """Cancel an outstanding offer link (admin, HR-02 only). The
+    token can no longer be used; the offer goes back to draft so
+    it can be corrected and re-sent."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["form_code"] != "HR-02":
+        conn.close()
+        return jsonify(
+            error="only an offer letter has a link to cancel"), 400
+    if sub["status"] not in ("sent",):
+        conn.close()
+        return jsonify(
+            error="only a sent offer can have its link cancelled"), 409
+    token = conn.execute(
+        "SELECT * FROM erp_hr_form_token_requests WHERE submission_id"
+        " = ? AND status IN ('sent', 'viewed') ORDER BY id DESC"
+        " LIMIT 1", (submission_id,)).fetchone()
+    if not token:
+        conn.close()
+        return jsonify(error="no outstanding signing link"), 409
+    now = _now_iso()
+    conn.execute(
+        "UPDATE erp_hr_form_token_requests SET status = 'cancelled',"
+        " updated_at = ? WHERE id = ?", (now, token["id"]))
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET status = 'draft',"
+        " updated_at = ? WHERE id = ?", (now, submission_id))
+    _erp_staff_audit(conn, actor, "hr.form_send_cancelled",
+                     "hr_form_submission", submission_id,
+                     "HR-02 signing link cancelled")
+    conn.commit()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "admin")
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/<int:submission_id>/delete")
+def hr_forms_delete(submission_id):
+    """Delete a draft submission (admin). Submitted records are
+    never deleted -- the paper packet stays the record instead."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not sub:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_admin(sub):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["status"] != "draft":
+        conn.close()
+        return jsonify(
+            error="only a draft can be deleted; submitted records"
+                  " are never deleted"), 409
+    conn.execute(
+        "DELETE FROM erp_hr_form_submission_versions"
+        " WHERE submission_id = ?", (submission_id,))
+    conn.execute(
+        "DELETE FROM erp_hr_form_signatures WHERE submission_id = ?",
+        (submission_id,))
+    conn.execute(
+        "DELETE FROM erp_hr_form_token_requests WHERE submission_id"
+        " = ?", (submission_id,))
+    conn.execute(
+        "DELETE FROM erp_hr_form_submissions WHERE id = ?",
+        (submission_id,))
+    _erp_staff_audit(conn, actor, "hr.form_deleted_draft",
+                     "hr_form_submission", submission_id,
+                     "%s draft deleted" % sub["form_code"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---- HR Forms endpoints (staff: My HR -> Forms) ----
+# Staff see only their own submissions, with HR-05 numbers masked
+# and no date of birth. A staff member who has no employee record
+# has no forms to see (404 on the staff endpoints, same as the
+# rest of My HR).
+
+@app.get("/api/erp/hr/forms/mine/defs")
+def hr_forms_mine_defs():
+    """The same 11 form definitions, for staff filling their own
+    forms in My HR."""
+    _, err = _require_erp()
+    if err:
+        return err
+    return jsonify(forms=HR_FORM_DEFS)
+
+
+@app.get("/api/erp/hr/forms/mine")
+def hr_forms_mine_list():
+    """The caller's own submissions (newest first). An admin's draft
+    about the caller is not shown until the admin submits it
+    (design §1.4)."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    mine = _hr_resolve_caller_employee(conn)
+    if not mine:
+        conn.close()
+        return jsonify(error="no employee record for this account"), 404
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_form_submissions WHERE employee_id = ?"
+        " ORDER BY updated_at DESC, id DESC", (mine["id"],)).fetchall()
+    out = [_hr_form_list_payload(r) for r in rows
+           if not _hr_form_hidden_from_staff(r, actor)]
+    conn.close()
+    return jsonify(forms=out)
+
+
+@app.post("/api/erp/hr/forms/mine")
+def hr_forms_mine_create():
+    """Create the caller's own draft (201). Only the six forms a
+    staff member may start themselves; the employee is always the
+    caller -- never a typed-in employee id."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    code = body.get("form_code")
+    d = _hr_form_def(code)
+    if not d:
+        return jsonify(error="unknown form"), 400
+    if code not in HR_FORM_STAFF_STARTABLE:
+        return jsonify(
+            error="this form is started by an admin, not by staff"), 400
+    conn = db()
+    mine = _hr_resolve_caller_employee(conn)
+    if not mine:
+        conn.close()
+        return jsonify(error="no employee record for this account"), 404
+    incoming = body.get("data") or {}
+    if not isinstance(incoming, dict):
+        conn.close()
+        return jsonify(error="data must be an object"), 400
+    incoming = _hr_form_prefill_create(conn, code, mine, incoming)
+    clean, verr = _hr_form_validate_data(code, incoming, partial=True)
+    if verr:
+        conn.close()
+        return jsonify(error=verr), 400
+    clean = _hr_form_stamp_checkitems(code, clean, actor)
+    stored, serr = _hr_form_encrypt_stored(code, clean)
+    if serr:
+        conn.close()
+        return jsonify(error=serr), 500
+    now = _now_iso()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_form_submissions (form_code, form_version,"
+        " employee_id, subject_name, status, data_json, created_by,"
+        " created_at, updated_at)"
+        " VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
+        (code, d["version"], mine["id"], mine["name"],
+         _hr_form_json_dumps(stored), actor, now, now))
+    sub_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.form_created",
+                     "hr_form_submission", sub_id,
+                     "%s draft created by %s" % (code, mine["name"]))
+    conn.commit()
+    sub = _hr_form_get_submission(conn, sub_id)
+    out = _hr_form_detail_payload(conn, sub, "staff")
+    conn.close()
+    return jsonify(out), 201
+
+
+@app.get("/api/erp/hr/forms/mine/<int:submission_id>")
+def hr_forms_mine_detail(submission_id):
+    """The caller's own submission, masked. Another employee's
+    submission is a 404, not a 403, per the ERP pattern."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    mine = _hr_resolve_caller_employee(conn)
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not mine or not sub or sub["employee_id"] != mine["id"]:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_staff(sub, actor):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    out = _hr_form_detail_payload(conn, sub, "staff")
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/mine/<int:submission_id>/save")
+def hr_forms_mine_save(submission_id):
+    """Save the caller's own draft data."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    mine = _hr_resolve_caller_employee(conn)
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not mine or not sub or sub["employee_id"] != mine["id"]:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_staff(sub, actor):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["status"] != "draft":
+        conn.close()
+        return jsonify(
+            error="only a draft can be edited; ask an admin to"
+                  " correct a submitted form"), 409
+    incoming = body.get("data")
+    if not isinstance(incoming, dict):
+        conn.close()
+        return jsonify(error="data must be an object"), 400
+    stored = _hr_form_json_loads(sub["data_json"])
+    plain, derr = _hr_form_decrypt_stored(sub["form_code"], stored)
+    if derr:
+        conn.close()
+        return jsonify(error="stored data could not be decrypted"), 500
+    clean, verr = _hr_form_validate_data(
+        sub["form_code"], incoming, partial=True, existing=plain)
+    if verr:
+        conn.close()
+        return jsonify(error=verr), 400
+    clean = _hr_form_stamp_checkitems(sub["form_code"], clean, actor)
+    stored2, serr = _hr_form_encrypt_stored(sub["form_code"], clean)
+    if serr:
+        conn.close()
+        return jsonify(error=serr), 500
+    now = _now_iso()
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET data_json = ?,"
+        " updated_at = ? WHERE id = ?",
+        (_hr_form_json_dumps(stored2), now, submission_id))
+    conn.commit()
+    sub = _hr_form_get_submission(conn, submission_id)
+    out = _hr_form_detail_payload(conn, sub, "staff")
+    conn.close()
+    return jsonify(out)
+
+
+@app.post("/api/erp/hr/forms/mine/<int:submission_id>/submit")
+def hr_forms_mine_submit(submission_id):
+    """Submit the caller's own draft. The employee signature in
+    the body must be typed by the caller themselves."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    conn = db()
+    mine = _hr_resolve_caller_employee(conn)
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not mine or not sub or sub["employee_id"] != mine["id"]:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_staff(sub, actor):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    member = _current_member()
+    out, ferr = _hr_form_do_submit(conn, sub, actor, body, member,
+                                   mine, "staff")
+    if ferr:
+        conn.close()
+        return jsonify(error=ferr[0]), ferr[1]
+    conn.close()
+    return jsonify(out)
+
+
+@app.delete("/api/erp/hr/forms/mine/<int:submission_id>")
+def hr_forms_mine_delete(submission_id):
+    """Delete the caller's own draft (staff, SOP 12.40: a draft may
+    be deleted by its creator or an admin). Another employee's
+    draft is a 404, not a 403, per the ERP pattern; a form that
+    was ever submitted is never deleted, even when it is back in
+    draft after a correction (ever_submitted stays set). The
+    submission, its versions, its signatures, and its token
+    requests are all deleted, and the delete is audited -- the
+    same cascade and audit as the admin delete."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    mine = _hr_resolve_caller_employee(conn)
+    sub = _hr_form_get_submission(conn, submission_id)
+    if not mine or not sub or sub["employee_id"] != mine["id"]:
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if _hr_form_hidden_from_staff(sub, actor):
+        conn.close()
+        return jsonify(error="form not found"), 404
+    if sub["status"] != "draft" or sub["ever_submitted"]:
+        conn.close()
+        return jsonify(
+            error="only a draft that was never submitted can be"
+                  " deleted; submitted records are never deleted"), 409
+    conn.execute(
+        "DELETE FROM erp_hr_form_submission_versions"
+        " WHERE submission_id = ?", (submission_id,))
+    conn.execute(
+        "DELETE FROM erp_hr_form_signatures WHERE submission_id = ?",
+        (submission_id,))
+    conn.execute(
+        "DELETE FROM erp_hr_form_token_requests WHERE submission_id"
+        " = ?", (submission_id,))
+    conn.execute(
+        "DELETE FROM erp_hr_form_submissions WHERE id = ?",
+        (submission_id,))
+    _erp_staff_audit(conn, actor, "hr.form_deleted_draft",
+                     "hr_form_submission", submission_id,
+                     "%s draft deleted by its creator" % sub["form_code"])
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---- HR Forms public signing (HR-02 candidate, by email link) ----
+# Mirrors the Wave-4 legal signing flow: the token is stored as a
+# SHA-256 hash, the link is valid for 7 days, the candidate signs
+# with their own typed name, and the signed copy is the offer data
+# as sent (version pinned to the token).
+
+def _hr_form_resolve_token(conn, token):
+    if not token:
+        return None, None
+    row = conn.execute(
+        "SELECT * FROM erp_hr_form_token_requests WHERE token_hash = ?",
+        (_esignature_token_hash(token),)).fetchone()
+    if not row:
+        return None, None
+    sub = _hr_form_get_submission(conn, row["submission_id"])
+    return row, sub
+
+
+def _hr_form_token_is_stale(conn, token_row):
+    """A token is stale when it expired, or when the offer was
+    corrected after it was sent (the pinned version no longer
+    matches the live version)."""
+    if token_row["status"] in ("sent", "viewed"):
+        try:
+            expires = datetime.fromisoformat(token_row["expires_at"])
+        except (ValueError, TypeError):
+            return True
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) > expires:
+            return True
+        sub = _hr_form_get_submission(conn, token_row["submission_id"])
+        if sub and sub["current_version"] != token_row["form_version"]:
+            return True
+    return False
+
+
+def _hr_form_expire_token(conn, token_row, actor):
+    conn.execute(
+        "UPDATE erp_hr_form_token_requests SET status = 'expired',"
+        " updated_at = ? WHERE id = ?",
+        (_now_iso(), token_row["id"]))
+    _erp_staff_audit(conn, actor, "hr.form_token_expired",
+                     "hr_form_submission", token_row["submission_id"],
+                     "HR-02 signing link expired")
+
+
+def _hr_form_token_payload(conn, token_row, sub):
+    stored = _hr_form_json_loads(sub["data_json"])
+    plain, err = _hr_form_decrypt_stored("HR-02", stored)
+    if err:
+        plain = {}
+    return {
+        "id": token_row["id"],
+        "signer_name": token_row["signer_name"],
+        "signer_email": token_row["signer_email"],
+        "status": token_row["status"],
+        "expires_at": token_row["expires_at"],
+        "sent_at": token_row["sent_at"],
+        "form_version": token_row["form_version"],
+        "offer": plain,
+        "instructions": _hr_form_def("HR-02")["instructions"],
+        "fields": _hr_form_def("HR-02")["fields"],
+        "submission_status": sub["status"],
+    }
+
+
+@app.get("/api/public/hr-forms/sign/<token>")
+def hr_forms_public_get(token):
+    """Open the offer letter (no login). A sent link becomes
+    viewed; a stale or expired link is 410."""
+    conn = db()
+    token_row, sub = _hr_form_resolve_token(conn, token)
+    if not token_row or not sub:
+        conn.close()
+        return jsonify(error="signing link not found"), 404
+    if token_row["status"] in ("sent", "viewed") and \
+            _hr_form_token_is_stale(conn, token_row):
+        _hr_form_expire_token(conn, token_row, "system")
+        conn.commit()
+        token_row = conn.execute(
+            "SELECT * FROM erp_hr_form_token_requests WHERE id = ?",
+            (token_row["id"],)).fetchone()
+    if token_row["status"] == "expired":
+        conn.close()
+        return jsonify(
+            error="this link has expired \u2014 ask Pop-A-Licious to send a"
+                  " new one"), 410
+    if token_row["status"] == "sent":
+        now = _now_iso()
+        conn.execute(
+            "UPDATE erp_hr_form_token_requests SET status = 'viewed',"
+            " viewed_at = ?, updated_at = ? WHERE id = ?",
+            (now, now, token_row["id"]))
+        _erp_staff_audit(conn, "signer", "hr.form_token_viewed",
+                         "hr_form_submission", sub["id"],
+                         "%s opened the offer letter link"
+                         % token_row["signer_name"])
+        conn.commit()
+        token_row = conn.execute(
+            "SELECT * FROM erp_hr_form_token_requests WHERE id = ?",
+            (token_row["id"],)).fetchone()
+    out = _hr_form_token_payload(conn, token_row, sub)
+    conn.close()
+    return jsonify(request=out)
+
+
+@app.post("/api/public/hr-forms/sign/<token>/sign")
+def hr_forms_public_sign(token):
+    """Sign the offer letter by token (no login). The typed name
+    must match the candidate name on the offer; the candidate
+    must agree to sign electronically. The signed copy is the
+    offer data as sent, frozen at the token's version."""
+    err = _auth_throttle_check("hr-form-sign-ip", _client_ip(),
+                               max_fails=20)
+    if err:
+        return err
+    _auth_throttle_fail("hr-form-sign-ip", _client_ip())
+    data = request.get_json(force=True) or {}
+    typed_name = (data.get("typed_name") or "").strip()
+    if not typed_name:
+        return jsonify(error="typed_name is required"), 400
+    if len(typed_name) > 200:
+        return jsonify(error="typed_name must be 200 characters or"
+                             " fewer"), 400
+    if data.get("agree") is not True:
+        return jsonify(
+            error="you must agree to sign this offer letter"
+                  " electronically"), 400
+    conn = db()
+    token_row, sub = _hr_form_resolve_token(conn, token)
+    if not token_row or not sub:
+        conn.close()
+        return jsonify(error="signing link not found"), 404
+    if token_row["status"] in ("sent", "viewed") and \
+            _hr_form_token_is_stale(conn, token_row):
+        _hr_form_expire_token(conn, token_row, "system")
+        conn.commit()
+        conn.close()
+        return jsonify(
+            error="this link has expired \u2014 ask Pop-A-Licious to send a"
+                  " new one"), 410
+    if token_row["status"] == "expired":
+        conn.close()
+        return jsonify(
+            error="this link has expired \u2014 ask Pop-A-Licious to send a"
+                  " new one"), 410
+    if token_row["status"] not in ("sent", "viewed"):
+        conn.close()
+        return jsonify(
+            error="this offer cannot be signed anymore (link is %s)"
+                  % token_row["status"]), 400
+    if sub["status"] != "sent":
+        conn.close()
+        return jsonify(
+            error="this offer cannot be signed anymore (offer is %s)"
+                  % sub["status"]), 400
+    stored = _hr_form_json_loads(sub["data_json"])
+    plain, derr = _hr_form_decrypt_stored("HR-02", stored)
+    if derr:
+        conn.close()
+        return jsonify(error="stored data could not be decrypted"), 500
+    candidate_name = (plain.get("candidate_name") or "").strip()
+    if typed_name.lower() != candidate_name.lower():
+        conn.close()
+        return jsonify(
+            error="typed name must match the candidate name on the"
+                  " offer"), 400
+    now = _now_iso()
+    version = conn.execute(
+        "SELECT * FROM erp_hr_form_submission_versions"
+        " WHERE submission_id = ? AND version = ?",
+        (sub["id"], token_row["form_version"])).fetchone()
+    signed_copy = version["data_json"] if version else \
+        _hr_form_json_dumps(stored)
+    conn.execute(
+        "UPDATE erp_hr_form_token_requests SET status = 'signed',"
+        " signed_at = ?, signed_name = ?, signed_copy_json = ?,"
+        " signer_ip = ?, signer_user_agent = ?, updated_at = ?"
+        " WHERE id = ?",
+        (now, typed_name, signed_copy, _client_ip(),
+         (request.headers.get("User-Agent") or "")[:500], now,
+         token_row["id"]))
+    _hr_form_record_signature(
+        conn, sub["id"], "candidate", "candidate", candidate_name,
+        typed_name, "token",
+        "Candidate signed the offer letter by email link.",
+        actor="signer")
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET status ="
+        " 'candidate_signed', updated_at = ? WHERE id = ?",
+        (now, sub["id"]))
+    _erp_staff_audit(conn, "signer", "hr.form_token_signed",
+                     "hr_form_submission", sub["id"],
+                     "%s signed the offer letter (version %d) as '%s'"
+                     % (candidate_name, token_row["form_version"],
+                        typed_name))
+    conn.commit()
+    token_row = conn.execute(
+        "SELECT * FROM erp_hr_form_token_requests WHERE id = ?",
+        (token_row["id"],)).fetchone()
+    sub = _hr_form_get_submission(conn, sub["id"])
+    out = _hr_form_token_payload(conn, token_row, sub)
+    conn.close()
+    return jsonify(request=out)
+
+
+@app.post("/api/public/hr-forms/sign/<token>/decline")
+def hr_forms_public_decline(token):
+    """Decline the offer letter by token (no login). A reason is
+    required; the offer moves to declined."""
+    err = _auth_throttle_check("hr-form-sign-ip", _client_ip(),
+                               max_fails=20)
+    if err:
+        return err
+    _auth_throttle_fail("hr-form-sign-ip", _client_ip())
+    data = request.get_json(force=True) or {}
+    reason = (data.get("reason") or "").strip()
+    if not reason:
+        return jsonify(error="a reason is required to decline"), 400
+    if len(reason) > 2000:
+        return jsonify(error="reason must be 2000 characters or"
+                             " fewer"), 400
+    conn = db()
+    token_row, sub = _hr_form_resolve_token(conn, token)
+    if not token_row or not sub:
+        conn.close()
+        return jsonify(error="signing link not found"), 404
+    if token_row["status"] in ("sent", "viewed") and \
+            _hr_form_token_is_stale(conn, token_row):
+        _hr_form_expire_token(conn, token_row, "system")
+        conn.commit()
+        conn.close()
+        return jsonify(
+            error="this link has expired \u2014 ask Pop-A-Licious to send a"
+                  " new one"), 410
+    if token_row["status"] == "expired":
+        conn.close()
+        return jsonify(
+            error="this link has expired \u2014 ask Pop-A-Licious to send a"
+                  " new one"), 410
+    if token_row["status"] not in ("sent", "viewed"):
+        conn.close()
+        return jsonify(
+            error="this offer cannot be declined anymore (link is %s)"
+                  % token_row["status"]), 400
+    if sub["status"] != "sent":
+        conn.close()
+        return jsonify(
+            error="this offer cannot be declined anymore (offer is"
+                  " %s)" % sub["status"]), 400
+    now = _now_iso()
+    conn.execute(
+        "UPDATE erp_hr_form_token_requests SET status = 'declined',"
+        " declined_at = ?, decline_reason = ?, signer_ip = ?,"
+        " signer_user_agent = ?, updated_at = ? WHERE id = ?",
+        (now, reason, _client_ip(),
+         (request.headers.get("User-Agent") or "")[:500], now,
+         token_row["id"]))
+    conn.execute(
+        "UPDATE erp_hr_form_submissions SET status = 'declined',"
+        " decision_notes = ?, updated_at = ? WHERE id = ?",
+        (reason, now, sub["id"]))
+    _erp_staff_audit(conn, "signer", "hr.form_token_declined",
+                     "hr_form_submission", sub["id"],
+                     "%s declined the offer letter"
+                     % token_row["signer_name"])
+    conn.commit()
+    token_row = conn.execute(
+        "SELECT * FROM erp_hr_form_token_requests WHERE id = ?",
+        (token_row["id"],)).fetchone()
+    sub = _hr_form_get_submission(conn, sub["id"])
+    out = _hr_form_token_payload(conn, token_row, sub)
+    conn.close()
+    return jsonify(request=out)
 
 
 # ---- Sales commissions (Wave 4 item 26, SOP 12.37) ----
@@ -39588,6 +44705,362 @@ def hr_delete_commission(commission_id):
     _erp_staff_audit(conn, actor, "hr.commission_deleted",
                      "hr_commission", commission_id,
                      "deleted pending commission #%d" % commission_id)
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---- Background checks (S7, SOP 12.39) ----
+# A REGISTER only -- one record per screening check, as reported by
+# the screening company. Admin-only reads AND writes, via
+# _require_erp_admin(), like commissions: background-check results
+# are sensitive personal data, so there is no staff view at all and
+# no My HR block -- not even the checked employee sees their own
+# result in the ERP. There is NO screening-vendor integration: the
+# ERP never runs a check, never contacts a vendor, and never fills
+# in a result -- the admin types in what the vendor's report says,
+# nothing more. A check is tied to an employee (required) and, where
+# the check satisfies a specific onboarding step, to that onboarding
+# checklist row (which must belong to the same employee). The vendor
+# is a company name typed by the admin, not a row in the vendors
+# table (suppliers are not screening companies). Identity (employee,
+# onboarding row, vendor) is never edited: a wrong requested check
+# is deleted and re-recorded; a check that is in progress, complete,
+# or cancelled is history and cannot be deleted. Status/result/dates
+# are updated as the vendor reports back, through /update.
+HR_BGCHECK_STATUSES = ("requested", "in_progress", "complete",
+                       "cancelled")
+HR_BGCHECK_RESULTS = ("pending", "clear", "review", "adverse")
+
+
+def _hr_get_background_check(conn, check_id):
+    try:
+        check_id = int(check_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute(
+        "SELECT * FROM erp_hr_background_checks WHERE id = ?",
+        (check_id,)).fetchone()
+
+
+def _hr_background_check_payload(conn, row):
+    """The check plus the employee name and the onboarding step label
+    it satisfies. A missing employee row (deleted after the fact)
+    reads as 'Former employee #N' -- the check row itself is never
+    rewritten. A missing onboarding row reads as '' -- the link is
+    informational, never a rewrite of the check."""
+    emp_name = ""
+    if row["employee_id"]:
+        emp = _hr_get_employee(conn, row["employee_id"])
+        emp_name = emp["name"] if emp else \
+            ("Former employee #%d" % row["employee_id"])
+    ob_label = ""
+    if row["onboarding_id"]:
+        ob = conn.execute(
+            "SELECT label FROM erp_hr_onboarding WHERE id = ?",
+            (row["onboarding_id"],)).fetchone()
+        if ob:
+            ob_label = ob["label"] or ""
+    return {
+        "id": row["id"],
+        "employee_id": row["employee_id"],
+        "employee_name": emp_name,
+        "onboarding_id": row["onboarding_id"],
+        "onboarding_label": ob_label,
+        "vendor": row["vendor"] or "",
+        "status": row["status"],
+        "result": row["result"],
+        "requested_date": row["requested_date"],
+        "completed_date": row["completed_date"] or "",
+        "report_reference": row["report_reference"] or "",
+        "notes": row["notes"] or "",
+        "created_by": row["created_by"] or "",
+        "created_at": row["created_at"],
+        "updated_by": row["updated_by"] or "",
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _hr_bgcheck_validate(conn, fields):
+    """Validate a merged background-check record (create or update).
+    Returns (values, error). A complete check must carry the
+    vendor's result (not pending) and the completed date from the
+    vendor's report; a check that is not complete carries no
+    completed date."""
+    employee_id = fields.get("employee_id")
+    if not employee_id:
+        return None, "employee_id is required"
+    try:
+        employee_id = int(employee_id)
+    except (TypeError, ValueError):
+        return None, "employee_id must be a number"
+    if not _hr_get_employee(conn, employee_id):
+        return None, "unknown employee"
+    onboarding_id = fields.get("onboarding_id")
+    if onboarding_id not in (None, "", 0):
+        try:
+            onboarding_id = int(onboarding_id)
+        except (TypeError, ValueError):
+            return None, "onboarding_id must be a number"
+        ob = conn.execute(
+            "SELECT employee_id FROM erp_hr_onboarding WHERE id = ?",
+            (onboarding_id,)).fetchone()
+        if not ob:
+            return None, "unknown onboarding record"
+        if ob["employee_id"] != employee_id:
+            return None, ("onboarding record #%d does not belong to"
+                          " employee #%d" % (onboarding_id, employee_id))
+    else:
+        onboarding_id = None
+    vendor = fields.get("vendor")
+    vendor = vendor.strip() if isinstance(vendor, str) else ""
+    if not vendor:
+        return None, "vendor is required"
+    if len(vendor) > 200:
+        return None, "vendor must be 200 characters or fewer"
+    status = fields.get("status") or "requested"
+    if status not in HR_BGCHECK_STATUSES:
+        return None, ("status must be one of: %s"
+                      % ", ".join(HR_BGCHECK_STATUSES))
+    result = fields.get("result") or "pending"
+    if result not in HR_BGCHECK_RESULTS:
+        return None, ("result must be one of: %s"
+                      % ", ".join(HR_BGCHECK_RESULTS))
+    requested_date = fields.get("requested_date")
+    requested_date = requested_date.strip() \
+        if isinstance(requested_date, str) else ""
+    if not requested_date or not _acct_valid_date(requested_date):
+        return None, "requested_date is required and must be YYYY-MM-DD"
+    completed_date = fields.get("completed_date")
+    completed_date = completed_date.strip() \
+        if isinstance(completed_date, str) else ""
+    if completed_date and not _acct_valid_date(completed_date):
+        return None, "completed_date must be YYYY-MM-DD"
+    if status == "complete":
+        if result == "pending":
+            return None, ("a complete check must carry the result"
+                          " from the vendor's report (clear, review"
+                          " or adverse), not pending")
+        if not completed_date:
+            return None, ("a complete check must carry the"
+                          " completed_date from the vendor's report")
+    elif completed_date:
+        return None, ("completed_date is only set when the check"
+                      " completes (status: complete)")
+    report_reference = fields.get("report_reference")
+    report_reference = report_reference.strip() \
+        if isinstance(report_reference, str) else ""
+    if len(report_reference) > 200:
+        return None, "report_reference must be 200 characters or fewer"
+    notes = fields.get("notes")
+    notes = notes.strip() if isinstance(notes, str) else ""
+    if len(notes) > 1000:
+        return None, "notes must be 1000 characters or fewer"
+    return {"employee_id": employee_id,
+            "onboarding_id": onboarding_id, "vendor": vendor,
+            "status": status, "result": result,
+            "requested_date": requested_date,
+            "completed_date": completed_date,
+            "report_reference": report_reference,
+            "notes": notes}, None
+
+
+@app.get("/api/erp/hr/background-checks")
+def hr_list_background_checks():
+    """Admin list: every background check, newest first, optionally
+    filtered by status and/or result and/or a search string over the
+    employee name and the vendor name."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip().lower()
+    result = (request.args.get("result") or "").strip().lower()
+    q = (request.args.get("q") or "").strip().lower()
+    if status and status not in HR_BGCHECK_STATUSES:
+        return jsonify(error="unknown status"), 400
+    if result and result not in HR_BGCHECK_RESULTS:
+        return jsonify(error="unknown result"), 400
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_hr_background_checks"
+        " ORDER BY id DESC").fetchall()
+    out = []
+    for r in rows:
+        if status and r["status"] != status:
+            continue
+        if result and r["result"] != result:
+            continue
+        d = _hr_background_check_payload(conn, r)
+        if q and q not in d["employee_name"].lower() \
+                and q not in d["vendor"].lower():
+            continue
+        out.append(d)
+    conn.close()
+    return jsonify(background_checks=out)
+
+
+@app.get("/api/erp/hr/background-checks/<int:check_id>")
+def hr_get_background_check_route(check_id):
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_background_check(conn, check_id)
+    if not row:
+        conn.close()
+        return jsonify(error="background check not found"), 404
+    out = _hr_background_check_payload(conn, row)
+    conn.close()
+    return jsonify(out)
+
+
+@app.get("/api/erp/hr/background-checks/candidates")
+def hr_list_background_check_candidates():
+    """Candidates for the record form: every active employee row,
+    each with its onboarding checklist items (id, label, done) so
+    the admin can link the check to the onboarding step it
+    satisfies. With no employees the list is empty, and the SOP
+    says so: there is nobody to check yet."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, name, email FROM erp_hr_employees WHERE active = 1"
+        " ORDER BY name, id").fetchall()
+    out = []
+    for r in rows:
+        out.append({"id": r["id"], "name": r["name"] or "",
+                    "email": r["email"] or "",
+                    "onboarding": _hr_onboarding_items(conn, r["id"])})
+    conn.close()
+    return jsonify(candidates=out)
+
+
+@app.post("/api/erp/hr/background-checks")
+def hr_create_background_check():
+    """Record a background check (201, admin only). The vendor, the
+    dates and the result are typed in from the vendor's report --
+    the ERP runs no check and computes nothing. Status starts
+    requested with result pending unless the admin records a check
+    that is already complete (with the result and completed date
+    from the report)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    conn = db()
+    fields, error = _hr_bgcheck_validate(conn, data)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_hr_background_checks (employee_id,"
+        " onboarding_id, vendor, status, result, requested_date,"
+        " completed_date, report_reference, notes, created_by,"
+        " created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["employee_id"], fields["onboarding_id"],
+         fields["vendor"], fields["status"], fields["result"],
+         fields["requested_date"], fields["completed_date"],
+         fields["report_reference"], fields["notes"],
+         actor or "", now, actor or "", now))
+    check_id = cur.lastrowid
+    _erp_staff_audit(conn, actor, "hr.background_check_created",
+                     "hr_background_check", check_id,
+                     "background check #%d recorded for employee #%d"
+                     " (%s, %s)"
+                     % (check_id, fields["employee_id"],
+                        fields["vendor"], fields["status"]))
+    conn.commit()
+    out = _hr_background_check_payload(
+        conn, _hr_get_background_check(conn, check_id))
+    conn.close()
+    return jsonify(out), 201
+
+
+@app.post("/api/erp/hr/background-checks/<int:check_id>/update")
+def hr_update_background_check(check_id):
+    """Update a check's status, result and dates as the vendor
+    reports back (admin only). Omitted fields keep their value.
+    Employee, onboarding row and vendor are identity -- they are
+    never edited here: a check recorded against the wrong person
+    or vendor is deleted (while still requested) and re-recorded.
+    The audit row records the status change, not the result value."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True, silent=True) or {}
+    conn = db()
+    row = _hr_get_background_check(conn, check_id)
+    if not row:
+        conn.close()
+        return jsonify(error="background check not found"), 404
+    merged = {"employee_id": row["employee_id"],
+              "onboarding_id": row["onboarding_id"],
+              "vendor": row["vendor"],
+              "status": data.get("status", row["status"]),
+              "result": data.get("result", row["result"]),
+              "requested_date": data.get("requested_date",
+                                         row["requested_date"]),
+              "completed_date": data.get("completed_date",
+                                         row["completed_date"]),
+              "report_reference": data.get("report_reference",
+                                           row["report_reference"]),
+              "notes": data.get("notes", row["notes"])}
+    fields, error = _hr_bgcheck_validate(conn, merged)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_hr_background_checks SET status = ?, result = ?,"
+        " requested_date = ?, completed_date = ?,"
+        " report_reference = ?, notes = ?, updated_by = ?,"
+        " updated_at = ? WHERE id = ?",
+        (fields["status"], fields["result"],
+         fields["requested_date"], fields["completed_date"],
+         fields["report_reference"], fields["notes"],
+         actor or "", now, check_id))
+    _erp_staff_audit(conn, actor, "hr.background_check_updated",
+                     "hr_background_check", check_id,
+                     "background check #%d: %s -> %s"
+                     % (check_id, row["status"], fields["status"]))
+    conn.commit()
+    out = _hr_background_check_payload(
+        conn, _hr_get_background_check(conn, check_id))
+    conn.close()
+    return jsonify(out)
+
+
+@app.delete("/api/erp/hr/background-checks/<int:check_id>")
+def hr_delete_background_check(check_id):
+    """Delete a background check, permanently (admin only). Only a
+    requested check deletes -- a check that is in progress,
+    complete, or cancelled is history and refuses delete (409); the
+    correction is a new check, never a delete and never an edit.
+    Two-tap confirm on the frontend; no window.confirm."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _hr_get_background_check(conn, check_id)
+    if not row:
+        conn.close()
+        return jsonify(error="background check not found"), 404
+    if row["status"] != "requested":
+        conn.close()
+        return jsonify(error="only a requested background check can"
+                       " be deleted (status: %s) -- in-progress,"
+                       " complete and cancelled checks are history"
+                       % row["status"]), 409
+    conn.execute("DELETE FROM erp_hr_background_checks WHERE id = ?",
+                 (check_id,))
+    _erp_staff_audit(conn, actor, "hr.background_check_deleted",
+                     "hr_background_check", check_id,
+                     "deleted requested background check #%d for"
+                     " employee #%d" % (check_id, row["employee_id"]))
     conn.commit()
     conn.close()
     return jsonify(ok=True)
@@ -44706,9 +50179,11 @@ def api_key_create():
 
 @app.post("/api/erp/settings/api-keys/<int:key_id>/revoke")
 def api_key_revoke(key_id):
-    """Revoke an API key permanently (not delete -- revocation must
-    stay auditable). A revoked key is rejected on every external
-    call, and can never be un-revoked. 409 when already revoked."""
+    """Revoke an API key permanently. A revoked key is rejected on
+    every external call, and can never be un-revoked. Revocation is
+    recorded in the staff audit log; a revoked key may later be
+    deleted (DELETE endpoint, SOP 10.15), but an active key can
+    never be deleted directly. 409 when already revoked."""
     actor, err = _require_erp_admin()
     if err:
         return err
@@ -44774,6 +50249,39 @@ def api_key_rotate(key_id):
     out = _api_key_dict(new_row)
     out["key"] = raw
     return jsonify(api_key=out, rotated_from=key_id), 201
+
+
+@app.delete("/api/erp/settings/api-keys/<int:key_id>")
+def api_key_delete(key_id):
+    """Delete a revoked API key (admin-only). An active key cannot
+    be deleted directly -- revoke it first, so no live integration
+    is ever killed by a delete: revoke is the explicit "stop
+    working now" step, delete only removes the dead row. The row
+    is deleted permanently (like the ITSM deletes); the staff audit
+    row (settings.api_key_deleted, with name + prefix + scopes) is
+    the permanent record. 404 when missing, 409 when still
+    active."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_api_keys WHERE id = ?", (key_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="API key not found"), 404
+    if not row["revoked"]:
+        conn.close()
+        return jsonify(error="only a revoked API key can be deleted --"
+                       " revoke it first"), 409
+    conn.execute("DELETE FROM erp_api_keys WHERE id = ?", (key_id,))
+    _erp_staff_audit(conn, actor, "settings.api_key_deleted",
+                     "api_key", key_id,
+                     "%s %s scopes %s" % (row["name"], row["key_prefix"],
+                                           row["scopes"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True, id=key_id, deleted=True)
 
 
 @app.get("/api/erp/settings/webhooks")
@@ -51595,6 +57103,1251 @@ def quality_spc_chart():
     return jsonify(chart=chart)
 
 
+# ---------------- Workplace safety incidents (SOP 13.22) ----------------
+# Facility-scoped register (NOT store-scoped): the workplace is the
+# production facility, so there is no store_id. Severity levels and
+# the OSHA-recordable flag are admin-entered/recorded only -- the ERP
+# defines no thresholds and never determines OSHA reportability; that
+# is the manager's call. Writes are admin-only (_require_erp_admin);
+# every write leaves an erp_staff_audit row, and the detail endpoint
+# returns those rows as the incident's audit trail. The register
+# starts empty -- no incident is ever seeded.
+_SAFETY_INCIDENT_TYPES = ("injury", "illness", "near_miss",
+                          "property_damage", "other")
+_SAFETY_SEVERITIES = ("minor", "moderate", "serious", "critical")
+_SAFETY_STATUSES = ("open", "investigating", "resolved")
+_SAFETY_WC_STATUSES = ("none", "filed", "pending", "approved",
+                       "denied", "closed")
+_SAFETY_FACILITY = ("Production facility — 6290 McLeod Dr, Suite 120,"
+                    " Las Vegas, NV")
+
+
+def _safety_bool(value):
+    """A flag from JSON: True/False, 1/0, or '1'/'0'/'true'/'false'/
+    'yes'/'no'. Returns True, False, or None when unrecognised."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "y"):
+            return True
+        if v in ("0", "false", "no", "n"):
+            return False
+    return None
+
+
+def _safety_valid_date(value):
+    """YYYY-MM-DD and a real calendar date."""
+    if not isinstance(value, str):
+        return False
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _safety_incident_dict(row):
+    d = dict(row)
+    d["medical_treatment"] = bool(row["medical_treatment"])
+    d["workers_comp_claim"] = bool(row["workers_comp_claim"])
+    d["osha_recordable"] = bool(row["osha_recordable"])
+    return d
+
+
+def _safety_clean(data, existing=None):
+    """Validate a safety incident. Fields fall back to the stored row
+    when updating. Returns (fields, None) or (None, error-string)."""
+    cur = dict(existing) if existing else {}
+    incident_date = (data.get("incident_date")
+                     if "incident_date" in data
+                     else cur.get("incident_date") or "").strip() \
+        if isinstance(data.get("incident_date", cur.get("incident_date", "")), str) \
+        else ""
+    if not incident_date:
+        return None, "incident_date is required"
+    if not _safety_valid_date(incident_date):
+        return None, "incident_date must be YYYY-MM-DD"
+    itype = (data.get("incident_type")
+             if "incident_type" in data
+             else cur.get("incident_type") or "").strip().lower() \
+        if isinstance(data.get("incident_type", cur.get("incident_type", "")), str) \
+        else ""
+    if itype not in _SAFETY_INCIDENT_TYPES:
+        return None, ("incident_type must be injury, illness, near_miss,"
+                      " property_damage or other")
+    location = (data.get("location")
+                if "location" in data
+                else cur.get("location") or _SAFETY_FACILITY).strip() \
+        if isinstance(data.get("location", cur.get("location", "")), str) \
+        else _SAFETY_FACILITY
+    if not location:
+        location = _SAFETY_FACILITY
+    if len(location) > 300:
+        return None, "location must be 300 characters or fewer"
+    description = (data.get("description")
+                   if "description" in data
+                   else cur.get("description") or "").strip() \
+        if isinstance(data.get("description", cur.get("description", "")), str) \
+        else ""
+    if len(description) > 5000:
+        return None, "description must be 5000 characters or fewer"
+    person = (data.get("person_involved")
+              if "person_involved" in data
+              else cur.get("person_involved") or "").strip() \
+        if isinstance(data.get("person_involved",
+                               cur.get("person_involved", "")), str) \
+        else ""
+    if len(person) > 200:
+        return None, "person_involved must be 200 characters or fewer"
+    severity = (data.get("severity")
+                if "severity" in data
+                else cur.get("severity") or "minor").strip().lower() \
+        if isinstance(data.get("severity", cur.get("severity", "")), str) \
+        else "minor"
+    if severity not in _SAFETY_SEVERITIES:
+        return None, "severity must be minor, moderate, serious or critical"
+    raw_days = data.get("lost_time_days", cur.get("lost_time_days", 0))
+    try:
+        if isinstance(raw_days, bool):
+            raise ValueError("not an integer")
+        lost_days = int(raw_days)
+        if isinstance(raw_days, str) and raw_days.strip() != str(lost_days):
+            raise ValueError("not an integer")
+    except (TypeError, ValueError):
+        return None, "lost_time_days must be a whole number of days"
+    if lost_days < 0:
+        return None, "lost_time_days cannot be negative"
+    raw_med = data.get("medical_treatment",
+                       cur.get("medical_treatment", 0))
+    medical = _safety_bool(raw_med)
+    if medical is None:
+        return None, "medical_treatment must be true or false"
+    med_detail = (data.get("medical_treatment_detail")
+                  if "medical_treatment_detail" in data
+                  else cur.get("medical_treatment_detail") or "").strip() \
+        if isinstance(data.get("medical_treatment_detail",
+                               cur.get("medical_treatment_detail", "")), str) \
+        else ""
+    if len(med_detail) > 2000:
+        return None, ("medical_treatment_detail must be 2000 characters"
+                      " or fewer")
+    raw_wc = data.get("workers_comp_claim",
+                      cur.get("workers_comp_claim", 0))
+    wc_claim = _safety_bool(raw_wc)
+    if wc_claim is None:
+        return None, "workers_comp_claim must be true or false"
+    wc_number = (data.get("workers_comp_claim_number")
+                 if "workers_comp_claim_number" in data
+                 else cur.get("workers_comp_claim_number") or "").strip() \
+        if isinstance(data.get("workers_comp_claim_number",
+                               cur.get("workers_comp_claim_number", "")), str) \
+        else ""
+    if len(wc_number) > 100:
+        return None, ("workers_comp_claim_number must be 100 characters"
+                      " or fewer")
+    wc_status = (data.get("workers_comp_status")
+                 if "workers_comp_status" in data
+                 else cur.get("workers_comp_status") or "none").strip().lower() \
+        if isinstance(data.get("workers_comp_status",
+                               cur.get("workers_comp_status", "")), str) \
+        else "none"
+    if wc_status not in _SAFETY_WC_STATUSES:
+        return None, ("workers_comp_status must be none, filed, pending,"
+                      " approved, denied or closed")
+    raw_osha = data.get("osha_recordable", cur.get("osha_recordable", 0))
+    osha = _safety_bool(raw_osha)
+    if osha is None:
+        return None, "osha_recordable must be true or false"
+    status = (data.get("status")
+              if "status" in data
+              else cur.get("status") or "open").strip().lower() \
+        if isinstance(data.get("status", cur.get("status", "")), str) \
+        else "open"
+    if status not in _SAFETY_STATUSES:
+        return None, "status must be open, investigating or resolved"
+    reported_by = (data.get("reported_by")
+                   if "reported_by" in data
+                   else cur.get("reported_by") or "").strip() \
+        if isinstance(data.get("reported_by", cur.get("reported_by", "")), str) \
+        else ""
+    if len(reported_by) > 200:
+        return None, "reported_by must be 200 characters or fewer"
+    follow_up = (data.get("follow_up_note")
+                 if "follow_up_note" in data
+                 else cur.get("follow_up_note") or "").strip() \
+        if isinstance(data.get("follow_up_note",
+                               cur.get("follow_up_note", "")), str) \
+        else ""
+    if len(follow_up) > 5000:
+        return None, "follow_up_note must be 5000 characters or fewer"
+    return {"incident_date": incident_date, "incident_type": itype,
+            "location": location, "description": description,
+            "person_involved": person, "severity": severity,
+            "lost_time_days": lost_days,
+            "medical_treatment": 1 if medical else 0,
+            "medical_treatment_detail": med_detail,
+            "workers_comp_claim": 1 if wc_claim else 0,
+            "workers_comp_claim_number": wc_number,
+            "workers_comp_status": wc_status,
+            "osha_recordable": 1 if osha else 0, "status": status,
+            "reported_by": reported_by,
+            "follow_up_note": follow_up}, None
+
+
+def _safety_audit_rows(conn, incident_id):
+    """The audit trail for one incident: every erp_staff_audit row
+    written for it, newest first. Reads only -- audit rows are never
+    edited or deleted."""
+    rows = conn.execute(
+        "SELECT id, actor, action, target_type, target_id, detail,"
+        " created_at FROM erp_staff_audit"
+        " WHERE target_type = 'quality_safety_incident'"
+        " AND target_id = ? ORDER BY id DESC",
+        (incident_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/erp/quality/safety-incidents")
+def quality_safety_incidents_list():
+    """Workplace safety incidents, newest first. Filters: status=,
+    severity=, incident_type=, osha_recordable=0/1,
+    medical_treatment=0/1, workers_comp_claim=0/1, from= / to=
+    (incident_date range, YYYY-MM-DD). Starts empty."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    status = (request.args.get("status") or "").strip().lower()
+    severity = (request.args.get("severity") or "").strip().lower()
+    itype = (request.args.get("incident_type") or "").strip().lower()
+    if status and status not in _SAFETY_STATUSES:
+        conn.close()
+        return jsonify(error="unknown status"), 400
+    if severity and severity not in _SAFETY_SEVERITIES:
+        conn.close()
+        return jsonify(error="unknown severity"), 400
+    if itype and itype not in _SAFETY_INCIDENT_TYPES:
+        conn.close()
+        return jsonify(error="unknown incident_type"), 400
+    flags = {}
+    for key in ("osha_recordable", "medical_treatment",
+                "workers_comp_claim"):
+        raw = request.args.get(key)
+        if raw is not None and raw != "":
+            val = _safety_bool(raw)
+            if val is None:
+                conn.close()
+                return jsonify(error="%s must be 0 or 1" % key), 400
+            flags[key] = 1 if val else 0
+    from_day = (request.args.get("from") or "").strip()
+    to_day = (request.args.get("to") or "").strip()
+    if from_day and not _safety_valid_date(from_day):
+        conn.close()
+        return jsonify(error="from must be YYYY-MM-DD"), 400
+    if to_day and not _safety_valid_date(to_day):
+        conn.close()
+        return jsonify(error="to must be YYYY-MM-DD"), 400
+    clauses, args = [], []
+    if status:
+        clauses.append("status = ?")
+        args.append(status)
+    if severity:
+        clauses.append("severity = ?")
+        args.append(severity)
+    if itype:
+        clauses.append("incident_type = ?")
+        args.append(itype)
+    for key, val in flags.items():
+        clauses.append("%s = ?" % key)
+        args.append(val)
+    if from_day:
+        clauses.append("incident_date >= ?")
+        args.append(from_day)
+    if to_day:
+        clauses.append("incident_date <= ?")
+        args.append(to_day)
+    query = "SELECT * FROM erp_quality_safety_incidents"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY incident_date DESC, id DESC"
+    rows = conn.execute(query, args).fetchall()
+    conn.close()
+    return jsonify(incidents=[_safety_incident_dict(r) for r in rows])
+
+
+@app.post("/api/erp/quality/safety-incidents")
+def quality_safety_incident_create():
+    """Record a workplace safety incident by hand. incident_date and
+    incident_type are required; severity, the OSHA-recordable flag,
+    lost-time days, medical treatment and workers-comp fields are
+    recorded exactly as entered -- the ERP assigns no thresholds and
+    never decides OSHA reportability. reported_by defaults to the
+    admin signed in now when left blank."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    fields, f_err = _safety_clean(data)
+    if f_err:
+        conn.close()
+        return jsonify(error=f_err), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_safety_incidents (incident_date,"
+        " incident_type, location, description, person_involved,"
+        " severity, lost_time_days, medical_treatment,"
+        " medical_treatment_detail, workers_comp_claim,"
+        " workers_comp_claim_number, workers_comp_status,"
+        " osha_recordable, status, reported_by, follow_up_note,"
+        " created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+        " ?, ?, ?, ?)",
+        (fields["incident_date"], fields["incident_type"],
+         fields["location"], fields["description"],
+         fields["person_involved"], fields["severity"],
+         fields["lost_time_days"], fields["medical_treatment"],
+         fields["medical_treatment_detail"],
+         fields["workers_comp_claim"],
+         fields["workers_comp_claim_number"],
+         fields["workers_comp_status"], fields["osha_recordable"],
+         fields["status"], fields["reported_by"] or actor,
+         fields["follow_up_note"], actor, now, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_quality_safety_incidents WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    out = _safety_incident_dict(row)
+    _erp_staff_audit(conn, actor, "quality.safety_incident_created",
+                     "quality_safety_incident", row["id"],
+                     "recorded %s %s (%s) on %s"
+                     % (fields["incident_type"], fields["severity"],
+                        fields["incident_date"], fields["location"]))
+    conn.commit()
+    conn.close()
+    return jsonify(incident=out), 201
+
+
+@app.get("/api/erp/quality/safety-incidents/<int:incident_id>")
+def quality_safety_incident_get(incident_id):
+    """One incident with its audit trail (every write to it, newest
+    first). The audit rows are read-only."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_safety_incidents WHERE id = ?",
+        (incident_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="incident not found"), 404
+    audit = _safety_audit_rows(conn, incident_id)
+    conn.close()
+    return jsonify(incident=_safety_incident_dict(row), audit=audit)
+
+
+@app.post("/api/erp/quality/safety-incidents/<int:incident_id>/update")
+def quality_safety_incident_update(incident_id):
+    """Edit an incident. Any field may change, including severity,
+    lost-time days and the OSHA-recordable flag -- every change is
+    recorded as entered, and the audit row names the fields changed."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_safety_incidents WHERE id = ?",
+        (incident_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="incident not found"), 404
+    fields, f_err = _safety_clean(data, existing=row)
+    if f_err:
+        conn.close()
+        return jsonify(error=f_err), 400
+    sets, args, changes = [], [], []
+    for key in ("incident_date", "incident_type", "location",
+                "description", "person_involved", "severity",
+                "lost_time_days", "medical_treatment",
+                "medical_treatment_detail", "workers_comp_claim",
+                "workers_comp_claim_number", "workers_comp_status",
+                "osha_recordable", "status", "reported_by",
+                "follow_up_note"):
+        if key in data and fields[key] != row[key]:
+            sets.append("%s = ?" % key)
+            args.append(fields[key])
+            changes.append("%s updated" % key)
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(incident_id)
+        conn.execute(
+            "UPDATE erp_quality_safety_incidents SET %s WHERE id = ?"
+            % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "quality.safety_incident_updated",
+                         "quality_safety_incident", incident_id,
+                         "; ".join(changes))
+        conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_safety_incidents WHERE id = ?",
+        (incident_id,)).fetchone()
+    out = _safety_incident_dict(row)
+    conn.close()
+    return jsonify(incident=out)
+
+
+@app.delete("/api/erp/quality/safety-incidents/<int:incident_id>")
+def quality_safety_incident_delete(incident_id):
+    """Delete an incident, permanently. The audit trail keeps the
+    record that it existed: the delete itself is audited, and the
+    earlier audit rows for this incident are never removed."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_safety_incidents WHERE id = ?",
+        (incident_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="incident not found"), 404
+    conn.execute(
+        "DELETE FROM erp_quality_safety_incidents WHERE id = ?",
+        (incident_id,))
+    _erp_staff_audit(conn, actor, "quality.safety_incident_deleted",
+                     "quality_safety_incident", incident_id,
+                     "deleted %s %s (%s) on %s"
+                     % (row["incident_type"], row["severity"],
+                        row["incident_date"], row["location"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+# ---------------- Sanitation / pest-control log (SOP 13.23) ----------------
+# One register for BOTH sanitation checks and pest-control visits,
+# distinguished by entry_type. Three tables: schedules (the recurring
+# plan), logs (one row per completed check/visit), findings (one row
+# per thing found wrong on a log; each finding may link ONE existing
+# CAPA by id -- a finding never auto-creates a CAPA, and no CAPA is
+# ever opened from here). Writes are admin-only
+# (_require_erp_admin); every write leaves an erp_staff_audit row,
+# and the detail endpoints return those rows as the audit trail.
+# All three registers start empty -- nothing is ever seeded.
+_SAN_ENTRY_TYPES = ("sanitation", "pest_control")
+_SAN_FREQUENCIES = ("daily", "weekly", "monthly", "quarterly",
+                    "as_needed")
+_SAN_LOG_RESULTS = ("pass", "fail")
+_SAN_FINDING_SEVERITIES = ("minor", "major", "critical")
+_SAN_FINDING_STATUSES = ("open", "in_progress", "resolved")
+
+
+def _san_valid_date(value):
+    """YYYY-MM-DD and a real calendar date."""
+    if not isinstance(value, str):
+        return False
+    if not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return True
+
+
+def _san_bool(value):
+    """A flag from JSON: True/False, 1/0, or '1'/'0'/'true'/'false'/
+    'yes'/'no'. Returns True, False, or None when unrecognised."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("1", "true", "yes", "y"):
+            return True
+        if v in ("0", "false", "no", "n"):
+            return False
+    return None
+
+
+def _san_text(data, key, existing, default=""):
+    """A text field: the posted value when the key is present, else
+    the stored row's value, else the default. Always a stripped
+    string."""
+    raw = data.get(key) if key in data else (
+        existing.get(key) if existing else None)
+    if raw is None:
+        raw = default
+    return raw.strip() if isinstance(raw, str) else default
+
+
+def _san_schedule_dict(row):
+    d = dict(row)
+    d["active"] = bool(row["active"])
+    return d
+
+
+def _san_log_dict(row):
+    d = dict(row)
+    if "findings_count" in d:
+        d["findings_count"] = int(d["findings_count"] or 0)
+    return d
+
+
+def _san_finding_dict(row):
+    return dict(row)
+
+
+def _san_clean_schedule(data, existing=None):
+    """Validate a sanitation schedule. Fields fall back to the stored
+    row when updating. Returns (fields, None) or (None, error)."""
+    cur = dict(existing) if existing else {}
+    name = _san_text(data, "name", cur)
+    if not name:
+        return None, "name is required"
+    if len(name) > 200:
+        return None, "name must be 200 characters or fewer"
+    entry_type = _san_text(data, "entry_type", cur,
+                           "sanitation").lower()
+    if entry_type not in _SAN_ENTRY_TYPES:
+        return None, "entry_type must be sanitation or pest_control"
+    area = _san_text(data, "area", cur)
+    if len(area) > 300:
+        return None, "area must be 300 characters or fewer"
+    frequency = _san_text(data, "frequency", cur, "weekly").lower()
+    if frequency not in _SAN_FREQUENCIES:
+        return None, ("frequency must be daily, weekly, monthly,"
+                      " quarterly or as_needed")
+    description = _san_text(data, "description", cur)
+    if len(description) > 5000:
+        return None, "description must be 5000 characters or fewer"
+    assigned_to = _san_text(data, "assigned_to", cur)
+    if len(assigned_to) > 200:
+        return None, "assigned_to must be 200 characters or fewer"
+    next_due = _san_text(data, "next_due_date", cur)
+    if next_due and not _san_valid_date(next_due):
+        return None, "next_due_date must be YYYY-MM-DD"
+    raw_active = data.get("active", cur.get("active", 1))
+    active = _san_bool(raw_active)
+    if active is None:
+        return None, "active must be true or false"
+    return {"name": name, "entry_type": entry_type, "area": area,
+            "frequency": frequency, "description": description,
+            "assigned_to": assigned_to, "next_due_date": next_due,
+            "active": 1 if active else 0}, None
+
+
+def _san_clean_log(data, existing, conn):
+    """Validate a sanitation log entry. schedule_id must name an
+    existing schedule of the SAME entry_type (a sanitation check
+    cannot be filed against a pest-control schedule); a blank or
+    missing schedule_id means the entry is unscheduled. Returns
+    (fields, None) or (None, error)."""
+    cur = dict(existing) if existing else {}
+    log_date = _san_text(data, "log_date", cur)
+    if not log_date:
+        return None, "log_date is required"
+    if not _san_valid_date(log_date):
+        return None, "log_date must be YYYY-MM-DD"
+    entry_type = _san_text(data, "entry_type", cur,
+                           "sanitation").lower()
+    if entry_type not in _SAN_ENTRY_TYPES:
+        return None, "entry_type must be sanitation or pest_control"
+    if "schedule_id" in data:
+        raw_sched = data.get("schedule_id")
+        if raw_sched in (None, ""):
+            schedule_id = None
+        else:
+            try:
+                if isinstance(raw_sched, bool):
+                    raise ValueError("not an integer")
+                schedule_id = int(raw_sched)
+                if isinstance(raw_sched, str) and \
+                        raw_sched.strip() != str(schedule_id):
+                    raise ValueError("not an integer")
+            except (TypeError, ValueError):
+                return None, "schedule_id must be a schedule id"
+            sched = conn.execute(
+                "SELECT id, entry_type FROM"
+                " erp_quality_sanitation_schedules WHERE id = ?",
+                (schedule_id,)).fetchone()
+            if not sched:
+                return None, "schedule not found"
+            if sched["entry_type"] != entry_type:
+                return None, ("schedule entry_type does not match"
+                              " the log entry_type")
+    else:
+        schedule_id = cur.get("schedule_id")
+    area = _san_text(data, "area", cur)
+    if len(area) > 300:
+        return None, "area must be 300 characters or fewer"
+    performed_by = _san_text(data, "performed_by", cur)
+    if len(performed_by) > 200:
+        return None, "performed_by must be 200 characters or fewer"
+    vendor = _san_text(data, "vendor", cur)
+    if len(vendor) > 200:
+        return None, "vendor must be 200 characters or fewer"
+    result = _san_text(data, "result", cur, "pass").lower()
+    if result not in _SAN_LOG_RESULTS:
+        return None, "result must be pass or fail"
+    notes = _san_text(data, "notes", cur)
+    if len(notes) > 5000:
+        return None, "notes must be 5000 characters or fewer"
+    return {"log_date": log_date, "entry_type": entry_type,
+            "schedule_id": schedule_id, "area": area,
+            "performed_by": performed_by, "vendor": vendor,
+            "result": result, "notes": notes}, None
+
+
+def _san_clean_finding(data, existing, conn):
+    """Validate a finding on a log. capa_id is a reference to an
+    EXISTING CAPA (NULL = unlinked): a value that names no CAPA is
+    refused, and a finding never creates one. Returns (fields, None)
+    or (None, error)."""
+    cur = dict(existing) if existing else {}
+    description = _san_text(data, "description", cur)
+    if not description:
+        return None, "description is required"
+    if len(description) > 5000:
+        return None, "description must be 5000 characters or fewer"
+    severity = _san_text(data, "severity", cur, "minor").lower()
+    if severity not in _SAN_FINDING_SEVERITIES:
+        return None, "severity must be minor, major or critical"
+    status = _san_text(data, "status", cur, "open").lower()
+    if status not in _SAN_FINDING_STATUSES:
+        return None, "status must be open, in_progress or resolved"
+    if "capa_id" in data:
+        raw_capa = data.get("capa_id")
+        if raw_capa in (None, ""):
+            capa_id = None
+        else:
+            try:
+                if isinstance(raw_capa, bool):
+                    raise ValueError("not an integer")
+                capa_id = int(raw_capa)
+                if isinstance(raw_capa, str) and \
+                        raw_capa.strip() != str(capa_id):
+                    raise ValueError("not an integer")
+            except (TypeError, ValueError):
+                return None, "capa_id must be a CAPA id"
+            found = conn.execute(
+                "SELECT id FROM erp_quality_capas WHERE id = ?",
+                (capa_id,)).fetchone()
+            if not found:
+                return None, "capa not found"
+    else:
+        capa_id = cur.get("capa_id")
+    return {"description": description, "severity": severity,
+            "status": status, "capa_id": capa_id}, None
+
+
+def _san_schedule_audit_rows(conn, schedule_id):
+    rows = conn.execute(
+        "SELECT id, actor, action, target_type, target_id, detail,"
+        " created_at FROM erp_staff_audit"
+        " WHERE target_type = 'quality_sanitation_schedule'"
+        " AND target_id = ? ORDER BY id DESC",
+        (schedule_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _san_log_findings(conn, log_id):
+    """The findings on one log, with the linked CAPA's title and
+    status when there is one (NULLs when unlinked)."""
+    rows = conn.execute(
+        "SELECT f.*, c.title AS capa_title, c.status AS capa_status"
+        " FROM erp_quality_sanitation_findings f"
+        " LEFT JOIN erp_quality_capas c ON c.id = f.capa_id"
+        " WHERE f.log_id = ? ORDER BY f.id ASC",
+        (log_id,)).fetchall()
+    return [_san_finding_dict(r) for r in rows]
+
+
+def _san_log_audit_rows(conn, log_id):
+    """The audit trail for one log: every write to the log itself
+    plus every write to its findings, newest first. Reads only --
+    audit rows are never edited or deleted."""
+    finding_ids = [r["id"] for r in conn.execute(
+        "SELECT id FROM erp_quality_sanitation_findings"
+        " WHERE log_id = ?", (log_id,)).fetchall()]
+    rows = conn.execute(
+        "SELECT id, actor, action, target_type, target_id, detail,"
+        " created_at FROM erp_staff_audit"
+        " WHERE (target_type = 'quality_sanitation_log'"
+        " AND target_id = ?)"
+        " ORDER BY id DESC",
+        (log_id,)).fetchall()
+    out = [dict(r) for r in rows]
+    if finding_ids:
+        placeholders = ",".join("?" * len(finding_ids))
+        frows = conn.execute(
+            "SELECT id, actor, action, target_type, target_id,"
+            " detail, created_at FROM erp_staff_audit"
+            " WHERE target_type = 'quality_sanitation_finding'"
+            " AND target_id IN (%s) ORDER BY id DESC" % placeholders,
+            finding_ids).fetchall()
+        out.extend(dict(r) for r in frows)
+        out.sort(key=lambda r: r["id"], reverse=True)
+    return out
+
+
+@app.get("/api/erp/quality/sanitation-schedules")
+def quality_sanitation_schedules_list():
+    """Sanitation / pest-control schedules, next-due first (no due
+    date sorts last). Filters: entry_type=, active=0/1, overdue=1
+    (active with a next-due date before today). Starts empty."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    entry_type = (request.args.get("entry_type") or "").strip().lower()
+    if entry_type and entry_type not in _SAN_ENTRY_TYPES:
+        conn.close()
+        return jsonify(error="unknown entry_type"), 400
+    active = request.args.get("active")
+    active_val = None
+    if active is not None and active != "":
+        active_val = _san_bool(active)
+        if active_val is None:
+            conn.close()
+            return jsonify(error="active must be 0 or 1"), 400
+    overdue = request.args.get("overdue")
+    overdue_val = None
+    if overdue is not None and overdue != "":
+        overdue_val = _san_bool(overdue)
+        if overdue_val is None:
+            conn.close()
+            return jsonify(error="overdue must be 0 or 1"), 400
+    clauses, args = [], []
+    if entry_type:
+        clauses.append("entry_type = ?")
+        args.append(entry_type)
+    if active_val is not None:
+        clauses.append("active = ?")
+        args.append(1 if active_val else 0)
+    if overdue_val:
+        today = datetime.now(timezone.utc).date().isoformat()
+        clauses.append("active = 1")
+        clauses.append("next_due_date != ''")
+        clauses.append("next_due_date < ?")
+        args.append(today)
+    query = "SELECT * FROM erp_quality_sanitation_schedules"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += (" ORDER BY CASE WHEN next_due_date = '' THEN 1 ELSE 0"
+              " END, next_due_date ASC, id DESC")
+    rows = conn.execute(query, args).fetchall()
+    conn.close()
+    return jsonify(schedules=[_san_schedule_dict(r) for r in rows])
+
+
+@app.post("/api/erp/quality/sanitation-schedules")
+def quality_sanitation_schedule_create():
+    """Add a recurring sanitation check or pest-control visit to the
+    plan. name and entry_type are required; frequency defaults to
+    weekly; next_due_date is blank until the admin sets it -- the
+    ERP never computes a due date from the frequency."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    fields, f_err = _san_clean_schedule(data)
+    if f_err:
+        conn.close()
+        return jsonify(error=f_err), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_sanitation_schedules (entry_type,"
+        " name, area, frequency, description, assigned_to,"
+        " next_due_date, active, created_by, created_at, updated_by,"
+        " updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["entry_type"], fields["name"], fields["area"],
+         fields["frequency"], fields["description"],
+         fields["assigned_to"], fields["next_due_date"],
+         fields["active"], actor, now, actor, now))
+    row = conn.execute(
+        "SELECT * FROM erp_quality_sanitation_schedules WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    out = _san_schedule_dict(row)
+    _erp_staff_audit(conn, actor, "quality.sanitation_schedule_created",
+                     "quality_sanitation_schedule", row["id"],
+                     "scheduled %s %s (%s)"
+                     % (fields["entry_type"], fields["name"],
+                        fields["frequency"]))
+    conn.commit()
+    conn.close()
+    return jsonify(schedule=out), 201
+
+
+@app.get("/api/erp/quality/sanitation-schedules/<int:schedule_id>")
+def quality_sanitation_schedule_get(schedule_id):
+    """One schedule with its audit trail (every write to it, newest
+    first). The audit rows are read-only."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_sanitation_schedules WHERE id = ?",
+        (schedule_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="schedule not found"), 404
+    audit = _san_schedule_audit_rows(conn, schedule_id)
+    conn.close()
+    return jsonify(schedule=_san_schedule_dict(row), audit=audit)
+
+
+@app.post("/api/erp/quality/sanitation-schedules/<int:schedule_id>/update")
+def quality_sanitation_schedule_update(schedule_id):
+    """Edit a schedule. Any field may change, including the
+    next-due date and the active flag -- every change is recorded
+    as entered, and the audit row names the fields changed."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_sanitation_schedules WHERE id = ?",
+        (schedule_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="schedule not found"), 404
+    fields, f_err = _san_clean_schedule(data, existing=row)
+    if f_err:
+        conn.close()
+        return jsonify(error=f_err), 400
+    sets, args, changes = [], [], []
+    for key in ("entry_type", "name", "area", "frequency",
+                "description", "assigned_to", "next_due_date",
+                "active"):
+        if key in data and fields[key] != row[key]:
+            sets.append("%s = ?" % key)
+            args.append(fields[key])
+            changes.append("%s updated" % key)
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(schedule_id)
+        conn.execute(
+            "UPDATE erp_quality_sanitation_schedules SET %s"
+            " WHERE id = ?" % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor,
+                         "quality.sanitation_schedule_updated",
+                         "quality_sanitation_schedule", schedule_id,
+                         "; ".join(changes))
+        conn.commit()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_sanitation_schedules WHERE id = ?",
+        (schedule_id,)).fetchone()
+    out = _san_schedule_dict(row)
+    conn.close()
+    return jsonify(schedule=out)
+
+
+@app.delete("/api/erp/quality/sanitation-schedules/<int:schedule_id>")
+def quality_sanitation_schedule_delete(schedule_id):
+    """Delete a schedule, permanently. Logs already filed against
+    it are kept -- their schedule_id still names the deleted
+    schedule, and the schedule name simply stops resolving. The
+    audit rows for the deleted schedule are kept."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_sanitation_schedules WHERE id = ?",
+        (schedule_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="schedule not found"), 404
+    conn.execute(
+        "DELETE FROM erp_quality_sanitation_schedules WHERE id = ?",
+        (schedule_id,))
+    _erp_staff_audit(conn, actor, "quality.sanitation_schedule_deleted",
+                     "quality_sanitation_schedule", schedule_id,
+                     "deleted %s %s (%s)"
+                     % (row["entry_type"], row["name"],
+                        row["frequency"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.get("/api/erp/quality/sanitation-logs")
+def quality_sanitation_logs_list():
+    """Sanitation / pest-control log entries, newest first, each
+    with its schedule name (when scheduled) and its finding count.
+    Filters: entry_type=, result=, schedule_id=, area= (substring),
+    from= / to= (log_date range, YYYY-MM-DD). Starts empty."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    entry_type = (request.args.get("entry_type") or "").strip().lower()
+    if entry_type and entry_type not in _SAN_ENTRY_TYPES:
+        conn.close()
+        return jsonify(error="unknown entry_type"), 400
+    result = (request.args.get("result") or "").strip().lower()
+    if result and result not in _SAN_LOG_RESULTS:
+        conn.close()
+        return jsonify(error="unknown result"), 400
+    schedule_id = request.args.get("schedule_id")
+    if schedule_id is not None and schedule_id != "":
+        try:
+            schedule_id = int(schedule_id)
+        except (TypeError, ValueError):
+            conn.close()
+            return jsonify(error="schedule_id must be a schedule id"), 400
+    area = (request.args.get("area") or "").strip()
+    from_day = (request.args.get("from") or "").strip()
+    to_day = (request.args.get("to") or "").strip()
+    if from_day and not _san_valid_date(from_day):
+        conn.close()
+        return jsonify(error="from must be YYYY-MM-DD"), 400
+    if to_day and not _san_valid_date(to_day):
+        conn.close()
+        return jsonify(error="to must be YYYY-MM-DD"), 400
+    clauses, args = [], []
+    if entry_type:
+        clauses.append("l.entry_type = ?")
+        args.append(entry_type)
+    if result:
+        clauses.append("l.result = ?")
+        args.append(result)
+    if schedule_id is not None and schedule_id != "":
+        clauses.append("l.schedule_id = ?")
+        args.append(schedule_id)
+    if area:
+        clauses.append("l.area LIKE ?")
+        args.append("%" + area + "%")
+    if from_day:
+        clauses.append("l.log_date >= ?")
+        args.append(from_day)
+    if to_day:
+        clauses.append("l.log_date <= ?")
+        args.append(to_day)
+    query = ("SELECT l.*, s.name AS schedule_name,"
+             " (SELECT COUNT(*) FROM erp_quality_sanitation_findings"
+             " WHERE log_id = l.id) AS findings_count"
+             " FROM erp_quality_sanitation_logs l"
+             " LEFT JOIN erp_quality_sanitation_schedules s"
+             " ON s.id = l.schedule_id")
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY l.log_date DESC, l.id DESC"
+    rows = conn.execute(query, args).fetchall()
+    conn.close()
+    return jsonify(logs=[_san_log_dict(r) for r in rows])
+
+
+@app.post("/api/erp/quality/sanitation-logs")
+def quality_sanitation_log_create():
+    """File one sanitation check or pest-control visit. log_date
+    and entry_type are required; schedule_id is optional (blank =
+    unscheduled -- a one-off check or visit). The vendor is typed
+    in by hand on pest-control visits; a blank vendor means the
+    visit was done in-house (or the vendor was not recorded). The
+    result is recorded exactly as entered."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    fields, f_err = _san_clean_log(data, None, conn)
+    if f_err:
+        conn.close()
+        return jsonify(error=f_err), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_sanitation_logs (entry_type,"
+        " log_date, schedule_id, area, performed_by, vendor, result,"
+        " notes, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (fields["entry_type"], fields["log_date"],
+         fields["schedule_id"], fields["area"],
+         fields["performed_by"], fields["vendor"], fields["result"],
+         fields["notes"], actor, now, actor, now))
+    row = conn.execute(
+        "SELECT l.*, s.name AS schedule_name,"
+        " (SELECT COUNT(*) FROM erp_quality_sanitation_findings"
+        " WHERE log_id = l.id) AS findings_count"
+        " FROM erp_quality_sanitation_logs l"
+        " LEFT JOIN erp_quality_sanitation_schedules s"
+        " ON s.id = l.schedule_id WHERE l.id = ?",
+        (cur.lastrowid,)).fetchone()
+    out = _san_log_dict(row)
+    _erp_staff_audit(conn, actor, "quality.sanitation_log_created",
+                     "quality_sanitation_log", row["id"],
+                     "filed %s %s on %s"
+                     % (fields["entry_type"], fields["result"],
+                        fields["log_date"]))
+    conn.commit()
+    conn.close()
+    return jsonify(log=out), 201
+
+
+@app.get("/api/erp/quality/sanitation-logs/<int:log_id>")
+def quality_sanitation_log_get(log_id):
+    """One log entry with its findings (each with the linked CAPA's
+    title and status when linked) and its audit trail -- every write
+    to the log and to its findings, newest first. The audit rows are
+    read-only."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT l.*, s.name AS schedule_name,"
+        " (SELECT COUNT(*) FROM erp_quality_sanitation_findings"
+        " WHERE log_id = l.id) AS findings_count"
+        " FROM erp_quality_sanitation_logs l"
+        " LEFT JOIN erp_quality_sanitation_schedules s"
+        " ON s.id = l.schedule_id WHERE l.id = ?",
+        (log_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="log not found"), 404
+    findings = _san_log_findings(conn, log_id)
+    audit = _san_log_audit_rows(conn, log_id)
+    conn.close()
+    return jsonify(log=_san_log_dict(row), findings=findings,
+                   audit=audit)
+
+
+@app.post("/api/erp/quality/sanitation-logs/<int:log_id>/update")
+def quality_sanitation_log_update(log_id):
+    """Edit a log entry. Any field may change, including the result
+    and the schedule link (blank schedule_id unlinks it) -- every
+    change is recorded as entered, and the audit row names the
+    fields changed."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_sanitation_logs WHERE id = ?",
+        (log_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="log not found"), 404
+    fields, f_err = _san_clean_log(data, row, conn)
+    if f_err:
+        conn.close()
+        return jsonify(error=f_err), 400
+    sets, args, changes = [], [], []
+    for key in ("entry_type", "log_date", "schedule_id", "area",
+                "performed_by", "vendor", "result", "notes"):
+        if key in data and fields[key] != row[key]:
+            sets.append("%s = ?" % key)
+            args.append(fields[key])
+            changes.append("%s updated" % key)
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(log_id)
+        conn.execute(
+            "UPDATE erp_quality_sanitation_logs SET %s WHERE id = ?"
+            % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor, "quality.sanitation_log_updated",
+                         "quality_sanitation_log", log_id,
+                         "; ".join(changes))
+        conn.commit()
+    row = conn.execute(
+        "SELECT l.*, s.name AS schedule_name,"
+        " (SELECT COUNT(*) FROM erp_quality_sanitation_findings"
+        " WHERE log_id = l.id) AS findings_count"
+        " FROM erp_quality_sanitation_logs l"
+        " LEFT JOIN erp_quality_sanitation_schedules s"
+        " ON s.id = l.schedule_id WHERE l.id = ?",
+        (log_id,)).fetchone()
+    out = _san_log_dict(row)
+    conn.close()
+    return jsonify(log=out)
+
+
+@app.delete("/api/erp/quality/sanitation-logs/<int:log_id>")
+def quality_sanitation_log_delete(log_id):
+    """Delete a log entry, permanently -- its findings go with it
+    (they belong to the entry and mean nothing without it). The
+    audit rows for the deleted log and its findings are kept, so
+    the trail still shows they existed. Deleting never touches any
+    other record -- no CAPA, schedule, or batch is affected."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_sanitation_logs WHERE id = ?",
+        (log_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="log not found"), 404
+    n_findings = conn.execute(
+        "SELECT COUNT(*) FROM erp_quality_sanitation_findings"
+        " WHERE log_id = ?", (log_id,)).fetchone()[0]
+    conn.execute(
+        "DELETE FROM erp_quality_sanitation_findings WHERE log_id = ?",
+        (log_id,))
+    conn.execute(
+        "DELETE FROM erp_quality_sanitation_logs WHERE id = ?",
+        (log_id,))
+    _erp_staff_audit(conn, actor, "quality.sanitation_log_deleted",
+                     "quality_sanitation_log", log_id,
+                     "deleted %s %s on %s (%d finding%s)"
+                     % (row["entry_type"], row["result"],
+                        row["log_date"], n_findings,
+                        "" if n_findings == 1 else "s"))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
+@app.post("/api/erp/quality/sanitation-logs/<int:log_id>/findings")
+def quality_sanitation_finding_create(log_id):
+    """Record a finding on a log entry. description is required;
+    severity and status are recorded exactly as entered. capa_id
+    links ONE existing CAPA by id (NULL = unlinked) -- a value
+    that names no CAPA is refused, and a finding never creates
+    a CAPA."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    log = conn.execute(
+        "SELECT id FROM erp_quality_sanitation_logs WHERE id = ?",
+        (log_id,)).fetchone()
+    if not log:
+        conn.close()
+        return jsonify(error="log not found"), 404
+    fields, f_err = _san_clean_finding(data, None, conn)
+    if f_err:
+        conn.close()
+        return jsonify(error=f_err), 400
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_quality_sanitation_findings (log_id,"
+        " description, severity, status, capa_id, created_by,"
+        " created_at, updated_by, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (log_id, fields["description"], fields["severity"],
+         fields["status"], fields["capa_id"], actor, now, actor, now))
+    row = conn.execute(
+        "SELECT f.*, c.title AS capa_title, c.status AS capa_status"
+        " FROM erp_quality_sanitation_findings f"
+        " LEFT JOIN erp_quality_capas c ON c.id = f.capa_id"
+        " WHERE f.id = ?", (cur.lastrowid,)).fetchone()
+    out = _san_finding_dict(row)
+    _erp_staff_audit(conn, actor, "quality.sanitation_finding_created",
+                     "quality_sanitation_finding", row["id"],
+                     "finding on log %d: %s (%s)%s"
+                     % (log_id, fields["severity"], fields["status"],
+                        " linked to CAPA %d" % fields["capa_id"]
+                        if fields["capa_id"] else ""))
+    conn.commit()
+    conn.close()
+    return jsonify(finding=out), 201
+
+
+@app.post("/api/erp/quality/sanitation-findings/<int:finding_id>/update")
+def quality_sanitation_finding_update(finding_id):
+    """Edit a finding. Any field may change, including the CAPA
+    link (a null capa_id unlinks it) -- the audit row names the
+    fields changed. Linking still requires an existing CAPA."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_sanitation_findings WHERE id = ?",
+        (finding_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="finding not found"), 404
+    fields, f_err = _san_clean_finding(data, row, conn)
+    if f_err:
+        conn.close()
+        return jsonify(error=f_err), 400
+    sets, args, changes = [], [], []
+    for key in ("description", "severity", "status", "capa_id"):
+        if key in data and fields[key] != row[key]:
+            sets.append("%s = ?" % key)
+            args.append(fields[key])
+            changes.append("%s updated" % key)
+    if sets:
+        now = datetime.now(timezone.utc).isoformat()
+        sets.append("updated_by = ?")
+        args.append(actor)
+        sets.append("updated_at = ?")
+        args.append(now)
+        args.append(finding_id)
+        conn.execute(
+            "UPDATE erp_quality_sanitation_findings SET %s"
+            " WHERE id = ?" % ", ".join(sets), args)
+        _erp_staff_audit(conn, actor,
+                         "quality.sanitation_finding_updated",
+                         "quality_sanitation_finding", finding_id,
+                         "; ".join(changes))
+        conn.commit()
+    row = conn.execute(
+        "SELECT f.*, c.title AS capa_title, c.status AS capa_status"
+        " FROM erp_quality_sanitation_findings f"
+        " LEFT JOIN erp_quality_capas c ON c.id = f.capa_id"
+        " WHERE f.id = ?", (finding_id,)).fetchone()
+    out = _san_finding_dict(row)
+    conn.close()
+    return jsonify(finding=out)
+
+
+@app.delete("/api/erp/quality/sanitation-findings/<int:finding_id>")
+def quality_sanitation_finding_delete(finding_id):
+    """Delete a finding, permanently. The audit rows for the deleted
+    finding are kept. Deleting never touches the log it sat on, and
+    never touches a linked CAPA -- the link is a reference, not a
+    record of its own."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = conn.execute(
+        "SELECT * FROM erp_quality_sanitation_findings WHERE id = ?",
+        (finding_id,)).fetchone()
+    if not row:
+        conn.close()
+        return jsonify(error="finding not found"), 404
+    conn.execute(
+        "DELETE FROM erp_quality_sanitation_findings WHERE id = ?",
+        (finding_id,))
+    _erp_staff_audit(conn, actor, "quality.sanitation_finding_deleted",
+                     "quality_sanitation_finding", finding_id,
+                     "deleted %s finding on log %d"
+                     % (row["severity"], row["log_id"]))
+    conn.commit()
+    conn.close()
+    return jsonify(ok=True)
+
+
 # ---------------- Dept 14 Legal & Compliance (Wave B) ----------------
 # Admin-only. Three registers: trademark/IP, contracts + insurance,
 # and a compliance calendar. No new permissions -- admin-only via
@@ -57461,6 +64214,974 @@ def stores_shift_delete(store_id, shift_id):
     conn.commit()
     conn.close()
     return jsonify(ok=True)
+
+
+# ---------------------------------------------------------------- Dept 15 (Stores) S4
+# Dated shift instances (rota): a specific date + time + employee +
+# location/scope, draft -> published, swap/drop requests, coverage
+# checks, and time-off conflict flags. The weekly templates stay the
+# plan's source: generate copies them into dated drafts, and the
+# coverage check measures published shifts against them -- there is
+# no separate required-roles config, so nothing is invented about
+# what a day "should" look like beyond the templates the admin
+# already set. PTO conflicts come from erp_hr_pto_requests with
+# status 'approved' (date spans, no times: any shift on an approved
+# PTO date conflicts); they are FLAGS, never blocks -- publishing a
+# shift over approved PTO is allowed but warned, and the warning
+# rides on the shift and in the coverage report. Double-booking one
+# employee on overlapping times IS blocked (400), same rule as the
+# templates. Schedule management writes are admin-only
+# (_require_erp_admin); staff act only on their own shifts through
+# the swap/drop request endpoints, resolved server-side via
+# _hr_me_resolve -- no employee_id is ever trusted from a staff
+# payload. Every write leaves a staff-audit row. A rota shift is a
+# plan, not hours worked: nothing here touches the timeclock, the
+# payrun feed, the ledger, or payroll.
+
+_ROTA_STATUSES = ("draft", "published", "cancelled")
+_ROTA_REQUEST_KINDS = ("swap", "drop")
+_ROTA_REQUEST_STATUSES = ("pending", "approved", "denied", "cancelled")
+
+
+def _rota_pto_conflicts(conn, employee_id, shift_date):
+    """Approved PTO requests covering this employee on this date.
+
+    PTO is stored in erp_hr_pto_requests as inclusive date spans
+    (start_date..end_date, status 'approved'); there are no times,
+    so any shift on a covered date conflicts. Returns a list of
+    {request_id, type_name, start_date, end_date} (empty when the
+    table is absent, e.g. a pre-PTO database)."""
+    try:
+        rows = conn.execute(
+            "SELECT id, type_name, start_date, end_date"
+            " FROM erp_hr_pto_requests"
+            " WHERE employee_id = ? AND status = 'approved'"
+            " AND start_date <= ? AND end_date >= ?"
+            " ORDER BY start_date, id",
+            (employee_id, shift_date, shift_date)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [{"request_id": r["id"], "type_name": r["type_name"] or "",
+             "start_date": r["start_date"] or "",
+             "end_date": r["end_date"] or ""} for r in rows]
+
+
+def _rota_shift_dict(conn, row):
+    d = dict(row)
+    d["weekday"] = (datetime.strptime(d["shift_date"], "%Y-%m-%d").weekday()
+                    if d.get("shift_date") else None)
+    d["weekday_label"] = (_STORE_WEEKDAYS[d["weekday"]]
+                          if d["weekday"] is not None else "")
+    emp_id = d.get("employee_id")
+    d["pto_conflicts"] = (_rota_pto_conflicts(conn, emp_id, d["shift_date"])
+                          if emp_id else [])
+    return d
+
+
+def _rota_shift_row(conn, rota_id):
+    return conn.execute(
+        "SELECT r.*, e.name AS employee_name, s.name AS store_name"
+        " FROM erp_store_rota_shifts r"
+        " LEFT JOIN erp_hr_employees e ON e.id = r.employee_id"
+        " LEFT JOIN erp_stores s ON s.id = r.store_id"
+        " WHERE r.id = ?", (rota_id,)).fetchone()
+
+
+def _rota_validate(conn, data, current=None):
+    """Validate rota-shift fields. `current` is the existing row on
+    update (fields fall back to it). employee_id may be None
+    (unassigned); when given it must be an active HR employee.
+    Returns the cleaned dict, or (error_response, status)."""
+    merged = dict(current) if current else {}
+    for key in ("employee_id", "shift_date", "start_time", "end_time",
+                "role", "scope"):
+        if key in data:
+            merged[key] = data[key]
+    employee_id = merged.get("employee_id")
+    if employee_id in ("", None):
+        employee_id = None
+    else:
+        try:
+            employee_id = int(employee_id)
+        except (TypeError, ValueError):
+            return jsonify(error="employee_id must be an employee id"
+                           " or empty (unassigned)"), 400
+        emp = conn.execute(
+            "SELECT id, active FROM erp_hr_employees WHERE id = ?",
+            (employee_id,)).fetchone()
+        if not emp:
+            return jsonify(error="employee not found"), 400
+        if not int(emp["active"] or 0):
+            return jsonify(error="employee is inactive"), 400
+    shift_date = (merged.get("shift_date") or "").strip()
+    if not _legal_valid_date(shift_date) or not shift_date:
+        return jsonify(error="shift_date must be YYYY-MM-DD"), 400
+    start = _stores_time_minutes(merged.get("start_time"))
+    end = _stores_time_minutes(merged.get("end_time"))
+    if start is None or end is None:
+        return jsonify(error="start_time and end_time must be HH:MM"), 400
+    if end <= start:
+        return jsonify(error="end_time must be after start_time"), 400
+    role = (merged.get("role") or "").strip()
+    scope = (merged.get("scope") or "").strip()
+    if len(role) > 100:
+        return jsonify(error="role must be 100 characters or fewer"), 400
+    if len(scope) > 100:
+        return jsonify(error="scope must be 100 characters or fewer"), 400
+    # No overlapping dated shifts for the same employee on the same
+    # date. Cancelled shifts do not block. A gap is fine.
+    if employee_id is not None:
+        others = conn.execute(
+            "SELECT id, start_time, end_time FROM erp_store_rota_shifts"
+            " WHERE employee_id = ? AND shift_date = ?"
+            " AND status != 'cancelled'",
+            (employee_id, shift_date)).fetchall()
+        for o in others:
+            if current and int(o["id"]) == int(current["id"]):
+                continue
+            o_start = _stores_time_minutes(o["start_time"])
+            o_end = _stores_time_minutes(o["end_time"])
+            if o_start is not None and o_end is not None \
+                    and start < o_end and o_start < end:
+                return jsonify(
+                    error="employee already has an overlapping shift"
+                    " that day"), 400
+    return {"employee_id": employee_id, "shift_date": shift_date,
+            "start_time": "%02d:%02d" % (start // 60, start % 60),
+            "end_time": "%02d:%02d" % (end // 60, end % 60),
+            "role": role, "scope": scope}
+
+
+def _rota_week_range(data):
+    """(from_date, to_date) for a rota range. ?from/?to (or a week
+    anchor) win; default is the current week, Monday..Sunday.
+    Returns (from_str, to_str) or (error_response, status)."""
+    args = request.args if request.method == "GET" else {}
+    date_from = (data.get("from") or data.get("from_date")
+                 or args.get("from") or "").strip()
+    date_to = (data.get("to") or data.get("to_date")
+               or args.get("to") or "").strip()
+    week = (data.get("week") or args.get("week") or "").strip()
+    if not date_from and not date_to and week:
+        if not _legal_valid_date(week):
+            return jsonify(error="week must be YYYY-MM-DD"), 400
+        any_day = datetime.strptime(week, "%Y-%m-%d").date()
+        monday = any_day - timedelta(days=any_day.weekday())
+        return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
+    if not date_from and not date_to:
+        today = datetime.now(timezone.utc).date()
+        monday = today - timedelta(days=today.weekday())
+        return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
+    if not date_from:
+        date_from = date_to
+    if not date_to:
+        date_to = date_from
+    if not _legal_valid_date(date_from) or not _legal_valid_date(date_to):
+        return jsonify(error="from and to must be YYYY-MM-DD"), 400
+    if date_to < date_from:
+        return jsonify(error="to must not be before from"), 400
+    if (datetime.strptime(date_to, "%Y-%m-%d")
+            - datetime.strptime(date_from, "%Y-%m-%d")).days > 62:
+        return jsonify(error="range must be 62 days or fewer"), 400
+    return date_from, date_to
+
+
+def _rota_coverage(conn, store_id, date_from, date_to):
+    """Coverage for each day in the range, honestly from data that
+    exists: the weekly templates for that weekday are the expected
+    coverage. A template role is 'covered' when a published rota
+    shift that day has the same role (case-insensitive) and its
+    time window overlaps the template's. Warnings per day:
+    uncovered template roles, published shifts with no employee,
+    published shifts whose employee has approved PTO that day, and
+    days where templates exist but no shift is published at all.
+    A day with no templates and no shifts is clear, not a gap --
+    nothing expected it to be staffed."""
+    templates = conn.execute(
+        "SELECT s.*, e.name AS employee_name FROM erp_store_shifts s"
+        " LEFT JOIN erp_hr_employees e ON e.id = s.employee_id"
+        " WHERE s.store_id = ? ORDER BY s.weekday, s.start_time, s.id",
+        (store_id,)).fetchall()
+    shifts = conn.execute(
+        "SELECT r.*, e.name AS employee_name"
+        " FROM erp_store_rota_shifts r"
+        " LEFT JOIN erp_hr_employees e ON e.id = r.employee_id"
+        " WHERE r.store_id = ? AND r.shift_date >= ?"
+        " AND r.shift_date <= ? ORDER BY r.shift_date, r.start_time,"
+        " r.id", (store_id, date_from, date_to)).fetchall()
+    by_date = {}
+    for s in shifts:
+        by_date.setdefault(s["shift_date"], []).append(s)
+    days = []
+    total_warnings = 0
+    day = datetime.strptime(date_from, "%Y-%m-%d").date()
+    last = datetime.strptime(date_to, "%Y-%m-%d").date()
+    while day <= last:
+        ds = day.isoformat()
+        weekday = day.weekday()
+        day_templates = [t for t in templates
+                         if int(t["weekday"]) == weekday]
+        day_shifts = by_date.get(ds, [])
+        published = [s for s in day_shifts if s["status"] == "published"]
+        uncovered = []
+        for t in day_templates:
+            t_start = _stores_time_minutes(t["start_time"])
+            t_end = _stores_time_minutes(t["end_time"])
+            covered = False
+            for s in published:
+                if (s["role"] or "").strip().lower() \
+                        != (t["role"] or "").strip().lower():
+                    continue
+                s_start = _stores_time_minutes(s["start_time"])
+                s_end = _stores_time_minutes(s["end_time"])
+                if None in (t_start, t_end, s_start, s_end):
+                    continue
+                if s_start < t_end and t_start < s_end:
+                    covered = True
+                    break
+            if not covered:
+                uncovered.append({
+                    "role": t["role"] or "",
+                    "start_time": t["start_time"],
+                    "end_time": t["end_time"],
+                    "template_employee_name": t["employee_name"] or "",
+                    "template_id": t["id"]})
+        unassigned = [{"id": s["id"], "start_time": s["start_time"],
+                       "end_time": s["end_time"], "role": s["role"] or "",
+                       "scope": s["scope"] or ""}
+                      for s in published if not s["employee_id"]]
+        pto = []
+        for s in published:
+            if not s["employee_id"]:
+                continue
+            for c in _rota_pto_conflicts(conn, s["employee_id"], ds):
+                pto.append({"shift_id": s["id"],
+                            "employee_id": s["employee_id"],
+                            "employee_name": s["employee_name"] or "",
+                            "role": s["role"] or "",
+                            "request_id": c["request_id"],
+                            "type_name": c["type_name"],
+                            "start_date": c["start_date"],
+                            "end_date": c["end_date"]})
+        no_published = bool(day_templates) and not published
+        warnings = len(uncovered) + len(unassigned) + len(pto) \
+            + (1 if no_published else 0)
+        total_warnings += warnings
+        days.append({"date": ds, "weekday": weekday,
+                     "weekday_label": _STORE_WEEKDAYS[weekday],
+                     "expected_roles": len(day_templates),
+                     "published_shifts": len(published),
+                     "draft_shifts": len([s for s in day_shifts
+                                          if s["status"] == "draft"]),
+                     "uncovered_roles": uncovered,
+                     "unassigned_shifts": unassigned,
+                     "pto_conflicts": pto,
+                     "no_published_shifts": no_published,
+                     "warnings": warnings})
+        day += timedelta(days=1)
+    return {"days": days, "total_warnings": total_warnings}
+
+
+def _rota_get_shift(conn, store_id, rota_id):
+    return conn.execute(
+        "SELECT * FROM erp_store_rota_shifts WHERE id = ? AND store_id = ?",
+        (rota_id, store_id)).fetchone()
+
+
+def _rota_request_dict(conn, row):
+    d = dict(row)
+    shift = conn.execute(
+        "SELECT r.*, e.name AS employee_name, s.name AS store_name"
+        " FROM erp_store_rota_shifts r"
+        " LEFT JOIN erp_hr_employees e ON e.id = r.employee_id"
+        " LEFT JOIN erp_stores s ON s.id = r.store_id"
+        " WHERE r.id = ?", (row["rota_shift_id"],)).fetchone()
+    d["shift"] = _rota_shift_dict(conn, shift) if shift else None
+    req = conn.execute(
+        "SELECT name FROM erp_hr_employees WHERE id = ?",
+        (row["employee_id"],)).fetchone()
+    d["employee_name"] = req["name"] if req else ""
+    tgt = None
+    if row["target_employee_id"]:
+        tgt = conn.execute(
+            "SELECT name FROM erp_hr_employees WHERE id = ?",
+            (row["target_employee_id"],)).fetchone()
+    d["target_employee_name"] = tgt["name"] if tgt else ""
+    return d
+
+
+@app.get("/api/erp/stores/<int:store_id>/rota")
+def stores_rota_list(store_id):
+    """Dated shifts for a store in a range (?from/?to, ?week, or the
+    current week by default), with employee names and PTO flags."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    rng = _rota_week_range({})
+    if isinstance(rng, tuple) and len(rng) == 2 \
+            and not isinstance(rng[0], str):
+        return rng
+    date_from, date_to = rng
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    rows = conn.execute(
+        "SELECT r.*, e.name AS employee_name, s.name AS store_name"
+        " FROM erp_store_rota_shifts r"
+        " LEFT JOIN erp_hr_employees e ON e.id = r.employee_id"
+        " LEFT JOIN erp_stores s ON s.id = r.store_id"
+        " WHERE r.store_id = ? AND r.shift_date >= ?"
+        " AND r.shift_date <= ?"
+        " ORDER BY r.shift_date, r.start_time, r.id",
+        (store_id, date_from, date_to)).fetchall()
+    out = [_rota_shift_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(store_id=store_id, store_name=store["name"],
+                   date_from=date_from, date_to=date_to, shifts=out)
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota")
+def stores_rota_create(store_id):
+    """Add a dated shift (draft by default). employee_id may be
+    omitted for an unassigned shift. Overlap with the same
+    employee's other dated shifts that day is blocked; an approved
+    PTO overlap is flagged on the returned shift, not blocked."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    fields = _rota_validate(conn, data)
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_store_rota_shifts (store_id, employee_id,"
+        " template_id, shift_date, start_time, end_time, role, scope,"
+        " status, created_by, created_at, updated_by, updated_at)"
+        " VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
+        (store_id, fields["employee_id"], fields["shift_date"],
+         fields["start_time"], fields["end_time"], fields["role"],
+         fields["scope"], actor, now, actor, now))
+    _erp_staff_audit(conn, actor, "stores.rota_shift_created",
+                     "store_rota_shift", cur.lastrowid,
+                     "Dated shift %s %s-%s at store %d (%s)" % (
+                         fields["shift_date"], fields["start_time"],
+                         fields["end_time"], store_id,
+                         fields["role"] or "no role"))
+    row = _rota_shift_row(conn, cur.lastrowid)
+    payload = _rota_shift_dict(conn, row)
+    conn.commit()
+    conn.close()
+    return jsonify(shift=payload), 201
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/<int:rota_id>/update")
+def stores_rota_update(store_id, rota_id):
+    """Edit a draft or published dated shift. Cancelled shifts
+    cannot be edited -- create a new one instead."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    row = _rota_get_shift(conn, store_id, rota_id)
+    if not row:
+        conn.close()
+        return jsonify(error="dated shift not found"), 404
+    if row["status"] == "cancelled":
+        conn.close()
+        return jsonify(error="cancelled shifts cannot be edited"), 400
+    fields = _rota_validate(conn, data, current=dict(row))
+    if isinstance(fields, tuple):
+        conn.close()
+        return fields
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_rota_shifts SET employee_id = ?,"
+        " shift_date = ?, start_time = ?, end_time = ?, role = ?,"
+        " scope = ?, updated_by = ?, updated_at = ? WHERE id = ?",
+        (fields["employee_id"], fields["shift_date"],
+         fields["start_time"], fields["end_time"], fields["role"],
+         fields["scope"], actor, now, rota_id))
+    _erp_staff_audit(conn, actor, "stores.rota_shift_updated",
+                     "store_rota_shift", rota_id,
+                     "Dated shift #%d updated" % rota_id)
+    out = _rota_shift_row(conn, rota_id)
+    payload = _rota_shift_dict(conn, out)
+    conn.commit()
+    conn.close()
+    return jsonify(shift=payload)
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/<int:rota_id>/publish")
+def stores_rota_publish(store_id, rota_id):
+    """Draft -> published. Publishing never blocks on warnings:
+    an unassigned shift or an approved-PTO overlap publishes
+    anyway and stays flagged in the response and the coverage
+    report, so the gap is visible instead of hidden."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _rota_get_shift(conn, store_id, rota_id)
+    if not row:
+        conn.close()
+        return jsonify(error="dated shift not found"), 404
+    if row["status"] == "published":
+        conn.close()
+        return jsonify(error="shift is already published"), 400
+    if row["status"] == "cancelled":
+        conn.close()
+        return jsonify(error="cancelled shifts cannot be published"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_rota_shifts SET status = 'published',"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (actor, now, rota_id))
+    out = _rota_shift_row(conn, rota_id)
+    d = _rota_shift_dict(conn, out)
+    _erp_staff_audit(conn, actor, "stores.rota_shift_published",
+                     "store_rota_shift", rota_id,
+                     "Dated shift #%d published %s %s-%s%s" % (
+                         rota_id, d["shift_date"], d["start_time"],
+                         d["end_time"],
+                         " (unassigned)" if not d["employee_id"] else
+                         (" (PTO conflict: %s)"
+                          % d["pto_conflicts"][0]["type_name"]
+                          if d["pto_conflicts"] else "")))
+    conn.commit()
+    conn.close()
+    return jsonify(shift=d)
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/<int:rota_id>/unpublish")
+def stores_rota_unpublish(store_id, rota_id):
+    """Published -> draft (pull a shift back before it goes out)."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _rota_get_shift(conn, store_id, rota_id)
+    if not row:
+        conn.close()
+        return jsonify(error="dated shift not found"), 404
+    if row["status"] != "published":
+        conn.close()
+        return jsonify(error="only a published shift can be"
+                       " unpublished"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_rota_shifts SET status = 'draft',"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (actor, now, rota_id))
+    _erp_staff_audit(conn, actor, "stores.rota_shift_unpublished",
+                     "store_rota_shift", rota_id,
+                     "Dated shift #%d unpublished" % rota_id)
+    out = _rota_shift_row(conn, rota_id)
+    payload = _rota_shift_dict(conn, out)
+    conn.commit()
+    conn.close()
+    return jsonify(shift=payload)
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/<int:rota_id>/cancel")
+def stores_rota_cancel(store_id, rota_id):
+    """Cancel a draft or published dated shift. The row stays (with
+    status cancelled) so the audit trail and any requests on it
+    stay readable; cancelled shifts never count for coverage or
+    overlap."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    row = _rota_get_shift(conn, store_id, rota_id)
+    if not row:
+        conn.close()
+        return jsonify(error="dated shift not found"), 404
+    if row["status"] == "cancelled":
+        conn.close()
+        return jsonify(error="shift is already cancelled"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_rota_shifts SET status = 'cancelled',"
+        " updated_by = ?, updated_at = ? WHERE id = ?",
+        (actor, now, rota_id))
+    conn.execute(
+        "UPDATE erp_store_rota_requests SET status = 'cancelled',"
+        " updated_at = ? WHERE rota_shift_id = ? AND status = 'pending'",
+        (now, rota_id))
+    _erp_staff_audit(conn, actor, "stores.rota_shift_cancelled",
+                     "store_rota_shift", rota_id,
+                     "Dated shift #%d cancelled" % rota_id)
+    out = _rota_shift_row(conn, rota_id)
+    payload = _rota_shift_dict(conn, out)
+    conn.commit()
+    conn.close()
+    return jsonify(shift=payload)
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/generate")
+def stores_rota_generate(store_id):
+    """Copy the weekly templates into dated drafts for a week
+    (?week anchor in the body, default the current week). One
+    draft per template per date; a date that already has a
+    non-cancelled instance of that template is skipped, so
+    generating twice never duplicates a shift. Hand-made shifts
+    (template_id NULL) are never touched."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    rng = _rota_week_range(data)
+    if isinstance(rng, tuple) and len(rng) == 2 \
+            and not isinstance(rng[0], str):
+        return rng
+    date_from, date_to = rng
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    templates = conn.execute(
+        "SELECT * FROM erp_store_shifts WHERE store_id = ?"
+        " ORDER BY weekday, start_time, id", (store_id,)).fetchall()
+    now = datetime.now(timezone.utc).isoformat()
+    created, skipped = 0, 0
+    day = datetime.strptime(date_from, "%Y-%m-%d").date()
+    last = datetime.strptime(date_to, "%Y-%m-%d").date()
+    while day <= last:
+        ds = day.isoformat()
+        for t in templates:
+            if int(t["weekday"]) != day.weekday():
+                continue
+            exists = conn.execute(
+                "SELECT 1 FROM erp_store_rota_shifts"
+                " WHERE template_id = ? AND shift_date = ?"
+                " AND status != 'cancelled'",
+                (t["id"], ds)).fetchone()
+            if exists:
+                skipped += 1
+                continue
+            conn.execute(
+                "INSERT INTO erp_store_rota_shifts (store_id,"
+                " employee_id, template_id, shift_date, start_time,"
+                " end_time, role, scope, status, created_by,"
+                " created_at, updated_by, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, '', 'draft', ?, ?, ?, ?)",
+                (store_id, t["employee_id"], t["id"], ds,
+                 t["start_time"], t["end_time"], t["role"],
+                 actor, now, actor, now))
+            created += 1
+        day += timedelta(days=1)
+    _erp_staff_audit(conn, actor, "stores.rota_generated",
+                     "store_rota_shift", store_id,
+                     "Generated %d dated draft shifts %s..%s at store"
+                     " %d (%d skipped as already present)"
+                     % (created, date_from, date_to, store_id, skipped))
+    conn.commit()
+    conn.close()
+    return jsonify(store_id=store_id, date_from=date_from,
+                   date_to=date_to, created=created, skipped=skipped)
+
+
+@app.get("/api/erp/stores/<int:store_id>/rota/coverage")
+def stores_rota_coverage(store_id):
+    """Coverage report for a range (?from/?to, ?week, or the current
+    week): per day, which template roles are uncovered, which
+    published shifts have no employee, which published shifts sit
+    on approved PTO, and which templated days have nothing
+    published at all."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    rng = _rota_week_range({})
+    if isinstance(rng, tuple) and len(rng) == 2 \
+            and not isinstance(rng[0], str):
+        return rng
+    date_from, date_to = rng
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    report = _rota_coverage(conn, store_id, date_from, date_to)
+    conn.close()
+    return jsonify(store_id=store_id, store_name=store["name"],
+                   date_from=date_from, date_to=date_to, **report)
+
+
+@app.get("/api/erp/stores/<int:store_id>/rota/requests")
+def stores_rota_requests_list(store_id):
+    """Swap/drop requests for a store, newest first. ?status=
+    pending/approved/denied/cancelled filters."""
+    _, err = _require_erp_admin()
+    if err:
+        return err
+    status = (request.args.get("status") or "").strip()
+    if status and status not in _ROTA_REQUEST_STATUSES:
+        return jsonify(error="unknown request status"), 400
+    conn = db()
+    store = conn.execute(
+        "SELECT * FROM erp_stores WHERE id = ?", (store_id,)).fetchone()
+    if not store:
+        conn.close()
+        return jsonify(error="store not found"), 404
+    q = ("SELECT q.* FROM erp_store_rota_requests q"
+         " JOIN erp_store_rota_shifts r ON r.id = q.rota_shift_id"
+         " WHERE r.store_id = ?")
+    params = [store_id]
+    if status:
+        q += " AND q.status = ?"
+        params.append(status)
+    rows = conn.execute(q + " ORDER BY q.id DESC", params).fetchall()
+    out = [_rota_request_dict(conn, r) for r in rows]
+    conn.close()
+    return jsonify(store_id=store_id, requests=out)
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/<int:rota_id>/request-swap")
+def stores_rota_request_swap(store_id, rota_id):
+    """Staff self-service: ask to swap one of YOUR published shifts
+    with another active employee. The caller is resolved server-side
+    (_hr_me_resolve); the shift must be yours and published, the
+    target must be active and not you, and the target must have no
+    overlapping dated shift that day. Admins decide on the request
+    list; nothing changes until an admin approves."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    emp, err_resp = _hr_me_resolve(conn)
+    if err_resp:
+        conn.close()
+        return err_resp
+    row = _rota_get_shift(conn, store_id, rota_id)
+    if not row:
+        conn.close()
+        return jsonify(error="dated shift not found"), 404
+    if int(row["employee_id"] or 0) != int(emp["id"]):
+        conn.close()
+        return jsonify(error="you can only request a swap on your own"
+                       " shift"), 403
+    if row["status"] != "published":
+        conn.close()
+        return jsonify(error="only a published shift can be swapped"), 400
+    try:
+        target_id = int(data.get("target_employee_id"))
+    except (TypeError, ValueError):
+        conn.close()
+        return jsonify(error="target_employee_id is required"), 400
+    if target_id == int(emp["id"]):
+        conn.close()
+        return jsonify(error="you cannot swap a shift with yourself"), 400
+    tgt = conn.execute(
+        "SELECT id, active FROM erp_hr_employees WHERE id = ?",
+        (target_id,)).fetchone()
+    if not tgt:
+        conn.close()
+        return jsonify(error="swap target employee not found"), 400
+    if not int(tgt["active"] or 0):
+        conn.close()
+        return jsonify(error="swap target employee is inactive"), 400
+    clash = conn.execute(
+        "SELECT id FROM erp_store_rota_shifts"
+        " WHERE employee_id = ? AND shift_date = ?"
+        " AND status != 'cancelled'"
+        " AND start_time < ? AND ? < end_time",
+        (target_id, row["shift_date"], row["end_time"],
+         row["start_time"])).fetchone()
+    if clash:
+        conn.close()
+        return jsonify(error="swap target already has an overlapping"
+                       " shift that day"), 400
+    pending = conn.execute(
+        "SELECT 1 FROM erp_store_rota_requests"
+        " WHERE rota_shift_id = ? AND status = 'pending'",
+        (rota_id,)).fetchone()
+    if pending:
+        conn.close()
+        return jsonify(error="this shift already has a pending"
+                       " request"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    reason = (data.get("reason") or "").strip()[:500]
+    cur = conn.execute(
+        "INSERT INTO erp_store_rota_requests (rota_shift_id,"
+        " employee_id, kind, target_employee_id, status, reason,"
+        " created_by, created_at, updated_at)"
+        " VALUES (?, ?, 'swap', ?, 'pending', ?, ?, ?, ?)",
+        (rota_id, emp["id"], target_id, reason, actor or "", now, now))
+    _erp_staff_audit(conn, actor, "stores.rota_request_created",
+                     "store_rota_request", cur.lastrowid,
+                     "Swap requested on dated shift #%d by %s to"
+                     " employee #%d" % (rota_id, emp["name"], target_id))
+    out = conn.execute(
+        "SELECT * FROM erp_store_rota_requests WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    payload = _rota_request_dict(conn, out)
+    conn.commit()
+    conn.close()
+    return jsonify(request=payload), 201
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/<int:rota_id>/request-drop")
+def stores_rota_request_drop(store_id, rota_id):
+    """Staff self-service: ask to drop one of YOUR published shifts.
+    Approving a drop unassigns the shift (it stays published so
+    coverage flags the gap); nothing changes until an admin
+    approves."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    emp, err_resp = _hr_me_resolve(conn)
+    if err_resp:
+        conn.close()
+        return err_resp
+    row = _rota_get_shift(conn, store_id, rota_id)
+    if not row:
+        conn.close()
+        return jsonify(error="dated shift not found"), 404
+    if int(row["employee_id"] or 0) != int(emp["id"]):
+        conn.close()
+        return jsonify(error="you can only request a drop on your own"
+                       " shift"), 403
+    if row["status"] != "published":
+        conn.close()
+        return jsonify(error="only a published shift can be dropped"), 400
+    pending = conn.execute(
+        "SELECT 1 FROM erp_store_rota_requests"
+        " WHERE rota_shift_id = ? AND status = 'pending'",
+        (rota_id,)).fetchone()
+    if pending:
+        conn.close()
+        return jsonify(error="this shift already has a pending"
+                       " request"), 409
+    now = datetime.now(timezone.utc).isoformat()
+    reason = (data.get("reason") or "").strip()[:500]
+    cur = conn.execute(
+        "INSERT INTO erp_store_rota_requests (rota_shift_id,"
+        " employee_id, kind, target_employee_id, status, reason,"
+        " created_by, created_at, updated_at)"
+        " VALUES (?, ?, 'drop', NULL, 'pending', ?, ?, ?, ?)",
+        (rota_id, emp["id"], reason, actor or "", now, now))
+    _erp_staff_audit(conn, actor, "stores.rota_request_created",
+                     "store_rota_request", cur.lastrowid,
+                     "Drop requested on dated shift #%d by %s"
+                     % (rota_id, emp["name"]))
+    out = conn.execute(
+        "SELECT * FROM erp_store_rota_requests WHERE id = ?",
+        (cur.lastrowid,)).fetchone()
+    payload = _rota_request_dict(conn, out)
+    conn.commit()
+    conn.close()
+    return jsonify(request=payload), 201
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/requests/<int:req_id>/approve")
+def stores_rota_request_approve(store_id, req_id):
+    """Admin decision on a pending swap/drop. A swap reassigns the
+    shift to the target employee (re-checked for overlap and active
+    status at decision time); a drop unassigns it and leaves it
+    published so coverage flags the gap. A PTO overlap on the new
+    assignee is flagged on the shift afterwards, not a block."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    req = conn.execute(
+        "SELECT q.* FROM erp_store_rota_requests q"
+        " JOIN erp_store_rota_shifts r ON r.id = q.rota_shift_id"
+        " WHERE q.id = ? AND r.store_id = ?",
+        (req_id, store_id)).fetchone()
+    if not req:
+        conn.close()
+        return jsonify(error="request not found"), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify(error="only a pending request can be approved"), 400
+    shift = _rota_get_shift(conn, store_id, req["rota_shift_id"])
+    if not shift or shift["status"] != "published":
+        conn.close()
+        return jsonify(error="the shift is no longer published"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    if req["kind"] == "swap":
+        tgt = conn.execute(
+            "SELECT id, active FROM erp_hr_employees WHERE id = ?",
+            (req["target_employee_id"],)).fetchone()
+        if not tgt or not int(tgt["active"] or 0):
+            conn.close()
+            return jsonify(error="swap target employee is no longer"
+                           " active"), 400
+        clash = conn.execute(
+            "SELECT id FROM erp_store_rota_shifts"
+            " WHERE employee_id = ? AND shift_date = ?"
+            " AND status != 'cancelled' AND id != ?"
+            " AND start_time < ? AND ? < end_time",
+            (req["target_employee_id"], shift["shift_date"], shift["id"],
+             shift["end_time"], shift["start_time"])).fetchone()
+        if clash:
+            conn.close()
+            return jsonify(error="swap target now has an overlapping"
+                           " shift that day"), 400
+        conn.execute(
+            "UPDATE erp_store_rota_shifts SET employee_id = ?,"
+            " updated_by = ?, updated_at = ? WHERE id = ?",
+            (req["target_employee_id"], actor, now, shift["id"]))
+        detail = ("Swap approved: dated shift #%d reassigned to"
+                  " employee #%d" % (shift["id"],
+                                     req["target_employee_id"]))
+    else:
+        conn.execute(
+            "UPDATE erp_store_rota_shifts SET employee_id = NULL,"
+            " updated_by = ?, updated_at = ? WHERE id = ?",
+            (actor, now, shift["id"]))
+        detail = ("Drop approved: dated shift #%d unassigned"
+                  % shift["id"])
+    conn.execute(
+        "UPDATE erp_store_rota_requests SET status = 'approved',"
+        " decided_by = ?, decided_at = ?, updated_at = ? WHERE id = ?",
+        (actor, now, now, req_id))
+    _erp_staff_audit(conn, actor, "stores.rota_request_approved",
+                     "store_rota_request", req_id, detail)
+    out = conn.execute(
+        "SELECT * FROM erp_store_rota_requests WHERE id = ?",
+        (req_id,)).fetchone()
+    payload = _rota_request_dict(conn, out)
+    conn.commit()
+    conn.close()
+    return jsonify(request=payload)
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/requests/<int:req_id>/deny")
+def stores_rota_request_deny(store_id, req_id):
+    """Admin denies a pending swap/drop. The shift is untouched."""
+    actor, err = _require_erp_admin()
+    if err:
+        return err
+    conn = db()
+    req = conn.execute(
+        "SELECT q.* FROM erp_store_rota_requests q"
+        " JOIN erp_store_rota_shifts r ON r.id = q.rota_shift_id"
+        " WHERE q.id = ? AND r.store_id = ?",
+        (req_id, store_id)).fetchone()
+    if not req:
+        conn.close()
+        return jsonify(error="request not found"), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify(error="only a pending request can be denied"), 400
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_rota_requests SET status = 'denied',"
+        " decided_by = ?, decided_at = ?, updated_at = ? WHERE id = ?",
+        (actor, now, now, req_id))
+    _erp_staff_audit(conn, actor, "stores.rota_request_denied",
+                     "store_rota_request", req_id,
+                     "%s request #%d denied" % (req["kind"], req_id))
+    out = conn.execute(
+        "SELECT * FROM erp_store_rota_requests WHERE id = ?",
+        (req_id,)).fetchone()
+    payload = _rota_request_dict(conn, out)
+    conn.commit()
+    conn.close()
+    return jsonify(request=payload)
+
+
+@app.post("/api/erp/stores/<int:store_id>/rota/requests/<int:req_id>/cancel")
+def stores_rota_request_cancel(store_id, req_id):
+    """Withdraw a pending request: the requesting employee themself
+    (resolved server-side) or an admin. The shift is untouched."""
+    actor, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    req = conn.execute(
+        "SELECT q.* FROM erp_store_rota_requests q"
+        " JOIN erp_store_rota_shifts r ON r.id = q.rota_shift_id"
+        " WHERE q.id = ? AND r.store_id = ?",
+        (req_id, store_id)).fetchone()
+    if not req:
+        conn.close()
+        return jsonify(error="request not found"), 404
+    if req["status"] != "pending":
+        conn.close()
+        return jsonify(error="only a pending request can be"
+                       " cancelled"), 400
+    user = _current_member()
+    is_admin = bool(user and _is_admin(user))
+    if not is_admin:
+        emp, err_resp = _hr_me_resolve(conn)
+        if err_resp:
+            conn.close()
+            return err_resp
+        if int(req["employee_id"]) != int(emp["id"]):
+            conn.close()
+            return jsonify(error="you can only cancel your own"
+                           " request"), 403
+    now = datetime.now(timezone.utc).isoformat()
+    conn.execute(
+        "UPDATE erp_store_rota_requests SET status = 'cancelled',"
+        " updated_at = ? WHERE id = ?", (now, req_id))
+    _erp_staff_audit(conn, actor, "stores.rota_request_cancelled",
+                     "store_rota_request", req_id,
+                     "%s request #%d cancelled" % (req["kind"], req_id))
+    out = conn.execute(
+        "SELECT * FROM erp_store_rota_requests WHERE id = ?",
+        (req_id,)).fetchone()
+    payload = _rota_request_dict(conn, out)
+    conn.commit()
+    conn.close()
+    return jsonify(request=payload)
+
+
+@app.get("/api/erp/hr/me/rota-shifts")
+def hr_me_rota_shifts():
+    """Staff self-service: your own dated shifts (any store) plus
+    your own swap/drop requests, newest first. Never another
+    employee's shifts."""
+    _, err = _require_erp()
+    if err:
+        return err
+    conn = db()
+    emp, err_resp = _hr_me_resolve(conn)
+    if err_resp:
+        conn.close()
+        return err_resp
+    shifts = conn.execute(
+        "SELECT r.*, e.name AS employee_name, s.name AS store_name"
+        " FROM erp_store_rota_shifts r"
+        " LEFT JOIN erp_hr_employees e ON e.id = r.employee_id"
+        " LEFT JOIN erp_stores s ON s.id = r.store_id"
+        " WHERE r.employee_id = ?"
+        " ORDER BY r.shift_date DESC, r.start_time, r.id",
+        (emp["id"],)).fetchall()
+    reqs = conn.execute(
+        "SELECT * FROM erp_store_rota_requests WHERE employee_id = ?"
+        " ORDER BY id DESC", (emp["id"],)).fetchall()
+    candidates = conn.execute(
+        "SELECT id, name, role FROM erp_hr_employees"
+        " WHERE active = 1 AND id != ? ORDER BY name, id",
+        (emp["id"],)).fetchall()
+    out = {"employee_id": emp["id"],
+           "shifts": [_rota_shift_dict(conn, r) for r in shifts],
+           "requests": [_rota_request_dict(conn, r) for r in reqs],
+           "swap_candidates": [dict(c) for c in candidates]}
+    conn.close()
+    return jsonify(out)
 
 
 @app.get("/api/erp/stores/<int:store_id>/roster")
@@ -64369,6 +72090,53 @@ def erp_list_items():
     return jsonify(items=[dict(r) for r in rows])
 
 
+@app.get("/api/erp/items/unassigned")
+def erp_list_unassigned_items():
+    # F3 orphaned-item cleanup (SOP 2.26): an active item with no row in
+    # erp_item_locations never appears in the Inventory stock table --
+    # /api/erp/stock is built from item<->location pairs -- so the normal
+    # "Delete an item" path (open the Inventory tab, find the item's row,
+    # Delete) cannot reach it. The same item still appears in every picker
+    # that reads erp_items directly, notably the FSMA 204 dropdowns. This
+    # list is the removal path for those items: the Inventory tab renders
+    # it as "Items with no location" with the same soft Delete. The
+    # reference counts are shown so the admin can see what the item is
+    # tied to before deleting; deletion itself is the existing soft delete
+    # (active = 0, history kept, SKU stays reserved), so references are
+    # never broken -- only new use is blocked.
+    actor, err = _erp_check_perm("inventory.read")
+    if err:
+        return err
+    conn = db()
+    rows = conn.execute(
+        "SELECT * FROM erp_items WHERE active = 1 AND id NOT IN"
+        " (SELECT item_id FROM erp_item_locations)"
+        " ORDER BY type, name").fetchall()
+    out = []
+    for it in rows:
+        d = dict(it)
+        d["on_hand"] = _erp_on_hand(conn, it["id"])
+        d["ledger_rows"] = conn.execute(
+            "SELECT COUNT(*) FROM erp_stock_ledger WHERE item_id = ?",
+            (it["id"],)).fetchone()[0]
+        d["recipe_lines"] = conn.execute(
+            "SELECT COUNT(*) FROM erp_recipe_lines WHERE item_id = ?",
+            (it["id"],)).fetchone()[0]
+        d["po_lines"] = conn.execute(
+            "SELECT COUNT(*) FROM erp_po_lines WHERE item_id = ?",
+            (it["id"],)).fetchone()[0]
+        d["fsma_events"] = conn.execute(
+            "SELECT COUNT(*) FROM erp_fsma_events WHERE item_id = ?",
+            (it["id"],)).fetchone()[0]
+        d["kit_ref"] = bool(conn.execute(
+            "SELECT 1 FROM erp_kit_definitions WHERE output_item_id = ?"
+            " UNION SELECT 1 FROM erp_kit_components WHERE item_id = ?"
+            " LIMIT 1", (it["id"], it["id"])).fetchone())
+        out.append(d)
+    conn.close()
+    return jsonify(items=out)
+
+
 def _erp_item_cost_fields(data, partial=False):
     """Parse the manual cost fields on an item payload.
 
@@ -67882,7 +75650,7 @@ class _AcctBackupError(Exception):
         self.message = message
 
 
-# The 40 accounting tables, in restore dependency order (spec 3.6):
+# The 41 accounting tables, in restore dependency order (spec 3.6):
 # (Dept 9 wave C adds erp_acct_credit_notes after invoices and
 # erp_acct_bill_po_links after bills; wave D adds erp_acct_draws;
 # big-company package module B adds erp_acct_budgets; Wave 3 B1 adds
@@ -67893,7 +75661,9 @@ class _AcctBackupError(Exception):
 # adds erp_acct_dunning_sequences + erp_acct_dunning_steps +
 # erp_acct_dunning_cases + erp_acct_dunning_events at the end; Wave 4
 # item 27 adds erp_acct_payroll_garnishments after
-# erp_acct_payroll_tax_forms.)
+# erp_acct_payroll_tax_forms; S1 (SOP 9.42) adds
+# erp_acct_payroll_disbursements after garnishments; S5 (SOP 9.43)
+# adds erp_acct_vendor_w9 after disbursements.)
 # accounts -> journal -> journal_lines -> invoices -> bills -> payments
 # -> bank_* -> tax_* -> reconciliations -> employees -> payruns ->
 # payrun_lines -> payroll_* -> migration_links -> audit.
@@ -67908,6 +75678,7 @@ _ACCT_BACKUP_TABLES = (
     "erp_acct_employees", "erp_acct_payruns", "erp_acct_payrun_lines",
     "erp_acct_payroll_tax_tables", "erp_acct_payroll_filings",
     "erp_acct_payroll_tax_forms", "erp_acct_payroll_garnishments",
+    "erp_acct_payroll_disbursements", "erp_acct_vendor_w9",
     "erp_acct_migration_links", "erp_acct_audit",
     "erp_acct_period_locks", "erp_acct_sale_posts",
     "erp_acct_draws", "erp_acct_bill_payment_requests",
@@ -78010,6 +85781,25 @@ def _acct_payroll_compute_line(conn, emp, gross_cents, ytd_before_cents,
     }, None
 
 
+ERP_PAYROLL_PAYMENT_METHODS = ("direct_deposit", "check", "cash")
+ERP_PAYROLL_PAYMENT_METHOD_LABELS = {
+    "direct_deposit": "Direct deposit",
+    "check": "Check",
+    "cash": "Cash",
+}
+ERP_PAYROLL_BANK_ACCOUNT_TYPES = ("checking", "savings")
+
+
+def _acct_routing_check_digit_ok(routing):
+    """ABA routing-number checksum: 3*(d1+d4+d7) + 7*(d2+d5+d8) +
+    (d3+d6+d9) must be a multiple of 10. routing is 9 digits."""
+    if len(routing) != 9 or not routing.isdigit():
+        return False
+    d = [int(c) for c in routing]
+    return (3 * (d[0] + d[3] + d[6]) + 7 * (d[1] + d[4] + d[7])
+            + (d[2] + d[5] + d[8])) % 10 == 0
+
+
 def _acct_employee_dict(row):
     d = dict(row)
     for k in ("step2_checkbox", "exempt", "active"):
@@ -78019,6 +85809,17 @@ def _acct_employee_dict(row):
     ssn = d.pop("ssn", "") or ""
     d["ssn_on_file"] = bool(ssn)
     d["ssn_last4"] = ssn[-4:] if ssn else ""
+    # S1 (SOP 9.42): bank account and routing numbers follow the
+    # same rule -- stored in full, never returned. Only whether each
+    # is on file and its last 4 digits leave the server, so an ACH
+    # file can be built server-side without any API response ever
+    # carrying a full account or routing number.
+    acct = d.pop("bank_account", "") or ""
+    routing = d.pop("bank_routing", "") or ""
+    d["bank_account_on_file"] = bool(acct)
+    d["bank_account_last4"] = acct[-4:] if acct else ""
+    d["bank_routing_on_file"] = bool(routing)
+    d["bank_routing_last4"] = routing[-4:] if routing else ""
     return d
 
 
@@ -78093,6 +85894,69 @@ def _acct_payroll_employee_fields(data, partial=False):
             fields["ssn"] = digits
         else:
             return None, "ssn must be 9 digits"
+    # S1 (SOP 9.42): payment method + bank details. Admin-entered
+    # only, never invented. Digits only are stored for account and
+    # routing; dashes / spaces in what the admin types are stripped.
+    # Blank clears the field. Routing must be 9 digits passing the
+    # ABA checksum; account must be 4-17 digits. A direct-deposit
+    # method needs an account and a routing number on file -- that
+    # completeness check lives in the create / update endpoints,
+    # which can see the stored row; this validator only checks
+    # format, so a partial update that only changes the name never
+    # trips it.
+    if "payment_method" in data:
+        v = (data.get("payment_method") or "").strip()
+        if v and v not in ERP_PAYROLL_PAYMENT_METHODS:
+            return None, ("payment_method must be direct_deposit,"
+                          " check, or cash")
+        fields["payment_method"] = v
+    elif not partial:
+        fields["payment_method"] = ""
+    if "bank_name" in data:
+        v = (data.get("bank_name") or "").strip()
+        if len(v) > 100:
+            return None, "bank_name must be 100 characters or fewer"
+        fields["bank_name"] = v
+    elif not partial:
+        fields["bank_name"] = ""
+    if "bank_account_type" in data:
+        v = (data.get("bank_account_type") or "").strip()
+        if v and v not in ERP_PAYROLL_BANK_ACCOUNT_TYPES:
+            return None, "bank_account_type must be checking or savings"
+        fields["bank_account_type"] = v
+    elif not partial:
+        fields["bank_account_type"] = ""
+    if "bank_account" in data:
+        raw = data.get("bank_account")
+        if raw is None:
+            raw = ""
+        if not isinstance(raw, str):
+            return None, "bank_account must be a string of digits"
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if raw.strip() == "":
+            fields["bank_account"] = ""
+        elif 4 <= len(digits) <= 17:
+            fields["bank_account"] = digits
+        else:
+            return None, "bank_account must be 4 to 17 digits"
+    elif not partial:
+        fields["bank_account"] = ""
+    if "bank_routing" in data:
+        raw = data.get("bank_routing")
+        if raw is None:
+            raw = ""
+        if not isinstance(raw, str):
+            return None, "bank_routing must be a string of 9 digits"
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if raw.strip() == "":
+            fields["bank_routing"] = ""
+        elif len(digits) == 9 and _acct_routing_check_digit_ok(digits):
+            fields["bank_routing"] = digits
+        else:
+            return None, ("bank_routing must be 9 digits passing the"
+                          " ABA routing-number checksum")
+    elif not partial:
+        fields["bank_routing"] = ""
     for key in ("step3_credit_cents", "step4a_cents", "step4b_cents",
                 "step4c_cents"):
         if key in data:
@@ -78128,6 +85992,11 @@ def _acct_payrun_dict(conn, run):
             (emp["first_name"] + " " + emp["last_name"]) if emp else "")
         out.append(ld)
     d["lines"] = out
+    # S1: the run's disbursement record, if one was prepared -- the
+    # payload carries masked last-4s only, never full bank numbers.
+    _disb = _acct_get_disbursement(conn, run["id"])
+    d["disbursement"] = (_acct_disbursement_payload(conn, _disb)
+                         if _disb else None)
     return d
 
 
@@ -78164,19 +86033,31 @@ def erp_acct_create_payroll_employee():
     fields, error = _acct_payroll_employee_fields(data)
     if error:
         return jsonify(error=error), 400
+    # S1: direct deposit needs bank details on file at creation.
+    if fields.get("payment_method") == "direct_deposit" and (
+            not fields.get("bank_account")
+            or not fields.get("bank_routing")):
+        return jsonify(error="direct deposit needs a bank account and"
+                             " routing number on file"), 400
     now = datetime.now(timezone.utc).isoformat()
     conn = db()
     cur = conn.execute(
         "INSERT INTO erp_acct_employees (first_name, last_name, pay_type,"
         " rate_cents, pay_schedule, filing_status, step2_checkbox,"
         " step3_credit_cents, step4a_cents, step4b_cents, step4c_cents,"
-        " exempt, active, ssn, qb_id, created_at)"
-        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, NULL, ?)",
+        " exempt, active, ssn, payment_method, bank_name,"
+        " bank_account_type, bank_account, bank_routing, qb_id,"
+        " created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?,"
+        " ?, NULL, ?)",
         (fields["first_name"], fields["last_name"], fields["pay_type"],
          fields["rate_cents"], fields["pay_schedule"], fields["filing_status"],
          fields["step2_checkbox"], fields["step3_credit_cents"],
          fields["step4a_cents"], fields["step4b_cents"], fields["step4c_cents"],
-         fields["exempt"], fields.get("ssn", ""), now))
+         fields["exempt"], fields.get("ssn", ""),
+         fields.get("payment_method", ""), fields.get("bank_name", ""),
+         fields.get("bank_account_type", ""), fields.get("bank_account", ""),
+         fields.get("bank_routing", ""), now))
     emp_id = cur.lastrowid
     _acct_audit(conn, actor, "payroll.employee.create", "payroll_employee",
                 emp_id, "#%d %s %s %s %d" % (emp_id, fields["first_name"],
@@ -78221,6 +86102,18 @@ def erp_acct_update_payroll_employee(employee_id):
     if not row:
         conn.close()
         return jsonify(error="employee not found"), 404
+    # S1: the effective payment method after this update is direct
+    # deposit only with an account and a routing number on file
+    # (typed here, or already stored). Clearing bank details while
+    # the method stays direct deposit is refused.
+    _eff_method = fields.get("payment_method", row["payment_method"])
+    _eff_acct = fields.get("bank_account", row["bank_account"])
+    _eff_routing = fields.get("bank_routing", row["bank_routing"])
+    if _eff_method == "direct_deposit" and (not _eff_acct
+                                            or not _eff_routing):
+        conn.close()
+        return jsonify(error="direct deposit needs a bank account and"
+                             " routing number on file"), 400
     sets = ", ".join("%s = ?" % k for k in fields)
     conn.execute("UPDATE erp_acct_employees SET %s WHERE id = ?" % sets,
                  tuple(fields.values()) + (employee_id,))
@@ -78229,6 +86122,10 @@ def erp_acct_update_payroll_employee(employee_id):
         if row[key] != fields[key]:
             if key == "ssn":
                 changes.append("ssn updated")
+            elif key == "bank_account":
+                changes.append("bank account updated")
+            elif key == "bank_routing":
+                changes.append("routing number updated")
             else:
                 changes.append("%s: %s \u2192 %s" % (key, row[key], fields[key]))
     _acct_audit(conn, actor, "payroll.employee.update", "payroll_employee",
@@ -78274,8 +86171,18 @@ def erp_acct_list_payroll_runs():
     rows = conn.execute(
         "SELECT * FROM erp_acct_payruns ORDER BY period_start DESC, id DESC"
         ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        _disb = _acct_get_disbursement(conn, r["id"])
+        d["disbursement"] = ({
+            "method": _disb["method"],
+            "reference": _disb["reference"],
+            "disbursed_date": _disb["disbursed_date"],
+        } if _disb else None)
+        out.append(d)
     conn.close()
-    return jsonify(runs=[dict(r) for r in rows])
+    return jsonify(runs=out)
 
 
 @app.post("/api/erp/accounting/payroll/runs")
@@ -78515,6 +86422,366 @@ def erp_acct_pay_payroll_run(run_id):
     out = _acct_payrun_dict(conn, row)
     conn.close()
     return jsonify(run=out, journal_entry_id=entry_id)
+
+
+# ---- Payroll disbursement (S1, SOP 9.42) ----
+# Prepares / records HOW a pay run was paid. It never transfers
+# funds: there is no bank or ACH integration. The disbursement is
+# a record (method, reference, date, per-line snapshot) plus two
+# preparation artifacts built from it -- a NACHA PPD file for the
+# direct-deposit lines and a check-run list for the check lines --
+# both of which the admin takes to the bank / the cheque book by
+# hand. Reads use payroll.read; writes use payroll.write (in
+# practice admin-only: legacy staff hold neither payroll
+# permission, same as garnishments). One disbursement per run; it
+# never changes the run status and never posts a journal entry.
+# There is no edit or delete endpoint: a recorded disbursement is
+# history, like a posted journal entry.
+ERP_PAYROLL_DISBURSEMENT_METHODS = ("direct_deposit", "check",
+                                    "cash", "mixed")
+ERP_PAYROLL_DISBURSEMENT_METHOD_LABELS = {
+    "direct_deposit": "Direct deposit (ACH)",
+    "check": "Check",
+    "cash": "Cash",
+    "mixed": "Mixed",
+}
+
+
+def _acct_disbursement_payload(conn, row):
+    d = dict(row)
+    try:
+        d["lines"] = json.loads(row["lines_json"] or "[]")
+    except (ValueError, TypeError):
+        d["lines"] = []
+    d.pop("lines_json", None)
+    d["method_label"] = ERP_PAYROLL_DISBURSEMENT_METHOD_LABELS.get(
+        d.get("method"), d.get("method") or "")
+    return d
+
+
+def _acct_get_disbursement(conn, run_id):
+    return conn.execute(
+        "SELECT * FROM erp_acct_payroll_disbursements"
+        " WHERE payrun_id = ?",
+        (run_id,)).fetchone()
+
+
+def _acct_nacha_pad(value, width):
+    return str(value or "")[:width].ljust(width)
+
+
+def _acct_nacha_file(run, dd_lines):
+    """Build a NACHA PPD file (94-char records, blocked in 10s)
+    for the direct-deposit lines of a disbursement. dd_lines are
+    dicts with routing (9 digits), account, account_type, name,
+    amount_cents. Company origin fields are ZERO-FILLED: the ERP
+    holds no company bank account, so the file is a PREPARATION
+    DRAFT -- the admin must complete the origin / destination
+    routing with the bank before uploading it, and must verify
+    every entry against the disbursement record first. The entry
+    details (RDFI routing, account, amount, name) are the real
+    stored values; nothing here is invented except the explicit
+    zero origin placeholders, which the SOP calls out."""
+    pay_date = run["pay_date"] or ""
+    eff = pay_date.replace("-", "")[2:] if len(pay_date) == 10 else "000000"
+    now = datetime.now(timezone.utc)
+    created = now.strftime("%y%m%d")
+    created_time = now.strftime("%H%M")
+    company = "POP-A-LICIOUS"
+    records = []
+    # File header (1): destination / origin routing are zero-filled
+    # placeholders -- see the docstring. File ID modifier A.
+    records.append(
+        "1" + "01" + " 000000000" + "0000000000" + created + created_time
+        + "A" + "094" + "10" + "1"
+        + _acct_nacha_pad(company, 23) + _acct_nacha_pad(company, 23)
+        + " " * 8)
+    # Batch header (5): service class 220 = credits only (PPD).
+    # Descriptive date is 6 chars (blank here); batch number 7.
+    records.append(
+        "5" + "220" + _acct_nacha_pad(company, 16) + " " * 20
+        + "0000000000" + "PPD" + _acct_nacha_pad("PAYROLL", 10)
+        + " " * 6 + eff + "   " + "1"
+        + "00000000" + "0000001")
+    total_credit = 0
+    entry_hash = 0
+    for i, line in enumerate(dd_lines, start=1):
+        routing = line["routing"]
+        entry_hash += int(routing[:8])
+        total_credit += int(line["amount_cents"])
+        tran = "32" if line.get("account_type") == "savings" else "22"
+        trace = "00000000" + ("%07d" % i)
+        records.append(
+            "6" + tran + routing
+            + _acct_nacha_pad(line["account"], 17)
+            + ("%010d" % int(line["amount_cents"]))
+            + _acct_nacha_pad(line.get("employee_id"), 15)
+            + _acct_nacha_pad(line["name"], 22) + "  " + "0" + trace)
+    count = len(dd_lines)
+    # Batch control (8).
+    records.append(
+        "8" + "220" + ("%06d" % count) + ("%010d" % (entry_hash % 10 ** 10))
+        + ("%012d" % 0) + ("%012d" % total_credit)
+        + "0000000000" + " " * 19 + " " * 6
+        + "00000000" + "0000001")
+    # File control (9). Block count is filled in after padding.
+    block_count = (len(records) + 1 + 9) // 10
+    records.append(
+        "9" + ("%06d" % 1) + ("%06d" % block_count)
+        + ("%08d" % count) + ("%010d" % (entry_hash % 10 ** 10))
+        + ("%012d" % 0) + ("%012d" % total_credit)
+        + " " * 39)
+    while len(records) % 10:
+        records.append("9" * 94)
+    assert all(len(r) == 94 for r in records)
+    return "\n".join(records) + "\n"
+
+
+@app.post("/api/erp/accounting/payroll/runs/<int:run_id>/disburse")
+def erp_acct_disburse_payroll_run(run_id):
+    actor, err = _erp_check_perm("payroll.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    method = (data.get("method") or "").strip()
+    if method not in ERP_PAYROLL_DISBURSEMENT_METHODS:
+        return jsonify(error="method must be direct_deposit, check,"
+                             " cash, or mixed"), 400
+    reference = (data.get("reference") or "").strip()
+    if not reference:
+        return jsonify(error="reference is required (bank batch"
+                             " reference for ACH, check batch reference"
+                             " for checks)"), 400
+    if len(reference) > 100:
+        return jsonify(error="reference must be 100 characters or fewer"), 400
+    disbursed_date = (data.get("disbursed_date") or "").strip()
+    if not _acct_valid_date(disbursed_date):
+        return jsonify(error="disbursed_date must be YYYY-MM-DD"), 400
+    notes = (data.get("notes") or "")
+    if not isinstance(notes, str) or len(notes) > 500:
+        return jsonify(error="notes must be 500 characters or fewer"), 400
+    check_start = data.get("check_start_number")
+    if check_start is not None:
+        try:
+            check_start = int(check_start)
+        except (TypeError, ValueError):
+            return jsonify(error="check_start_number must be a whole"
+                                 " number"), 400
+        if isinstance(data.get("check_start_number"), bool) \
+                or check_start < 1:
+            return jsonify(error="check_start_number must be a whole"
+                                 " number above zero"), 400
+    conn = db()
+    run = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    if not run:
+        conn.close()
+        return jsonify(error="pay run not found"), 404
+    if run["status"] not in ("approved", "paid"):
+        conn.close()
+        return jsonify(error="only an approved or paid pay run can be"
+                             " disbursed (this run is %s)" % run["status"]), 400
+    if _acct_get_disbursement(conn, run_id):
+        conn.close()
+        return jsonify(error="pay run %d already has a disbursement"
+                             " recorded" % run_id), 409
+    lines = conn.execute(
+        "SELECT * FROM erp_acct_payrun_lines WHERE payrun_id = ?"
+        " ORDER BY id", (run_id,)).fetchall()
+    if not lines:
+        conn.close()
+        return jsonify(error="pay run has no lines to disburse"), 400
+    # Per-line method comes from the employee's stored payment
+    # method. Every line must have one set, and a single-method
+    # disbursement must match every line.
+    snapshot = []
+    missing_method = []
+    missing_bank = []
+    has_check = False
+    for line in lines:
+        emp = conn.execute(
+            "SELECT * FROM erp_acct_employees WHERE id = ?",
+            (line["employee_id"],)).fetchone()
+        name = ((emp["first_name"] + " " + emp["last_name"]) if emp
+                else ("employee #%d" % line["employee_id"]))
+        emp_method = (emp["payment_method"] or "") if emp else ""
+        if not emp_method:
+            missing_method.append(name)
+            continue
+        if emp_method == "check":
+            has_check = True
+        if emp_method == "direct_deposit":
+            acct = (emp["bank_account"] or "") if emp else ""
+            routing = (emp["bank_routing"] or "") if emp else ""
+            if not acct or not routing:
+                missing_bank.append(name)
+        snapshot.append({
+            "employee_id": line["employee_id"],
+            "employee_name": name,
+            "net_cents": int(line["net_cents"] or 0),
+            "method": emp_method,
+            "account_last4": ((emp["bank_account"] or "")[-4:]
+                              if emp else ""),
+            "routing_last4": ((emp["bank_routing"] or "")[-4:]
+                              if emp else ""),
+            "check_number": None,
+        })
+    if missing_method:
+        conn.close()
+        return jsonify(error="no payment method on file for: "
+                             + ", ".join(missing_method)), 400
+    if missing_bank:
+        conn.close()
+        return jsonify(error="direct deposit needs a bank account and"
+                             " routing number on file for: "
+                             + ", ".join(missing_bank)), 400
+    if method != "mixed":
+        wrong = [s["employee_name"] for s in snapshot
+                 if s["method"] != method]
+        if wrong:
+            conn.close()
+            return jsonify(error="method is %s but these lines are paid"
+                                 " another way: %s (use mixed, or fix the"
+                                 " employees' payment methods)"
+                                 % (method, ", ".join(wrong))), 400
+    if has_check and check_start is None:
+        conn.close()
+        return jsonify(error="check_start_number is required when any"
+                             " line is paid by check"), 400
+    if has_check:
+        nxt = check_start
+        for s in snapshot:
+            if s["method"] == "check":
+                s["check_number"] = nxt
+                nxt += 1
+    total_net = sum(s["net_cents"] for s in snapshot)
+    now = datetime.now(timezone.utc).isoformat()
+    cur = conn.execute(
+        "INSERT INTO erp_acct_payroll_disbursements (payrun_id, method,"
+        " reference, disbursed_date, check_start_number, lines_json,"
+        " total_net_cents, line_count, notes, prepared_by, prepared_at,"
+        " created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (run_id, method, reference, disbursed_date, check_start,
+         json.dumps(snapshot), total_net, len(snapshot), notes.strip(),
+         actor or "", now, now))
+    disb_id = cur.lastrowid
+    _acct_audit(conn, actor, "payroll.disbursement.create",
+                "payroll_disbursement", disb_id,
+                "run #%d %s ref %s date %s total %d (%d lines) --"
+                " preparation / record only, no funds transferred"
+                % (run_id, method, reference, disbursed_date,
+                   total_net, len(snapshot)))
+    conn.commit()
+    row = _acct_get_disbursement(conn, run_id)
+    out = _acct_disbursement_payload(conn, row)
+    conn.close()
+    return jsonify(disbursement=out), 201
+
+
+@app.get("/api/erp/accounting/payroll/runs/<int:run_id>/disbursement")
+def erp_acct_get_payroll_disbursement(run_id):
+    actor, err = _erp_check_perm("payroll.read")
+    if err:
+        return err
+    conn = db()
+    run = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    if not run:
+        conn.close()
+        return jsonify(error="pay run not found"), 404
+    row = _acct_get_disbursement(conn, run_id)
+    conn.close()
+    if not row:
+        return jsonify(disbursement=None)
+    return jsonify(disbursement=_acct_disbursement_payload(conn, row))
+
+
+@app.get("/api/erp/accounting/payroll/runs/<int:run_id>/disbursement/ach")
+def erp_acct_payroll_disbursement_ach(run_id):
+    """Download the NACHA PPD preparation file for the run's
+    direct-deposit lines. Full account / routing numbers are read
+    server-side for the file and never appear in any JSON payload.
+    The file is a PREPARATION DRAFT: its company origin fields
+    are zero-filled (the ERP holds no company bank account) and
+    must be completed with the bank before upload."""
+    actor, err = _erp_check_perm("payroll.read")
+    if err:
+        return err
+    conn = db()
+    run = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    if not run:
+        conn.close()
+        return jsonify(error="pay run not found"), 404
+    row = _acct_get_disbursement(conn, run_id)
+    if not row:
+        conn.close()
+        return jsonify(error="no disbursement recorded for this pay"
+                             " run yet"), 404
+    lines = conn.execute(
+        "SELECT * FROM erp_acct_payrun_lines WHERE payrun_id = ?"
+        " ORDER BY id", (run_id,)).fetchall()
+    dd_lines = []
+    for line in lines:
+        emp = conn.execute(
+            "SELECT * FROM erp_acct_employees WHERE id = ?",
+            (line["employee_id"],)).fetchone()
+        if not emp or emp["payment_method"] != "direct_deposit":
+            continue
+        acct = emp["bank_account"] or ""
+        routing = emp["bank_routing"] or ""
+        if not acct or not routing:
+            conn.close()
+            return jsonify(error="bank details are no longer on file"
+                                 " for %s %s -- re-enter them before"
+                                 " downloading the ACH file"
+                                 % (emp["first_name"],
+                                    emp["last_name"])), 409
+        dd_lines.append({
+            "employee_id": line["employee_id"],
+            "name": emp["first_name"] + " " + emp["last_name"],
+            "routing": routing,
+            "account": acct,
+            "account_type": emp["bank_account_type"] or "",
+            "amount_cents": int(line["net_cents"] or 0),
+        })
+    conn.close()
+    if not dd_lines:
+        return jsonify(error="no direct-deposit lines in this"
+                             " disbursement"), 409
+    body = _acct_nacha_file(run, dd_lines)
+    resp = Response(body, mimetype="text/plain")
+    resp.headers["Content-Disposition"] = (
+        "attachment; filename=payroll-run-%d-ach.txt" % run_id)
+    return resp
+
+
+@app.get("/api/erp/accounting/payroll/runs/<int:run_id>/disbursement/check-run")
+def erp_acct_payroll_disbursement_check_run(run_id):
+    actor, err = _erp_check_perm("payroll.read")
+    if err:
+        return err
+    conn = db()
+    run = conn.execute("SELECT * FROM erp_acct_payruns WHERE id = ?",
+                       (run_id,)).fetchone()
+    if not run:
+        conn.close()
+        return jsonify(error="pay run not found"), 404
+    row = _acct_get_disbursement(conn, run_id)
+    if not row:
+        conn.close()
+        return jsonify(error="no disbursement recorded for this pay"
+                             " run yet"), 404
+    disb = _acct_disbursement_payload(conn, row)
+    conn.close()
+    checks = [s for s in disb["lines"] if s["method"] == "check"]
+    return jsonify(run_id=run_id, disbursement=disb,
+                   check_run=[{
+                       "employee_id": s["employee_id"],
+                       "employee_name": s["employee_name"],
+                       "net_cents": s["net_cents"],
+                       "check_number": s["check_number"],
+                   } for s in checks])
 
 
 @app.post("/api/erp/accounting/payroll/runs/<int:run_id>/lines/<int:line_id>/unfeed")
@@ -79143,6 +87410,330 @@ def erp_acct_delete_payroll_tax_form(form_id):
     conn.commit()
     conn.close()
     return jsonify(deleted=True)
+
+
+# ---- 1099-NEC reporting (S5, SOP 9.43) ----
+# W-9 collection + contractor-payment tracking + year-end 1099-NEC data
+# preparation. The ERP prepares the data only: it NEVER files anything
+# with the IRS and generates no filing -- the summary is handed to the
+# filer outside the ERP, and the UI and SOP say so in plain words.
+# The summary is computed live from approved bill payments on every
+# read (erp_acct_payments rows with a bill_id, joined through
+# erp_acct_bills to the vendor) -- there is no stored 1099 draft to go
+# stale, the same read-computed rule as the customer lifetime total
+# (SOP 9.41). A contractor is a vendor the admin flagged
+# is_contractor=1 on the W-9 record; a flagged contractor with no W-9
+# on file still counts -- the missing W-9 is flagged, never silently
+# dropped. Only payments DATED in the calendar year count (cash basis:
+# the payment date governs, not the bill date). Customer payments
+# (invoice_id set, bill_id NULL) never count, and neither do bill
+# payment requests that were never approved -- only the posted
+# erp_acct_payments row counts. Reads/writes use tax.read / tax.write
+# -- the tightest existing tax permission. Legacy staff hold neither
+# (they are not in _ERP_LEGACY_STAFF_PERMS), so in practice this is
+# admin-only, the same pattern as the payroll tax forms (SOP 9.38).
+# The full TIN is stored but NEVER returned by any endpoint: only
+# whether one is on file and its last 4 digits, the same rule as the
+# payroll SSN (SOP 9.38) and the bank details (SOP 9.42). Audit rows
+# name the fields changed, never the TIN value.
+# The $600 threshold is the IRS 1099-NEC rule as given for this build:
+# a contractor paid $600 or more in a calendar year is reportable.
+ERP_1099_NEC_THRESHOLD_CENTS = 60000
+ERP_1099_ENTITY_TYPES = ("individual", "c_corporation", "s_corporation",
+                         "partnership", "trust_estate", "llc", "other")
+ERP_1099_ENTITY_TYPE_LABELS = {
+    "individual": "Individual / sole proprietor",
+    "c_corporation": "C corporation",
+    "s_corporation": "S corporation",
+    "partnership": "Partnership",
+    "trust_estate": "Trust / estate",
+    "llc": "LLC",
+    "other": "Other",
+}
+ERP_1099_TIN_TYPES = ("ssn", "ein")
+
+
+def _acct_vendor_w9_dict(row):
+    """Masked W-9 record: the full TIN never leaves the server."""
+    d = dict(row)
+    tin = d.pop("tin", "") or ""
+    d["tin_on_file"] = bool(tin)
+    d["tin_last4"] = tin[-4:] if tin else ""
+    d["is_contractor"] = bool(d["is_contractor"])
+    d["w9_on_file"] = bool(d["w9_received_date"])
+    d["entity_type_label"] = ERP_1099_ENTITY_TYPE_LABELS.get(
+        d["entity_type"], "")
+    return d
+
+
+def _acct_1099_contractor_row(conn, vendor):
+    """One vendor merged with its W-9 record (masked). Vendors with no
+    W-9 row yet read as not-a-contractor with nothing on file."""
+    w9 = conn.execute(
+        "SELECT * FROM erp_acct_vendor_w9 WHERE vendor_id = ?",
+        (vendor["id"],)).fetchone()
+    out = {
+        "vendor_id": vendor["id"],
+        "vendor_name": vendor["name"],
+        "vendor_active": bool(vendor["active"]),
+    }
+    if w9:
+        out.update(_acct_vendor_w9_dict(w9))
+    else:
+        out.update({
+            "id": None, "is_contractor": False, "legal_name": "",
+            "entity_type": "", "entity_type_label": "", "tin_type": "",
+            "tin_on_file": False, "tin_last4": "",
+            "address": "", "city": "", "state": "", "zip": "",
+            "w9_received_date": "", "w9_on_file": False,
+        })
+    return out
+
+
+def _acct_1099_summary(conn, year):
+    """Per-contractor, per-year summary of reportable payments, computed
+    live from posted bill payments. year is a 4-digit string."""
+    payments = conn.execute(
+        "SELECT p.id, p.date, p.bill_id, p.amount_cents, p.method,"
+        " b.vendor_id FROM erp_acct_payments p"
+        " JOIN erp_acct_bills b ON b.id = p.bill_id"
+        " WHERE substr(p.date, 1, 4) = ? ORDER BY p.date, p.id",
+        (year,)).fetchall()
+    by_vendor = {}
+    for p in payments:
+        by_vendor.setdefault(p["vendor_id"], []).append(dict(p))
+    vendors = conn.execute(
+        "SELECT * FROM erp_vendors ORDER BY name").fetchall()
+    contractors = []
+    unflagged_paid = []
+    total_paid = 0
+    reportable_total = 0
+    reportable_count = 0
+    for v in vendors:
+        w9 = conn.execute(
+            "SELECT * FROM erp_acct_vendor_w9 WHERE vendor_id = ?",
+            (v["id"],)).fetchone()
+        flagged = bool(w9 and w9["is_contractor"])
+        plist = by_vendor.get(v["id"], [])
+        paid = sum(p["amount_cents"] for p in plist)
+        if not plist:
+            if flagged:
+                row = _acct_1099_contractor_row(conn, v)
+                row.update({
+                    "total_paid_cents": 0, "payment_count": 0,
+                    "meets_threshold": False, "payments": [],
+                })
+                contractors.append(row)
+            continue
+        if flagged:
+            total_paid += paid
+            meets = paid >= ERP_1099_NEC_THRESHOLD_CENTS
+            if meets:
+                reportable_total += paid
+                reportable_count += 1
+            row = _acct_1099_contractor_row(conn, v)
+            row.update({
+                "total_paid_cents": paid,
+                "payment_count": len(plist),
+                "meets_threshold": meets,
+                "payments": [{
+                    "id": p["id"], "date": p["date"],
+                    "bill_id": p["bill_id"],
+                    "amount_cents": p["amount_cents"],
+                    "method": p["method"]} for p in plist],
+            })
+            contractors.append(row)
+        elif paid >= ERP_1099_NEC_THRESHOLD_CENTS:
+            # Paid at/over the threshold but never flagged as a
+            # contractor: not in the reportable list, but surfaced so
+            # the admin can check whether the vendor should have been
+            # flagged (or the payments are for goods, not services).
+            unflagged_paid.append({
+                "vendor_id": v["id"], "vendor_name": v["name"],
+                "vendor_active": bool(v["active"]),
+                "total_paid_cents": paid,
+                "payment_count": len(plist),
+            })
+    return {
+        "year": int(year),
+        "threshold_cents": ERP_1099_NEC_THRESHOLD_CENTS,
+        "contractors": contractors,
+        "unflagged_paid": unflagged_paid,
+        "totals": {
+            "contractor_count": len(contractors),
+            "reportable_count": reportable_count,
+            "total_paid_cents": total_paid,
+            "reportable_total_cents": reportable_total,
+        },
+    }
+
+
+def _acct_1099_validate_w9_fields(data, existing):
+    """Validate a W-9 save. Returns (fields, None) or (None, error).
+    Partial: only keys present in data are validated/returned. A blank
+    TIN clears the TIN and its type; a non-blank TIN needs 9 digits and
+    a tin_type (given now or already on file)."""
+    fields = {}
+    if "is_contractor" in data:
+        v = data.get("is_contractor")
+        if v is True or v == 1:
+            fields["is_contractor"] = 1
+        elif v is False or v == 0:
+            fields["is_contractor"] = 0
+        else:
+            return None, "is_contractor must be true or false"
+    if "legal_name" in data:
+        fields["legal_name"] = (data.get("legal_name") or "").strip()
+    if "entity_type" in data:
+        v = (data.get("entity_type") or "").strip()
+        if v and v not in ERP_1099_ENTITY_TYPES:
+            return None, ("entity_type must be one of "
+                          + ", ".join(ERP_1099_ENTITY_TYPES))
+        fields["entity_type"] = v
+    if "tin_type" in data:
+        v = (data.get("tin_type") or "").strip()
+        if v and v not in ERP_1099_TIN_TYPES:
+            return None, "tin_type must be ssn or ein"
+        fields["tin_type"] = v
+    if "tin" in data:
+        raw = data.get("tin")
+        if raw is None:
+            raw = ""
+        if not isinstance(raw, str):
+            return None, "tin must be a string of 9 digits"
+        digits = "".join(ch for ch in raw if ch.isdigit())
+        if raw.strip() == "":
+            fields["tin"] = ""
+            fields["tin_type"] = ""
+        elif len(digits) == 9:
+            fields["tin"] = digits
+            if not fields.get("tin_type"):
+                have = (existing or {}).get("tin_type") or ""
+                if not have:
+                    return None, "tin_type is required with a TIN"
+                fields["tin_type"] = have
+        else:
+            return None, "tin must be 9 digits"
+    for key in ("address", "city", "state", "zip"):
+        if key in data:
+            fields[key] = (data.get(key) or "").strip()
+    if "state" in fields:
+        fields["state"] = fields["state"].upper()
+    if "w9_received_date" in data:
+        v = (data.get("w9_received_date") or "").strip()
+        if v and not _acct_valid_date(v):
+            return None, "w9_received_date must be YYYY-MM-DD"
+        fields["w9_received_date"] = v
+    return fields, None
+
+
+@app.get("/api/erp/accounting/1099/contractors")
+def erp_acct_1099_contractors():
+    actor, err = _erp_check_perm("tax.read")
+    if err:
+        return err
+    conn = db()
+    vendors = conn.execute(
+        "SELECT * FROM erp_vendors ORDER BY name").fetchall()
+    out = [_acct_1099_contractor_row(conn, v) for v in vendors]
+    conn.close()
+    return jsonify(contractors=out)
+
+
+@app.put("/api/erp/accounting/1099/contractors/<int:vendor_id>/w9")
+def erp_acct_1099_save_w9(vendor_id):
+    actor, err = _erp_check_perm("tax.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    conn = db()
+    vendor = conn.execute(
+        "SELECT * FROM erp_vendors WHERE id = ?", (vendor_id,)).fetchone()
+    if not vendor:
+        conn.close()
+        return jsonify(error="vendor not found"), 404
+    existing = conn.execute(
+        "SELECT * FROM erp_acct_vendor_w9 WHERE vendor_id = ?",
+        (vendor_id,)).fetchone()
+    fields, error = _acct_1099_validate_w9_fields(
+        data, dict(existing) if existing else None)
+    if error:
+        conn.close()
+        return jsonify(error=error), 400
+    now = datetime.now(timezone.utc).isoformat()
+    if existing:
+        if fields:
+            sets = ", ".join("%s = ?" % k for k in fields)
+            conn.execute(
+                "UPDATE erp_acct_vendor_w9 SET %s, updated_at = ?"
+                " WHERE vendor_id = ?" % sets,
+                tuple(fields.values()) + (now, vendor_id))
+    elif fields:
+        cols = ["vendor_id"] + list(fields.keys()) + ["created_at"]
+        vals = [vendor_id] + list(fields.values()) + [now]
+        conn.execute(
+            "INSERT INTO erp_acct_vendor_w9 (%s) VALUES (%s)"
+            % (", ".join(cols), ", ".join("?" * len(cols))), vals)
+    if fields:
+        _acct_audit(
+            conn, actor, "1099.w9.save", "vendor_w9", vendor_id,
+            "vendor #%d W-9 fields updated: %s"
+            % (vendor_id, ", ".join(sorted(fields.keys()))))
+        conn.commit()
+    row = _acct_1099_contractor_row(conn, vendor)
+    conn.close()
+    return jsonify(contractor=row)
+
+
+@app.get("/api/erp/accounting/1099/summary")
+def erp_acct_1099_summary():
+    actor, err = _erp_check_perm("tax.read")
+    if err:
+        return err
+    year = (request.args.get("year") or "").strip()
+    if not year:
+        year = str(datetime.now(timezone.utc).year)
+    if not (len(year) == 4 and year.isdigit()
+            and 2000 <= int(year) <= 2100):
+        return jsonify(error="year must be a year like 2026"), 400
+    conn = db()
+    out = _acct_1099_summary(conn, year)
+    conn.close()
+    return jsonify(summary=out)
+
+
+@app.post("/api/erp/accounting/1099/summary/prepare")
+def erp_acct_1099_prepare_summary():
+    actor, err = _erp_check_perm("tax.write")
+    if err:
+        return err
+    data = request.get_json(force=True) or {}
+    year = data.get("year")
+    if year is None or year == "":
+        year = datetime.now(timezone.utc).year
+    try:
+        year = int(year)
+    except (TypeError, ValueError):
+        return jsonify(error="year must be a year like 2026"), 400
+    if not 2000 <= year <= 2100:
+        return jsonify(error="year must be a year like 2026"), 400
+    conn = db()
+    out = _acct_1099_summary(conn, str(year))
+    # Preparing the data is a write (it is the step the admin takes
+    # before handing the figures to the filer), so it leaves an audit
+    # row -- which also states, in the record, that nothing was filed.
+    _acct_audit(
+        conn, actor, "1099.summary.prepare", "1099_summary", year,
+        "1099-NEC summary prepared for %d: %d contractor(s), %d at/over"
+        " $600, total paid %d cents, reportable %d cents -- data"
+        " preparation only, NOT filed with the IRS"
+        % (year, out["totals"]["contractor_count"],
+           out["totals"]["reportable_count"],
+           out["totals"]["total_paid_cents"],
+           out["totals"]["reportable_total_cents"]))
+    conn.commit()
+    conn.close()
+    return jsonify(summary=out), 201
 
 
 # ---- Payroll garnishments (Wave 4 item 27, SOP 9.40) ----
@@ -88379,6 +96970,10 @@ def erp_delivery_route_deliver_stop(route_id, stop_id):
                      "order %d delivered on route #%d"
                      % (order_id, route_id))
     conn.commit()
+    # SMS (SOP 8.40, item S6): the stop delivery shipped the order --
+    # auto-send runs only after that committed, and only when the
+    # admin turned auto_shipped on and wrote an order_shipped template.
+    _sms_maybe_auto_send(conn, "wholesale", order_id, "order_shipped", actor)
     row = conn.execute(
         "SELECT * FROM erp_delivery_routes WHERE id = ?",
         (route_id,)).fetchone()
@@ -88583,244 +97178,2812 @@ def _erp_search_money(cents):
     return "$%.2f" % ((cents or 0) / 100.0)
 
 
+# ---- Poppy search expansion (Nov 27, 2026) ----
+# The registry is the ONLY place a searchable type is added or removed.
+# Each entry is either a "fn" section (custom code: the 9 original
+# sections, moved verbatim, plus customer / gift-card / file / forms)
+# or a declarative spec: an explicit-column SQL query, an allowlisted
+# haystack, title/subtitle templates, a gate copied from the type's
+# list endpoint, and a staff rule. No section ever SELECTs * into a
+# haystack, and no section ever returns a field listed in the hard
+# rules (design section 3): API secrets/hashes, full bank/routing
+# numbers, SSN/TIN even last-4, passwords/tokens, full gift-card
+# codes, file blobs, pay/salary/bonus/garnishment amounts, or
+# background-check detail. Deleted/tombstoned/inactive records never
+# surface: specs filter active = 1 / published where the list
+# endpoint does, and staff see published-only policies/bulletins.
+# Staff policy visibility lives in exactly ONE place --
+# _poppy_row_visible's "policy" mode, which ANDs the published
+# check with _hr_policy_visible_to_employee (the shared audience
+# helper, SOP 12.38 scoping); do not add a second staff filter for
+# policies anywhere else.
+# Response contract: each result carries its "type"; the response
+# carries "types": {key: label} for the types present. New types
+# open via a generic "postMap": {key, value} (the frontend sets
+# erpState[postMap.key] = postMap.value) plus a "highlight" id.
+# Staff policy/bulletin/help-case results carry "mine": true so the
+# frontend routes to My HR instead of the admin tab.
+POPPY_OVERALL_CAP = 50
+
+
+def _poppy_like_clause(words, atoms):
+    """SQL LIKE pre-filter for the largest tables, before the Python
+    match. Each word must appear in at least one atom; an atom is a
+    column name (becomes "col LIKE ?") or a full expression that
+    already contains exactly one "?" (used verbatim, e.g. an EXISTS
+    subquery or a CAST). Returns (clause, args) or None when the
+    pre-filter must be skipped -- non-ASCII words, where SQLite LIKE
+    case-folding differs from Python's lower(). The Python match in
+    the section stays authoritative, so the pre-filter can only
+    narrow to a superset of the true matches, never fewer."""
+    if not words or any(not w.isascii() for w in words):
+        return None
+    groups = []
+    args = []
+    for w in words:
+        parts = []
+        for a in atoms:
+            if "?" in a:
+                parts.append("(%s)" % a)
+            else:
+                parts.append("(%s LIKE ?)" % a)
+            args.append("%%%s%%" % w)
+        groups.append("(%s)" % " OR ".join(parts))
+    return (" AND ".join(groups), args)
+
+
+def _poppy_fmt(template, row):
+    """Fill a title/subtitle template from a result row (a dict).
+    {col} -> the column value ("" when NULL). {money:col} -> $X.XX.
+    {trunc:col:N} -> value truncated to N chars with an ellipsis.
+    {date:col} -> the YYYY-MM-DD prefix of a date/datetime value.
+    Unknown placeholders render empty, never raise."""
+    def _rep(m):
+        inner = m.group(1)
+        if inner.startswith("money:"):
+            return _erp_search_money(row.get(inner[6:]))
+        if inner.startswith("trunc:"):
+            _t, col, num = inner.split(":", 2)
+            v = str(row.get(col) or "")
+            try:
+                n = int(num)
+            except ValueError:
+                n = 60
+            return v if len(v) <= n else v[:n - 1].rstrip() + "…"
+        if inner.startswith("date:"):
+            return str(row.get(inner[5:]) or "")[:10]
+        return str(row.get(inner) or "")
+    return re.sub(r"\{([^{}]+)\}", _rep, template)
+
+
+def _poppy_gate_ok(gate, ctx=None):
+    """True when the caller passes a section's gate -- the same check
+    its list endpoint uses. "admin" is the admin-only gate, "any_mkt"
+    is _mkt_check_any_read, "erp" is any signed-in ERP user (the
+    route itself already requires _require_erp), anything else is a
+    single _erp_check_perm grant string. Results are cached in the
+    per-request ctx: _erp_check_perm re-authenticates the token from
+    the database on every call, and with 183 sections an uncached
+    check costs ~5s per search. The cache lives only in ctx (one
+    request, one caller), so no result ever leaks across users."""
+    if ctx is not None:
+        cache = ctx.setdefault("gates", {})
+        if gate in cache:
+            return cache[gate]
+        ok = _poppy_gate_ok(gate)
+        cache[gate] = ok
+        return ok
+    if gate == "admin":
+        return _require_erp_admin()[1] is None
+    if gate == "any_mkt":
+        return _mkt_check_any_read()[1] is None
+    if gate == "erp":
+        return True
+    return _erp_check_perm(gate)[1] is None
+
+
+def _poppy_staff_ctx(conn):
+    """Per-request staff context, resolved server-side once: the
+    caller's role, actor login string, staff id, linked HR employee
+    row, and the id sets that bound staff-visible slices (training
+    paths/courses/lessons/quizzes on their role's paths, projects
+    they own or have tasks on, events they are rostered for). Admin
+    callers get empty sets -- they see everything their gate allows."""
+    ctx = {"role": _erp_role(), "actor": _erp_actor(), "mine": None,
+           "mine_id": None, "staff_id": None,
+           "paths": set(), "courses": set(), "lessons": set(),
+           "quizzes": set(), "projects": set(), "events": set()}
+    if ctx["role"] != "staff":
+        return ctx
+    staff = _staff_from_request()
+    if staff:
+        ctx["staff_id"] = staff["id"]
+    mine = _hr_resolve_caller_employee(conn)
+    if not mine:
+        return ctx
+    ctx["mine"] = mine
+    ctx["mine_id"] = mine["id"]
+    # Training: paths assigned to the caller's role (role_id NULL is
+    # the "(all roles)" path -- visible to every role), plus the
+    # courses/lessons/quizzes on those paths.
+    role_ids = []
+    if (mine["role"] or "").strip():
+        role_ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM erp_hr_roles WHERE LOWER(title) = LOWER(?)",
+            (mine["role"],)).fetchall()]
+    q = "SELECT id FROM erp_hr_learning_paths WHERE role_id IS NULL"
+    args = []
+    if role_ids:
+        q += " OR role_id IN (%s)" % ",".join("?" * len(role_ids))
+        args = role_ids
+    ctx["paths"] = {r["id"] for r in conn.execute(q, args).fetchall()}
+    if ctx["paths"]:
+        ph = ",".join("?" * len(ctx["paths"]))
+        plist = list(ctx["paths"])
+        ctx["courses"] = {r["course_id"] for r in conn.execute(
+            "SELECT course_id FROM erp_hr_learning_path_steps"
+            " WHERE path_id IN (%s)" % ph, plist).fetchall()
+            if r["course_id"]}
+        if ctx["courses"]:
+            cph = ",".join("?" * len(ctx["courses"]))
+            clist = list(ctx["courses"])
+            ctx["lessons"] = {r["id"] for r in conn.execute(
+                "SELECT id FROM erp_hr_lessons WHERE course_id IN (%s)"
+                " OR learning_path_id IN (%s)" % (cph, ph),
+                clist + plist).fetchall()}
+        else:
+            ctx["lessons"] = {r["id"] for r in conn.execute(
+                "SELECT id FROM erp_hr_lessons"
+                " WHERE learning_path_id IN (%s)" % ph, plist).fetchall()}
+        if ctx["lessons"]:
+            lph = ",".join("?" * len(ctx["lessons"]))
+            llist = list(ctx["lessons"])
+            cph2 = ",".join("?" * len(ctx["courses"])) if ctx["courses"] else ""
+            if ctx["courses"]:
+                ctx["quizzes"] = {r["id"] for r in conn.execute(
+                    "SELECT id FROM erp_hr_quizzes WHERE course_id IN (%s)"
+                    " OR lesson_id IN (%s)" % (cph2, lph),
+                    list(ctx["courses"]) + llist).fetchall()}
+            else:
+                ctx["quizzes"] = {r["id"] for r in conn.execute(
+                    "SELECT id FROM erp_hr_quizzes"
+                    " WHERE lesson_id IN (%s)" % lph, llist).fetchall()}
+    # Projects the caller owns or has a task on (same rule as
+    # /api/erp/hr/projects/mine); events they are rostered for
+    # (same rule as /api/erp/hr/me).
+    ctx["projects"] = {r["id"] for r in conn.execute(
+        "SELECT id FROM erp_hr_projects WHERE owner_employee_id = ?",
+        (mine["id"],)).fetchall()}
+    ctx["projects"] |= {r["project_id"] for r in conn.execute(
+        "SELECT project_id FROM erp_hr_project_tasks"
+        " WHERE owner_employee_id = ?", (mine["id"],)).fetchall()}
+    ctx["events"] = {r["event_id"] for r in conn.execute(
+        "SELECT event_id FROM erp_hr_event_staff WHERE employee_id = ?",
+        (mine["id"],)).fetchall()}
+    return ctx
+
+
+def _poppy_row_visible(conn, spec, row, ctx):
+    """Staff slice for one row. Admins always see the row (the gate
+    already passed). Staff modes: "admin" (never), "all" (same as
+    admin), "published" (status = published), "policy" (the single
+    staff-policy call site -- see below), "own:<col>" (the row's
+    employee id is the caller), "own_login:<col>" (the row's
+    requested_by is the caller's login), "own_staff:<col>" (the row's
+    staff id is the caller, e.g. delivery driver), "training:<kind>"
+    (the row is on the caller's role path), "projects" / "events"
+    (the row is one of the caller's), "store_task" (assigned to the
+    caller as an HR employee)."""
+    if ctx["role"] != "staff":
+        return True
+    mode = spec.get("staff", "all")
+    if mode == "admin":
+        return False
+    if mode == "all":
+        return True
+    if mode == "policy":
+        # STAFF POLICY VISIBILITY — single call site: the /mine
+        # rule (published-only) AND the shared audience helper.
+        # A staff member must never Poppy-find a draft, even one in
+        # their audience, and a caller with no linked HR record
+        # (mine is None) sees nothing, same as /mine returning 404.
+        if ctx["mine"] is None:
+            return False
+        return ((row.get("status") or "") == "published"
+                and _hr_policy_visible_to_employee(
+                    conn, row.get("id"), ctx["mine"]))
+    if mode == "published":
+        return (row.get("status") or "") == "published"
+    if mode.startswith("own:"):
+        col = mode[4:]
+        return ctx["mine_id"] is not None and row.get(col) == ctx["mine_id"]
+    if mode.startswith("own_login:"):
+        col = mode[10:]
+        return bool(ctx["actor"]) and row.get(col) == ctx["actor"]
+    if mode.startswith("own_staff:"):
+        col = mode[10:]
+        return (ctx["staff_id"] is not None
+                and row.get(col) == ctx["staff_id"])
+    if mode.startswith("training:"):
+        return row.get("id") in ctx[mode[9:]]
+    if mode == "projects":
+        return row.get("id") in ctx["projects"]
+    if mode == "events":
+        return row.get("id") in ctx["events"]
+    if mode == "store_task":
+        return (row.get("assigned_employee_kind") == "hr"
+                and ctx["mine_id"] is not None
+                and row.get("assigned_employee_id") == ctx["mine_id"])
+    return True
+
+
+def _poppy_sort_key(spec, row):
+    """Second sort element inside a type (the first is the rank).
+    "-id": newest first. "name": the primary field, case-insensitive.
+    "dept": SOP order (dept, position, id)."""
+    mode = spec.get("sort", "-id")
+    if mode == "-id":
+        return -row["id"]
+    if mode == "name":
+        return (row.get(spec["primary"]) or "").lower()
+    if mode == "dept":
+        return (row.get("dept") or 0, row.get("position") or 0,
+                row.get("id") or 0)
+    return row["id"]
+
+
+def _poppy_run_spec(conn, spec, ctx, words):
+    """Run one declarative registry entry. Returns the section's
+    (rank, sort, item) rows, unsliced -- the caller sorts and caps."""
+    if not _poppy_gate_ok(spec["gate"], ctx):
+        return []
+    if ctx["role"] == "staff" and spec.get("staff") == "admin":
+        return []
+    sql = spec["sql"]
+    args = []
+    if spec.get("prefilter"):
+        like = _poppy_like_clause(words, spec["prefilter"])
+        if like is not None:
+            if " WHERE " in sql:
+                sql = sql.replace(" ORDER BY ",
+                                  " AND " + like[0] + " ORDER BY ", 1)
+            else:
+                sql = sql.replace(" ORDER BY ",
+                                  " WHERE " + like[0] + " ORDER BY ", 1)
+            args = like[1]
+    found = []
+    for r in conn.execute(sql, args).fetchall():
+        row = dict(r)
+        if not _poppy_row_visible(conn, spec, row, ctx):
+            continue
+        # Haystack values are coerced to text (an integer column in a
+        # haystack must not break the join in _erp_search_match).
+        hay = ["" if row.get(c) is None else str(row.get(c))
+               for c in spec["hay"]]
+        if not _erp_search_match(hay, words):
+            continue
+        number = row.get(spec["number"]) if spec.get("number") else ""
+        if spec.get("id") and spec["id"] != "{id}":
+            item_id = _poppy_fmt(spec["id"], row)
+        else:
+            item_id = row["id"]
+        if spec.get("postmap_value") and spec["postmap_value"] != "{id}":
+            pm_value = _poppy_fmt(spec["postmap_value"], row)
+        else:
+            pm_value = row["id"]
+        item = {"type": spec["key"], "id": item_id,
+                "title": _poppy_fmt(spec["title"], row),
+                "subtitle": _poppy_fmt(spec["subtitle"], row),
+                "route": spec["route"],
+                "open": {"postMap": {"key": spec["postmap"],
+                                     "value": pm_value},
+                         "highlight": "%s-%s" % (spec["key"], item_id)}}
+        if spec.get("mine") and ctx["role"] == "staff":
+            item["open"]["mine"] = True
+        found.append((_erp_search_rank(str(row.get(spec["primary"]) or ""),
+                                      str(number or ""), words),
+                      _poppy_sort_key(spec, row), item))
+    return found
+
+
+def _poppy_section_customer(conn, ctx, words):
+    """Retail/CRM customers, from _mkt_crm_rows -- the same rows the
+    Marketing customers list shows (online orders + wholesale
+    accounts + loyalty members). Gate is _mkt_check_any_read."""
+    found = []
+    for c in _mkt_crm_rows(conn):
+        hay = [c.get("display"), c.get("email"), c.get("account_name"),
+               " ".join(c.get("tags") or [])]
+        if not _erp_search_match(hay, words):
+            continue
+        sub = "Customer"
+        if c.get("email"):
+            sub += " · %s" % c["email"]
+        loy = c.get("loyalty") or {}
+        if loy:
+            sub += " · %s Kernels" % (loy.get("kernels") or 0)
+        found.append((_erp_search_rank(c.get("display") or "", "", words),
+                      (c.get("display") or "").lower(),
+                      {"type": "customer", "id": c.get("key"),
+                       "title": c.get("account_name") or c.get("display") or "—",
+                       "subtitle": sub, "route": "#/marketing",
+                       "open": {"postMap": {"key": "customerPostMap",
+                                            "value": c.get("key")},
+                                "highlight": "customer-%s" % c.get("key")}}))
+    return found
+
+
+def _poppy_section_gift_card(conn, ctx, words):
+    """Gift cards, admin-only. A word matches the recipient fields
+    by substring, or the code by exact/prefix only -- the full code
+    is NEVER in a haystack, title, subtitle, or payload. The title
+    and id carry only the masked last 4."""
+    found = []
+    for r in conn.execute(
+            "SELECT code, recipient_name, recipient_email, balance_cents,"
+            " active, created_at FROM gift_cards"
+            " ORDER BY created_at DESC").fetchall():
+        row = dict(r)
+        code = (row["code"] or "")
+        last4 = code[-4:] if len(code) >= 4 else code
+        hay_text = " ".join(h for h in
+                            [row["recipient_name"], row["recipient_email"]]
+                            if h).lower()
+        ok = True
+        code_hit = False
+        for w in words:
+            if w in hay_text:
+                continue
+            if w and code.lower().startswith(w):
+                code_hit = True
+                continue
+            ok = False
+            break
+        if not ok:
+            continue
+        rank = 0 if code_hit else _erp_search_rank(
+            row["recipient_name"] or "", "", words)
+        # Newest first: the sort key is the negated created_at, so the
+        # ascending (rank, sort) order in _add puts the newest first
+        # (gift cards have no numeric id to negate).
+        _sort = tuple(-ord(c) for c in (row["created_at"] or ""))
+        found.append((rank, _sort,
+                      {"type": "gift-card", "id": "····" + last4,
+                       "title": "Gift card ····%s — %s" % (
+                           last4, row["recipient_name"]
+                           or row["recipient_email"] or "—"),
+                       "subtitle": "%s · %s" % (
+                           _erp_search_money(row["balance_cents"]),
+                           "Active" if row["active"] else "Inactive"),
+                       "route": "#/accounting",
+                       "open": {"postMap": {"key": "giftCardPostMap",
+                                            "value": last4},
+                                "highlight": "gift-card-····" + last4}}))
+    return found
+
+
+def _poppy_section_file(conn, ctx, words):
+    """File store: filename/metadata only, never the blob (the blob
+    is never selected here). Each row passes the same per-owner gate
+    the file-store list endpoint uses (_file_store_read_gate): admins
+    see every file; staff see only expense receipts for their own
+    claims."""
+    found = []
+    _routes = {"coa": "#/quality", "store_document": "#/stores",
+               "allergen_statement": "#/quality",
+               "cert_evidence": "#/quality",
+               "expense_receipt": "#/accounting"}
+    for r in conn.execute(
+            "SELECT id, kind, owner_type, owner_id, filename, mime_type,"
+            " size_bytes, notes, uploaded_by, created_at FROM erp_file_store"
+            " ORDER BY id DESC").fetchall():
+        row = dict(r)
+        if ctx["role"] != "admin":
+            if row["kind"] != "expense_receipt":
+                continue
+            owner = conn.execute(
+                "SELECT * FROM erp_acct_expense_claims WHERE id = ?",
+                (row["owner_id"],)).fetchone()
+            if owner is None:
+                continue
+            _, gerr = _file_store_read_gate(conn, row["kind"], owner)
+            if gerr is not None:
+                continue
+        hay = [row["filename"], row["kind"], row["notes"],
+               row["uploaded_by"]]
+        if not _erp_search_match(hay, words):
+            continue
+        found.append((_erp_search_rank(row["filename"] or "", "", words),
+                      -row["id"],
+                      {"type": "file", "id": row["id"],
+                       "title": row["filename"] or "—",
+                       "subtitle": "%s · %s #%s" % (
+                           row["kind"] or "", row["owner_type"] or "",
+                           row["owner_id"]),
+                       "route": _routes.get(row["kind"], "#/settings"),
+                       "open": {"postMap": {"key": "filePostMap",
+                                            "value": row["id"]},
+                                "highlight": "file-%d" % row["id"]}}))
+    return found
+
+
+def _poppy_section_forms(conn, ctx, words):
+    """HR form submissions. Haystack is ONLY form_code, subject_name,
+    subject_email, status -- data_json (which holds HR-05 account
+    numbers) is never selected. Admins skip staff-created
+    unsubmitted drafts (_hr_form_hidden_from_admin, same as the
+    admin list); staff see only their own submissions, and never a
+    draft they did not create that was never submitted
+    (_hr_form_hidden_from_staff, same as /mine)."""
+    found = []
+    for r in conn.execute(
+            "SELECT id, form_code, employee_id, subject_name, subject_email,"
+            " status, decision, submitted_at, ever_submitted, created_by"
+            " FROM erp_hr_form_submissions"
+            " ORDER BY updated_at DESC, id DESC").fetchall():
+        row = dict(r)
+        if ctx["role"] == "admin":
+            if _hr_form_hidden_from_admin(row):
+                continue
+        else:
+            if (ctx["mine_id"] is None
+                    or row.get("employee_id") != ctx["mine_id"]):
+                continue
+            if _hr_form_hidden_from_staff(row, ctx["actor"]):
+                continue
+        hay = [row["form_code"], row["subject_name"],
+               row["subject_email"], row["status"]]
+        if not _erp_search_match(hay, words):
+            continue
+        d = _hr_form_def(row["form_code"]) or {}
+        found.append((_erp_search_rank(row["subject_name"] or "",
+                                      row["form_code"], words),
+                      -row["id"],
+                      {"type": "hr-form-submission", "id": row["id"],
+                       "title": "%s %s — %s" % (
+                           row["form_code"], d.get("title", ""),
+                           row["subject_name"] or "—"),
+                       "subtitle": "%s · %s" % (
+                           row["status"],
+                           (row["submitted_at"] or "")[:10]),
+                       "route": "#/hr",
+                       "open": {"postMap": {"key": "hrFormPostMap",
+                                            "value": row["id"]},
+                                "highlight": "hr-form-submission-%d"
+                                             % row["id"]}}))
+    return found
+
+
+def _poppy_v1_orders(conn, ctx, words):
+    """One of the 9 original Poppy sections, moved verbatim onto
+    the registry (Nov 27, 2026 expansion). Behaviour unchanged."""
+    fulf = {(f["order_source"], f["order_id"]): f["status"]
+            for f in conn.execute("SELECT order_source, order_id, status"
+                                  " FROM erp_order_fulfillment").fetchall()}
+    found = []
+    ws_lines = {}
+    for l in conn.execute("SELECT order_id, flavor_name FROM erp_wholesale_order_lines").fetchall():
+        ws_lines.setdefault(l["order_id"], []).append(l["flavor_name"])
+    _wsql = ("SELECT w.* FROM erp_wholesale_orders w"
+             " LEFT JOIN erp_wholesale_accounts a ON a.id = w.account_id")
+    _wargs = []
+    _wpre = _poppy_like_clause(words, [
+        "w.order_number", "w.status", "a.name",
+        "EXISTS (SELECT 1 FROM erp_wholesale_order_lines l"
+        " WHERE l.order_id = w.id AND l.flavor_name LIKE?)",
+        "EXISTS (SELECT 1 FROM erp_order_fulfillment f"
+        " WHERE f.order_source = 'wholesale' AND f.order_id = w.id"
+        " AND f.status LIKE?)"])
+    if _wpre:
+        _wsql += " WHERE (%s)" % _wpre[0]
+        _wargs = _wpre[1]
+    for w in conn.execute(_wsql + " ORDER BY w.id DESC", _wargs).fetchall():
+        brief = _erp_wholesale_order_brief(conn, w)
+        brief["status"] = fulf.get(("wholesale", w["id"]), brief["status"])
+        hay = [w["order_number"], brief["account_name"], brief["status"],
+               w["po_number"] if "po_number" in w.keys() else "",
+               " ".join(ws_lines.get(w["id"], []))]
+        if not _erp_search_match(hay, words):
+            continue
+        found.append((_erp_search_rank(brief["account_name"], w["order_number"], words),
+                      -w["id"],
+                      {"type": "order", "id": w["id"],
+                       "title": "%s — %s" % (w["order_number"], brief["account_name"] or "—"),
+                       "subtitle": "Wholesale · %g bags · %s · %s" % (
+                           brief["total_qty"], _erp_search_money(brief["total_cents"]),
+                           brief["status"]),
+                       "route": "#/orders",
+                       "open": {"ordersPostMap": {"source": "wholesale", "id": w["id"]}}}))
+    for source, table in (("stripe", "orders"), ("paypal", "paypal_orders")):
+        if source == "stripe":
+            _osql = ("SELECT * FROM orders"
+                     " WHERE stripe_session_id NOT LIKE 'paypal:%'")
+            _oatoms = ["CAST(1000 + id AS TEXT) LIKE?",
+                       "('#' || CAST(1000 + id AS TEXT)) LIKE?",
+                       "customer_name", "email", "items_summary"]
+        else:
+            _osql = "SELECT * FROM paypal_orders WHERE status = 'captured'"
+            _oatoms = ["CAST(1000 + id AS TEXT) LIKE?",
+                       "('#' || CAST(1000 + id AS TEXT)) LIKE?",
+                       "email", "items_summary"]
+        _oargs = []
+        _opre = _poppy_like_clause(words, _oatoms)
+        if _opre:
+            _osql += " AND (%s)" % _opre[0]
+            _oargs = _opre[1]
+        rows = conn.execute(_osql + " ORDER BY id DESC", _oargs).fetchall()
+        for r in rows:
+            o = _erp_online_order(conn, source, r["id"])
+            if not o:
+                continue
+            o["status"] = fulf.get((source, r["id"]), "new")
+            hay = [o["number"], o["customer_name"], o["email"], o["items_summary"]]
+            if not _erp_search_match(hay, words):
+                continue
+            who = o["customer_name"] or o["email"] or "—"
+            found.append((_erp_search_rank(who, o["number"], words),
+                          -r["id"],
+                          {"type": "order", "id": r["id"],
+                           "title": "%s — %s" % (o["number"], who),
+                           "subtitle": "Website · %s · %s" % (
+                               _erp_search_money(o["total_cents"]), o["status"]),
+                           "route": "#/orders",
+                           "open": {"ordersPostMap": {"source": source, "id": r["id"]}}}))
+    return found
+
+
+def _poppy_v1_invoices(conn, ctx, words):
+    """One of the 9 original Poppy sections, moved verbatim onto
+    the registry (Nov 27, 2026 expansion). Behaviour unchanged."""
+    found = []
+    for r in conn.execute("SELECT * FROM erp_acct_invoices"
+                          " ORDER BY date DESC, id DESC").fetchall():
+        hay = ["#%d" % r["id"], str(r["id"]), r["customer_name"], r["status"]]
+        if not _erp_search_match(hay, words):
+            continue
+        sub = "%s · %s" % (_erp_search_money(r["total_cents"]), r["status"])
+        if r["due_date"]:
+            sub += " · due %s" % r["due_date"]
+        found.append((_erp_search_rank(r["customer_name"], "#%d" % r["id"], words),
+                      -r["id"],
+                      {"type": "invoice", "id": r["id"],
+                       "title": "Invoice #%d — %s" % (r["id"], r["customer_name"]),
+                       "subtitle": sub, "route": "#/accounting",
+                       "open": {"acctView": "invoices", "highlight": "invoice-%d" % r["id"]}}))
+    return found
+
+
+def _poppy_v1_bills(conn, ctx, words):
+    """One of the 9 original Poppy sections, moved verbatim onto
+    the registry (Nov 27, 2026 expansion). Behaviour unchanged."""
+    found = []
+    for r in conn.execute("SELECT * FROM erp_acct_bills"
+                          " ORDER BY date DESC, id DESC").fetchall():
+        hay = ["#%d" % r["id"], str(r["id"]), r["vendor_name"], r["status"]]
+        if not _erp_search_match(hay, words):
+            continue
+        sub = "%s · %s" % (_erp_search_money(r["total_cents"]), r["status"])
+        if r["due_date"]:
+            sub += " · due %s" % r["due_date"]
+        found.append((_erp_search_rank(r["vendor_name"], "#%d" % r["id"], words),
+                      -r["id"],
+                      {"type": "bill", "id": r["id"],
+                       "title": "Bill #%d — %s" % (r["id"], r["vendor_name"] or "—"),
+                       "subtitle": sub, "route": "#/accounting",
+                       "open": {"acctView": "bills", "highlight": "bill-%d" % r["id"]}}))
+    return found
+
+
+def _poppy_v1_vendors(conn, ctx, words):
+    """One of the 9 original Poppy sections, moved verbatim onto
+    the registry (Nov 27, 2026 expansion). Behaviour unchanged."""
+    found = []
+    for r in conn.execute("SELECT * FROM erp_vendors WHERE active = 1"
+                          " ORDER BY name").fetchall():
+        hay = [r["name"], r["contact_name"], r["email"], r["phone"],
+               r["notes"], r["payment_terms"]]
+        if not _erp_search_match(hay, words):
+            continue
+        sub = "Vendor"
+        if r["payment_terms"]:
+            sub += " · %s" % r["payment_terms"]
+        if r["email"]:
+            sub += " · %s" % r["email"]
+        found.append((_erp_search_rank(r["name"], "", words), r["name"].lower(),
+                      {"type": "vendor", "id": r["id"], "title": r["name"],
+                       "subtitle": sub, "route": "#/purchasing",
+                       "open": {"highlight": "vendor-%d" % r["id"]}}))
+    return found
+
+
+def _poppy_v1_pos(conn, ctx, words):
+    """One of the 9 original Poppy sections, moved verbatim onto
+    the registry (Nov 27, 2026 expansion). Behaviour unchanged."""
+    vendors = {v["id"]: v["name"] for v in conn.execute(
+        "SELECT id, name FROM erp_vendors").fetchall()}
+    po_totals = {t["po_id"]: t["total"] for t in conn.execute(
+        "SELECT po_id, COALESCE(SUM(qty_ordered * unit_cost_cents), 0) AS total"
+        " FROM erp_po_lines GROUP BY po_id").fetchall()}
+    found = []
+    for r in conn.execute("SELECT * FROM erp_purchase_orders"
+                          " ORDER BY id DESC").fetchall():
+        vname = vendors.get(r["vendor_id"], "")
+        hay = [r["po_number"], vname, r["status"]]
+        if not _erp_search_match(hay, words):
+            continue
+        found.append((_erp_search_rank(vname, r["po_number"], words),
+                      -r["id"],
+                      {"type": "purchase-order", "id": r["id"],
+                       "title": "%s — %s" % (r["po_number"], vname or "—"),
+                       "subtitle": "Purchase order · %s · %s" % (
+                           r["status"], _erp_search_money(po_totals.get(r["id"], 0))),
+                       "route": "#/purchasing",
+                       "open": {"poPostMap": r["id"]}}))
+    return found
+
+
+def _poppy_v1_items(conn, ctx, words):
+    """One of the 9 original Poppy sections, moved verbatim onto
+    the registry (Nov 27, 2026 expansion). Behaviour unchanged."""
+    found = []
+    _sql = "SELECT * FROM erp_items WHERE active = 1"
+    _args = []
+    _pre = _poppy_like_clause(words, ["name", "sku", "type"])
+    if _pre:
+        _sql += " AND (%s)" % _pre[0]
+        _args = _pre[1]
+    for r in conn.execute(_sql + " ORDER BY type, name", _args).fetchall():
+        hay = [r["name"], r["sku"], r["type"]]
+        if not _erp_search_match(hay, words):
+            continue
+        found.append((_erp_search_rank(r["name"], r["sku"], words), r["name"].lower(),
+                      {"type": "item", "id": r["id"], "title": r["name"],
+                       "subtitle": "Item · %s · %s" % (r["sku"], r["type"]),
+                       "route": "#/inventory",
+                       "open": {"itemPostMap": r["id"]}}))
+    return found
+
+
+def _poppy_v1_recipes(conn, ctx, words):
+    """One of the 9 original Poppy sections, moved verbatim onto
+    the registry (Nov 27, 2026 expansion). Behaviour unchanged."""
+    found = []
+    for r in conn.execute("SELECT * FROM erp_recipes WHERE active = 1"
+                          " ORDER BY name").fetchall():
+        if not _erp_search_match([r["name"]], words):
+            continue
+        found.append((_erp_search_rank(r["name"], "", words), r["name"].lower(),
+                      {"type": "recipe", "id": r["id"], "title": r["name"],
+                       "subtitle": "Recipe · %s bags per batch" % _erp_fmt_qty(r["batch_size_bags"]),
+                       "route": "#/production",
+                       "open": {"recipePostMap": r["id"]}}))
+    return found
+
+
+def _poppy_v1_accounts(conn, ctx, words):
+    """One of the 9 original Poppy sections, moved verbatim onto
+    the registry (Nov 27, 2026 expansion). Behaviour unchanged."""
+    found = []
+    for r in conn.execute("SELECT * FROM erp_wholesale_accounts"
+                          " ORDER BY name").fetchall():
+        hay = [r["name"], r["contact_name"], r["email"],
+               r["billing_name"] if "billing_name" in r.keys() else "",
+               r["billing_email"] if "billing_email" in r.keys() else ""]
+        if not _erp_search_match(hay, words):
+            continue
+        sub = "Wholesale account"
+        if r["contact_name"]:
+            sub += " · %s" % r["contact_name"]
+        if r["email"]:
+            sub += " · %s" % r["email"]
+        found.append((_erp_search_rank(r["name"], "", words), r["name"].lower(),
+                      {"type": "account", "id": r["id"], "title": r["name"],
+                       "subtitle": sub, "route": "#/orders",
+                       "open": {"accountsPostMap": r["id"]}}))
+    return found
+
+
+def _poppy_v1_sops(conn, ctx, words):
+    """One of the 9 original Poppy sections, moved verbatim onto
+    the registry (Nov 27, 2026 expansion). Behaviour unchanged."""
+    found = []
+    for r in conn.execute("SELECT * FROM erp_quality_sops"
+                          " ORDER BY dept, position, id").fetchall():
+        if not _erp_search_match([r["title"], r["body"]], words):
+            continue
+        d = _quality_sop_dict(r)
+        found.append((_erp_search_rank(r["title"], "", words),
+                      (r["dept"], r["position"], r["id"]),
+                      {"type": "sop", "id": r["id"], "title": r["title"],
+                       "subtitle": "Dept %d · %s" % (r["dept"], d["dept_name"]),
+                       "route": "#/quality",
+                       "open": {"sopPostMap": r["id"]}}))
+    return found
+
+
+POPPY_SECTIONS = [
+    # --- The 9 original sections, in their original order. Their
+    # "fn" bodies are the pre-expansion blocks moved verbatim; the
+    # gate in each entry is the same check the block used inline.
+    {"key": "order", "label": "Orders", "gate": "orders.read",
+     "fn": _poppy_v1_orders},
+    {"key": "invoice", "label": "Invoices", "gate": "accounting.read",
+     "fn": _poppy_v1_invoices},
+    {"key": "bill", "label": "Bills", "gate": "accounting.read",
+     "fn": _poppy_v1_bills},
+    {"key": "vendor", "label": "Vendors", "gate": "purchasing.read",
+     "fn": _poppy_v1_vendors},
+    {"key": "purchase-order", "label": "Purchase orders",
+     "gate": "purchasing.read", "fn": _poppy_v1_pos},
+    {"key": "item", "label": "Inventory items",
+     "gate": "inventory.read", "fn": _poppy_v1_items},
+    {"key": "recipe", "label": "Recipes", "gate": "recipes.read",
+     "fn": _poppy_v1_recipes},
+    {"key": "account", "label": "Wholesale accounts",
+     "gate": "accounts.read", "fn": _poppy_v1_accounts},
+    {"key": "sop", "label": "SOPs", "gate": "admin", "staff": "admin",
+     "fn": _poppy_v1_sops},
+
+    # --- Inventory (Dept 2) ---
+    {"key": "bin", "label": "Bins", "gate": "inventory.read",
+     "sql": "SELECT b.id, b.code, b.description, l.code AS loc_code"
+            " FROM erp_inventory_bins b"
+            " LEFT JOIN erp_locations l ON l.id = b.location_id"
+            " WHERE b.active = 1 ORDER BY b.code",
+     "hay": ["code", "description", "loc_code"], "number": "code",
+     "primary": "code", "sort": "name", "title": "{code} — {loc_code}",
+     "subtitle": "Bin · {trunc:description:60}", "route": "#/inventory",
+     "postmap": "binPostMap"},
+    {"key": "cycle-count", "label": "Cycle counts",
+     "gate": "inventory.read",
+     "sql": "SELECT c.id, c.count_date, c.status, c.notes,"
+            " l.code AS loc_code, l.name AS loc_name"
+            " FROM erp_inventory_counts c"
+            " LEFT JOIN erp_locations l ON l.id = c.location_id"
+            " ORDER BY c.id DESC",
+     "hay": ["count_date", "status", "notes", "loc_code", "loc_name"],
+     "primary": "loc_code", "title": "Count #{id} — {loc_name}",
+     "subtitle": "{status} · {date:count_date}", "route": "#/inventory",
+     "postmap": "cycleCountPostMap"},
+    {"key": "cycle-count-detail", "label": "Cycle count items",
+     "gate": "inventory.read",
+     "sql": "SELECT c.id, c.status, c.counted_qty, c.counted_by,"
+            " i.name AS item_name, i.sku AS item_sku, l.code AS loc_code"
+            " FROM erp_cycle_counts c"
+            " LEFT JOIN erp_items i ON i.id = c.item_id"
+            " LEFT JOIN erp_locations l ON l.id = c.location_id"
+            " ORDER BY c.id DESC",
+     "hay": ["item_name", "item_sku", "loc_code", "status", "counted_by"],
+     "primary": "item_name", "title": "{item_name} — {loc_code}",
+     "subtitle": "Cycle count · {status} · counted {counted_qty}",
+     "route": "#/inventory", "postmap": "cycleCountDetailPostMap"},
+    {"key": "lot", "label": "Lots", "gate": "inventory.read",
+     "sql": "SELECT l.id, l.lot_code, l.supplier_lot, l.expiry_date,"
+            " i.name AS item_name, i.sku AS item_sku FROM erp_lots l"
+            " LEFT JOIN erp_items i ON i.id = l.item_id"
+            " ORDER BY l.id DESC",
+     "hay": ["lot_code", "item_name", "item_sku", "supplier_lot"],
+     "number": "lot_code", "primary": "lot_code",
+     "title": "{lot_code} — {item_name}",
+     "subtitle": "Lot · expires {date:expiry_date}",
+     "route": "#/inventory", "postmap": "lotPostMap"},
+    {"key": "location", "label": "Locations", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, code, name, type FROM erp_locations"
+            " WHERE active = 1 ORDER BY code",
+     "hay": ["code", "name", "type"], "number": "code",
+     "primary": "code", "sort": "name", "title": "{code} — {name}",
+     "subtitle": "Location · {type}", "route": "#/inventory",
+     "postmap": "locationPostMap"},
+    {"key": "reorder-rule", "label": "Reorder rules", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT r.id, r.reorder_point, r.reorder_qty,"
+            " i.name AS item_name, i.sku AS item_sku, l.code AS loc_code"
+            " FROM erp_reorder_rules r"
+            " LEFT JOIN erp_items i ON i.id = r.item_id"
+            " LEFT JOIN erp_locations l ON l.id = r.location_id"
+            " ORDER BY r.id DESC",
+     "hay": ["item_name", "item_sku", "loc_code"],
+     "primary": "item_name", "title": "{item_name}",
+     "subtitle": "Reorder rule · min {reorder_point} · {loc_code}",
+     "route": "#/inventory", "postmap": "reorderRulePostMap"},
+    {"key": "stock-target", "label": "Stock targets",
+     "gate": "batches.read",
+     "sql": "SELECT t.id, t.target_bags, r.name AS recipe_name,"
+            " l.code AS loc_code FROM erp_stock_targets t"
+            " LEFT JOIN erp_recipes r ON r.id = t.recipe_id"
+            " LEFT JOIN erp_locations l ON l.id = t.location_id"
+            " ORDER BY t.id DESC",
+     "hay": ["recipe_name", "loc_code"], "primary": "recipe_name",
+     "title": "{recipe_name} — {loc_code}",
+     "subtitle": "Stock target · {target_bags} bags",
+     "route": "#/production", "postmap": "stockTargetPostMap"},
+
+    # --- Purchasing (Dept 3) ---
+    {"key": "requisition", "label": "Requisitions", "gate": "erp",
+     "staff": "own_login:requested_by",
+     "sql": "SELECT q.id, q.status, q.reason, q.requested_by, q.quantity,"
+            " i.name AS item_name, i.sku AS item_sku,"
+            " v.name AS vendor_name FROM erp_purchase_requisitions q"
+            " LEFT JOIN erp_items i ON i.id = q.item_id"
+            " LEFT JOIN erp_vendors v ON v.id = q.vendor_id"
+            " ORDER BY q.id DESC",
+     "hay": ["item_name", "item_sku", "vendor_name", "status", "reason",
+             "requested_by"],
+     "primary": "item_name", "title": "Req #{id} — {item_name}",
+     "subtitle": "{status} · {requested_by}", "route": "#/purchasing",
+     "postmap": "requisitionPostMap"},
+    {"key": "rfq", "label": "RFQs", "gate": "purchasing.read",
+     "sql": "SELECT q.id, q.title, q.status,"
+            " GROUP_CONCAT(v.name, ' ') AS vendor_names FROM erp_rfqs q"
+            " LEFT JOIN erp_rfq_vendors rv ON rv.rfq_id = q.id"
+            " LEFT JOIN erp_vendors v ON v.id = rv.vendor_id"
+            " GROUP BY q.id ORDER BY q.id DESC",
+     "hay": ["title", "status", "vendor_names"], "primary": "title",
+     "title": "RFQ #{id} — {title}", "subtitle": "RFQ · {status}",
+     "route": "#/purchasing", "postmap": "rfqPostMap"},
+    {"key": "supplier", "label": "Approved suppliers",
+     "gate": "purchasing.read",
+     "sql": "SELECT o.id, o.status, o.coa_status, v.name AS vendor_name"
+            " FROM erp_vendor_onboarding o"
+            " LEFT JOIN erp_vendors v ON v.id = o.vendor_id"
+            " ORDER BY o.id DESC",
+     "hay": ["vendor_name", "status"], "primary": "vendor_name",
+     "title": "{vendor_name}",
+     "subtitle": "Approved supplier · {status}",
+     "route": "#/purchasing", "postmap": "supplierPostMap"},
+    {"key": "edi-partner", "label": "EDI partners", "gate": "edi.read",
+     "sql": "SELECT id, name, provider, transport FROM erp_edi_partners"
+            " WHERE active = 1 ORDER BY name",
+     "hay": ["name", "provider", "transport"], "primary": "name",
+     "sort": "name", "title": "{name}",
+     "subtitle": "EDI partner · {provider}", "route": "#/edi",
+     "postmap": "ediPartnerPostMap"},
+    {"key": "edi-document", "label": "EDI documents", "gate": "edi.read",
+     "sql": "SELECT d.id, d.doc_type, d.direction, d.status,"
+            " p.name AS partner_name FROM erp_edi_documents d"
+            " LEFT JOIN erp_edi_partners p ON p.id = d.partner_id"
+            " ORDER BY d.id DESC",
+     "hay": ["doc_type", "direction", "status", "partner_name"],
+     "primary": "partner_name",
+     "title": "EDI doc #{id} — {partner_name}",
+     "subtitle": "{doc_type} · {status}", "route": "#/edi",
+     "postmap": "ediDocumentPostMap"},
+
+    # --- Production (Dept 4) ---
+    {"key": "batch", "label": "Batches", "gate": "batches.read",
+     "sql": "SELECT b.id, b.batch_number, b.status, b.scheduled_date,"
+            " b.actual_qty_bags, b.lot_code, r.name AS recipe_name"
+            " FROM erp_production_batches b"
+            " LEFT JOIN erp_recipes r ON r.id = b.recipe_id"
+            " ORDER BY b.id DESC",
+     "hay": ["batch_number", "recipe_name", "status", "lot_code"],
+     "number": "batch_number", "primary": "recipe_name",
+     "title": "Batch {batch_number} — {recipe_name}",
+     "subtitle": "{status} · {actual_qty_bags} bags",
+     "route": "#/production", "postmap": "batchPostMap"},
+    {"key": "work-order", "label": "Work orders", "gate": "batches.read",
+     "sql": "SELECT w.id, w.status, w.planned_qty, r.name AS recipe_name,"
+            " e.name AS operator_name FROM erp_work_orders w"
+            " LEFT JOIN erp_recipes r ON r.id = w.recipe_id"
+            " LEFT JOIN erp_hr_employees e ON e.id = w.operator_employee_id"
+            " ORDER BY w.id DESC",
+     "hay": ["recipe_name", "operator_name", "status"],
+     "primary": "recipe_name",
+     "title": "Work order #{id} — {recipe_name}",
+     "subtitle": "{status} · {operator_name}", "route": "#/production",
+     "postmap": "workOrderPostMap"},
+    {"key": "equipment", "label": "Production equipment",
+     "gate": "batches.read",
+     "sql": "SELECT e.id, e.name, e.serial_no, e.status,"
+            " l.name AS loc_name FROM erp_prod_equipment e"
+            " LEFT JOIN erp_locations l ON l.id = e.location_id"
+            " ORDER BY e.name",
+     "hay": ["name", "serial_no", "loc_name"], "primary": "name",
+     "sort": "name", "title": "{name}",
+     "subtitle": "{serial_no} · {loc_name}", "route": "#/production",
+     "postmap": "equipmentPostMap"},
+    {"key": "kit", "label": "Kits", "gate": "batches.read",
+     "sql": "SELECT k.id, k.name, k.description, i.sku AS out_sku"
+            " FROM erp_kit_definitions k"
+            " LEFT JOIN erp_items i ON i.id = k.output_item_id"
+            " WHERE k.active = 1 ORDER BY k.name",
+     "hay": ["name", "description", "out_sku"], "primary": "name",
+     "sort": "name", "title": "{name}", "subtitle": "Kit · {out_sku}",
+     "route": "#/production", "postmap": "kitPostMap"},
+
+    # --- Order hub, wholesale & retail customers (Dept 5-6, 8) ---
+    {"key": "wholesale-return", "label": "Wholesale returns",
+     "gate": "orders.read",
+     "sql": "SELECT r.id, r.rma_no, r.reason, r.status, r.credit_cents,"
+            " a.name AS account_name FROM erp_wholesale_returns r"
+            " LEFT JOIN erp_wholesale_orders o ON o.id = r.order_id"
+            " LEFT JOIN erp_wholesale_accounts a ON a.id = o.account_id"
+            " ORDER BY r.id DESC",
+     "hay": ["rma_no", "account_name", "reason", "status"],
+     "number": "rma_no", "primary": "account_name",
+     "title": "RMA {rma_no} — {account_name}",
+     "subtitle": "{status} · {money:credit_cents}", "route": "#/orders",
+     "postmap": "wholesaleReturnPostMap"},
+    {"key": "pos-return", "label": "POS returns", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT r.id, r.sale_key, r.reason, r.disposition,"
+            " s.name AS store_name FROM erp_pos_returns r"
+            " LEFT JOIN erp_stores s ON s.id = r.store_id"
+            " ORDER BY r.id DESC",
+     "hay": ["sale_key", "reason", "disposition", "store_name"],
+     "primary": "sale_key", "title": "Return #{id} — {sale_key}",
+     "subtitle": "{reason} · {disposition}", "route": "#/stores",
+     "postmap": "posReturnPostMap"},
+    {"key": "sales-quote", "label": "Sales quotes",
+     "gate": "accounts.read",
+     "sql": "SELECT q.id, q.status, q.valid_until,"
+            " p.company_name AS company FROM erp_sales_quotes q"
+            " LEFT JOIN erp_sales_prospects p ON p.id = q.prospect_id"
+            " ORDER BY q.id DESC",
+     "hay": ["company", "status"], "primary": "company",
+     "title": "Quote #{id} — {company}",
+     "subtitle": "{status} · valid until {date:valid_until}",
+     "route": "#/orders", "postmap": "salesQuotePostMap"},
+    {"key": "prospect", "label": "Sales prospects",
+     "gate": "accounts.read",
+     "sql": "SELECT id, company_name, contact_name, email, stage"
+            " FROM erp_sales_prospects ORDER BY id DESC",
+     "hay": ["company_name", "contact_name", "email", "stage"],
+     "primary": "company_name",
+     "title": "{contact_name} — {company_name}",
+     "subtitle": "{stage}", "route": "#/orders",
+     "postmap": "prospectPostMap"},
+    {"key": "delivery-route", "label": "Delivery routes",
+     "gate": "orders.read", "staff": "own_staff:driver_id",
+     "sql": "SELECT r.id, r.route_date, r.status, r.notes, r.driver_id,"
+            " s.name AS driver_name, v.name AS vehicle_name"
+            " FROM erp_delivery_routes r"
+            " LEFT JOIN staff s ON s.id = r.driver_id"
+            " LEFT JOIN erp_fleet_vehicles v ON v.id = r.vehicle_id"
+            " ORDER BY r.route_date DESC, r.id DESC",
+     "hay": ["route_date", "status", "notes", "driver_name",
+             "vehicle_name"],
+     "primary": "driver_name", "title": "Route — {date:route_date}",
+     "subtitle": "{driver_name} · {status}", "route": "#/orders",
+     "postmap": "deliveryRoutePostMap"},
+    {"key": "pick-list", "label": "Pick lists",
+     "gate": "inventory.read",
+     "sql": "SELECT p.id, p.order_source, p.order_id, p.status,"
+            " l.code AS loc_code FROM erp_pick_lists p"
+            " LEFT JOIN erp_locations l ON l.id = p.location_id"
+            " ORDER BY p.id DESC",
+     "hay": ["order_source", "order_id", "status", "loc_code"],
+     "primary": "loc_code",
+     "title": "Pick list #{id} — {order_source} #{order_id}",
+     "subtitle": "{status} · {loc_code}", "route": "#/inventory",
+     "postmap": "pickListPostMap"},
+    {"key": "subscription", "label": "Subscriptions", "gate": "any_mkt",
+     "sql": "SELECT id, ship_name, ship_email, frequency, status,"
+            " next_billing_date FROM subscriptions ORDER BY id DESC",
+     "hay": ["ship_name", "ship_email", "frequency", "status"],
+     "primary": "ship_name", "title": "{ship_name} — {frequency}",
+     "subtitle": "{status} · next billing {date:next_billing_date}",
+     "route": "#/marketing", "postmap": "subscriptionPostMap"},
+    {"key": "gift-card", "label": "Gift cards", "gate": "admin",
+     "staff": "admin", "fn": _poppy_section_gift_card},
+    {"key": "customer", "label": "Customers", "gate": "any_mkt",
+     "fn": _poppy_section_customer},
+    {"key": "price-tier", "label": "Price tiers",
+     "gate": "accounts.read",
+     "sql": "SELECT t.id, t.category, t.min_bags, a.name AS account_name"
+            " FROM erp_wholesale_price_tiers t"
+            " LEFT JOIN erp_wholesale_accounts a ON a.id = t.account_id"
+            " ORDER BY t.id DESC",
+     "hay": ["account_name", "category"], "primary": "account_name",
+     "title": "{account_name} — {category}",
+     "subtitle": "Price tier · {min_bags}+ bags", "route": "#/orders",
+     "postmap": "priceTierPostMap"},
+    {"key": "loyalty-tier", "label": "Loyalty tiers",
+     "gate": "loyalty.read",
+     "sql": "SELECT id, name FROM erp_loyalty_tiers"
+            " WHERE active = 1 ORDER BY name",
+     "hay": ["name"], "primary": "name", "sort": "name",
+     "title": "{name}", "subtitle": "Loyalty tier", "route": "#/loyalty",
+     "postmap": "loyaltyTierPostMap"},
+    {"key": "loyalty-reward", "label": "Loyalty rewards",
+     "gate": "loyalty.read",
+     "sql": "SELECT id, label, kernels FROM erp_loyalty_rewards_catalog"
+            " WHERE active = 1 ORDER BY kernels ASC, id ASC",
+     "hay": ["label"], "primary": "label", "sort": "name",
+     "title": "{label}", "subtitle": "Loyalty reward · {kernels} Kernels",
+     "route": "#/loyalty", "postmap": "loyaltyRewardPostMap"},
+    {"key": "web-return", "label": "Web returns", "gate": "any_mkt",
+     "sql": "SELECT id, order_source, order_id, customer_email, reason,"
+            " status FROM erp_mkt_returns ORDER BY id DESC",
+     "hay": ["customer_email", "reason", "status"],
+     "primary": "customer_email",
+     "title": "Web return #{id} — {customer_email}",
+     "subtitle": "{reason} · {status}", "route": "#/marketing",
+     "postmap": "webReturnPostMap"},
+
+    # --- Marketing & service (Dept 8) ---
+    {"key": "campaign", "label": "Campaigns", "gate": "any_mkt",
+     "sql": "SELECT id, name, status FROM erp_mkt_campaigns"
+            " ORDER BY id DESC",
+     "hay": ["name", "status"], "primary": "name", "title": "{name}",
+     "subtitle": "Campaign · {status}", "route": "#/marketing",
+     "postmap": "campaignPostMap"},
+    {"key": "newsletter", "label": "Newsletters",
+     "gate": "newsletter.read",
+     "sql": "SELECT id, subject, status, sent_at FROM erp_mkt_newsletters"
+            " ORDER BY id DESC",
+     "hay": ["subject", "status"], "primary": "subject",
+     "title": "{subject}", "subtitle": "{status} · {date:sent_at}",
+     "route": "#/marketing", "postmap": "newsletterPostMap"},
+    {"key": "segment", "label": "Segments", "gate": "any_mkt",
+     "sql": "SELECT id, name FROM erp_mkt_segments ORDER BY name",
+     "hay": ["name"], "primary": "name", "sort": "name",
+     "title": "{name}", "subtitle": "Segment", "route": "#/marketing",
+     "postmap": "segmentPostMap"},
+    {"key": "ticket", "label": "Support tickets", "gate": "support.read",
+     "sql": "SELECT id, subject, customer_name, customer_email, status"
+            " FROM erp_mkt_tickets ORDER BY id DESC",
+     "hay": ["subject", "customer_name", "customer_email", "status"],
+     "primary": "subject", "title": "Ticket #{id} — {subject}",
+     "subtitle": "{status}", "route": "#/marketing",
+     "postmap": "ticketPostMap"},
+    {"key": "kb-article", "label": "Help articles",
+     "gate": "support.read", "staff": "published",
+     "sql": "SELECT id, title, body, category, status"
+            " FROM erp_mkt_kb_articles ORDER BY updated_at DESC, id DESC",
+     "hay": ["title", "body", "category"], "primary": "title",
+     "title": "{title}", "subtitle": "Help article · {category}",
+     "route": "#/marketing", "postmap": "kbArticlePostMap"},
+    {"key": "survey", "label": "Surveys", "gate": "support.read",
+     "sql": "SELECT id, title, description FROM erp_mkt_surveys"
+            " ORDER BY id DESC",
+     "hay": ["title", "description"], "primary": "title",
+     "title": "{title}", "subtitle": "Survey", "route": "#/marketing",
+     "postmap": "surveyPostMap"},
+    {"key": "ig-post", "label": "Instagram posts",
+     "gate": "instagram.read",
+     "sql": "SELECT id, kind, caption, status, promo_date"
+            " FROM erp_mkt_ig_posts ORDER BY id DESC",
+     "hay": ["caption", "status", "kind"], "primary": "caption",
+     "title": "{trunc:caption:60}",
+     "subtitle": "{status} · {date:promo_date}", "route": "#/marketing",
+     "postmap": "igPostPostMap"},
+    {"key": "ig-comment", "label": "Instagram comments",
+     "gate": "instagram.read",
+     "sql": "SELECT id, username, text, status, commented_at"
+            " FROM erp_mkt_ig_comments ORDER BY id DESC",
+     "hay": ["username", "text"], "primary": "username",
+     "title": "{username} — {trunc:text:50}",
+     "subtitle": "{status} · {date:commented_at}",
+     "route": "#/marketing", "postmap": "igCommentPostMap"},
+    {"key": "review", "label": "Reviews", "gate": "support.read",
+     "sql": "SELECT id, user_name, flavor_slug, text, created_at"
+            " FROM reviews ORDER BY id DESC",
+     "hay": ["user_name", "flavor_slug", "text"], "primary": "user_name",
+     "title": "{user_name} — {flavor_slug}",
+     "subtitle": "Review · {date:created_at}", "route": "#/marketing",
+     "postmap": "reviewPostMap"},
+    {"key": "referral", "label": "Referrals", "gate": "any_mkt",
+     "sql": "SELECT r.id, r.referred_email, r.status,"
+            " u.name AS referrer_name FROM erp_mkt_referrals r"
+            " LEFT JOIN users u ON u.id = r.referrer_user_id"
+            " ORDER BY r.id DESC",
+     "hay": ["referrer_name", "referred_email", "status"],
+     "primary": "referrer_name",
+     "title": "{referrer_name} — {referred_email}",
+     "subtitle": "Referral · {status}", "route": "#/marketing",
+     "postmap": "referralPostMap"},
+    {"key": "drip", "label": "Drip sequences", "gate": "newsletter.read",
+     "sql": "SELECT id, name, trigger_kind, active"
+            " FROM erp_mkt_drip_sequences ORDER BY id DESC",
+     "hay": ["name", "trigger_kind"], "primary": "name",
+     "title": "{name}", "subtitle": "Drip sequence · {trigger_kind}",
+     "route": "#/marketing", "postmap": "dripPostMap"},
+    {"key": "subscriber", "label": "Subscribers",
+     "gate": "newsletter.read", "id": "{email}",
+     "sql": "SELECT email, created_at,"
+            " CASE WHEN active = 1 THEN 'active' ELSE 'unsubscribed' END"
+            " AS state FROM newsletter_subscribers"
+            " ORDER BY created_at DESC",
+     "hay": ["email"], "primary": "email", "sort": "name",
+     "title": "{email}", "subtitle": "Subscriber · {state}",
+     "route": "#/marketing", "postmap": "subscriberPostMap",
+     "postmap_value": "{email}"},
+    {"key": "abandoned-cart", "label": "Abandoned carts",
+     "gate": "any_mkt",
+     "sql": "SELECT id, email, items_summary, status, created_at"
+            " FROM abandoned_carts ORDER BY id DESC",
+     "hay": ["email", "items_summary", "status"], "primary": "email",
+     "title": "{email}",
+     "subtitle": "{trunc:items_summary:60} · {date:created_at}",
+     "route": "#/marketing", "postmap": "abandonedCartPostMap"},
+    {"key": "sms-message", "label": "SMS messages", "gate": "any_mkt",
+     "sql": "SELECT id, to_number, body, status, order_source, order_id"
+            " FROM erp_sms_messages ORDER BY id DESC",
+     "hay": ["to_number", "body", "status"], "primary": "to_number",
+     "title": "{to_number}", "subtitle": "{trunc:body:60} · {status}",
+     "route": "#/marketing", "postmap": "smsMessagePostMap"},
+    {"key": "sms-template", "label": "SMS templates", "gate": "any_mkt",
+     "sql": "SELECT id, name, kind, body FROM erp_sms_templates"
+            " ORDER BY name",
+     "hay": ["name", "kind", "body"], "primary": "name", "sort": "name",
+     "title": "{name}", "subtitle": "SMS template · {kind}",
+     "route": "#/marketing", "postmap": "smsTemplatePostMap"},
+    {"key": "cms-slot", "label": "CMS slots", "gate": "newsletter.read",
+     "sql": "SELECT id, slot_key, title, placement FROM erp_mkt_cms_slots"
+            " ORDER BY slot_key",
+     "hay": ["slot_key", "title", "placement"], "primary": "title",
+     "sort": "name", "title": "{title}",
+     "subtitle": "CMS slot · {placement}", "route": "#/marketing",
+     "postmap": "cmsSlotPostMap"},
+    {"key": "support-macro", "label": "Support macros",
+     "gate": "support.read",
+     "sql": "SELECT id, title, body FROM erp_support_macros"
+            " WHERE active = 1 ORDER BY title",
+     "hay": ["title", "body"], "primary": "title", "sort": "name",
+     "title": "{title}", "subtitle": "Support macro",
+     "route": "#/marketing", "postmap": "supportMacroPostMap"},
+    {"key": "sla-policy", "label": "SLA policies", "gate": "support.read",
+     "sql": "SELECT id, priority, first_response_minutes,"
+            " resolution_minutes FROM erp_support_sla_policies"
+            " WHERE active = 1 ORDER BY id",
+     "hay": ["priority"], "primary": "priority",
+     "title": "SLA — {priority}",
+     "subtitle": "First response {first_response_minutes} min ·"
+                 " resolution {resolution_minutes} min",
+     "route": "#/marketing", "postmap": "slaPolicyPostMap"},
+
+    # --- Accounting, tax, payroll (Dept 9) ---
+    {"key": "credit-note", "label": "Credit notes",
+     "gate": "accounting.read",
+     "sql": "SELECT c.id, c.amount_cents, c.status, c.date,"
+            " i.customer_name AS customer FROM erp_acct_credit_notes c"
+            " LEFT JOIN erp_acct_invoices i ON i.id = c.invoice_id"
+            " ORDER BY c.id DESC",
+     "hay": ["customer", "status"], "primary": "customer",
+     "title": "Credit note #{id} — {customer}",
+     "subtitle": "{money:amount_cents} · {status}",
+     "route": "#/accounting", "postmap": "creditNotePostMap"},
+    {"key": "journal", "label": "Journal entries",
+     "gate": "accounting.read",
+     "prefilter": ["memo", "CAST(id AS TEXT) LIKE ?",
+                   "('#' || CAST(id AS TEXT)) LIKE ?", "date"],
+     "sql": "SELECT id, memo, date, source FROM erp_acct_journal"
+            " ORDER BY id DESC",
+     "hay": ["memo", "date", "id"], "number": "id", "primary": "memo",
+     "title": "JE #{id} — {trunc:memo:60}",
+     "subtitle": "{date:date} · {source}", "route": "#/accounting",
+     "postmap": "journalPostMap"},
+    {"key": "fixed-asset", "label": "Fixed assets",
+     "gate": "accounting.read",
+     "sql": "SELECT id, name, status, placed_in_service_date"
+            " FROM erp_acct_fixed_assets ORDER BY name",
+     "hay": ["name", "status"], "primary": "name", "sort": "name",
+     "title": "{name}",
+     "subtitle": "{status} · in service {date:placed_in_service_date}",
+     "route": "#/accounting", "postmap": "fixedAssetPostMap"},
+    {"key": "budget", "label": "Budgets", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT b.id, b.period, a.code AS acct_code,"
+            " a.name AS acct_name FROM erp_acct_budgets b"
+            " LEFT JOIN erp_acct_accounts a ON a.id = b.account_id"
+            " ORDER BY b.id DESC",
+     "hay": ["period", "acct_code", "acct_name"],
+     "primary": "acct_name", "title": "Budget — {period}",
+     "subtitle": "{acct_code} {acct_name}", "route": "#/accounting",
+     "postmap": "budgetPostMap"},
+    {"key": "bank-account", "label": "Bank accounts",
+     "gate": "accounting.read",
+     "sql": "SELECT id, name, type FROM erp_acct_bank_accounts"
+            " WHERE active = 1 ORDER BY name",
+     "hay": ["name", "type"], "primary": "name", "sort": "name",
+     "title": "{name}", "subtitle": "Bank account · {type}",
+     "route": "#/accounting", "postmap": "bankAccountPostMap"},
+    {"key": "tax-filing", "label": "Tax filings", "gate": "tax.read",
+     "sql": "SELECT id, period_start, period_end, jurisdiction, status"
+            " FROM erp_acct_tax_filings ORDER BY id DESC",
+     "hay": ["jurisdiction", "status"], "primary": "jurisdiction",
+     "title": "{date:period_start} – {date:period_end} — {jurisdiction}",
+     "subtitle": "Tax filing · {status}", "route": "#/accounting",
+     "postmap": "taxFilingPostMap"},
+    {"key": "payrun", "label": "Pay runs", "gate": "payroll.read",
+     "sql": "SELECT id, period_start, period_end, pay_date, status"
+            " FROM erp_acct_payruns ORDER BY id DESC",
+     "hay": ["status"], "primary": "period_start",
+     "title": "Pay run — {date:period_start} – {date:period_end}",
+     "subtitle": "{status} · paid {date:pay_date}",
+     "route": "#/accounting", "postmap": "payrunPostMap"},
+    {"key": "payroll-employee", "label": "Payroll employees",
+     "gate": "payroll.read",
+     "sql": "SELECT id, first_name || ' ' || last_name AS full_name,"
+            " pay_type, active FROM erp_acct_employees"
+            " ORDER BY last_name, first_name",
+     "hay": ["full_name"], "primary": "full_name", "sort": "name",
+     "title": "{full_name}",
+     "subtitle": "Payroll employee · {pay_type}",
+     "route": "#/accounting", "postmap": "payrollEmployeePostMap"},
+    {"key": "disbursement", "label": "Payroll disbursements",
+     "gate": "payroll.read",
+     "sql": "SELECT d.id, d.method, d.reference, d.disbursed_date,"
+            " p.period_start AS run_start, p.period_end AS run_end"
+            " FROM erp_acct_payroll_disbursements d"
+            " LEFT JOIN erp_acct_payruns p ON p.id = d.payrun_id"
+            " ORDER BY d.id DESC",
+     "hay": ["method", "reference"], "primary": "method",
+     "title": "Disbursement — {date:run_start} – {date:run_end}",
+     "subtitle": "{method} · {reference}", "route": "#/accounting",
+     "postmap": "disbursementPostMap"},
+    {"key": "garnishment", "label": "Garnishments",
+     "gate": "payroll.read",
+     "sql": "SELECT g.id, g.authority, g.type, g.status,"
+            " e.first_name || ' ' || e.last_name AS emp_name"
+            " FROM erp_acct_payroll_garnishments g"
+            " LEFT JOIN erp_acct_employees e ON e.id = g.employee_id"
+            " ORDER BY g.id DESC",
+     "hay": ["emp_name", "authority", "type", "status"],
+     "primary": "emp_name", "title": "{emp_name}",
+     "subtitle": "Garnishment · {authority} · {status}",
+     "route": "#/accounting", "postmap": "garnishmentPostMap"},
+    {"key": "expense-claim", "label": "Expense claims", "gate": "erp",
+     "staff": "own:employee_id",
+     "sql": "SELECT c.id, c.employee_id, c.category, c.description,"
+            " c.status, c.amount_cents, c.date, e.name AS emp_name"
+            " FROM erp_acct_expense_claims c"
+            " LEFT JOIN erp_hr_employees e ON e.id = c.employee_id"
+            " ORDER BY c.id DESC",
+     "hay": ["emp_name", "category", "description", "status"],
+     "primary": "emp_name",
+     "title": "{emp_name} — {trunc:description:50}",
+     "subtitle": "{status} · {money:amount_cents}",
+     "route": "#/accounting", "postmap": "expenseClaimPostMap"},
+    {"key": "dunning-case", "label": "Dunning cases",
+     "gate": "accounting.read",
+     "sql": "SELECT id, status, current_step_index"
+            " FROM erp_acct_dunning_cases ORDER BY id DESC",
+     "hay": ["status"], "primary": "status",
+     "title": "Dunning case #{id}",
+     "subtitle": "{status} · step {current_step_index}",
+     "route": "#/accounting", "postmap": "dunningCasePostMap"},
+    {"key": "dispute", "label": "Disputes", "gate": "orders.read",
+     "sql": "SELECT d.id, d.channel, d.channel_dispute_id, d.status,"
+            " COALESCE(o.customer_name, p.email, a.name, '') AS who"
+            " FROM erp_disputes d"
+            " LEFT JOIN orders o ON d.order_source = 'stripe'"
+            " AND o.id = d.order_id"
+            " LEFT JOIN paypal_orders p ON d.order_source = 'paypal'"
+            " AND p.id = d.order_id"
+            " LEFT JOIN erp_wholesale_orders wo"
+            " ON d.order_source = 'wholesale' AND wo.id = d.order_id"
+            " LEFT JOIN erp_wholesale_accounts a"
+            " ON a.id = wo.account_id ORDER BY d.id DESC",
+     "hay": ["channel", "channel_dispute_id", "status", "who"],
+     "primary": "who", "title": "Dispute #{id} — {channel}",
+     "subtitle": "{status} · {who}", "route": "#/orders",
+     "postmap": "disputePostMap"},
+    {"key": "deferred-revenue", "label": "Deferred revenue",
+     "gate": "accounting.read",
+     "sql": "SELECT id, kind, label, start_date, end_date, method"
+            " FROM erp_acct_deferred_revenue ORDER BY id DESC",
+     "hay": ["label", "kind", "method"], "primary": "label",
+     "title": "{label}",
+     "subtitle": "{kind} · {date:start_date} – {date:end_date}",
+     "route": "#/accounting", "postmap": "deferredRevenuePostMap"},
+    {"key": "depreciation-run", "label": "Depreciation runs",
+     "gate": "accounting.read",
+     "sql": "SELECT r.id, r.period, a.name AS asset_name"
+            " FROM erp_acct_depreciation_runs r"
+            " LEFT JOIN erp_acct_fixed_assets a ON a.id = r.asset_id"
+            " ORDER BY r.id DESC",
+     "hay": ["period", "asset_name"], "primary": "asset_name",
+     "title": "Depreciation — {period}", "subtitle": "{asset_name}",
+     "route": "#/accounting", "postmap": "depreciationRunPostMap"},
+    {"key": "draw", "label": "Owner draws", "gate": "accounting.read",
+     "sql": "SELECT id, owner_name, date, amount_cents, status"
+            " FROM erp_acct_draws ORDER BY id DESC",
+     "hay": ["owner_name", "status"], "primary": "owner_name",
+     "title": "{owner_name} — {date:date}",
+     "subtitle": "{status} · {money:amount_cents}",
+     "route": "#/accounting", "postmap": "drawPostMap"},
+    {"key": "bill-payment-request", "label": "Bill payment requests",
+     "gate": "accounting.read",
+     "sql": "SELECT r.id, r.amount_cents, r.status, r.date,"
+            " b.vendor_name AS vendor FROM erp_acct_bill_payment_requests r"
+            " LEFT JOIN erp_acct_bills b ON b.id = r.bill_id"
+            " ORDER BY r.id DESC",
+     "hay": ["vendor", "status"], "primary": "vendor",
+     "title": "Bill payment #{id} — {vendor}",
+     "subtitle": "{status} · {money:amount_cents}",
+     "route": "#/accounting", "postmap": "billPaymentRequestPostMap"},
+    {"key": "contractor-1099", "label": "1099 contractors",
+     "gate": "tax.read",
+     "sql": "SELECT v.id, v.name,"
+            " CASE WHEN w.w9_received_date IS NOT NULL THEN 'received'"
+            " ELSE 'pending' END AS w9_state FROM erp_vendors v"
+            " JOIN erp_acct_vendor_w9 w ON w.vendor_id = v.id"
+            " ORDER BY v.name",
+     "hay": ["name"], "primary": "name", "sort": "name",
+     "title": "{name}", "subtitle": "1099 contractor · W-9 {w9_state}",
+     "route": "#/accounting", "postmap": "contractor1099PostMap"},
+    {"key": "payroll-tax-form", "label": "Payroll tax forms",
+     "gate": "payroll.read",
+     "sql": "SELECT id, form_type, period, employee_name, status"
+            " FROM erp_acct_payroll_tax_forms ORDER BY id DESC",
+     "hay": ["form_type", "period", "employee_name", "status"],
+     "primary": "form_type", "title": "{form_type} — {period}",
+     "subtitle": "{status} · {employee_name}", "route": "#/accounting",
+     "postmap": "payrollTaxFormPostMap"},
+    {"key": "gl-account", "label": "GL accounts",
+     "gate": "accounting.read",
+     "sql": "SELECT id, code, name, type FROM erp_acct_accounts"
+            " WHERE active = 1 ORDER BY code",
+     "hay": ["code", "name", "type"], "number": "code",
+     "primary": "name", "sort": "name", "title": "{code} — {name}",
+     "subtitle": "Account · {type}", "route": "#/accounting",
+     "postmap": "glAccountPostMap"},
+    {"key": "tax-reminder", "label": "Tax reminders", "gate": "tax.read",
+     "sql": "SELECT id, period_start, period_end, kind, sent_to, sent_at"
+            " FROM erp_acct_tax_reminders ORDER BY id DESC",
+     "hay": ["kind", "sent_to"], "primary": "kind",
+     "title": "Tax reminder — {kind} {date:period_start}",
+     "subtitle": "{sent_to} · {date:sent_at}", "route": "#/accounting",
+     "postmap": "taxReminderPostMap"},
+
+    # --- Settings, IT, legal (Dept 10 / 14) ---
+    {"key": "api-key", "label": "API keys", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, name, key_prefix, scopes, revoked"
+            " FROM erp_api_keys ORDER BY id DESC",
+     "hay": ["name", "key_prefix", "scopes"], "primary": "name",
+     "title": "{name}", "subtitle": "{key_prefix} · {scopes}",
+     "route": "#/settings", "postmap": "apiKeyPostMap"},
+    {"key": "webhook", "label": "Webhooks", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, url, events, enabled"
+            " FROM erp_webhook_subscriptions ORDER BY id DESC",
+     "hay": ["url", "events"], "primary": "url", "title": "{url}",
+     "subtitle": "Webhook · {events}", "route": "#/settings",
+     "postmap": "webhookPostMap"},
+    {"key": "file", "label": "Files", "gate": "erp",
+     "fn": _poppy_section_file},
+    {"key": "it-asset", "label": "IT assets", "gate": "it.read",
+     "sql": "SELECT id, name, asset_type, serial_number, assigned_to,"
+            " status FROM erp_it_assets ORDER BY name",
+     "hay": ["name", "asset_type", "serial_number", "assigned_to"],
+     "primary": "name", "sort": "name", "title": "{name}",
+     "subtitle": "{serial_number} · {assigned_to}",
+     "route": "#/settings", "postmap": "itAssetPostMap"},
+    {"key": "it-incident", "label": "IT incidents", "gate": "it.read",
+     "sql": "SELECT id, title, category, priority, status"
+            " FROM erp_it_incidents ORDER BY id DESC",
+     "hay": ["title", "category", "status"], "primary": "title",
+     "title": "{title}", "subtitle": "{status} · {priority}",
+     "route": "#/settings", "postmap": "itIncidentPostMap"},
+    {"key": "it-change", "label": "IT changes", "gate": "it.read",
+     "sql": "SELECT id, title, status, planned_date"
+            " FROM erp_it_changes ORDER BY id DESC",
+     "hay": ["title", "status"], "primary": "title",
+     "title": "{title}", "subtitle": "{status} · {date:planned_date}",
+     "route": "#/settings", "postmap": "itChangePostMap"},
+    {"key": "it-problem", "label": "IT problems", "gate": "it.read",
+     "sql": "SELECT id, title, root_cause, status FROM erp_it_problems"
+            " ORDER BY id DESC",
+     "hay": ["title", "root_cause", "status"], "primary": "title",
+     "title": "{title}", "subtitle": "IT problem · {status}",
+     "route": "#/settings", "postmap": "itProblemPostMap"},
+    {"key": "legal-agreement", "label": "Legal agreements",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, title, counterparty, type, start_date, end_date"
+            " FROM erp_legal_agreements ORDER BY id DESC",
+     "hay": ["title", "counterparty", "type"], "primary": "title",
+     "title": "{title} — {counterparty}",
+     "subtitle": "{type} · {date:start_date} – {date:end_date}",
+     "route": "#/legal", "postmap": "legalAgreementPostMap"},
+    {"key": "license", "label": "Licenses", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, name, authority, type, expiry_date"
+            " FROM erp_legal_licenses ORDER BY name",
+     "hay": ["name", "authority", "type"], "primary": "name",
+     "sort": "name", "title": "{name}",
+     "subtitle": "{authority} · expires {date:expiry_date}",
+     "route": "#/legal", "postmap": "licensePostMap"},
+    {"key": "lease", "label": "Leases", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT l.id, l.commencement, l.term_months,"
+            " a.title AS agreement_title, a.counterparty AS counterparty"
+            " FROM erp_legal_lease_schedules l"
+            " LEFT JOIN erp_legal_agreements a ON a.id = l.agreement_id"
+            " ORDER BY l.id DESC",
+     "hay": ["agreement_title", "counterparty"],
+     "primary": "agreement_title", "title": "{agreement_title}",
+     "subtitle": "Lease · {term_months} months from {date:commencement}",
+     "route": "#/legal", "postmap": "leasePostMap"},
+    {"key": "legal-ip", "label": "Intellectual property",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, name, type, status FROM erp_legal_ip"
+            " ORDER BY name",
+     "hay": ["name", "type", "status"], "primary": "name",
+     "sort": "name", "title": "{name}",
+     "subtitle": "IP · {type} · {status}", "route": "#/legal",
+     "postmap": "legalIpPostMap"},
+    {"key": "legal-signature", "label": "Signature requests",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT s.id, s.signer_name, s.signer_email, s.status,"
+            " a.title AS doc_title FROM erp_legal_signature_requests s"
+            " LEFT JOIN erp_legal_agreements a ON a.id = s.agreement_id"
+            " ORDER BY s.id DESC",
+     "hay": ["doc_title", "signer_name", "signer_email", "status"],
+     "primary": "doc_title", "title": "{doc_title} — {signer_name}",
+     "subtitle": "Signature request · {status}", "route": "#/legal",
+     "postmap": "legalSignaturePostMap"},
+    {"key": "legal-risk", "label": "Legal risks", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, title, likelihood, impact, owner"
+            " FROM erp_legal_risks ORDER BY id DESC",
+     "hay": ["title", "owner"], "primary": "title",
+     "title": "{title}",
+     "subtitle": "Legal risk · {likelihood}/{impact} · {owner}",
+     "route": "#/legal", "postmap": "legalRiskPostMap"},
+    {"key": "esg-metric", "label": "ESG metrics",
+     "gate": "reports.read",
+     "sql": "SELECT id, name, unit FROM erp_reports_esg_metrics"
+            " ORDER BY name",
+     "hay": ["name", "unit"], "primary": "name", "sort": "name",
+     "title": "{name}", "subtitle": "ESG metric · {unit}",
+     "route": "#/reports", "postmap": "esgMetricPostMap"},
+    {"key": "barcode", "label": "Barcodes", "gate": "recipes.read",
+     "id": "{code}",
+     "sql": "SELECT p.code, p.status, r.name AS recipe_name"
+            " FROM erp_barcode_pool p"
+            " LEFT JOIN erp_recipes r ON r.id = p.recipe_id"
+            " ORDER BY p.code",
+     "hay": ["code", "status", "recipe_name"], "primary": "code",
+     "sort": "name", "title": "{code}",
+     "subtitle": "Barcode · {status} · {recipe_name}",
+     "route": "#/production", "postmap": "barcodePostMap",
+     "postmap_value": "{code}"},
+
+    # --- Staff & permissions (Dept 11) ---
+    {"key": "staff", "label": "Staff", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, name, email FROM staff WHERE active = 1"
+            " ORDER BY name",
+     "hay": ["name", "email"], "primary": "name", "sort": "name",
+     "title": "{name}", "subtitle": "Staff · {email}",
+     "route": "#/settings", "postmap": "staffPostMap"},
+    {"key": "job-role", "label": "Job roles", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, title, description, position,"
+            " base_salary_range, whats_in_it_for_you, what_you_bring,"
+            " job_duties FROM erp_hr_roles"
+            " WHERE active = 1 ORDER BY title",
+     "hay": ["title", "description", "position", "base_salary_range",
+             "whats_in_it_for_you", "what_you_bring", "job_duties"],
+     "primary": "title",
+     "sort": "name", "title": "{title}", "subtitle": "Job role",
+     "route": "#/hr", "postmap": "jobRolePostMap"},
+
+    # --- HR (Dept 12) ---
+    {"key": "employee", "label": "Employees", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, name, email, role, department,"
+            " CASE WHEN active = 1 THEN 'active' ELSE 'inactive' END"
+            " AS state FROM erp_hr_employees WHERE active = 1"
+            " ORDER BY name",
+     "hay": ["name", "email", "role", "department"], "primary": "name",
+     "sort": "name", "title": "{name}",
+     "subtitle": "{role} · {department}", "route": "#/hr",
+     "postmap": "employeePostMap"},
+    {"key": "applicant", "label": "Applicants", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, name, role, email, stage FROM erp_hr_applicants"
+            " ORDER BY id DESC",
+     "hay": ["name", "role", "email", "stage"], "primary": "name",
+     "title": "{name} — {role}", "subtitle": "Applicant · {stage}",
+     "route": "#/hr", "postmap": "applicantPostMap"},
+    {"key": "offer", "label": "Offers", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT o.id, o.status, o.start_date, a.name AS cand_name,"
+            " a.role AS cand_role FROM erp_hr_offers o"
+            " LEFT JOIN erp_hr_applicants a ON a.id = o.applicant_id"
+            " ORDER BY o.id DESC",
+     "hay": ["cand_name", "cand_role", "status"], "primary": "cand_name",
+     "title": "{cand_name} — {cand_role}",
+     "subtitle": "Offer · {status} · starts {date:start_date}",
+     "route": "#/hr", "postmap": "offerPostMap"},
+    {"key": "onboarding", "label": "Onboarding", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT o.id, o.label,"
+            " CASE WHEN o.done = 1 THEN 'done' ELSE 'pending' END"
+            " AS state, e.name AS emp_name FROM erp_hr_onboarding o"
+            " LEFT JOIN erp_hr_employees e ON e.id = o.employee_id"
+            " ORDER BY o.id DESC",
+     "hay": ["emp_name", "label"], "primary": "emp_name",
+     "title": "{emp_name} — {label}",
+     "subtitle": "Onboarding · {state}", "route": "#/hr",
+     "postmap": "onboardingPostMap"},
+    {"key": "offboarding", "label": "Offboarding", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT o.id, o.exit_date, o.reason, e.name AS emp_name"
+            " FROM erp_hr_offboarding o"
+            " LEFT JOIN erp_hr_employees e ON e.id = o.employee_id"
+            " ORDER BY o.id DESC",
+     "hay": ["emp_name", "reason"], "primary": "emp_name",
+     "title": "{emp_name}",
+     "subtitle": "Offboarding · exits {date:exit_date}", "route": "#/hr",
+     "postmap": "offboardingPostMap"},
+    {"key": "time-record", "label": "Time records", "gate": "erp",
+     "staff": "own:employee_id",
+     "sql": "SELECT t.id, t.employee_id, t.hours, t.approval_status,"
+            " t.created_at, e.name AS emp_name, ev.name AS event_name"
+            " FROM erp_hr_time_records t"
+            " LEFT JOIN erp_hr_employees e ON e.id = t.employee_id"
+            " LEFT JOIN erp_hr_events ev ON ev.id = t.event_id"
+            " ORDER BY t.id DESC",
+     "hay": ["emp_name", "event_name", "approval_status"],
+     "primary": "emp_name", "title": "{emp_name} — {date:created_at}",
+     "subtitle": "{approval_status} · {hours}h · {event_name}",
+     "route": "#/hr", "postmap": "timeRecordPostMap"},
+    {"key": "pto-request", "label": "PTO requests", "gate": "erp",
+     "staff": "own:employee_id",
+     "sql": "SELECT p.id, p.employee_id, p.type_name, p.start_date,"
+            " p.end_date, p.status, e.name AS emp_name"
+            " FROM erp_hr_pto_requests p"
+            " LEFT JOIN erp_hr_employees e ON e.id = p.employee_id"
+            " ORDER BY p.id DESC",
+     "hay": ["emp_name", "type_name", "status"], "primary": "emp_name",
+     "title": "{emp_name} — {type_name}",
+     "subtitle": "{date:start_date} – {date:end_date} · {status}",
+     "route": "#/hr", "postmap": "ptoRequestPostMap"},
+    {"key": "training-course", "label": "Training courses",
+     "gate": "erp", "staff": "training:courses",
+     "sql": "SELECT id, title, description FROM erp_hr_training_courses"
+            " WHERE active = 1 ORDER BY title",
+     "hay": ["title", "description"], "primary": "title",
+     "sort": "name", "title": "{title}", "subtitle": "Training course",
+     "route": "#/hr", "postmap": "trainingCoursePostMap"},
+    {"key": "lesson", "label": "Lessons", "gate": "erp",
+     "staff": "training:lessons",
+     "sql": "SELECT l.id, l.title, l.description, c.title AS course_title"
+            " FROM erp_hr_lessons l"
+            " LEFT JOIN erp_hr_training_courses c ON c.id = l.course_id"
+            " WHERE l.active = 1 ORDER BY l.id",
+     "hay": ["title", "description", "course_title"],
+     "primary": "title", "title": "{title}",
+     "subtitle": "Lesson · {course_title}", "route": "#/hr",
+     "postmap": "lessonPostMap"},
+    {"key": "quiz", "label": "Quizzes", "gate": "erp",
+     "staff": "training:quizzes",
+     "sql": "SELECT q.id, q.title, l.title AS lesson_title,"
+            " c.title AS course_title FROM erp_hr_quizzes q"
+            " LEFT JOIN erp_hr_lessons l ON l.id = q.lesson_id"
+            " LEFT JOIN erp_hr_training_courses c ON c.id = q.course_id"
+            " WHERE q.active = 1 ORDER BY q.id",
+     "hay": ["title", "lesson_title", "course_title"],
+     "primary": "title", "title": "{title}",
+     "subtitle": "Quiz · {course_title}", "route": "#/hr",
+     "postmap": "quizPostMap"},
+    {"key": "learning-path", "label": "Learning paths", "gate": "erp",
+     "staff": "training:paths",
+     "sql": "SELECT p.id, p.title, p.description,"
+            " COALESCE(r.title, '(all roles)') AS role_title"
+            " FROM erp_hr_learning_paths p"
+            " LEFT JOIN erp_hr_roles r ON r.id = p.role_id"
+            " WHERE p.active = 1 ORDER BY p.title",
+     "hay": ["title", "description", "role_title"], "primary": "title",
+     "sort": "name", "title": "{title}",
+     "subtitle": "Learning path · {role_title}", "route": "#/hr",
+     "postmap": "learningPathPostMap"},
+    {"key": "policy", "label": "Policies", "gate": "erp",
+     "staff": "policy", "mine": True,
+     "sql": "SELECT p.id, p.title, p.category, p.status,"
+            " p.current_version, v.body AS body FROM erp_hr_policies p"
+            " LEFT JOIN erp_hr_policy_versions v"
+            " ON v.policy_id = p.id AND v.version = p.current_version"
+            " ORDER BY p.id DESC",
+     "hay": ["title", "category", "body"], "primary": "title",
+     "title": "{title}",
+     "subtitle": "{category} · v{current_version} · {status}",
+     "route": "#/hr", "postmap": "policyPostMap"},
+    {"key": "bulletin", "label": "Bulletins", "gate": "erp",
+     "staff": "all", "mine": True,
+     "sql": "SELECT id, title, body, category, created_at"
+            " FROM erp_hr_bulletins ORDER BY id DESC",
+     "hay": ["title", "body", "category"], "primary": "title",
+     "title": "{title}", "subtitle": "{category} · {date:created_at}",
+     "route": "#/hr", "postmap": "bulletinPostMap"},
+    {"key": "help-case", "label": "Help cases", "gate": "erp",
+     "staff": "own:employee_id", "mine": True,
+     "sql": "SELECT id, employee_id, subject, category, status"
+            " FROM erp_hr_help_cases ORDER BY id DESC",
+     "hay": ["subject", "category", "status"], "primary": "subject",
+     "title": "Case #{id} — {subject}",
+     "subtitle": "{status} · {category}", "route": "#/hr",
+     "postmap": "helpCasePostMap"},
+    {"key": "goal", "label": "Goals", "gate": "erp",
+     "staff": "own:employee_id",
+     "sql": "SELECT g.id, g.employee_id, g.title, g.status, g.due_date,"
+            " e.name AS emp_name FROM erp_hr_goals g"
+            " LEFT JOIN erp_hr_employees e ON e.id = g.employee_id"
+            " ORDER BY g.id DESC",
+     "hay": ["emp_name", "title", "status"], "primary": "emp_name",
+     "title": "{emp_name} — {title}",
+     "subtitle": "{status} · due {date:due_date}", "route": "#/hr",
+     "postmap": "goalPostMap"},
+    {"key": "hr-review", "label": "HR reviews", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT r.id, r.status, e.name AS emp_name,"
+            " c.name AS cycle_name FROM erp_hr_reviews r"
+            " LEFT JOIN erp_hr_employees e ON e.id = r.employee_id"
+            " LEFT JOIN erp_hr_review_cycles c ON c.id = r.cycle_id"
+            " ORDER BY r.id DESC",
+     "hay": ["emp_name", "cycle_name", "status"], "primary": "emp_name",
+     "title": "{emp_name} — {cycle_name}",
+     "subtitle": "Review · {status}", "route": "#/hr",
+     "postmap": "hrReviewPostMap"},
+    {"key": "comp-cycle", "label": "Comp reviews", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT c.id, c.decision, e.name AS emp_name,"
+            " y.name AS cycle_name FROM erp_hr_comp_reviews c"
+            " LEFT JOIN erp_hr_employees e ON e.id = c.employee_id"
+            " LEFT JOIN erp_hr_review_cycles y ON y.id = c.cycle_id"
+            " ORDER BY c.id DESC",
+     "hay": ["emp_name", "cycle_name", "decision"],
+     "primary": "emp_name", "title": "{emp_name} — {cycle_name}",
+     "subtitle": "Comp review · {decision}", "route": "#/hr",
+     "postmap": "compReviewPostMap"},
+    {"key": "benefit-plan", "label": "Benefit plans", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, name, benefit_type, carrier"
+            " FROM erp_hr_benefit_plans WHERE active = 1 ORDER BY name",
+     "hay": ["name", "benefit_type", "carrier"], "primary": "name",
+     "sort": "name", "title": "{name}",
+     "subtitle": "{benefit_type} · {carrier}", "route": "#/hr",
+     "postmap": "benefitPlanPostMap"},
+    {"key": "pay-grade", "label": "Pay grades", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT g.id, g.grade, r.title AS role_title"
+            " FROM erp_hr_pay_grades g"
+            " LEFT JOIN erp_hr_roles r ON r.id = g.role_id"
+            " WHERE g.active = 1 ORDER BY g.grade",
+     "hay": ["grade", "role_title"], "primary": "grade",
+     "sort": "name", "title": "{grade}",
+     "subtitle": "Pay grade · {role_title}", "route": "#/hr",
+     "postmap": "payGradePostMap"},
+    {"key": "position", "label": "Positions", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT p.id, p.title, p.status, r.title AS role_title"
+            " FROM erp_hr_positions p"
+            " LEFT JOIN erp_hr_roles r ON r.id = p.role_id"
+            " ORDER BY p.title",
+     "hay": ["title", "role_title", "status"], "primary": "title",
+     "sort": "name", "title": "{title}",
+     "subtitle": "{role_title} · {status}", "route": "#/hr",
+     "postmap": "positionPostMap"},
+    {"key": "background-check", "label": "Background checks",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT b.id, b.vendor, b.status, b.requested_date,"
+            " e.name AS emp_name FROM erp_hr_background_checks b"
+            " LEFT JOIN erp_hr_employees e ON e.id = b.employee_id"
+            " ORDER BY b.id DESC",
+     "hay": ["emp_name", "vendor", "status"], "primary": "emp_name",
+     "title": "{emp_name}",
+     "subtitle": "Background check · {status} · {date:requested_date}",
+     "route": "#/hr", "postmap": "backgroundCheckPostMap"},
+    {"key": "hr-document", "label": "HR documents", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT d.id, d.doc_type, d.expiry_date, e.name AS emp_name"
+            " FROM erp_hr_documents d"
+            " LEFT JOIN erp_hr_employees e ON e.id = d.employee_id"
+            " ORDER BY d.id DESC",
+     "hay": ["emp_name", "doc_type"], "primary": "emp_name",
+     "title": "{emp_name} — {doc_type}",
+     "subtitle": "Document · expires {date:expiry_date}",
+     "route": "#/hr", "postmap": "hrDocumentPostMap"},
+    {"key": "hr-form-submission", "label": "HR form submissions",
+     "gate": "erp", "fn": _poppy_section_forms},
+    {"key": "hr-event", "label": "HR events", "gate": "erp",
+     "staff": "events",
+     "sql": "SELECT id, name, date, location FROM erp_hr_events"
+            " ORDER BY date DESC, id DESC",
+     "hay": ["name", "location"], "primary": "name",
+     "title": "{name} — {date:date}", "subtitle": "{location}",
+     "route": "#/hr", "postmap": "hrEventPostMap"},
+    {"key": "succession", "label": "Succession", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT s.id, s.readiness, p.title AS pos_title,"
+            " e.name AS succ_name FROM erp_hr_succession s"
+            " LEFT JOIN erp_hr_positions p ON p.id = s.position_id"
+            " LEFT JOIN erp_hr_employees e"
+            " ON e.id = s.successor_employee_id ORDER BY s.id DESC",
+     "hay": ["pos_title", "succ_name"], "primary": "pos_title",
+     "title": "{pos_title}",
+     "subtitle": "Succession · {succ_name} · {readiness}",
+     "route": "#/hr", "postmap": "successionPostMap"},
+    {"key": "career-path", "label": "Career paths", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, title, description FROM erp_hr_career_paths"
+            " WHERE active = 1 ORDER BY title",
+     "hay": ["title", "description"], "primary": "title",
+     "sort": "name", "title": "{title}", "subtitle": "Career path",
+     "route": "#/hr", "postmap": "careerPathPostMap"},
+    {"key": "bonus-plan", "label": "Bonus plans", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, title, basis, eligibility"
+            " FROM erp_hr_bonus_plans WHERE active = 1 ORDER BY title",
+     "hay": ["title", "basis", "eligibility"], "primary": "title",
+     "sort": "name", "title": "{title}",
+     "subtitle": "Bonus plan · {basis}", "route": "#/hr",
+     "postmap": "bonusPlanPostMap"},
+    {"key": "requisition-hr", "label": "HR requisitions",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT q.id, q.title, q.status, r.title AS role_title"
+            " FROM erp_hr_requisitions q"
+            " LEFT JOIN erp_hr_roles r ON r.id = q.role_id"
+            " ORDER BY q.id DESC",
+     "hay": ["title", "role_title", "status"], "primary": "title",
+     "title": "{title}", "subtitle": "{role_title} · {status}",
+     "route": "#/hr", "postmap": "hrRequisitionPostMap"},
+    {"key": "leave-policy", "label": "Leave policies", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT l.id, l.policy_text, t.name AS type_name"
+            " FROM erp_hr_leave_policies l"
+            " LEFT JOIN erp_hr_pto_types t ON t.id = l.type_id"
+            " ORDER BY l.id DESC",
+     "hay": ["type_name", "policy_text"], "primary": "type_name",
+     "title": "{type_name}", "subtitle": "Leave policy",
+     "route": "#/hr", "postmap": "leavePolicyPostMap"},
+    {"key": "headcount-target", "label": "Headcount targets",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT t.id, t.scope_type, r.title AS role_title,"
+            " p.label AS period_label FROM erp_hr_headcount_targets t"
+            " LEFT JOIN erp_hr_roles r ON r.id = t.role_id"
+            " LEFT JOIN erp_hr_headcount_periods p"
+            " ON p.id = t.period_id ORDER BY t.id DESC",
+     "hay": ["role_title", "period_label", "scope_type"],
+     "primary": "role_title", "title": "{role_title} — {period_label}",
+     "subtitle": "Headcount target · {scope_type}", "route": "#/hr",
+     "postmap": "headcountTargetPostMap"},
+    {"key": "review-cycle", "label": "Review cycles", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, name, period, due_date FROM erp_hr_review_cycles"
+            " ORDER BY id DESC",
+     "hay": ["name", "period"], "primary": "name", "title": "{name}",
+     "subtitle": "Review cycle · {period}", "route": "#/hr",
+     "postmap": "reviewCyclePostMap"},
+    {"key": "interview", "label": "Interviews", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT i.id, i.scheduled_at, i.status, i.interviewer,"
+            " a.name AS appl_name FROM erp_hr_interviews i"
+            " LEFT JOIN erp_hr_applicants a ON a.id = i.applicant_id"
+            " ORDER BY i.id DESC",
+     "hay": ["appl_name", "interviewer", "status"],
+     "primary": "appl_name",
+     "title": "{appl_name} — {date:scheduled_at}",
+     "subtitle": "Interview · {status}", "route": "#/hr",
+     "postmap": "interviewPostMap"},
+    {"key": "enrollment-window", "label": "Enrollment windows",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, name, start_date, end_date, status"
+            " FROM erp_hr_enrollment_windows ORDER BY id DESC",
+     "hay": ["name", "status"], "primary": "name", "title": "{name}",
+     "subtitle": "Enrollment · {date:start_date} – {date:end_date} ·"
+                 " {status}",
+     "route": "#/hr", "postmap": "enrollmentWindowPostMap"},
+    {"key": "commission", "label": "Commissions", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT c.id, c.status, c.earned_date,"
+            " COALESCE(e.name, c.external_rep_name, '') AS who"
+            " FROM erp_hr_commissions c"
+            " LEFT JOIN erp_hr_employees e ON e.id = c.employee_id"
+            " ORDER BY c.id DESC",
+     "hay": ["who", "status"], "primary": "who", "title": "{who}",
+     "subtitle": "Commission · {status} · {date:earned_date}",
+     "route": "#/hr", "postmap": "commissionPostMap"},
+    {"key": "recurring-event", "label": "Recurring events",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, title, frequency, location"
+            " FROM erp_hr_recurring_events ORDER BY title",
+     "hay": ["title", "frequency", "location"], "primary": "title",
+     "sort": "name", "title": "{title}",
+     "subtitle": "Recurring · {frequency} · {location}",
+     "route": "#/hr", "postmap": "recurringEventPostMap"},
+
+    # --- Quality (Dept 14) ---
+    {"key": "haccp", "label": "HACCP plans", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, product_line, hazard, ccp, monitoring_frequency,"
+            " owner FROM erp_quality_haccp ORDER BY product_line",
+     "hay": ["product_line", "hazard", "ccp", "owner"],
+     "primary": "product_line", "sort": "name",
+     "title": "{product_line} — {ccp}",
+     "subtitle": "HACCP · {hazard} · {monitoring_frequency}",
+     "route": "#/quality", "postmap": "haccpPostMap"},
+    {"key": "capa", "label": "CAPAs", "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, title, description, root_cause, status, owner,"
+            " due_date FROM erp_quality_capas ORDER BY id DESC",
+     "hay": ["title", "description", "root_cause", "owner", "status"],
+     "primary": "title", "title": "{title}",
+     "subtitle": "CAPA · {status} · due {date:due_date}",
+     "route": "#/quality", "postmap": "capaPostMap"},
+    {"key": "supplier-audit", "label": "Supplier audits",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT a.id, a.audit_date, a.auditor, a.scope, a.outcome,"
+            " v.name AS vendor_name FROM erp_quality_supplier_audits a"
+            " LEFT JOIN erp_vendors v ON v.id = a.vendor_id"
+            " ORDER BY a.id DESC",
+     "hay": ["vendor_name", "scope", "auditor", "outcome"],
+     "primary": "vendor_name",
+     "title": "{vendor_name} — {date:audit_date}",
+     "subtitle": "Supplier audit · {outcome}", "route": "#/quality",
+     "postmap": "supplierAuditPostMap"},
+    {"key": "quality-hold", "label": "Quality holds", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT h.id, h.lot_code, h.reason, h.held_at,"
+            " CASE WHEN h.released_at IS NULL THEN 'Held'"
+            " ELSE 'Released' END AS state, i.name AS item_name"
+            " FROM erp_qc_holds h"
+            " LEFT JOIN erp_items i ON i.id = h.item_id"
+            " ORDER BY h.id DESC",
+     "hay": ["lot_code", "item_name", "reason"], "primary": "lot_code",
+     "title": "Hold · {lot_code}",
+     "subtitle": "{state} · {item_name} · {reason}", "route": "#/quality",
+     "postmap": "qualityHoldPostMap"},
+    {"key": "recall", "label": "Recalls", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, lot_code, reason, status, opened_at"
+            " FROM erp_quality_recall_executions ORDER BY id DESC",
+     "hay": ["lot_code", "reason", "status"], "primary": "lot_code",
+     "title": "Recall · {lot_code}",
+     "subtitle": "{status} · {reason}", "route": "#/quality",
+     "postmap": "recallPostMap"},
+    {"key": "calibration", "label": "Calibrations", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT c.id, c.calibration_date, c.due_date, c.result,"
+            " c.performed_by, e.name AS equip_name"
+            " FROM erp_quality_calibrations c"
+            " LEFT JOIN erp_quality_equipment e"
+            " ON e.id = c.equipment_id ORDER BY c.id DESC",
+     "hay": ["equip_name", "result", "performed_by"],
+     "primary": "equip_name",
+     "title": "{equip_name} — {date:calibration_date}",
+     "subtitle": "Calibration · {result} · due {date:due_date}",
+     "route": "#/quality", "postmap": "calibrationPostMap"},
+    {"key": "quality-audit", "label": "Quality audits", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, audit_date, scope, auditor, status"
+            " FROM erp_quality_audits ORDER BY id DESC",
+     "hay": ["scope", "auditor", "status"], "primary": "scope",
+     "title": "{scope} — {date:audit_date}",
+     "subtitle": "Audit · {status} · {auditor}", "route": "#/quality",
+     "postmap": "qualityAuditPostMap"},
+    {"key": "safety-incident", "label": "Safety incidents",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, incident_date, incident_type, location,"
+            " description, severity, status"
+            " FROM erp_quality_safety_incidents ORDER BY id DESC",
+     "hay": ["incident_type", "location", "description"],
+     "primary": "incident_type",
+     "title": "{incident_type} — {date:incident_date}",
+     "subtitle": "Safety incident · {severity} · {status} · {location}",
+     "route": "#/quality", "postmap": "safetyIncidentPostMap"},
+    {"key": "sanitation-schedule", "label": "Sanitation schedules",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, name, area, frequency, description,"
+            " next_due_date FROM erp_quality_sanitation_schedules"
+            " WHERE active = 1 ORDER BY name",
+     "hay": ["name", "area", "frequency", "description"],
+     "primary": "name", "sort": "name", "title": "{name}",
+     "subtitle": "Sanitation · {area} · {frequency}",
+     "route": "#/quality", "postmap": "sanitationSchedulePostMap"},
+    {"key": "sanitation-log", "label": "Sanitation logs",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, log_date, area, performed_by, vendor, result"
+            " FROM erp_quality_sanitation_logs ORDER BY id DESC",
+     "hay": ["area", "performed_by", "vendor", "result"],
+     "primary": "area", "title": "{area} — {date:log_date}",
+     "subtitle": "Sanitation log · {result} · {performed_by}",
+     "route": "#/quality", "postmap": "sanitationLogPostMap"},
+    {"key": "sanitation-finding", "label": "Sanitation findings",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, description, severity, status"
+            " FROM erp_quality_sanitation_findings ORDER BY id DESC",
+     "hay": ["description", "severity", "status"],
+     "primary": "description", "title": "{trunc:description:60}",
+     "subtitle": "Finding · {severity} · {status}",
+     "route": "#/quality", "postmap": "sanitationFindingPostMap"},
+    {"key": "spc-limit", "label": "SPC limits", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT s.id, s.characteristic, s.unit, r.name AS recipe_name"
+            " FROM erp_quality_spc_limits s"
+            " LEFT JOIN erp_recipes r ON r.id = s.recipe_id"
+            " ORDER BY s.id",
+     "hay": ["characteristic", "recipe_name", "unit"],
+     "primary": "characteristic", "title": "{characteristic}",
+     "subtitle": "SPC limit · {recipe_name} · {unit}",
+     "route": "#/quality", "postmap": "spcLimitPostMap"},
+    {"key": "fsma-event", "label": "FSMA events", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, traceability_lot_code, event_type, event_date,"
+            " item_name, location FROM erp_fsma_events ORDER BY id DESC",
+     "hay": ["traceability_lot_code", "event_type", "item_name",
+            "location"],
+     "primary": "traceability_lot_code",
+     "title": "{event_type} — {date:event_date}",
+     "subtitle": "FSMA · {traceability_lot_code} · {item_name}",
+     "route": "#/quality", "postmap": "fsmaEventPostMap"},
+    {"key": "coa", "label": "Certificates of analysis",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT c.id, c.certificate_ref, c.received_date,"
+            " c.expiry_date, c.status, l.lot_code AS lot_code"
+            " FROM erp_quality_coas c"
+            " LEFT JOIN erp_lots l ON l.id = c.lot_id"
+            " ORDER BY c.id DESC",
+     "hay": ["certificate_ref", "lot_code", "status"],
+     "primary": "certificate_ref",
+     "title": "COA {certificate_ref}",
+     "subtitle": "{lot_code} · {status} · exp {date:expiry_date}",
+     "route": "#/quality", "postmap": "coaPostMap"},
+    {"key": "certification", "label": "Certifications", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, scheme, scope, status, certifying_body,"
+            " certificate_number, expiry_date"
+            " FROM erp_quality_certifications ORDER BY id DESC",
+     "hay": ["scheme", "scope", "certifying_body",
+            "certificate_number"],
+     "primary": "scheme", "title": "{scheme} — {scope}",
+     "subtitle": "{certifying_body} · {status} · exp {date:expiry_date}",
+     "route": "#/quality", "postmap": "certificationPostMap"},
+    {"key": "allergen-statement", "label": "Allergen statements",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT s.id, s.statement_text, s.date_received,"
+            " s.expiry_date, v.name AS vendor_name, l.lot_code AS lot_code"
+            " FROM erp_quality_supplier_allergen_statements s"
+            " LEFT JOIN erp_vendors v ON v.id = s.vendor_id"
+            " LEFT JOIN erp_lots l ON l.id = s.lot_id"
+            " ORDER BY s.id DESC",
+     "hay": ["vendor_name", "lot_code", "statement_text"],
+     "primary": "vendor_name",
+     "title": "{vendor_name} — {lot_code}",
+     "subtitle": "Allergen statement · received {date:date_received}",
+     "route": "#/quality", "postmap": "allergenStatementPostMap"},
+    {"key": "quality-equipment", "label": "Quality equipment",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, name, type, location, serial"
+            " FROM erp_quality_equipment WHERE active = 1 ORDER BY name",
+     "hay": ["name", "type", "location", "serial"], "primary": "name",
+     "sort": "name", "title": "{name}",
+     "subtitle": "{type} · {location}", "route": "#/quality",
+     "postmap": "qualityEquipmentPostMap"},
+    {"key": "quality-checklist", "label": "Quality checklists",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT c.id, c.template_name, c.checklist_date,"
+            " c.completed_by, s.name AS store_name"
+            " FROM erp_quality_checklists c"
+            " LEFT JOIN erp_stores s ON s.id = c.store_id"
+            " ORDER BY c.id DESC",
+     "hay": ["template_name", "store_name", "completed_by"],
+     "primary": "template_name",
+     "title": "{template_name} — {date:checklist_date}",
+     "subtitle": "Checklist · {store_name}", "route": "#/quality",
+     "postmap": "qualityChecklistPostMap"},
+    {"key": "checklist-template", "label": "Checklist templates",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, name FROM erp_quality_checklist_templates"
+            " ORDER BY name",
+     "hay": ["name"], "primary": "name", "sort": "name",
+     "title": "{name}", "subtitle": "Checklist template",
+     "route": "#/quality", "postmap": "checklistTemplatePostMap"},
+    {"key": "cross-contact", "label": "Cross-contact", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT x.id, x.surface_kind, x.surface_name,"
+            " a.name AS recipe_a, b.name AS recipe_b"
+            " FROM erp_quality_cross_contact x"
+            " LEFT JOIN erp_recipes a ON a.id = x.recipe_a_id"
+            " LEFT JOIN erp_recipes b ON b.id = x.recipe_b_id"
+            " ORDER BY x.id",
+     "hay": ["recipe_a", "recipe_b", "surface_kind", "surface_name"],
+     "primary": "recipe_a", "title": "{recipe_a} ↔ {recipe_b}",
+     "subtitle": "Cross-contact · {surface_kind} {surface_name}",
+     "route": "#/quality", "postmap": "crossContactPostMap"},
+    {"key": "recall-drill", "label": "Recall drills", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, drill_date, scope, outcome"
+            " FROM erp_quality_recall_drills ORDER BY id DESC",
+     "hay": ["scope", "outcome"], "primary": "scope",
+     "title": "Drill — {date:drill_date}",
+     "subtitle": "Recall drill · {outcome} · {scope}",
+     "route": "#/quality", "postmap": "recallDrillPostMap"},
+
+    # --- Stores (Dept 15) ---
+    {"key": "store", "label": "Stores", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, name, address, type, status FROM erp_stores"
+            " ORDER BY name",
+     "hay": ["name", "address", "type", "status"], "primary": "name",
+     "sort": "name", "title": "{name}",
+     "subtitle": "{type} · {status} · {address}", "route": "#/stores",
+     "postmap": "storePostMap"},
+    {"key": "store-shift", "label": "Store shifts", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT sh.id, sh.weekday, sh.start_time, sh.end_time,"
+            " sh.role, s.name AS store_name, e.name AS emp_name"
+            " FROM erp_store_shifts sh"
+            " LEFT JOIN erp_stores s ON s.id = sh.store_id"
+            " LEFT JOIN erp_hr_employees e ON e.id = sh.employee_id"
+            " ORDER BY sh.id DESC",
+     "hay": ["emp_name", "store_name", "weekday", "role"],
+     "primary": "emp_name", "title": "{emp_name} — {weekday}",
+     "subtitle": "{store_name} · {start_time}–{end_time} · {role}",
+     "route": "#/stores", "postmap": "storeShiftPostMap"},
+    {"key": "rota-shift", "label": "Rota shifts", "gate": "erp",
+     "staff": "own:employee_id",
+     "sql": "SELECT sh.id, sh.employee_id, sh.shift_date,"
+            " sh.start_time, sh.end_time, sh.role, sh.status,"
+            " s.name AS store_name, e.name AS emp_name"
+            " FROM erp_store_rota_shifts sh"
+            " LEFT JOIN erp_stores s ON s.id = sh.store_id"
+            " LEFT JOIN erp_hr_employees e ON e.id = sh.employee_id"
+            " ORDER BY sh.id DESC",
+     "hay": ["emp_name", "store_name", "role", "status"],
+     "primary": "emp_name",
+     "title": "{emp_name} — {date:shift_date}",
+     "subtitle": "{store_name} · {start_time}–{end_time} · {status}",
+     "route": "#/stores", "postmap": "rotaShiftPostMap"},
+    {"key": "timeclock", "label": "Timeclock", "gate": "erp",
+     "staff": "own:employee_id",
+     "sql": "SELECT t.id, t.employee_id, t.clock_in, t.clock_out,"
+            " t.hours, e.name AS emp_name FROM erp_store_timeclock t"
+            " LEFT JOIN erp_hr_employees e ON e.id = t.employee_id"
+            " ORDER BY t.id DESC",
+     "hay": ["emp_name"], "primary": "emp_name",
+     "title": "{emp_name} — {date:clock_in}",
+     "subtitle": "Clock {date:clock_in} · {hours}h",
+     "route": "#/stores", "postmap": "timeclockPostMap"},
+    {"key": "drawer", "label": "Drawers", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT d.id, d.register, d.status, d.opened_at,"
+            " s.name AS store_name FROM erp_store_drawers d"
+            " LEFT JOIN erp_stores s ON s.id = d.store_id"
+            " ORDER BY d.id DESC",
+     "hay": ["store_name", "register", "status"], "primary": "store_name",
+     "title": "{store_name} · {register}",
+     "subtitle": "Drawer · {status} · {date:opened_at}",
+     "route": "#/stores", "postmap": "drawerPostMap"},
+    {"key": "cash-audit", "label": "Cash audits", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT a.id, a.actor, a.audit_date, s.name AS store_name"
+            " FROM erp_store_cash_audits a"
+            " LEFT JOIN erp_stores s ON s.id = a.store_id"
+            " ORDER BY a.id DESC",
+     "hay": ["store_name", "actor"], "primary": "store_name",
+     "title": "{store_name} — {date:audit_date}",
+     "subtitle": "Cash audit · {actor}", "route": "#/stores",
+     "postmap": "cashAuditPostMap"},
+    {"key": "store-deposit", "label": "Store deposits", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT d.id, d.deposit_date, d.counted_by, d.bank_ref,"
+            " s.name AS store_name FROM erp_store_deposits d"
+            " LEFT JOIN erp_stores s ON s.id = d.store_id"
+            " ORDER BY d.id DESC",
+     "hay": ["store_name", "counted_by", "bank_ref"],
+     "primary": "store_name",
+     "title": "{store_name} — {date:deposit_date}",
+     "subtitle": "Deposit · {bank_ref}", "route": "#/stores",
+     "postmap": "storeDepositPostMap"},
+    {"key": "store-void", "label": "Store voids", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT v.id, v.register, v.sale_key, v.reason, v.actor,"
+            " s.name AS store_name FROM erp_store_voids v"
+            " LEFT JOIN erp_stores s ON s.id = v.store_id"
+            " ORDER BY v.id DESC",
+     "hay": ["sale_key", "store_name", "reason", "actor"],
+     "primary": "sale_key", "title": "Void {sale_key}",
+     "subtitle": "{store_name} · {reason}", "route": "#/stores",
+     "postmap": "storeVoidPostMap"},
+    {"key": "z-report", "label": "Z reports", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT z.id, z.register, z.report_date, s.name AS store_name"
+            " FROM erp_store_zreports z"
+            " LEFT JOIN erp_stores s ON s.id = z.store_id"
+            " ORDER BY z.id DESC",
+     "hay": ["store_name", "register"], "primary": "store_name",
+     "title": "{store_name} · {register} — {date:report_date}",
+     "subtitle": "Z report", "route": "#/stores",
+     "postmap": "zReportPostMap"},
+    {"key": "store-sale", "label": "Store sales", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT s.id, s.sale_key, s.tender, s.sold_at,"
+            " s.member_email, st.name AS store_name"
+            " FROM erp_store_sales s"
+            " LEFT JOIN erp_stores st ON st.id = s.store_id"
+            " ORDER BY s.id DESC",
+     "hay": ["sale_key", "tender", "member_email", "store_name"],
+     "primary": "sale_key", "title": "Sale {sale_key}",
+     "subtitle": "{store_name} · {tender} · {date:sold_at}",
+     "route": "#/stores", "postmap": "storeSalePostMap"},
+    {"key": "store-delivery", "label": "Store deliveries",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT d.id, d.delivery_date, d.delivery_ref,"
+            " d.received_by, s.name AS store_name, v.name AS vendor_name"
+            " FROM erp_store_deliveries d"
+            " LEFT JOIN erp_stores s ON s.id = d.store_id"
+            " LEFT JOIN erp_vendors v ON v.id = d.vendor_id"
+            " ORDER BY d.id DESC",
+     "hay": ["vendor_name", "store_name", "delivery_ref",
+            "received_by"],
+     "primary": "vendor_name",
+     "title": "{vendor_name} — {date:delivery_date}",
+     "subtitle": "Delivery · {store_name} · {delivery_ref}",
+     "route": "#/stores", "postmap": "storeDeliveryPostMap"},
+    {"key": "store-transfer", "label": "Store transfers",
+     "gate": "inventory.transfer", "staff": "all",
+     "sql": "SELECT t.id, t.transfer_ref, t.status, i.name AS item_name,"
+            " f.name AS from_name, g.name AS to_name"
+            " FROM erp_store_transfers t"
+            " LEFT JOIN erp_items i ON i.id = t.item_id"
+            " LEFT JOIN erp_locations f ON f.id = t.from_location_id"
+            " LEFT JOIN erp_locations g ON g.id = t.to_location_id"
+            " ORDER BY t.id DESC",
+     "hay": ["transfer_ref", "item_name", "from_name", "to_name",
+            "status"],
+     "primary": "transfer_ref",
+     "title": "{transfer_ref} — {item_name}",
+     "subtitle": "Transfer · {status} · {from_name} → {to_name}",
+     "route": "#/stores", "postmap": "storeTransferPostMap"},
+    {"key": "store-task", "label": "Store tasks", "gate": "erp",
+     "staff": "store_task",
+     "sql": "SELECT t.id, t.title, t.detail, t.priority, t.status,"
+            " t.due_date, t.assigned_employee_kind,"
+            " t.assigned_employee_id, s.name AS store_name"
+            " FROM erp_store_tasks t"
+            " LEFT JOIN erp_stores s ON s.id = t.store_id"
+            " ORDER BY t.id DESC",
+     "hay": ["title", "detail", "store_name", "status"],
+     "primary": "title", "title": "{title}",
+     "subtitle": "{store_name} · {priority} · {status} ·"
+                 " due {date:due_date}",
+     "route": "#/stores", "postmap": "storeTaskPostMap"},
+    {"key": "store-checklist", "label": "Store checklists",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT c.id, c.checklist_date, c.kind, c.completed_by,"
+            " s.name AS store_name FROM erp_store_checklists c"
+            " LEFT JOIN erp_stores s ON s.id = c.store_id"
+            " ORDER BY c.id DESC",
+     "hay": ["kind", "store_name", "completed_by"], "primary": "kind",
+     "title": "{kind} — {date:checklist_date}",
+     "subtitle": "Checklist · {store_name}", "route": "#/stores",
+     "postmap": "storeChecklistPostMap"},
+    {"key": "store-incident", "label": "Store incidents",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT i.id, i.incident_date, i.type, i.description,"
+            " i.status, s.name AS store_name"
+            " FROM erp_store_incidents i"
+            " LEFT JOIN erp_stores s ON s.id = i.store_id"
+            " ORDER BY i.id DESC",
+     "hay": ["type", "description", "store_name", "status"],
+     "primary": "type", "title": "{type} — {date:incident_date}",
+     "subtitle": "Store incident · {status} · {store_name}",
+     "route": "#/stores", "postmap": "storeIncidentPostMap"},
+    {"key": "store-maintenance", "label": "Store maintenance",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT m.id, m.equipment, m.issue, m.priority, m.status,"
+            " m.due_date, s.name AS store_name"
+            " FROM erp_store_maintenance m"
+            " LEFT JOIN erp_stores s ON s.id = m.store_id"
+            " ORDER BY m.id DESC",
+     "hay": ["equipment", "issue", "store_name", "status"],
+     "primary": "equipment", "title": "{equipment} — {issue}",
+     "subtitle": "Maintenance · {priority} · {status}",
+     "route": "#/stores", "postmap": "storeMaintenancePostMap"},
+    {"key": "planogram", "label": "Planograms", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT p.id, p.area, p.effective_date, s.name AS store_name"
+            " FROM erp_store_planograms p"
+            " LEFT JOIN erp_stores s ON s.id = p.store_id"
+            " WHERE p.active = 1 ORDER BY p.id DESC",
+     "hay": ["area", "store_name"], "primary": "area",
+     "title": "{area} — {date:effective_date}",
+     "subtitle": "Planogram · {store_name}", "route": "#/stores",
+     "postmap": "planogramPostMap"},
+    {"key": "price-change", "label": "Price changes", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT p.id, p.item_kind, p.item_key, p.reason,"
+            " p.effective_date, s.name AS store_name"
+            " FROM erp_store_price_changes p"
+            " LEFT JOIN erp_stores s ON s.id = p.store_id"
+            " ORDER BY p.id DESC",
+     "hay": ["item_key", "store_name", "reason"], "primary": "item_key",
+     "title": "{item_key}",
+     "subtitle": "Price change · {date:effective_date} · {reason}",
+     "route": "#/stores", "postmap": "priceChangePostMap"},
+    {"key": "store-document", "label": "Store documents",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT d.id, d.doc_type, d.title, d.reference,"
+            " d.expiry_date, s.name AS store_name"
+            " FROM erp_store_documents d"
+            " LEFT JOIN erp_stores s ON s.id = d.store_id"
+            " ORDER BY d.id DESC",
+     "hay": ["title", "doc_type", "store_name", "reference"],
+     "primary": "title", "title": "{title}",
+     "subtitle": "{doc_type} · {store_name} · exp {date:expiry_date}",
+     "route": "#/stores", "postmap": "storeDocumentPostMap"},
+    {"key": "rota-request", "label": "Rota requests", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT q.id, q.kind, q.status, q.reason, e.name AS emp_name"
+            " FROM erp_store_rota_requests q"
+            " LEFT JOIN erp_hr_employees e ON e.id = q.employee_id"
+            " ORDER BY q.id DESC",
+     "hay": ["emp_name", "kind", "status"], "primary": "emp_name",
+     "title": "{emp_name} — {kind}",
+     "subtitle": "Rota request · {status}", "route": "#/stores",
+     "postmap": "rotaRequestPostMap"},
+    {"key": "lp-flag", "label": "Loss-prevention flags",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT f.id, f.rule, f.sale_key, f.status, f.actor,"
+            " s.name AS store_name FROM erp_store_lp_flags f"
+            " LEFT JOIN erp_stores s ON s.id = f.store_id"
+            " ORDER BY f.id DESC",
+     "hay": ["rule", "sale_key", "store_name", "status"],
+     "primary": "rule", "title": "LP flag · {rule}",
+     "subtitle": "{store_name} · {sale_key} · {status}",
+     "route": "#/stores", "postmap": "lpFlagPostMap"},
+    {"key": "pm-schedule", "label": "PM schedules", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT p.id, p.equipment, p.interval_days, p.last_done,"
+            " p.assigned_vendor, s.name AS store_name"
+            " FROM erp_store_pm_schedules p"
+            " LEFT JOIN erp_stores s ON s.id = p.store_id"
+            " ORDER BY p.id DESC",
+     "hay": ["equipment", "store_name", "assigned_vendor"],
+     "primary": "equipment", "title": "{equipment}",
+     "subtitle": "PM · every {interval_days}d · {store_name}",
+     "route": "#/stores", "postmap": "pmSchedulePostMap"},
+    {"key": "terminal-payment", "label": "Terminal payments",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT t.id, t.sale_key, t.status, t.reader_id,"
+            " t.created_at, s.name AS store_name"
+            " FROM erp_terminal_payments t"
+            " LEFT JOIN erp_stores s ON s.id = t.store_id"
+            " ORDER BY t.id DESC",
+     "hay": ["sale_key", "store_name", "status", "reader_id"],
+     "primary": "sale_key", "title": "Terminal {sale_key}",
+     "subtitle": "{store_name} · {status}", "route": "#/stores",
+     "postmap": "terminalPaymentPostMap"},
+
+    # --- Cross-department ---
+    {"key": "project", "label": "Projects", "gate": "erp",
+     "staff": "projects",
+     "sql": "SELECT id, name, description, departments, status,"
+            " start_date, target_date FROM erp_hr_projects"
+            " ORDER BY id DESC",
+     "hay": ["name", "description", "departments", "status"],
+     "primary": "name", "title": "{name}",
+     "subtitle": "{status} · {departments}", "route": "#/hr",
+     "postmap": "projectPostMap"},
+    {"key": "report-schedule", "label": "Report schedules",
+     "gate": "reports.read", "staff": "all",
+     "sql": "SELECT id, report_key, cadence, day_of_week, day_of_month,"
+            " recipients, last_sent_at, enabled"
+            " FROM erp_report_schedules ORDER BY id DESC",
+     "hay": ["report_key", "cadence", "recipients"],
+     "primary": "report_key", "title": "{report_key}",
+     "subtitle": "Report · {cadence}", "route": "#/reports",
+     "postmap": "reportSchedulePostMap"},
+    {"key": "kpi-threshold", "label": "KPI thresholds", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, kpi, enabled FROM erp_dash_kpi_thresholds"
+            " ORDER BY kpi",
+     "hay": ["kpi"], "primary": "kpi", "sort": "name",
+     "title": "{kpi}", "subtitle": "KPI threshold",
+     "route": "#/reports", "postmap": "kpiThresholdPostMap"},
+    {"key": "price-list", "label": "Price lists",
+     "gate": "accounts.read", "staff": "all",
+     "sql": "SELECT id, name, description, effective_date, status,"
+            " version FROM erp_price_lists ORDER BY id DESC",
+     "hay": ["name", "description", "status"], "primary": "name",
+     "title": "{name}",
+     "subtitle": "Price list · {status} · v{version}",
+     "route": "#/accounts", "postmap": "priceListPostMap"},
+    {"key": "vendor-portal-submission", "label": "Vendor portal submissions",
+     "gate": "purchasing.read", "staff": "all",
+     "sql": "SELECT s.id, s.vendor_invoice_number, s.note, s.status,"
+            " v.name AS vendor_name FROM erp_vendor_portal_submissions s"
+            " LEFT JOIN erp_vendor_portal_tokens t"
+            " ON t.id = s.token_id"
+            " LEFT JOIN erp_purchase_orders p ON p.id = t.po_id"
+            " LEFT JOIN erp_vendors v ON v.id = p.vendor_id"
+            " ORDER BY s.id DESC",
+     "hay": ["vendor_name", "vendor_invoice_number", "note", "status"],
+     "primary": "vendor_name",
+     "title": "Submission #{id} — {vendor_invoice_number}",
+     "subtitle": "{vendor_name} · {status}", "route": "#/purchasing",
+     "postmap": "vendorPortalSubmissionPostMap"},
+    {"key": "approval", "label": "Approvals", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, object_type, object_id, status, current_step"
+            " FROM erp_approvals ORDER BY id DESC",
+     "hay": ["object_type", "status"], "primary": "object_type",
+     "title": "{object_type} #{object_id}",
+     "subtitle": "Approval · {status} · step {current_step}",
+     "route": "#/settings", "postmap": "approvalPostMap"},
+    {"key": "approval-template", "label": "Approval templates",
+     "gate": "admin", "staff": "admin",
+     "sql": "SELECT id, object_type, enabled FROM erp_approval_templates"
+            " ORDER BY id DESC",
+     "hay": ["object_type"], "primary": "object_type",
+     "title": "{object_type}", "subtitle": "Approval template",
+     "route": "#/settings", "postmap": "approvalTemplatePostMap"},
+    {"key": "fleet-vehicle", "label": "Fleet vehicles", "gate": "admin",
+     "staff": "admin",
+     "sql": "SELECT id, name, make, model, year, plate, status"
+            " FROM erp_fleet_vehicles ORDER BY name",
+     "hay": ["name", "make", "model", "plate", "status"],
+     "primary": "name", "sort": "name",
+     "title": "{name} — {make} {model}",
+     "subtitle": "{plate} · {status}", "route": "#/settings",
+     "postmap": "fleetVehiclePostMap"},
+    {"key": "flavor-request", "label": "Flavor requests",
+     "gate": "recipes.read", "staff": "all",
+     "sql": "SELECT id, flavor_name, slug, category, description,"
+            " status FROM erp_website_flavor_requests ORDER BY id DESC",
+     "hay": ["flavor_name", "category", "description", "status"],
+     "primary": "flavor_name", "title": "{flavor_name}",
+     "subtitle": "{category} · {status}", "route": "#/recipes",
+     "postmap": "flavorRequestPostMap"},
+    {"key": "wholesale-address", "label": "Wholesale addresses",
+     "gate": "accounts.read", "staff": "all",
+     "sql": "SELECT a.id, a.label, a.street, a.city, a.state, a.zip,"
+            " w.name AS account_name FROM erp_wholesale_addresses a"
+            " LEFT JOIN erp_wholesale_accounts w"
+            " ON w.id = a.account_id WHERE a.active = 1 ORDER BY a.id",
+     "hay": ["label", "street", "city", "state", "zip", "account_name"],
+     "primary": "label", "title": "{label} — {street}",
+     "subtitle": "{city}, {state} {zip} · {account_name}",
+     "route": "#/accounts", "postmap": "wholesaleAddressPostMap"},
+]
+
+
+# Poppy search classification manifest (design §5). Every table in
+# init_db is in exactly one of these two dicts -- a table that is
+# neither searchable nor explicitly excluded is a bug, and the
+# classification test asserts full coverage against init_db.
+# POPPY_SEARCHABLE maps table -> [poppy type keys that read it].
+# A type whose rows come from several tables lists each of them.
+POPPY_SEARCHABLE = {
+    'abandoned_carts': ['abandoned-cart'],
+    'erp_acct_accounts': ['gl-account'],
+    'erp_acct_bank_accounts': ['bank-account'],
+    'erp_acct_bill_payment_requests': ['bill-payment-request'],
+    'erp_acct_bills': ['bill'],
+    'erp_acct_budgets': ['budget'],
+    'erp_acct_credit_notes': ['credit-note'],
+    'erp_acct_deferred_revenue': ['deferred-revenue'],
+    'erp_acct_depreciation_runs': ['depreciation-run'],
+    'erp_acct_draws': ['draw'],
+    'erp_acct_dunning_cases': ['dunning-case'],
+    'erp_acct_employees': ['payroll-employee'],
+    'erp_acct_expense_claims': ['expense-claim'],
+    'erp_acct_fixed_assets': ['fixed-asset'],
+    'erp_acct_invoices': ['invoice'],
+    'erp_acct_journal': ['journal'],
+    'erp_acct_payroll_disbursements': ['disbursement'],
+    'erp_acct_payroll_garnishments': ['garnishment'],
+    'erp_acct_payroll_tax_forms': ['payroll-tax-form'],
+    'erp_acct_payruns': ['payrun'],
+    'erp_acct_tax_filings': ['tax-filing'],
+    'erp_acct_tax_reminders': ['tax-reminder'],
+    'erp_acct_vendor_w9': ['contractor-1099'],
+    'erp_api_keys': ['api-key'],
+    'erp_approval_templates': ['approval-template'],
+    'erp_approvals': ['approval'],
+    'erp_barcode_pool': ['barcode'],
+    'erp_cycle_counts': ['cycle-count-detail'],
+    'erp_dash_kpi_thresholds': ['kpi-threshold'],
+    'erp_delivery_routes': ['delivery-route'],
+    'erp_disputes': ['dispute'],
+    'erp_edi_documents': ['edi-document'],
+    'erp_edi_partners': ['edi-partner'],
+    'erp_file_store': ['file'],
+    'erp_fleet_vehicles': ['fleet-vehicle'],
+    'erp_fsma_events': ['fsma-event'],
+    'erp_hr_applicants': ['applicant'],
+    'erp_hr_background_checks': ['background-check'],
+    'erp_hr_benefit_plans': ['benefit-plan'],
+    'erp_hr_bonus_plans': ['bonus-plan'],
+    'erp_hr_bulletins': ['bulletin'],
+    'erp_hr_career_paths': ['career-path'],
+    'erp_hr_commissions': ['commission'],
+    'erp_hr_comp_reviews': ['comp-cycle'],
+    'erp_hr_documents': ['hr-document'],
+    'erp_hr_employees': ['employee'],
+    'erp_hr_enrollment_windows': ['enrollment-window'],
+    'erp_hr_events': ['hr-event'],
+    'erp_hr_form_submissions': ['hr-form-submission'],
+    'erp_hr_goals': ['goal'],
+    'erp_hr_headcount_targets': ['headcount-target'],
+    'erp_hr_help_cases': ['help-case'],
+    'erp_hr_interviews': ['interview'],
+    'erp_hr_learning_paths': ['learning-path'],
+    'erp_hr_leave_policies': ['leave-policy'],
+    'erp_hr_lessons': ['lesson'],
+    'erp_hr_offboarding': ['offboarding'],
+    'erp_hr_offers': ['offer'],
+    'erp_hr_onboarding': ['onboarding'],
+    'erp_hr_pay_grades': ['pay-grade'],
+    'erp_hr_policies': ['policy'],
+    'erp_hr_positions': ['position'],
+    'erp_hr_projects': ['project'],
+    'erp_hr_pto_requests': ['pto-request'],
+    'erp_hr_quizzes': ['quiz'],
+    'erp_hr_recurring_events': ['recurring-event'],
+    'erp_hr_requisitions': ['requisition-hr'],
+    'erp_hr_review_cycles': ['review-cycle'],
+    'erp_hr_reviews': ['hr-review'],
+    'erp_hr_roles': ['job-role'],
+    'erp_hr_succession': ['succession'],
+    'erp_hr_time_records': ['time-record'],
+    'erp_hr_training_courses': ['training-course'],
+    'erp_inventory_bins': ['bin'],
+    'erp_inventory_counts': ['cycle-count'],
+    'erp_it_assets': ['it-asset'],
+    'erp_it_changes': ['it-change'],
+    'erp_it_incidents': ['it-incident'],
+    'erp_it_problems': ['it-problem'],
+    'erp_items': ['item'],
+    'erp_kit_definitions': ['kit'],
+    'erp_legal_agreements': ['legal-agreement'],
+    'erp_legal_ip': ['legal-ip'],
+    'erp_legal_lease_schedules': ['lease'],
+    'erp_legal_licenses': ['license'],
+    'erp_legal_risks': ['legal-risk'],
+    'erp_legal_signature_requests': ['legal-signature'],
+    'erp_locations': ['location'],
+    'erp_lots': ['lot'],
+    'erp_loyalty_rewards_catalog': ['loyalty-reward'],
+    'erp_loyalty_tiers': ['loyalty-tier'],
+    'erp_mkt_campaigns': ['campaign'],
+    'erp_mkt_cms_slots': ['cms-slot'],
+    'erp_mkt_drip_sequences': ['drip'],
+    'erp_mkt_ig_comments': ['ig-comment'],
+    'erp_mkt_ig_posts': ['ig-post'],
+    'erp_mkt_kb_articles': ['kb-article'],
+    'erp_mkt_newsletters': ['newsletter'],
+    'erp_mkt_referrals': ['referral'],
+    'erp_mkt_returns': ['web-return'],
+    'erp_mkt_segments': ['segment'],
+    'erp_mkt_surveys': ['survey'],
+    'erp_mkt_tickets': ['ticket'],
+    'erp_pick_lists': ['pick-list'],
+    'erp_pos_returns': ['pos-return'],
+    'erp_price_lists': ['price-list'],
+    'erp_prod_equipment': ['equipment'],
+    'erp_production_batches': ['batch'],
+    'erp_purchase_orders': ['purchase-order'],
+    'erp_purchase_requisitions': ['requisition'],
+    'erp_qc_holds': ['quality-hold'],
+    'erp_quality_audits': ['quality-audit'],
+    'erp_quality_calibrations': ['calibration'],
+    'erp_quality_capas': ['capa'],
+    'erp_quality_certifications': ['certification'],
+    'erp_quality_checklist_templates': ['checklist-template'],
+    'erp_quality_checklists': ['quality-checklist'],
+    'erp_quality_coas': ['coa'],
+    'erp_quality_cross_contact': ['cross-contact'],
+    'erp_quality_equipment': ['quality-equipment'],
+    'erp_quality_haccp': ['haccp'],
+    'erp_quality_recall_drills': ['recall-drill'],
+    'erp_quality_recall_executions': ['recall'],
+    'erp_quality_safety_incidents': ['safety-incident'],
+    'erp_quality_sanitation_findings': ['sanitation-finding'],
+    'erp_quality_sanitation_logs': ['sanitation-log'],
+    'erp_quality_sanitation_schedules': ['sanitation-schedule'],
+    'erp_quality_sops': ['sop'],
+    'erp_quality_spc_limits': ['spc-limit'],
+    'erp_quality_supplier_allergen_statements': ['allergen-statement'],
+    'erp_quality_supplier_audits': ['supplier-audit'],
+    'erp_recipes': ['recipe'],
+    'erp_reorder_rules': ['reorder-rule'],
+    'erp_report_schedules': ['report-schedule'],
+    'erp_reports_esg_metrics': ['esg-metric'],
+    'erp_rfqs': ['rfq'],
+    'erp_sales_prospects': ['prospect'],
+    'erp_sales_quotes': ['sales-quote'],
+    'erp_sms_messages': ['sms-message'],
+    'erp_sms_templates': ['sms-template'],
+    'erp_stock_targets': ['stock-target'],
+    'erp_store_cash_audits': ['cash-audit'],
+    'erp_store_checklists': ['store-checklist'],
+    'erp_store_deliveries': ['store-delivery'],
+    'erp_store_deposits': ['store-deposit'],
+    'erp_store_documents': ['store-document'],
+    'erp_store_drawers': ['drawer'],
+    'erp_store_incidents': ['store-incident'],
+    'erp_store_lp_flags': ['lp-flag'],
+    'erp_store_maintenance': ['store-maintenance'],
+    'erp_store_planograms': ['planogram'],
+    'erp_store_pm_schedules': ['pm-schedule'],
+    'erp_store_price_changes': ['price-change'],
+    'erp_store_rota_requests': ['rota-request'],
+    'erp_store_rota_shifts': ['rota-shift'],
+    'erp_store_sales': ['store-sale'],
+    'erp_store_shifts': ['store-shift'],
+    'erp_store_tasks': ['store-task'],
+    'erp_store_timeclock': ['timeclock'],
+    'erp_store_transfers': ['store-transfer'],
+    'erp_store_voids': ['store-void'],
+    'erp_store_zreports': ['z-report'],
+    'erp_stores': ['store'],
+    'erp_support_macros': ['support-macro'],
+    'erp_support_sla_policies': ['sla-policy'],
+    'erp_terminal_payments': ['terminal-payment'],
+    'erp_vendor_portal_submissions': ['vendor-portal-submission'],
+    'erp_vendors': ['vendor', 'supplier', 'contractor-1099'],
+    'erp_webhook_subscriptions': ['webhook'],
+    'erp_website_flavor_requests': ['flavor-request'],
+    'erp_wholesale_accounts': ['account', 'customer'],
+    'erp_wholesale_addresses': ['wholesale-address'],
+    'erp_wholesale_orders': ['order', 'customer'],
+    'erp_wholesale_price_tiers': ['price-tier'],
+    'erp_wholesale_returns': ['wholesale-return'],
+    'erp_work_orders': ['work-order'],
+    'gift_cards': ['gift-card'],
+    'newsletter_subscribers': ['subscriber'],
+    'orders': ['order', 'customer'],
+    'paypal_orders': ['order'],
+    'reviews': ['review'],
+    'staff': ['staff'],
+    'subscriptions': ['subscription'],
+    'users': ['customer'],
+}
+
+# POPPY_EXCLUDED maps table -> one-line reason it is not searchable.
+POPPY_EXCLUDED = {
+    'cart_events': 'event rows of an abandoned cart; the cart is searchable',
+    'erp_acct_audit': 'audit/log rows, not a findable record',
+    'erp_acct_bank_txns': 'no list endpoint; rows on the bank account detail',
+    'erp_acct_bill_po_links': 'link rows between a bill and a purchase order',
+    'erp_acct_dunning_events': 'event rows of a dunning case',
+    'erp_acct_dunning_sequences': 'config rows of dunning',
+    'erp_acct_dunning_steps': 'child rows of a dunning sequence',
+    'erp_acct_journal_lines': 'line rows of a journal entry',
+    'erp_acct_migration_links': 'migration link rows',
+    'erp_acct_payments': 'no list endpoint; child rows of an invoice or bill',
+    'erp_acct_payroll_filings': 'no list endpoint; child rows of a payrun',
+    'erp_acct_payroll_tax_tables': 'config reference data',
+    'erp_acct_payrun_lines': 'line rows of a payrun; amounts never searchable',
+    'erp_acct_period_locks': 'config rows',
+    'erp_acct_reconciliations': 'no list endpoint; child rows of a bank account',
+    'erp_acct_revenue_recognitions': 'no list endpoint; child rows of deferred revenue',
+    'erp_acct_sale_posts': 'posting rows; no list endpoint',
+    'erp_acct_tax_checklist': 'no list endpoint; checklist rows',
+    'erp_acct_tax_nexus': 'config reference data',
+    'erp_acct_tax_rates': 'config reference data',
+    'erp_acct_tax_remittances': 'no list endpoint; child rows of a tax filing',
+    'erp_approval_steps': 'step rows of an approval template',
+    'erp_audit_changes': 'audit/log rows, not a findable record',
+    'erp_batch_ingredients': 'line rows of a production batch',
+    'erp_batch_orders': 'link rows between a batch and an order; the batch is searchable',
+    'erp_company_profile': 'singleton profile, not searchable',
+    'erp_deleted_keys': 'tombstone rows; deleted records never surface',
+    'erp_delivery_route_stops': 'stop rows of a delivery route',
+    'erp_document_versions': 'version rows',
+    'erp_drop_ship_shipments': 'no list endpoint; shown on purchase-order detail only',
+    'erp_edi_as2_messages': 'message rows of an EDI partner',
+    'erp_edi_changes': 'change log rows of an EDI document',
+    'erp_edi_ssccs': 'label rows of an EDI document',
+    'erp_faire_import_log': 'sync log rows',
+    'erp_faire_oauth': 'secret/token rows',
+    'erp_faire_orders': 'sync rows; the wholesale order is searchable',
+    'erp_faire_sync': 'sync rows',
+    'erp_flavor_categories': 'tiny config rows',
+    'erp_fleet_fuel': 'fuel log rows of a vehicle',
+    'erp_fleet_maintenance': 'maintenance rows of a vehicle',
+    'erp_fulfillment_history': 'history rows of an order',
+    'erp_hr_benefit_eligibility': 'eligibility rows of a benefit plan',
+    'erp_hr_benefits': 'per-employee enrollment rows',
+    'erp_hr_bonus_payouts': 'per-person payout rows; amounts never searchable',
+    'erp_hr_bulletin_reads': 'read-receipt rows of a bulletin',
+    'erp_hr_career_path_steps': 'step rows of a career path',
+    'erp_hr_event_staff': 'roster rows of an HR event',
+    'erp_hr_form_defs': 'form definitions (config); submissions are searchable',
+    'erp_hr_form_signatures': 'child rows of a submission',
+    'erp_hr_form_submission_versions': 'version rows',
+    'erp_hr_form_token_requests': 'tokens/secrets',
+    'erp_hr_headcount_periods': 'period rows of a headcount target',
+    'erp_hr_learning_path_steps': 'step rows of a learning path',
+    'erp_hr_offboarding_items': 'item rows of an offboarding',
+    'erp_hr_onboarding_templates': 'template rows',
+    'erp_hr_policy_acknowledgements': 'acknowledgement rows of a policy',
+    'erp_hr_policy_audiences': 'audience rows of a policy; who-sees-what metadata, never searchable',
+    'erp_hr_policy_versions': 'version rows',
+    'erp_hr_project_tasks': 'task rows of a project',
+    'erp_hr_pto_accrual_ledger': 'ledger rows; balances never searchable',
+    'erp_hr_pto_accrual_rules': 'tiny config rows',
+    'erp_hr_pto_balances': 'per-person balance rows',
+    'erp_hr_pto_types': 'tiny config rows',
+    'erp_hr_quiz_attempts': 'per-person attempt rows',
+    'erp_hr_quiz_questions': 'question rows of a quiz',
+    'erp_hr_recurring_instances': 'instance rows of a recurring event',
+    'erp_hr_training_categories': 'tiny config rows',
+    'erp_hr_training_completions': 'per-person completion rows',
+    'erp_inv_demand_settings': 'config rows',
+    'erp_inventory_count_lines': 'line rows of a count',
+    'erp_it_problem_incidents': 'link rows of an IT problem',
+    'erp_item_locations': 'location rows of an item',
+    'erp_kit_assemblies': 'no list endpoint; assemblies shown on kit detail only',
+    'erp_kit_components': 'component rows of a kit',
+    'erp_legal_agreement_items': 'item rows of a legal agreement',
+    'erp_legal_compliance': 'no list endpoint; compliance rows',
+    'erp_login_codes': 'token/secret rows',
+    'erp_loyalty_tier_rule_runs': 'rule-run log rows',
+    'erp_loyalty_tier_rules': 'config/rule rows',
+    'erp_mkt_ab_tests': 'config rows',
+    'erp_mkt_audit': 'audit/log rows, not a findable record',
+    'erp_mkt_campaign_channels': 'child rows of a campaign',
+    'erp_mkt_campaign_costs': 'child rows of a campaign',
+    'erp_mkt_cms_versions': 'version rows',
+    'erp_mkt_customer_notes': 'note rows; the customer record is searchable',
+    'erp_mkt_drip_enrollments': 'enrollment rows of a drip sequence',
+    'erp_mkt_drip_steps': 'child rows of a drip sequence',
+    'erp_mkt_ig_actions': 'action log rows',
+    'erp_mkt_ig_insights': 'metric rows; the post is searchable',
+    'erp_mkt_newsletter_events': 'event rows of a newsletter',
+    'erp_mkt_promo_overrides': 'config/rule rows',
+    'erp_mkt_referral_settings': 'config rows',
+    'erp_mkt_review_request_settings': 'config rows',
+    'erp_mkt_score_rules': 'config/rule rows',
+    'erp_mkt_survey_answers': 'answer rows of a survey response',
+    'erp_mkt_survey_questions': 'question rows of a survey',
+    'erp_mkt_survey_responses': 'response rows of a survey',
+    'erp_mkt_ticket_replies': 'reply rows of a ticket',
+    'erp_mkt_winback_sends': 'send log rows',
+    'erp_notification_prefs': 'per-person preference rows',
+    'erp_order_fulfillment': 'child rows of an order',
+    'erp_order_pickup': 'child rows of an order',
+    'erp_order_production_lines': 'line rows of an order',
+    'erp_pick_list_lines': 'line rows of a pick list',
+    'erp_po_lines': 'line rows of a purchase order',
+    'erp_price_list_assignments': 'assignment rows of a price list',
+    'erp_price_list_lines': 'line rows of a price list',
+    'erp_price_list_versions': 'version rows',
+    'erp_production_settings': 'config rows',
+    'erp_qb_config': 'config/sync rows',
+    'erp_qb_links': 'sync rows',
+    'erp_qb_oauth': 'secret/token rows',
+    'erp_quality_audit_actions': 'action rows of a quality audit',
+    'erp_quality_audit_checklist': 'checklist rows of a quality audit',
+    'erp_quality_audit_findings': 'finding rows of a quality audit',
+    'erp_quality_capa_actions': 'action rows of a CAPA',
+    'erp_quality_cert_checklists': 'checklist rows of a certification',
+    'erp_quality_cert_evidence': 'evidence rows of a certification',
+    'erp_quality_complaint_links': 'no register table; links only',
+    'erp_quality_recall_plan': 'singleton plan, not searchable',
+    'erp_quality_spc_measurements': 'measurement rows of an SPC limit',
+    'erp_quality_supplier_audit_findings': 'finding rows of a supplier audit',
+    'erp_recipe_lines': 'line rows of a recipe',
+    'erp_reports_esg_values': 'value rows of an ESG metric',
+    'erp_retention_policies': 'config rows',
+    'erp_retention_runs': 'audit/log rows, not a findable record',
+    'erp_rfq_lines': 'line rows of an RFQ',
+    'erp_rfq_quotes': 'quote rows of an RFQ',
+    'erp_rfq_vendors': 'vendor rows of an RFQ',
+    'erp_sales_quote_lines': 'line rows of a quote',
+    'erp_sales_summaries': 'summary/aggregate rows',
+    'erp_security_check_runs': 'audit/log rows, not a findable record',
+    'erp_settings_audit': 'audit/log rows, not a findable record',
+    'erp_sms_config': 'config rows',
+    'erp_staff_audit': 'audit/log rows, not a findable record',
+    'erp_staff_perms': 'per-staff permission rows',
+    'erp_stock_ledger': 'ledger rows',
+    'erp_store_delivery_lines': 'line rows of a store delivery',
+    'erp_store_settings': 'config rows',
+    'erp_token_denylist': 'token/secret rows',
+    'erp_vendor_approval_history': 'history rows of a vendor',
+    'erp_vendor_onboarding': 'onboarding rows of a vendor',
+    'erp_vendor_portal_tokens': 'secret/token rows',
+    'erp_webhook_deliveries': 'delivery log rows',
+    'erp_wholesale_order_lines': 'line rows of a wholesale order',
+    'erp_wholesale_return_lines': 'line rows of a wholesale return',
+    'erp_wholesale_users': 'no ERP list endpoint/UI',
+    'erp_wipe_exports': 'export rows',
+    'erp_work_order_steps': 'step rows of a work order',
+    'fundraiser_orders': 'no ERP list endpoint/UI; public storefront only',
+    'fundraiser_sellers': 'no ERP list endpoint/UI; public storefront only',
+    'fundraiser_sponsors': 'no ERP list endpoint/UI; public storefront only',
+    'fundraiser_stretch_goals': 'no ERP list endpoint/UI; public storefront only',
+    'fundraiser_teams': 'no ERP list endpoint/UI; public storefront only',
+    'fundraiser_ticker': 'no ERP list endpoint/UI; public storefront only',
+    'fundraisers': 'no ERP list endpoint/UI; public storefront only',
+    'kernel_transactions': 'ledger rows; amounts never searchable',
+    'loyalty_rewards': 'customer reward instances; no ERP list UI; the catalog is searchable',
+    'marketing_campaigns': 'legacy send log; superseded by erp_mkt_campaigns',
+    'marketing_unsubscribes': 'unsubscribe log rows',
+    'password_reset_tokens': 'token/secret rows',
+    'paypal_meta': 'metadata rows of a PayPal order',
+    'paypal_pending_subscriptions': 'pending checkout rows; the subscription is searchable',
+    'promo_redemptions': 'redemption log rows',
+    'push_tokens': 'token/secret rows',
+    'redemptions': 'redemption log rows',
+    'site_visits': 'analytics rows',
+    'staff_kernel_transactions': 'ledger rows; amounts never searchable',
+    'staff_password_reset_tokens': 'token/secret rows',
+    'staff_verification_tokens': 'token/secret rows',
+    'subscription_email_templates': 'email template rows; the subscription is searchable',
+    'subscription_renewals': 'renewal rows of a subscription',
+    'subscription_requests': 'no list endpoint',
+    'verification_tokens': 'token/secret rows',
+}
+
+
+POPPY_LABELS = {s["key"]: s["label"] for s in POPPY_SECTIONS}
+
+
 @app.get("/api/erp/search")
 def erp_search():
-    """Find-anything search for Poppy, the ERP chat bot (Nov 17, 2026).
+    """Find-anything search for Poppy, the ERP chat bot (Nov 27, 2026
+    expansion).
 
     FIND-ONLY: keyword matching over the caller's own ERP data, no data
-    changes, no computed answers, no external service. Each record type is
-    queried only when the caller holds that type's read perm (checked with
-    the same _erp_check_perm the list endpoint uses); a type the caller
-    cannot read is silently omitted. SOPs are admin-only, like their list
-    endpoint. Empty q (or under 2 chars) returns {results: []}.
+    changes, no computed answers, no external service. Each record type
+    is queried only when the caller holds that type's read perm (checked
+    with the same gate its list endpoint uses); a type the caller
+    cannot list, they cannot find. Staff see only their own records
+    where the design says so, published-only policies/bulletins, and
+    training on their role's paths; staff never find another person.
+
+    Matching is unchanged from v1: all query words must appear as
+    substrings in the record's haystack; rank 0 = a word matches the
+    primary field exactly / as a prefix, 1 = substring, 2 = other
+    haystack field. Per-type cap is `limit` (default 5, clamped 1-10);
+    the whole response caps at POPPY_OVERALL_CAP (50), sections run in
+    registry order and stop early once the cap is hit. Short/empty
+    queries return no results. The response carries `types`: {key:
+    label} for the types present, so the frontend need not guess
+    labels.
     """
-    _, err = _require_erp()
-    if err:
-        return err
+    _, _err = _require_erp()
+    if _err:
+        return _err
     q_raw = (request.args.get("q") or "").strip()
     if len(q_raw) < 2:
-        return jsonify(q=q_raw, results=[])
+        return jsonify(q=q_raw, results=[], types={})
     try:
         limit = int(request.args.get("limit") or 5)
     except (TypeError, ValueError):
         limit = 5
-    limit = max(1, min(limit, 10))
-    words = q_raw.lower().split()
-    results = []
+    limit = max(1, min(10, limit))
+    words = [w.lower() for w in q_raw.split() if w]
+    if not words:
+        return jsonify(q=q_raw, results=[], types={})
     conn = db()
+    ctx = _poppy_staff_ctx(conn)
+    results = []
 
-    def _add(rows):
-        rows.sort(key=lambda r: (r[0], r[1]))
-        for _, _, item in rows[:limit]:
+    def _add(found):
+        for _rank, _sort, item in sorted(
+                found, key=lambda t: (t[0], t[1]))[:limit]:
+            if len(results) >= POPPY_OVERALL_CAP:
+                return
             results.append(item)
 
-    # --- orders: wholesale + website (stripe + captured paypal only) ---
-    _, oerr = _erp_check_perm("orders.read")
-    if oerr is None:
-        fulf = {(f["order_source"], f["order_id"]): f["status"]
-                for f in conn.execute("SELECT order_source, order_id, status"
-                                      " FROM erp_order_fulfillment").fetchall()}
-        found = []
-        ws_lines = {}
-        for l in conn.execute("SELECT order_id, flavor_name FROM erp_wholesale_order_lines").fetchall():
-            ws_lines.setdefault(l["order_id"], []).append(l["flavor_name"])
-        for w in conn.execute("SELECT * FROM erp_wholesale_orders ORDER BY id DESC").fetchall():
-            brief = _erp_wholesale_order_brief(conn, w)
-            brief["status"] = fulf.get(("wholesale", w["id"]), brief["status"])
-            hay = [w["order_number"], brief["account_name"], brief["status"],
-                   w["po_number"] if "po_number" in w.keys() else "",
-                   " ".join(ws_lines.get(w["id"], []))]
-            if not _erp_search_match(hay, words):
+    for spec in POPPY_SECTIONS:
+        if len(results) >= POPPY_OVERALL_CAP:
+            break
+        if "fn" in spec:
+            if not _poppy_gate_ok(spec["gate"], ctx):
                 continue
-            found.append((_erp_search_rank(brief["account_name"], w["order_number"], words),
-                          -w["id"],
-                          {"type": "order", "id": w["id"],
-                           "title": "%s — %s" % (w["order_number"], brief["account_name"] or "—"),
-                           "subtitle": "Wholesale · %g bags · %s · %s" % (
-                               brief["total_qty"], _erp_search_money(brief["total_cents"]),
-                               brief["status"]),
-                           "route": "#/orders",
-                           "open": {"ordersPostMap": {"source": "wholesale", "id": w["id"]}}}))
-        for source, table in (("stripe", "orders"), ("paypal", "paypal_orders")):
-            if source == "stripe":
-                rows = conn.execute(
-                    "SELECT * FROM orders WHERE stripe_session_id NOT LIKE 'paypal:%'"
-                    " ORDER BY id DESC").fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM paypal_orders WHERE status = 'captured'"
-                    " ORDER BY id DESC").fetchall()
-            for r in rows:
-                o = _erp_online_order(conn, source, r["id"])
-                if not o:
-                    continue
-                o["status"] = fulf.get((source, r["id"]), "new")
-                hay = [o["number"], o["customer_name"], o["email"], o["items_summary"]]
-                if not _erp_search_match(hay, words):
-                    continue
-                who = o["customer_name"] or o["email"] or "—"
-                found.append((_erp_search_rank(who, o["number"], words),
-                              -r["id"],
-                              {"type": "order", "id": r["id"],
-                               "title": "%s — %s" % (o["number"], who),
-                               "subtitle": "Website · %s · %s" % (
-                                   _erp_search_money(o["total_cents"]), o["status"]),
-                               "route": "#/orders",
-                               "open": {"ordersPostMap": {"source": source, "id": r["id"]}}}))
-        _add(found)
-
-    # --- invoices ---
-    _, aerr = _erp_check_perm("accounting.read")
-    if aerr is None:
-        found = []
-        for r in conn.execute("SELECT * FROM erp_acct_invoices"
-                              " ORDER BY date DESC, id DESC").fetchall():
-            hay = ["#%d" % r["id"], str(r["id"]), r["customer_name"], r["status"]]
-            if not _erp_search_match(hay, words):
+            if ctx["role"] == "staff" and spec.get("staff") == "admin":
                 continue
-            sub = "%s · %s" % (_erp_search_money(r["total_cents"]), r["status"])
-            if r["due_date"]:
-                sub += " · due %s" % r["due_date"]
-            found.append((_erp_search_rank(r["customer_name"], "#%d" % r["id"], words),
-                          -r["id"],
-                          {"type": "invoice", "id": r["id"],
-                           "title": "Invoice #%d — %s" % (r["id"], r["customer_name"]),
-                           "subtitle": sub, "route": "#/accounting",
-                           "open": {"acctView": "invoices", "highlight": "invoice-%d" % r["id"]}}))
-        _add(found)
-        # --- bills ---
-        found = []
-        for r in conn.execute("SELECT * FROM erp_acct_bills"
-                              " ORDER BY date DESC, id DESC").fetchall():
-            hay = ["#%d" % r["id"], str(r["id"]), r["vendor_name"], r["status"]]
-            if not _erp_search_match(hay, words):
-                continue
-            sub = "%s · %s" % (_erp_search_money(r["total_cents"]), r["status"])
-            if r["due_date"]:
-                sub += " · due %s" % r["due_date"]
-            found.append((_erp_search_rank(r["vendor_name"], "#%d" % r["id"], words),
-                          -r["id"],
-                          {"type": "bill", "id": r["id"],
-                           "title": "Bill #%d — %s" % (r["id"], r["vendor_name"] or "—"),
-                           "subtitle": sub, "route": "#/accounting",
-                           "open": {"acctView": "bills", "highlight": "bill-%d" % r["id"]}}))
-        _add(found)
-
-    # --- vendors ---
-    _, perr = _erp_check_perm("purchasing.read")
-    if perr is None:
-        found = []
-        for r in conn.execute("SELECT * FROM erp_vendors WHERE active = 1"
-                              " ORDER BY name").fetchall():
-            hay = [r["name"], r["contact_name"], r["email"], r["phone"],
-                   r["notes"], r["payment_terms"]]
-            if not _erp_search_match(hay, words):
-                continue
-            sub = "Vendor"
-            if r["payment_terms"]:
-                sub += " · %s" % r["payment_terms"]
-            if r["email"]:
-                sub += " · %s" % r["email"]
-            found.append((_erp_search_rank(r["name"], "", words), r["name"].lower(),
-                          {"type": "vendor", "id": r["id"], "title": r["name"],
-                           "subtitle": sub, "route": "#/purchasing",
-                           "open": {"highlight": "vendor-%d" % r["id"]}}))
-        _add(found)
-        # --- purchase orders ---
-        vendors = {v["id"]: v["name"] for v in conn.execute(
-            "SELECT id, name FROM erp_vendors").fetchall()}
-        po_totals = {t["po_id"]: t["total"] for t in conn.execute(
-            "SELECT po_id, COALESCE(SUM(qty_ordered * unit_cost_cents), 0) AS total"
-            " FROM erp_po_lines GROUP BY po_id").fetchall()}
-        found = []
-        for r in conn.execute("SELECT * FROM erp_purchase_orders"
-                              " ORDER BY id DESC").fetchall():
-            vname = vendors.get(r["vendor_id"], "")
-            hay = [r["po_number"], vname, r["status"]]
-            if not _erp_search_match(hay, words):
-                continue
-            found.append((_erp_search_rank(vname, r["po_number"], words),
-                          -r["id"],
-                          {"type": "purchase-order", "id": r["id"],
-                           "title": "%s — %s" % (r["po_number"], vname or "—"),
-                           "subtitle": "Purchase order · %s · %s" % (
-                               r["status"], _erp_search_money(po_totals.get(r["id"], 0))),
-                           "route": "#/purchasing",
-                           "open": {"poPostMap": r["id"]}}))
-        _add(found)
-
-    # --- inventory items ---
-    _, ierr = _erp_check_perm("inventory.read")
-    if ierr is None:
-        found = []
-        for r in conn.execute("SELECT * FROM erp_items WHERE active = 1"
-                              " ORDER BY type, name").fetchall():
-            hay = [r["name"], r["sku"], r["type"]]
-            if not _erp_search_match(hay, words):
-                continue
-            found.append((_erp_search_rank(r["name"], r["sku"], words), r["name"].lower(),
-                          {"type": "item", "id": r["id"], "title": r["name"],
-                           "subtitle": "Item · %s · %s" % (r["sku"], r["type"]),
-                           "route": "#/inventory",
-                           "open": {"itemPostMap": r["id"]}}))
-        _add(found)
-
-    # --- recipes ---
-    _, rerr = _erp_check_perm("recipes.read")
-    if rerr is None:
-        found = []
-        for r in conn.execute("SELECT * FROM erp_recipes WHERE active = 1"
-                              " ORDER BY name").fetchall():
-            if not _erp_search_match([r["name"]], words):
-                continue
-            found.append((_erp_search_rank(r["name"], "", words), r["name"].lower(),
-                          {"type": "recipe", "id": r["id"], "title": r["name"],
-                           "subtitle": "Recipe · %s bags per batch" % _erp_fmt_qty(r["batch_size_bags"]),
-                           "route": "#/production",
-                           "open": {"recipePostMap": r["id"]}}))
-        _add(found)
-
-    # --- wholesale accounts ---
-    _, cerr = _erp_check_perm("accounts.read")
-    if cerr is None:
-        found = []
-        for r in conn.execute("SELECT * FROM erp_wholesale_accounts"
-                              " ORDER BY name").fetchall():
-            hay = [r["name"], r["contact_name"], r["email"],
-                   r["billing_name"] if "billing_name" in r.keys() else "",
-                   r["billing_email"] if "billing_email" in r.keys() else ""]
-            if not _erp_search_match(hay, words):
-                continue
-            sub = "Wholesale account"
-            if r["contact_name"]:
-                sub += " · %s" % r["contact_name"]
-            if r["email"]:
-                sub += " · %s" % r["email"]
-            found.append((_erp_search_rank(r["name"], "", words), r["name"].lower(),
-                          {"type": "account", "id": r["id"], "title": r["name"],
-                           "subtitle": sub, "route": "#/orders",
-                           "open": {"accountsPostMap": r["id"]}}))
-        _add(found)
-
-    # --- SOPs: admin only, like the SOP list endpoint ---
-    _, serr = _require_erp_admin()
-    if serr is None:
-        found = []
-        for r in conn.execute("SELECT * FROM erp_quality_sops"
-                              " ORDER BY dept, position, id").fetchall():
-            if not _erp_search_match([r["title"], r["body"]], words):
-                continue
-            d = _quality_sop_dict(r)
-            found.append((_erp_search_rank(r["title"], "", words),
-                          (r["dept"], r["position"], r["id"]),
-                          {"type": "sop", "id": r["id"], "title": r["title"],
-                           "subtitle": "Dept %d · %s" % (r["dept"], d["dept_name"]),
-                           "route": "#/quality",
-                           "open": {"sopPostMap": r["id"]}}))
-        _add(found)
-
+            _add(spec["fn"](conn, ctx, words))
+        else:
+            _add(_poppy_run_spec(conn, spec, ctx, words))
     conn.close()
-    return jsonify(q=q_raw, results=results)
+    types = {}
+    for item in results:
+        if item["type"] not in types:
+            types[item["type"]] = POPPY_LABELS[item["type"]]
+    return jsonify(q=q_raw, results=results, types=types)
 
 
 @app.post("/api/erp/orders/<source>/<int:order_id>/status")
@@ -88856,6 +100019,13 @@ def erp_order_set_status(source, order_id):
         # Phase 5: entering production generates the per-flavor checklist.
         _erp_ensure_production_lines(conn, order_id)
     conn.commit()
+    # SMS (SOP 8.40, item S6): auto-send runs only after the status
+    # change committed, and only when the admin turned the auto flag
+    # on and wrote a template of that kind -- otherwise nothing sends.
+    if source == "wholesale" and status == "ready":
+        _sms_maybe_auto_send(conn, source, order_id, "order_ready", actor)
+    elif source == "wholesale" and status in ("shipped", "partially_shipped"):
+        _sms_maybe_auto_send(conn, source, order_id, "order_shipped", actor)
     conn.close()
     return jsonify(ok=True, status=status)
 
@@ -90787,6 +101957,8 @@ _ERP_RESET_TABLES = [
     "erp_store_zreports",
     "erp_store_shifts",
     "erp_store_timeclock",
+    "erp_store_rota_shifts",
+    "erp_store_rota_requests",
     "erp_store_maintenance",
     "erp_store_voids",
     "erp_store_cash_audits",
@@ -90876,6 +102048,20 @@ assert "erp_hr_goals" not in _ERP_RESET_TABLES, \
 # a pay decision.
 assert "erp_hr_comp_reviews" not in _ERP_RESET_TABLES, \
     "erp_hr_comp_reviews must survive the reset (comp reviews)"
+# Digital HR Forms (SOPs 12.40-12.46): form records are people
+# records like the policies they sit beside -- a wipe must never
+# erase a submitted form, its versions, its signatures, or its
+# offer links.
+assert "erp_hr_form_defs" not in _ERP_RESET_TABLES, \
+    "erp_hr_form_defs must survive the reset (HR form definitions)"
+assert "erp_hr_form_submissions" not in _ERP_RESET_TABLES, \
+    "erp_hr_form_submissions must survive the reset (HR forms)"
+assert "erp_hr_form_submission_versions" not in _ERP_RESET_TABLES, \
+    "erp_hr_form_submission_versions must survive the reset (HR forms)"
+assert "erp_hr_form_signatures" not in _ERP_RESET_TABLES, \
+    "erp_hr_form_signatures must survive the reset (HR forms)"
+assert "erp_hr_form_token_requests" not in _ERP_RESET_TABLES, \
+    "erp_hr_form_token_requests must survive the reset (HR forms)"
 # Bonus plans + payouts (SOP 12.32): plans and payouts are people
 # records like the comp reviews they sit beside -- a wipe must
 # never erase a recorded bonus decision.
@@ -91176,6 +102362,15 @@ assert "erp_quality_audit_actions" not in _ERP_RESET_TABLES, \
 # them, and no CAPA is ever auto-created to backfill one.
 assert "erp_quality_capas" not in _ERP_RESET_TABLES, \
     "erp_quality_capas must survive the reset (CAPA records)"
+# Sanitation / pest-control register (SOP 13.23): schedules, log
+# entries and findings are quality records -- a wipe must never
+# erase them, same as the CAPAs and the safety incidents.
+assert "erp_quality_sanitation_schedules" not in _ERP_RESET_TABLES, \
+    "erp_quality_sanitation_schedules must survive the reset (sanitation schedules)"
+assert "erp_quality_sanitation_logs" not in _ERP_RESET_TABLES, \
+    "erp_quality_sanitation_logs must survive the reset (sanitation log entries)"
+assert "erp_quality_sanitation_findings" not in _ERP_RESET_TABLES, \
+    "erp_quality_sanitation_findings must survive the reset (sanitation findings)"
 assert "erp_quality_capa_actions" not in _ERP_RESET_TABLES, \
     "erp_quality_capa_actions must survive the reset (CAPA actions)"
 # Wave 3 B4 supplier quality audits (SOP 13.15): supplier audits and
@@ -94487,6 +105682,10 @@ def erp_wholesale_order_ship(order_id):
         conn.close()
         return jsonify(error=err_msg), 400
     conn.commit()
+    # SMS (SOP 8.40, item S6): auto-send runs only after the ship
+    # committed, and only when the admin turned auto_shipped on and
+    # wrote an order_shipped template -- otherwise nothing sends.
+    _sms_maybe_auto_send(conn, "wholesale", order_id, "order_shipped", actor)
     w = conn.execute("SELECT * FROM erp_wholesale_orders WHERE id = ?",
                      (order_id,)).fetchone()
     out = _erp_wholesale_order_brief(conn, w)
@@ -97588,6 +108787,27 @@ def _erp_sales_breakdown(conn, df, dt, channel, online_rows):
 
 # ---------- report: sales by flavor/channel ----------
 
+# F4 (Nov 27, 2026): a dead wholesale sale never counts -- not in a
+# customer's lifetime total, not in the sales report. A cancelled
+# order never shipped, and an order whose AR invoice was voided had
+# its sale reversed (the void posts a reversing journal entry; the
+# order row stays as history). Before this, Benjy Levit's customer
+# page read "2 orders · $248.00" after invoice #352 ($8) was voided,
+# because the lifetime summed every wholesale order and never looked
+# at order status or invoices, while AR aging, the customer
+# statement and the BI billed series already excluded void invoices
+# -- so the lifetime disagreed with AR ($240). The invoice link is
+# the sale post: erp_acct_sale_posts (kind 'wholesale', ref_id =
+# order id) carries the invoice id. Read path only: no journal
+# entry, invoice, or order row is written or changed here.
+_ERP_WHOLESALE_LIVE_ORDER = (
+    "o.status != 'cancelled'"
+    " AND NOT EXISTS (SELECT 1 FROM erp_acct_sale_posts sp"
+    " JOIN erp_acct_invoices iv ON iv.id = sp.invoice_id"
+    " WHERE sp.kind = 'wholesale' AND sp.ref_id = o.id"
+    " AND iv.status = 'void')")
+
+
 def _erp_sales_report_data(conn, df, dt, channel):
     """Sales report computation, shared by the tab endpoint and the
     scheduled-report sender (Wave 3 B6): one computation, so a
@@ -97620,13 +108840,16 @@ def _erp_sales_report_data(conn, df, dt, channel):
         online["flavors"] = [{"flavor": k, "bags": v}
                              for k, v in sorted(flavors.items(), key=lambda kv: -kv[1])]
     if channel in ("all", "wholesale"):
+        _conds = [_ERP_WHOLESALE_LIVE_ORDER]
+        if where:
+            _conds.append("(" + where.replace("created_at", "o.created_at") + ")")
         q = ("SELECT o.id, o.order_number, o.created_at, a.name AS account_name,"
              " COALESCE(SUM(l.line_total_cents), 0) AS total_cents,"
              " COALESCE(SUM(l.qty_bags), 0) AS bags"
              " FROM erp_wholesale_orders o"
              " JOIN erp_wholesale_accounts a ON a.id = o.account_id"
              " LEFT JOIN erp_wholesale_order_lines l ON l.order_id = o.id"
-             + (" WHERE " + where.replace("created_at", "o.created_at") if where else "")
+             " WHERE " + " AND ".join(_conds)
              + " GROUP BY o.id ORDER BY o.id")
         rows = conn.execute(q, params).fetchall()
         flavors = {}
@@ -97713,6 +108936,9 @@ def _erp_customer_rows(conn, df="", dt=""):
     normalized lowercase email from _erp_online_sales_rows (orders +
     captured paypal_orders, uncaptured PayPal excluded), wholesale
     keyed by account email — or by account when it has no email.
+    A dead wholesale sale never counts (F4, SOP 9.41): cancelled
+    orders and orders whose AR invoice was voided are excluded from
+    the order count, bags, and spend, so the lifetime agrees with AR.
     Returns the customers dict (no repeat flag, no sorting)."""
     customers = {}
 
@@ -97743,13 +108969,16 @@ def _erp_customer_rows(conn, df="", dt=""):
             _add("email:", "(no email)", "", "", r["created_at"],
                  float(_erp_online_bags(r)), int(r["amount_total_cents"] or 0))
     where, params = _erp_date_where(df, dt, "o.created_at")
+    _conds = [_ERP_WHOLESALE_LIVE_ORDER]
+    if where:
+        _conds.append("(" + where + ")")
     q = ("SELECT o.id, o.created_at, a.id AS account_id, a.name AS account_name,"
          " a.email AS account_email, COALESCE(SUM(l.qty_bags), 0) AS bags,"
          " COALESCE(SUM(l.line_total_cents), 0) AS spent"
          " FROM erp_wholesale_orders o"
          " JOIN erp_wholesale_accounts a ON a.id = o.account_id"
          " LEFT JOIN erp_wholesale_order_lines l ON l.order_id = o.id"
-         + (" WHERE " + where if where else "")
+         " WHERE " + " AND ".join(_conds)
          + " GROUP BY o.id ORDER BY o.id")
     for r in conn.execute(q, params).fetchall():
         email = (r["account_email"] or "").strip().lower()
@@ -100620,11 +111849,12 @@ def _erp_health_entry(key, name, configured, last_success_at,
 
 
 def _erp_integration_health(conn):
-    """Health for the six integrations, from env/config + stored data only.
+    """Health for the seven integrations, from env/config + stored data only.
     Last-success sources: QuickBooks pushes (erp_qb_links), Shippo labels
     (orders / fundraiser_orders), Stripe orders (orders), captured PayPal
     orders (paypal_orders), Printful submissions (orders), Faire imports
-    (erp_faire_import_log + erp_faire_sync summary). Last-error sources:
+    (erp_faire_import_log + erp_faire_sync summary), SMS sends
+    (erp_sms_messages). Last-error sources:
     Faire import log / sync summary only -- the other integrations store
     no error record (failures surface only in server logs), and the entry
     says so rather than claiming a clean bill of health."""
@@ -100799,6 +112029,41 @@ def _erp_integration_health(conn):
     except Exception as e:
         out.append(_erp_health_entry(
             "faire", "Faire", False, "", "", "", "", check_error=str(e)))
+
+    # SMS (Twilio, SOP 8.40, item S6): configured means a complete
+    # Settings config (SID + from number + stored token); last success
+    # is the last message row recorded 'sent', last error the last
+    # 'failed' row. Unlike the other integrations, SMS failures ARE
+    # stored, so an error here is real evidence, not a guess.
+    try:
+        cfg = _sms_config_row(conn)
+        sms_configured = bool(cfg and (cfg["account_sid"] or "")
+                              and (cfg["from_number"] or "")
+                              and (cfg["auth_token_enc"] or ""))
+        last_sent = conn.execute(
+            "SELECT MAX(created_at) AS m, COUNT(*) AS c"
+            " FROM erp_sms_messages WHERE status = 'sent'").fetchone()
+        last_fail = conn.execute(
+            "SELECT created_at, error FROM erp_sms_messages"
+            " WHERE status = 'failed' ORDER BY id DESC LIMIT 1").fetchone()
+        sms_success = (last_sent["m"] or "") if last_sent else ""
+        sms_detail = ("Last SMS sent %s (%d sent total)"
+                      % (sms_success, int(last_sent["c"] or 0))
+                      if sms_success else "")
+        entry = _erp_health_entry(
+            "sms", "SMS (Twilio)", sms_configured, sms_success, sms_detail,
+            (last_fail["created_at"] or "") if last_fail else "",
+            (last_fail["error"] or "")[:200] if last_fail else "",
+            connected=None)
+        if not sms_configured:
+            entry["evidence"] = ("Not configured: enter the Twilio"
+                                 " credentials in Settings first -- SMS"
+                                 " never sends until then.")
+        out.append(entry)
+    except Exception as e:
+        out.append(_erp_health_entry(
+            "sms", "SMS (Twilio)", False, "", "", "", "",
+            check_error=str(e)))
 
     return {"integrations": out}
 
